@@ -1,0 +1,705 @@
+//! Reduce file size.
+//!
+//! Follows the original feature: one quality slider (0 to 100, default 50) that affects only
+//! images; byte-identical streams are merged; images are re-encoded and down-sampled according to
+//! how large they are drawn; the result is written with object streams and a cross-reference stream
+//! and is rejected unless the whole file got smaller.
+//!
+//! Deviations (the original used JPEG 2000 and JBIG2 encoders that are not available here):
+//! photographic images are re-encoded as JPEG, 1-bit and JPEG 2000 sources are left unchanged,
+//! CMYK images are left unchanged, an image is only replaced if the new data is smaller, and the
+//! output is not linearized.
+
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Cursor, Write};
+use std::path::{Path, PathBuf};
+
+use flate2::{write::ZlibEncoder, Compression};
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, ExtendedColorType, ImageFormat};
+use lopdf::content::Content;
+use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
+
+use crate::error::{Error, Result};
+use crate::pdf::Pdf;
+
+pub const DEFAULT_IMAGE_FACTOR: u8 = 50;
+
+/// Verbatim strings from the original.
+pub mod messages {
+    pub const NOT_SMALLER: &str = "The size of file is not smaller.";
+    pub const XFA: &str = "The XFA document cannot be reduced.";
+    pub const NO_PERMISSION: &str = "You do not have sufficient permissions to perform this task.\nPlease change the security settings from the document Properties dialog and try again.";
+    pub const OPEN_FAILED: &str = "You do not have sufficient permissions to perform this task.";
+    pub const SAVE_ERROR: &str = "An error was encountered while saving the document.";
+    pub const PORTFOLIO: &str = "Ignored";
+    pub const NEED_SAVE: &str = "The PDF document needs to be saved before it can be optimized. Do you want to save and continue?";
+    pub const CHOOSE_FOLDER: &str = "Please choose the folder for the output location.";
+    pub const INVALID_PATH: &str = "The path is invalid or does not exist.";
+    pub const FILE_EXISTS: &str = "Current setting would require overwriting existing files…";
+    pub const SLIDER_NOTE: &str = "Note: The slider bar affects only images within a document.";
+}
+
+/// Why a document is refused before any work is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    Xfa,
+    NoPermission,
+    Portfolio,
+}
+
+impl Refusal {
+    pub fn message(self) -> &'static str {
+        match self {
+            Refusal::Xfa => messages::XFA,
+            Refusal::NoPermission => messages::NO_PERMISSION,
+            Refusal::Portfolio => messages::PORTFOLIO,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReduceOptions {
+    /// Slider position: 0 (small size) to 100 (high quality).
+    pub image_factor: u8,
+}
+
+impl Default for ReduceOptions {
+    fn default() -> Self {
+        Self { image_factor: DEFAULT_IMAGE_FACTOR }
+    }
+}
+
+impl ReduceOptions {
+    /// `f = factor/100`, clamped to 0.05..=0.95 as in the original.
+    fn f(&self) -> f32 {
+        (self.image_factor.min(100) as f32 / 100.0).clamp(0.05, 0.95)
+    }
+    /// Scales the down-sampling target: 1.0 at the default slider position.
+    fn k2(&self) -> f32 {
+        self.f() + 0.5
+    }
+    fn jpeg_quality(&self) -> u8 {
+        (30.0 + 65.0 * self.f()).round().clamp(10.0, 95.0) as u8
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReduceReport {
+    pub size_before: usize,
+    pub size_after: usize,
+    pub images_recompressed: usize,
+    pub images_downsampled: usize,
+    pub streams_merged: usize,
+    pub streams_recompressed: usize,
+}
+
+/// Pixels per inch that "drawn at 100 %" corresponds to when sizing images.
+const REFERENCE_PPI: f32 = 150.0;
+const MIN_SIDE: u32 = 24;
+
+// ---- eligibility ---------------------------------------------------------------------------
+
+impl Pdf {
+    pub fn reduce_refusal(&self) -> Option<Refusal> {
+        let catalog = self.doc.catalog().ok()?;
+        if catalog.has(b"Collection") {
+            return Some(Refusal::Portfolio);
+        }
+        if let Ok(form) = catalog.get(b"AcroForm") {
+            if let Object::Dictionary(form) = self.resolve(form) {
+                if form.has(b"XFA") {
+                    return Some(Refusal::Xfa);
+                }
+                // Signatures exist and the file is append-only: a full save would invalidate them.
+                if let Ok(Object::Integer(flags)) = form.get(b"SigFlags").map(|o| self.resolve(o)) {
+                    if flags & 0b11 == 0b11 {
+                        return Some(Refusal::NoPermission);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+// ---- reduce --------------------------------------------------------------------------------
+
+fn flate(data: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(9));
+    let _ = encoder.write_all(data);
+    encoder.finish().unwrap_or_default()
+}
+
+/// Product of two PDF matrices: apply `a` first, then `b`.
+fn multiply(a: [f32; 6], b: [f32; 6]) -> [f32; 6] {
+    [
+        a[0] * b[0] + a[1] * b[2],
+        a[0] * b[1] + a[1] * b[3],
+        a[2] * b[0] + a[3] * b[2],
+        a[2] * b[1] + a[3] * b[3],
+        a[4] * b[0] + a[5] * b[2] + b[4],
+        a[4] * b[1] + a[5] * b[3] + b[5],
+    ]
+}
+
+fn number(object: &Object) -> Option<f32> {
+    object.as_float().ok()
+}
+
+fn matrix_from(object: Option<&Object>) -> [f32; 6] {
+    if let Some(Object::Array(values)) = object {
+        let numbers: Vec<f32> = values.iter().filter_map(number).collect();
+        if numbers.len() == 6 {
+            return [numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], numbers[5]];
+        }
+    }
+    [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+}
+
+impl Pdf {
+    /// Largest drawn size, in points, of every image XObject (page content and nested forms).
+    fn drawn_sizes(&self) -> HashMap<ObjectId, (f32, f32)> {
+        let mut sizes: HashMap<ObjectId, (f32, f32)> = HashMap::new();
+        for page_id in self.page_ids() {
+            let resources = self
+                .inherited(page_id, b"Resources")
+                .and_then(|o| o.as_dict().ok().cloned())
+                .unwrap_or_default();
+            let content = self.doc.get_page_content(page_id);
+            self.scan_content(&content, &resources, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], 0, &mut sizes);
+        }
+        sizes
+    }
+
+    fn scan_content(
+        &self,
+        content: &[u8],
+        resources: &Dictionary,
+        base: [f32; 6],
+        depth: usize,
+        sizes: &mut HashMap<ObjectId, (f32, f32)>,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        let Ok(parsed) = Content::decode(content) else { return };
+        let xobjects = match resources.get(b"XObject").map(|o| self.resolve(o)) {
+            Ok(Object::Dictionary(d)) => d,
+            _ => return,
+        };
+        let mut ctm = base;
+        let mut stack: Vec<[f32; 6]> = Vec::new();
+        for op in parsed.operations {
+            match op.operator.as_str() {
+                "q" => stack.push(ctm),
+                "Q" => {
+                    if let Some(saved) = stack.pop() {
+                        ctm = saved;
+                    }
+                }
+                "cm" if op.operands.len() == 6 => {
+                    let v: Vec<f32> = op.operands.iter().filter_map(number).collect();
+                    if v.len() == 6 {
+                        ctm = multiply([v[0], v[1], v[2], v[3], v[4], v[5]], ctm);
+                    }
+                }
+                "Do" => {
+                    let Some(Object::Name(name)) = op.operands.first() else { continue };
+                    let Ok(entry) = xobjects.get(name) else { continue };
+                    let Ok(id) = entry.as_reference() else { continue };
+                    let Ok(Object::Stream(stream)) = self.doc.get_object(id) else { continue };
+                    match stream.dict.get(b"Subtype").and_then(|o| o.as_name()) {
+                        Ok(b"Image") => {
+                            let w = (ctm[0] * ctm[0] + ctm[1] * ctm[1]).sqrt();
+                            let h = (ctm[2] * ctm[2] + ctm[3] * ctm[3]).sqrt();
+                            let slot = sizes.entry(id).or_insert((0.0, 0.0));
+                            slot.0 = slot.0.max(w);
+                            slot.1 = slot.1.max(h);
+                        }
+                        Ok(b"Form") => {
+                            let form_resources = match stream.dict.get(b"Resources").map(|o| self.resolve(o)) {
+                                Ok(Object::Dictionary(d)) => d,
+                                _ => resources.clone(),
+                            };
+                            let matrix = matrix_from(stream.dict.get(b"Matrix").ok());
+                            let body = stream.get_plain_content().unwrap_or_default();
+                            self.scan_content(&body, &form_resources, multiply(matrix, ctm), depth + 1, sizes);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Objects used as soft masks or stencil masks. They are only re-Flated, never JPEG-encoded
+    /// or resampled on their own, because that would alter transparency edges.
+    fn mask_ids(&self) -> std::collections::HashSet<ObjectId> {
+        let mut ids = std::collections::HashSet::new();
+        for object in self.doc.objects.values() {
+            if let Object::Stream(stream) = object {
+                for key in [&b"SMask"[..], b"Mask"] {
+                    if let Ok(Object::Reference(id)) = stream.dict.get(key) {
+                        ids.insert(*id);
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    /// Merges byte-identical streams (same dictionary and same data) into one object.
+    fn merge_identical_streams(&mut self) -> usize {
+        let mut first: HashMap<(Vec<u8>, Vec<u8>), ObjectId> = HashMap::new();
+        let mut replace: BTreeMap<ObjectId, ObjectId> = BTreeMap::new();
+        for (id, object) in &self.doc.objects {
+            let Object::Stream(stream) = object else { continue };
+            if let Ok(name) = stream.dict.get(b"Type").and_then(|o| o.as_name()) {
+                if matches!(name, b"ObjStm" | b"XRef" | b"Metadata") {
+                    continue;
+                }
+            }
+            let mut dict_key = Vec::new();
+            let mut entries: Vec<_> = stream.dict.iter().filter(|(k, _)| k.as_slice() != b"Length").collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (k, v) in entries {
+                dict_key.extend_from_slice(k);
+                dict_key.extend_from_slice(format!("{v:?}").as_bytes());
+            }
+            match first.get(&(dict_key.clone(), stream.content.clone())) {
+                Some(original) => {
+                    replace.insert(*id, *original);
+                }
+                None => {
+                    first.insert((dict_key, stream.content.clone()), *id);
+                }
+            }
+        }
+        if replace.is_empty() {
+            return 0;
+        }
+        fn rewrite(object: &mut Object, map: &BTreeMap<ObjectId, ObjectId>) {
+            match object {
+                Object::Reference(id) => {
+                    if let Some(target) = map.get(id) {
+                        *id = *target;
+                    }
+                }
+                Object::Array(items) => items.iter_mut().for_each(|o| rewrite(o, map)),
+                Object::Dictionary(d) => d.iter_mut().for_each(|(_, o)| rewrite(o, map)),
+                Object::Stream(s) => s.dict.iter_mut().for_each(|(_, o)| rewrite(o, map)),
+                _ => {}
+            }
+        }
+        for object in self.doc.objects.values_mut() {
+            rewrite(object, &replace);
+        }
+        for (_, value) in self.doc.trailer.iter_mut() {
+            rewrite(value, &replace);
+        }
+        let count = replace.len();
+        for id in replace.keys() {
+            self.doc.objects.remove(id);
+        }
+        count
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Raw,
+    Flate,
+    Jpeg,
+}
+
+struct Decoded {
+    width: u32,
+    height: u32,
+    components: u32,
+    samples: Vec<u8>,
+    source: Source,
+}
+
+/// Decodes an 8-bit gray or RGB image, or `None` when this image should be left alone.
+fn decode_image(doc: &Document, stream: &Stream) -> Option<Decoded> {
+    let dict = &stream.dict;
+    if matches!(dict.get(b"ImageMask"), Ok(Object::Boolean(true))) {
+        return None;
+    }
+    if dict.has(b"Mask") || dict.has(b"Decode") {
+        return None;
+    }
+    let width = dict.get(b"Width").ok()?.as_i64().ok()? as u32;
+    let height = dict.get(b"Height").ok()?.as_i64().ok()? as u32;
+    let bpc = dict.get(b"BitsPerComponent").ok().and_then(|o| o.as_i64().ok()).unwrap_or(8);
+    let components = match dict.get(b"ColorSpace").ok().map(|o| match o {
+        Object::Reference(id) => doc.get_object(*id).cloned().unwrap_or(Object::Null),
+        other => other.clone(),
+    }) {
+        Some(Object::Name(n)) => match n.as_slice() {
+            b"DeviceGray" | b"CalGray" => 1,
+            b"DeviceRGB" | b"CalRGB" => 3,
+            _ => return None,
+        },
+        _ => return None, // ICCBased, Indexed, Separation, ...: leave unchanged
+    };
+    if width == 0 || height == 0 || width as u64 * height as u64 > 100_000_000 {
+        return None;
+    }
+
+    let filter: Vec<Vec<u8>> = match dict.get(b"Filter") {
+        Ok(Object::Name(n)) => vec![n.clone()],
+        Ok(Object::Array(items)) => items.iter().filter_map(|o| o.as_name().ok().map(|n| n.to_vec())).collect(),
+        Ok(_) => return None,
+        Err(_) => Vec::new(),
+    };
+
+    match filter.as_slice() {
+        [] if bpc == 8 => {
+            let expected = (width * height * components) as usize;
+            (stream.content.len() == expected).then(|| Decoded {
+                width,
+                height,
+                components,
+                samples: stream.content.clone(),
+                source: Source::Raw,
+            })
+        }
+        [f] if f == b"FlateDecode" && bpc == 8 && !dict.has(b"DecodeParms") => {
+            let samples = stream.get_plain_content().ok()?;
+            let expected = (width * height * components) as usize;
+            (samples.len() == expected).then_some(Decoded { width, height, components, samples, source: Source::Flate })
+        }
+        [f] if f == b"DCTDecode" && bpc == 8 => {
+            let image = image::load_from_memory_with_format(&stream.content, ImageFormat::Jpeg).ok()?;
+            let (w, h) = (image.width(), image.height());
+            let (samples, n) = match components {
+                1 => (image.to_luma8().into_raw(), 1),
+                _ => (image.to_rgb8().into_raw(), 3),
+            };
+            (w == width && h == height).then_some(Decoded { width: w, height: h, components: n, samples, source: Source::Jpeg })
+        }
+        _ => None,
+    }
+}
+
+fn encode_jpeg(samples: &[u8], width: u32, height: u32, components: u32, quality: u8) -> Option<Vec<u8>> {
+    let mut out = Cursor::new(Vec::new());
+    let color = if components == 1 { ExtendedColorType::L8 } else { ExtendedColorType::Rgb8 };
+    JpegEncoder::new_with_quality(&mut out, quality).encode(samples, width, height, color).ok()?;
+    Some(out.into_inner())
+}
+
+impl Pdf {
+    /// Re-encodes images in place. Returns (recompressed, downsampled).
+    fn recompress_images(&mut self, options: &ReduceOptions) -> (usize, usize) {
+        let drawn = self.drawn_sizes();
+        let masks = self.mask_ids();
+        let ids: Vec<ObjectId> = self
+            .doc
+            .objects
+            .iter()
+            .filter_map(|(id, o)| match o {
+                Object::Stream(s) if matches!(s.dict.get(b"Subtype").and_then(|o| o.as_name()), Ok(b"Image")) => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect();
+
+        let (mut recompressed, mut downsampled) = (0, 0);
+        for id in ids {
+            let Ok(Object::Stream(original)) = self.doc.get_object(id).cloned() else { continue };
+            let is_mask = masks.contains(&id);
+            let old_len = original.content.len();
+            let Some(decoded) = decode_image(&self.doc, &original) else { continue };
+
+            // Target size from how large the image is drawn.
+            let (mut width, mut height) = (decoded.width, decoded.height);
+            let mut samples = decoded.samples.clone();
+            let mut resized = false;
+            if !is_mask {
+                if let Some(&(draw_w, draw_h)) = drawn.get(&id) {
+                    if draw_w > 0.0 && draw_h > 0.0 {
+                        let k2 = options.k2();
+                        let want_w = (draw_w / 72.0 * REFERENCE_PPI * k2).ceil().max(1.0) as u32;
+                        let want_h = (draw_h / 72.0 * REFERENCE_PPI * k2).ceil().max(1.0) as u32;
+                        let scale = (want_w as f32 / width as f32).min(want_h as f32 / height as f32);
+                        if scale < 1.0 {
+                            let (nw, nh) = ((width as f32 * scale) as u32, (height as f32 * scale) as u32);
+                            if nw >= MIN_SIDE && nh >= MIN_SIDE {
+                                let resized_samples = if decoded.components == 1 {
+                                    image::GrayImage::from_raw(width, height, samples.clone())
+                                        .map(|img| image::imageops::resize(&img, nw, nh, FilterType::Triangle).into_raw())
+                                } else {
+                                    image::RgbImage::from_raw(width, height, samples.clone())
+                                        .map(|img| image::imageops::resize(&img, nw, nh, FilterType::Triangle).into_raw())
+                                };
+                                if let Some(new_samples) = resized_samples {
+                                    samples = new_samples;
+                                    width = nw;
+                                    height = nh;
+                                    resized = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Photographs are JPEG-encoded; flat graphics stay lossless.
+            let sample_for_estimate = &samples[..samples.len().min(1 << 20)];
+            let flate_ratio = flate(sample_for_estimate).len() as f32 / sample_for_estimate.len().max(1) as f32;
+            let photo_like = flate_ratio > 0.25 && width as u64 * height as u64 > 64 * 1024;
+            let use_jpeg = !is_mask && photo_like && (decoded.source != Source::Jpeg || resized || options.f() < 0.5);
+
+            let (data, filter): (Vec<u8>, &'static str) = if use_jpeg {
+                match encode_jpeg(&samples, width, height, decoded.components, options.jpeg_quality()) {
+                    Some(jpeg) => (jpeg, "DCTDecode"),
+                    None => continue,
+                }
+            } else if decoded.source == Source::Jpeg && !resized {
+                continue; // nothing to gain without changing the pixels
+            } else {
+                (flate(&samples), "FlateDecode")
+            };
+
+            // The original replaces unconditionally; here an image never gets bigger.
+            if data.len() >= old_len && !resized {
+                continue;
+            }
+            if data.len() >= old_len && resized && decoded.source == Source::Jpeg && filter == "FlateDecode" {
+                continue;
+            }
+
+            if let Ok(Object::Stream(stream)) = self.doc.get_object_mut(id) {
+                stream.dict.remove(b"DecodeParms");
+                stream.dict.remove(b"Metadata");
+                stream.dict.set("Width", width as i64);
+                stream.dict.set("Height", height as i64);
+                stream.dict.set("BitsPerComponent", 8);
+                stream.dict.set("Filter", Object::Name(filter.as_bytes().to_vec()));
+                stream.dict.set("Length", data.len() as i64);
+                stream.content = data;
+                stream.allows_compression = false;
+                recompressed += 1;
+                if resized {
+                    downsampled += 1;
+                }
+            }
+        }
+        (recompressed, downsampled)
+    }
+
+    /// Re-Flates other streams stored uncompressed or with an older filter.
+    fn reflate_streams(&mut self) -> usize {
+        let ids: Vec<ObjectId> = self.doc.objects.keys().copied().collect();
+        let mut changed = 0;
+        for id in ids {
+            let Ok(Object::Stream(stream)) = self.doc.get_object(id) else { continue };
+            if let Ok(name) = stream.dict.get(b"Type").and_then(|o| o.as_name()) {
+                if matches!(name, b"ObjStm" | b"XRef" | b"Metadata") {
+                    continue;
+                }
+            }
+            if matches!(stream.dict.get(b"Subtype").and_then(|o| o.as_name()), Ok(b"Image")) {
+                continue;
+            }
+            if stream.dict.has(b"Filter") {
+                continue; // already encoded (Flate, DCT, ...): leave as is
+            }
+            let data = stream.content.clone();
+            if data.len() < 64 {
+                continue;
+            }
+            let compressed = flate(&data);
+            if compressed.len() < data.len() {
+                if let Ok(Object::Stream(stream)) = self.doc.get_object_mut(id) {
+                    stream.dict.set("Filter", Object::Name(b"FlateDecode".to_vec()));
+                    stream.dict.set("Length", compressed.len() as i64);
+                    stream.content = compressed;
+                    stream.allows_compression = false;
+                    changed += 1;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Reduces this document and returns the new file bytes. `size_before` is the size of the file
+    /// the document was loaded from (or of its current serialization when `None`).
+    ///
+    /// Fails with [`messages::NOT_SMALLER`] when the result is not smaller than the input.
+    pub fn reduce(&mut self, options: &ReduceOptions, size_before: Option<usize>) -> Result<(Vec<u8>, ReduceReport)> {
+        if let Some(refusal) = self.reduce_refusal() {
+            return Err(Error::Other(refusal.message().to_string()));
+        }
+        let before = match size_before {
+            Some(n) => n,
+            None => self.clone().to_bytes()?.len(),
+        };
+
+        let mut work = self.clone();
+        let mut report = ReduceReport { size_before: before, ..Default::default() };
+        report.streams_merged = work.merge_identical_streams();
+        let (recompressed, downsampled) = work.recompress_images(options);
+        report.images_recompressed = recompressed;
+        report.images_downsampled = downsampled;
+        report.streams_recompressed = work.reflate_streams();
+        work.doc.prune_objects();
+
+        let save = lopdf::SaveOptions::builder()
+            .use_object_streams(true)
+            .use_xref_streams(true)
+            .compression_level(9)
+            .build();
+        let mut out = Vec::new();
+        work.doc.save_with_options(&mut out, save)?;
+        report.size_after = out.len();
+        if report.size_after >= before {
+            return Err(Error::Other(messages::NOT_SMALLER.to_string()));
+        }
+        Ok((out, report))
+    }
+}
+
+// ---- batch and output options --------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetFolder {
+    SameAsOriginal,
+    Specific(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputOptions {
+    pub folder: TargetFolder,
+    /// "Add to original file names": `prefix + stem + suffix + ".pdf"`. Both empty keeps the name.
+    pub prefix: String,
+    pub suffix: String,
+    pub overwrite: bool,
+}
+
+impl Default for OutputOptions {
+    fn default() -> Self {
+        Self { folder: TargetFolder::SameAsOriginal, prefix: String::new(), suffix: String::new(), overwrite: true }
+    }
+}
+
+impl OutputOptions {
+    /// Output path for `input`, validated like the original's Output Options dialog.
+    pub fn output_path(&self, input: &Path) -> std::result::Result<PathBuf, &'static str> {
+        let directory = match &self.folder {
+            TargetFolder::SameAsOriginal => input.parent().map(Path::to_path_buf).unwrap_or_default(),
+            TargetFolder::Specific(path) if path.as_os_str().is_empty() => return Err(messages::CHOOSE_FOLDER),
+            TargetFolder::Specific(path) => path.clone(),
+        };
+        let directory = if directory.as_os_str().is_empty() { PathBuf::from(".") } else { directory };
+        if !directory.is_dir() {
+            return Err(messages::INVALID_PATH);
+        }
+        let name = if self.prefix.is_empty() && self.suffix.is_empty() {
+            input.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        } else {
+            let stem = input.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            format!("{}{}{}.pdf", self.prefix, stem, self.suffix)
+        };
+        let path = directory.join(name);
+        if !self.overwrite && path.exists() {
+            return Err(messages::FILE_EXISTS);
+        }
+        Ok(path)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileOutcome {
+    pub input: PathBuf,
+    pub output: Option<PathBuf>,
+    /// `None` on success, otherwise the message the original would show in "Conversion Warnings".
+    pub warning: Option<String>,
+    pub report: Option<ReduceReport>,
+}
+
+/// Reduces several files. A failed file leaves its original untouched, even when the output path
+/// is the input path (in-place reduction). Returns one outcome per input, in order.
+pub fn reduce_files(inputs: &[PathBuf], output: &OutputOptions, options: &ReduceOptions) -> Vec<FileOutcome> {
+    inputs
+        .iter()
+        .map(|input| {
+            let fail = |message: &str| FileOutcome {
+                input: input.clone(),
+                output: None,
+                warning: Some(message.to_string()),
+                report: None,
+            };
+            let target = match output.output_path(input) {
+                Ok(path) => path,
+                Err(message) => return fail(message),
+            };
+            let bytes = match std::fs::read(input) {
+                Ok(b) => b,
+                Err(_) => return fail(messages::OPEN_FAILED),
+            };
+            let mut pdf = match Pdf::from_bytes(&bytes) {
+                Ok(p) => p,
+                Err(_) => return fail(messages::OPEN_FAILED),
+            };
+            match pdf.reduce(options, Some(bytes.len())) {
+                Ok((reduced, report)) => {
+                    // Write next to the target and move into place, so a crash never leaves a
+                    // half-written file where the original was.
+                    let temp = target.with_extension("pdf.carbide-tmp");
+                    if std::fs::write(&temp, &reduced).and_then(|_| std::fs::rename(&temp, &target)).is_err() {
+                        let _ = std::fs::remove_file(&temp);
+                        return fail(messages::SAVE_ERROR);
+                    }
+                    FileOutcome { input: input.clone(), output: Some(target), warning: None, report: Some(report) }
+                }
+                Err(Error::Other(message)) => fail(&message),
+                Err(_) => fail(messages::SAVE_ERROR),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slider_maps_like_the_original() {
+        let at = |v| ReduceOptions { image_factor: v };
+        assert!((at(50).f() - 0.5).abs() < 1e-6);
+        assert!((at(50).k2() - 1.0).abs() < 1e-6, "default slider leaves the drawn size unchanged");
+        assert!((at(0).f() - 0.05).abs() < 1e-6, "clamped to 0.05");
+        assert!((at(100).f() - 0.95).abs() < 1e-6, "clamped to 0.95");
+        assert!(at(0).k2() < at(50).k2() && at(50).k2() < at(100).k2());
+        assert!(at(0).jpeg_quality() < at(100).jpeg_quality());
+    }
+
+    #[test]
+    fn output_paths_follow_the_dialog_rules() {
+        let dir = std::env::temp_dir();
+        let input = dir.join("report.pdf");
+        let mut options = OutputOptions::default();
+        assert_eq!(options.output_path(&input).unwrap(), input);
+
+        options.prefix = "small-".into();
+        options.suffix = "-v2".into();
+        assert_eq!(options.output_path(&input).unwrap(), dir.join("small-report-v2.pdf"));
+
+        options.folder = TargetFolder::Specific(PathBuf::new());
+        assert_eq!(options.output_path(&input), Err(messages::CHOOSE_FOLDER));
+        options.folder = TargetFolder::Specific(dir.join("definitely-not-a-folder-xyz"));
+        assert_eq!(options.output_path(&input), Err(messages::INVALID_PATH));
+    }
+
+    #[test]
+    fn matrices_multiply_in_pdf_order() {
+        // Scale by 2 then translate by (10, 0): the point (1, 1) lands on (12, 2).
+        let m = multiply([2.0, 0.0, 0.0, 2.0, 0.0, 0.0], [1.0, 0.0, 0.0, 1.0, 10.0, 0.0]);
+        assert_eq!((m[0] * 1.0 + m[2] * 1.0 + m[4], m[1] * 1.0 + m[3] * 1.0 + m[5]), (12.0, 2.0));
+    }
+}

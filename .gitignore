@@ -1,0 +1,21 @@
+# Build output and local environments
+target/
+.build/
+.venv/
+__pycache__/
+.DS_Store
+.idea/
+
+# Downloaded third-party tooling (JDK, Ghidra, PDFium, OCR models).
+# carbide-pdf/README.md says where to get PDFium and the OCR models.
+/tools/
+
+# A separate third-party reverse-engineering workspace.
+/hopper disassemble/
+
+# The earlier SwiftUI prototype is kept locally only; the Rust workspace replaces it.
+/carbide-pdf-swift/
+
+# Local research material, not part of the project.
+/analysis/
+/REPORT-tungsten-power-pdf.md

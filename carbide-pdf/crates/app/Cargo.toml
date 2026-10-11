@@ -1,0 +1,23 @@
+[package]
+name = "carbide-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "carbide-gui"
+path = "src/main.rs"
+
+[dependencies]
+carbide-engine = { path = "../engine" }
+eframe.workspace = true
+rfd.workspace = true
+image.workspace = true
+base64.workspace = true
+chrono.workspace = true
+
+# Only used to make the application menu's Quit go through the window's close request.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSResponder"] }
+

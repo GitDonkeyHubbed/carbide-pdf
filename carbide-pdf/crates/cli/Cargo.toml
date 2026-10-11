@@ -1,0 +1,15 @@
+[package]
+name = "carbide-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "carbide"
+path = "src/main.rs"
+
+[dependencies]
+carbide-engine = { path = "../engine" }
+clap.workspace = true
+base64.workspace = true
+chrono.workspace = true

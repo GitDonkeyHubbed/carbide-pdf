@@ -1,0 +1,29 @@
+[package]
+name = "carbide-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lopdf.workspace = true
+pdfium-render.workspace = true
+image.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+getrandom.workspace = true
+chrono.workspace = true
+roxmltree.workspace = true
+flate2.workspace = true
+ureq.workspace = true
+p12-keystore.workspace = true
+x509-cert.workspace = true
+sha2.workspace = true
+rsa.workspace = true
+base64.workspace = true
+ocrs.workspace = true
+rten.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+rcgen = "0.14"
+rand = "0.8"

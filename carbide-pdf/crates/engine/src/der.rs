@@ -1,0 +1,202 @@
+//! Minimal DER encoding and walking, enough to build and read CMS SignedData and RFC 3161
+//! messages. (The original also encodes these structures by hand.)
+
+pub const SEQUENCE: u8 = 0x30;
+pub const SET: u8 = 0x31;
+pub const INTEGER: u8 = 0x02;
+pub const OCTET_STRING: u8 = 0x04;
+pub const NULL: u8 = 0x05;
+pub const OID: u8 = 0x06;
+pub const BOOLEAN: u8 = 0x01;
+
+pub fn length(len: usize) -> Vec<u8> {
+    if len < 0x80 {
+        vec![len as u8]
+    } else {
+        let bytes = len.to_be_bytes();
+        let skip = bytes.iter().take_while(|b| **b == 0).count();
+        let mut out = vec![0x80 | (bytes.len() - skip) as u8];
+        out.extend_from_slice(&bytes[skip..]);
+        out
+    }
+}
+
+pub fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend(length(content.len()));
+    out.extend_from_slice(content);
+    out
+}
+
+pub fn concat(parts: &[&[u8]]) -> Vec<u8> {
+    parts.iter().flat_map(|p| p.iter().copied()).collect()
+}
+
+pub fn sequence(parts: &[&[u8]]) -> Vec<u8> {
+    tlv(SEQUENCE, &concat(parts))
+}
+
+pub fn set(parts: &[&[u8]]) -> Vec<u8> {
+    tlv(SET, &concat(parts))
+}
+
+pub fn octet_string(bytes: &[u8]) -> Vec<u8> {
+    tlv(OCTET_STRING, bytes)
+}
+
+pub fn null() -> Vec<u8> {
+    vec![NULL, 0]
+}
+
+pub fn boolean(value: bool) -> Vec<u8> {
+    tlv(BOOLEAN, &[if value { 0xFF } else { 0x00 }])
+}
+
+pub fn integer_small(value: u32) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let skip = bytes.iter().take_while(|b| **b == 0).count().min(3);
+    let mut content = bytes[skip..].to_vec();
+    if content[0] & 0x80 != 0 {
+        content.insert(0, 0);
+    }
+    tlv(INTEGER, &content)
+}
+
+/// Positive big-endian integer (nonce, serial numbers).
+pub fn integer_unsigned(bytes: &[u8]) -> Vec<u8> {
+    let trimmed: &[u8] = {
+        let skip = bytes.iter().take_while(|b| **b == 0).count().min(bytes.len().saturating_sub(1));
+        &bytes[skip..]
+    };
+    let mut content = trimmed.to_vec();
+    if content.first().is_some_and(|b| b & 0x80 != 0) {
+        content.insert(0, 0);
+    }
+    tlv(INTEGER, &content)
+}
+
+/// Object identifier from its arcs.
+pub fn oid(arcs: &[u32]) -> Vec<u8> {
+    let mut content = vec![(arcs[0] * 40 + arcs[1]) as u8];
+    for &arc in &arcs[2..] {
+        let mut stack = vec![(arc & 0x7F) as u8];
+        let mut rest = arc >> 7;
+        while rest > 0 {
+            stack.push(0x80 | (rest & 0x7F) as u8);
+            rest >>= 7;
+        }
+        stack.reverse();
+        content.extend(stack);
+    }
+    tlv(OID, &content)
+}
+
+/// Context-specific tag; `constructed` marks the usual EXPLICIT/IMPLICIT-of-constructed case.
+pub fn context(number: u8, constructed: bool, content: &[u8]) -> Vec<u8> {
+    tlv(0x80 | number | if constructed { 0x20 } else { 0 }, content)
+}
+
+/// A parsed element: tag, content and the full encoding (header included).
+#[derive(Debug, Clone, Copy)]
+pub struct Element<'a> {
+    pub tag: u8,
+    pub content: &'a [u8],
+    pub raw: &'a [u8],
+}
+
+/// Reads one element from the front of `data`, returning it and the remaining bytes.
+pub fn read(data: &[u8]) -> Option<(Element<'_>, &[u8])> {
+    let tag = *data.first()?;
+    let first = *data.get(1)?;
+    let (len, header) = if first < 0x80 {
+        (first as usize, 2)
+    } else {
+        let n = (first & 0x7F) as usize;
+        if n == 0 || n > 4 || data.len() < 2 + n {
+            return None;
+        }
+        let mut len = 0usize;
+        for byte in &data[2..2 + n] {
+            len = (len << 8) | *byte as usize;
+        }
+        (len, 2 + n)
+    };
+    let end = header.checked_add(len)?;
+    if data.len() < end {
+        return None;
+    }
+    Some((Element { tag, content: &data[header..end], raw: &data[..end] }, &data[end..]))
+}
+
+/// All elements directly inside `content`.
+pub fn children(content: &[u8]) -> Vec<Element<'_>> {
+    let mut out = Vec::new();
+    let mut rest = content;
+    while !rest.is_empty() {
+        match read(rest) {
+            Some((element, next)) => {
+                out.push(element);
+                rest = next;
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Decodes an OID element's content to dotted-decimal text.
+pub fn oid_to_string(content: &[u8]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut value: u64 = 0;
+    for (i, byte) in content.iter().enumerate() {
+        value = (value << 7) | (*byte & 0x7F) as u64;
+        if byte & 0x80 == 0 {
+            if i == content.iter().position(|_| true).unwrap_or(0) && parts.is_empty() {
+                parts.push((value / 40).min(2).to_string());
+                parts.push((value - (value / 40).min(2) * 40).to_string());
+            } else {
+                parts.push(value.to_string());
+            }
+            value = 0;
+        }
+    }
+    parts.join(".")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lengths_and_integers() {
+        assert_eq!(length(5), vec![5]);
+        assert_eq!(length(200), vec![0x81, 200]);
+        assert_eq!(length(0x1234), vec![0x82, 0x12, 0x34]);
+        assert_eq!(integer_small(1), vec![2, 1, 1]);
+        assert_eq!(integer_small(128), vec![2, 2, 0, 0x80]);
+        assert_eq!(integer_unsigned(&[0, 0, 0xFF]), vec![2, 2, 0, 0xFF]);
+    }
+
+    #[test]
+    fn oid_round_trip() {
+        // sha256: 2.16.840.1.101.3.4.2.1
+        let encoded = oid(&[2, 16, 840, 1, 101, 3, 4, 2, 1]);
+        assert_eq!(encoded, vec![0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01]);
+        let (element, _) = read(&encoded).unwrap();
+        assert_eq!(oid_to_string(element.content), "2.16.840.1.101.3.4.2.1");
+        let rsa = oid(&[1, 2, 840, 113549, 1, 1, 11]);
+        let (element, _) = read(&rsa).unwrap();
+        assert_eq!(oid_to_string(element.content), "1.2.840.113549.1.1.11");
+    }
+
+    #[test]
+    fn walk_nested_structures() {
+        let data = sequence(&[&integer_small(7), &set(&[&octet_string(b"abc")])]);
+        let (root, rest) = read(&data).unwrap();
+        assert!(rest.is_empty());
+        let kids = children(root.content);
+        assert_eq!(kids.len(), 2);
+        assert_eq!(kids[0].tag, INTEGER);
+        assert_eq!(children(kids[1].content)[0].content, b"abc");
+    }
+}

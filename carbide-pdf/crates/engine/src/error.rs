@@ -1,0 +1,33 @@
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("PDF error: {0}")]
+    Pdf(#[from] lopdf::Error),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("page {index} does not exist (the document has {count} pages)")]
+    PageOutOfRange { index: usize, count: usize },
+
+    #[error("invalid page range: {0}")]
+    InvalidRange(String),
+
+    #[error("the document is password protected")]
+    PasswordRequired,
+
+    #[error("the password is incorrect")]
+    WrongPassword,
+
+    #[error("rendering backend: {0}")]
+    Render(String),
+
+    #[error("{0}")]
+    Unsupported(String),
+
+    #[error("{0}")]
+    Other(String),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
