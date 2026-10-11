@@ -24,19 +24,19 @@ use crate::pdf::Pdf;
 
 pub const DEFAULT_IMAGE_FACTOR: u8 = 50;
 
-/// Verbatim strings from the original.
+/// User-facing messages.
 pub mod messages {
-    pub const NOT_SMALLER: &str = "The size of file is not smaller.";
-    pub const XFA: &str = "The XFA document cannot be reduced.";
-    pub const NO_PERMISSION: &str = "You do not have sufficient permissions to perform this task.\nPlease change the security settings from the document Properties dialog and try again.";
-    pub const OPEN_FAILED: &str = "You do not have sufficient permissions to perform this task.";
-    pub const SAVE_ERROR: &str = "An error was encountered while saving the document.";
-    pub const PORTFOLIO: &str = "Ignored";
-    pub const NEED_SAVE: &str = "The PDF document needs to be saved before it can be optimized. Do you want to save and continue?";
-    pub const CHOOSE_FOLDER: &str = "Please choose the folder for the output location.";
-    pub const INVALID_PATH: &str = "The path is invalid or does not exist.";
-    pub const FILE_EXISTS: &str = "Current setting would require overwriting existing files…";
-    pub const SLIDER_NOTE: &str = "Note: The slider bar affects only images within a document.";
+    pub const NOT_SMALLER: &str = "The result is not smaller than the original file.";
+    pub const XFA: &str = "XFA forms cannot be reduced.";
+    pub const NO_PERMISSION: &str = "This document's security settings do not allow that change.\nChange them in the document properties and try again.";
+    pub const OPEN_FAILED: &str = "This document's security settings do not allow that change.";
+    pub const SAVE_ERROR: &str = "The document could not be saved.";
+    pub const PORTFOLIO: &str = "Skipped";
+    pub const NEED_SAVE: &str = "Save this document before reducing it. Save now and continue?";
+    pub const CHOOSE_FOLDER: &str = "Choose a folder for the output files.";
+    pub const INVALID_PATH: &str = "That folder does not exist.";
+    pub const FILE_EXISTS: &str = "These settings would overwrite existing files…";
+    pub const SLIDER_NOTE: &str = "The slider only changes how images are compressed.";
 }
 
 /// Why a document is refused before any work is done.
@@ -70,7 +70,7 @@ impl Default for ReduceOptions {
 }
 
 impl ReduceOptions {
-    /// `f = factor/100`, clamped to 0.05..=0.95 as in the original.
+    /// `f = factor/100`, clamped to 0.05..=0.95.
     fn f(&self) -> f32 {
         (self.image_factor.min(100) as f32 / 100.0).clamp(0.05, 0.95)
     }
@@ -588,7 +588,7 @@ impl Default for OutputOptions {
 }
 
 impl OutputOptions {
-    /// Output path for `input`, validated like the original's Output Options dialog.
+    /// Output path for `input`, validated the way the Reduce dialog does.
     pub fn output_path(&self, input: &Path) -> std::result::Result<PathBuf, &'static str> {
         let directory = match &self.folder {
             TargetFolder::SameAsOriginal => input.parent().map(Path::to_path_buf).unwrap_or_default(),

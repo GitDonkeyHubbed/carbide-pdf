@@ -1,8 +1,7 @@
 //! Imposition: turns a document into printable sheets.
 //!
-//! Page-to-cell assignment comes from [`crate::imposition_plan`] and is verified against the
-//! original's worked examples. Cell geometry (origin, fit, creep, marks) was not fully recovered
-//! from the original, so those parts are a documented design: pages are centred in equal cells,
+//! Page-to-cell assignment comes from [`crate::imposition_plan`] and is covered by worked examples
+//! in the tests. Cell geometry (origin, fit, creep, marks) is a documented design: pages are centred in equal cells,
 //! "fit" scales uniformly to the cell, and creep moves pages toward the spine.
 
 use lopdf::{dictionary, Dictionary, Object, ObjectId, Stream};
@@ -14,9 +13,9 @@ use crate::imposition_plan::{output_order, plan_plates, LayoutKind, Plate, PlanO
 use crate::pdf::Pdf;
 
 pub mod messages {
-    pub const NO_MEDIA: &str = "No media size has been selected for this imposition. Please select the appropriate media or Autosize from the Media tab before performing this imposition.";
-    pub const MARGINS: &str = "The margin settings are too wide for the page size.";
-    pub const INVALID_SETTINGS: &str = "The Settings file was invalid and failed to load.";
+    pub const NO_MEDIA: &str = "Choose a media size (or Autosize) before imposing; none is selected.";
+    pub const MARGINS: &str = "The margins leave no room on this page size.";
+    pub const INVALID_SETTINGS: &str = "The settings file is not valid and could not be loaded.";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -87,7 +86,7 @@ pub struct ImpositionOptions {
     pub scale_x_percent: f32,
     pub scale_y_percent: f32,
     pub margins: Margins,
-    /// Gap between the two pages of a spread (the original's "Horizontal").
+    /// Gap between the two pages of a spread.
     pub gutter_horizontal: f32,
     pub gutter_vertical: f32,
     /// Gap between spreads in 4- and 8-column grids.
@@ -217,7 +216,7 @@ impl ImpositionOptions {
         Ok(upright)
     }
 
-    /// Checks settings that do not depend on the document. Returns the verbatim message on failure.
+    /// Checks settings that do not depend on the document. Returns the user-facing message on failure.
     pub fn validate(&self) -> Result<()> {
         if matches!(self.media, Media::None) {
             return Err(Error::Other(messages::NO_MEDIA.into()));
@@ -639,7 +638,7 @@ impl ImpositionOptions {
                 Some(name) => {
                     if !PAPER_SIZES.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(name)) {
                         return Err(Error::Other(
-                            "The custom media size used in the imposition settings file does not exist. You must recreate it or select another size from the Media list.".into(),
+                            "The custom media size in this settings file no longer exists. Recreate it or choose another size.".into(),
                         ));
                     }
                     Media::Named(name.to_string())

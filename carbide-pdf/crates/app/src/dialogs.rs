@@ -301,16 +301,16 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                         .selected_text(match request.certify {
                             None => "Do not certify",
                             Some(CertifyLevel::NoChanges) => "No changes allowed",
-                            Some(CertifyLevel::FormFilling) => "Form filling and signing",
-                            Some(CertifyLevel::Commenting) => "Form filling, signing and commenting",
+                            Some(CertifyLevel::FormFilling) => "Allow filling forms and signing",
+                            Some(CertifyLevel::Commenting) => "Allow filling forms, signing and commenting",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut request.certify, None, "Do not certify");
                             ui.selectable_value(&mut request.certify, Some(CertifyLevel::NoChanges), "No changes allowed");
-                            ui.selectable_value(&mut request.certify, Some(CertifyLevel::FormFilling), "Form filling and signing");
-                            ui.selectable_value(&mut request.certify, Some(CertifyLevel::Commenting), "Form filling, signing and commenting");
+                            ui.selectable_value(&mut request.certify, Some(CertifyLevel::FormFilling), "Allow filling forms and signing");
+                            ui.selectable_value(&mut request.certify, Some(CertifyLevel::Commenting), "Allow filling forms, signing and commenting");
                         });
-                    ui.checkbox(&mut request.lock, "Lock Document After Signing");
+                    ui.checkbox(&mut request.lock, "Lock the document after signing");
                     for (label, value) in [
                         ("Reason", &mut request.reason),
                         ("Location", &mut request.location),
@@ -786,16 +786,16 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
     egui::ComboBox::from_label("Printing order")
         .selected_text(match o.plan.printing_order {
             PrintingOrder::Interleaved => "(front, back, front, back)",
-            PrintingOrder::FrontsThenBacks => "Fronts first, then backs",
-            PrintingOrder::FrontsThenBacksReversed => "Fronts first, then backs reversed",
+            PrintingOrder::FrontsThenBacks => "All fronts, then all backs",
+            PrintingOrder::FrontsThenBacksReversed => "All fronts, then all backs in reverse",
         })
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut o.plan.printing_order, PrintingOrder::Interleaved, "(front, back, front, back)");
-            ui.selectable_value(&mut o.plan.printing_order, PrintingOrder::FrontsThenBacks, "Fronts first, then backs");
+            ui.selectable_value(&mut o.plan.printing_order, PrintingOrder::FrontsThenBacks, "All fronts, then all backs");
             ui.selectable_value(
                 &mut o.plan.printing_order,
                 PrintingOrder::FrontsThenBacksReversed,
-                "Fronts first, then backs reversed",
+                "All fronts, then all backs in reverse",
             );
         });
 
@@ -826,7 +826,7 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
         Media::Autosize
     };
     ui.checkbox(&mut o.auto_rotate, "Auto-Rotate");
-    ui.checkbox(&mut o.fit_to_media, "Fit to Media Size");
+    ui.checkbox(&mut o.fit_to_media, "Scale to fit the media");
     if !o.fit_to_media {
         ui.horizontal(|ui| {
             ui.label("Scale H %");
@@ -870,7 +870,7 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
     }
     ui.checkbox(&mut o.page_info, "Description");
     ui.checkbox(&mut o.scale_large_pages, "Scale Large Pages");
-    ui.checkbox(&mut o.flip_backs, "Flip backs of sheets");
+    ui.checkbox(&mut o.flip_backs, "Flip the back side of each sheet");
     ui.horizontal(|ui| {
         if ui.button("Save Settings...").clicked() {
             if let Some(path) = rfd::FileDialog::new().set_file_name("imposition.ini").save_file() {
@@ -986,11 +986,11 @@ fn reduce_dialog(app: &mut CarbideApp, ctx: &egui::Context, form: &mut ReduceFor
         }
         ui.separator();
         ui.label("Target Folder");
-        ui.radio_value(&mut form.same_folder, true, "Same folder as originals");
+        ui.radio_value(&mut form.same_folder, true, "Next to the source files");
         ui.horizontal(|ui| {
             ui.radio_value(&mut form.same_folder, false, "Specific folder");
             if !form.same_folder && ui.button("Browse").clicked() {
-                if let Some(folder) = rfd::FileDialog::new().set_title("Select Folder for Output Files").pick_folder() {
+                if let Some(folder) = rfd::FileDialog::new().set_title("Choose an output folder").pick_folder() {
                     form.folder = Some(folder);
                 }
             }
@@ -999,13 +999,13 @@ fn reduce_dialog(app: &mut CarbideApp, ctx: &egui::Context, form: &mut ReduceFor
             }
         });
         ui.label("File Naming");
-        ui.radio_value(&mut form.add_to_names, false, "Keep original file names");
-        ui.radio_value(&mut form.add_to_names, true, "Add to original file names");
+        ui.radio_value(&mut form.add_to_names, false, "Use the same file names");
+        ui.radio_value(&mut form.add_to_names, true, "Add text to the file names");
         if form.add_to_names {
             ui.horizontal(|ui| {
                 ui.label("Insert Before");
                 ui.text_edit_singleline(&mut form.prefix);
-                ui.label("+ original file name +");
+                ui.label("file name");
                 ui.label("Insert After");
                 ui.text_edit_singleline(&mut form.suffix);
             });

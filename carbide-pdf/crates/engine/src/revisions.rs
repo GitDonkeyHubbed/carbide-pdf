@@ -4,7 +4,7 @@
 //! in the order they were saved, "Open" is only available once two dated revisions exist, and
 //! opening one produces the file exactly as it was at that point as a separate document.
 //!
-//! Design choice (the original's on-disk form was not established): each revision is an incremental
+//! Design choice: each revision is an incremental
 //! update of the file plus a record in the catalog under `/CarbideRevisions`. The record's `Length`
 //! is the file size at the end of that update, so the revision is simply a prefix of the file.
 
@@ -15,8 +15,8 @@ use crate::error::{Error, Result};
 use crate::pdf::Pdf;
 
 pub const CATALOG_KEY: &[u8] = b"CarbideRevisions";
-/// Shown when the label is empty after trimming (verbatim from the original).
-pub const EMPTY_LABEL_MESSAGE: &str = "Please input the label!";
+/// Shown when the label is empty after trimming.
+pub const EMPTY_LABEL_MESSAGE: &str = "Enter a label for the revision.";
 
 const LENGTH_PLACEHOLDER: &[u8] = b"(0000000000)";
 
@@ -176,7 +176,7 @@ impl Pdf {
 
 /// The file as it was when `revision` was saved, ready to open as a separate document.
 pub fn open_revision_bytes(file_bytes: &[u8], revision: &Revision) -> Result<Vec<u8>> {
-    // A non-positive offset does nothing in the original.
+    // An offset of zero means no position was stored.
     if revision.file_offset == 0 {
         return Err(Error::Other("this revision has no stored position".into()));
     }
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn labels_are_trimmed_only_for_the_emptiness_check() {
-        assert_eq!(validate_label("  \t "), Err("Please input the label!"));
+        assert_eq!(validate_label("  \t "), Err(EMPTY_LABEL_MESSAGE));
         assert!(validate_label(" draft 2 ").is_ok());
     }
 

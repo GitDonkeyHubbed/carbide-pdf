@@ -1,7 +1,7 @@
 //! Digital signatures: signing (PKCS#7 detached, CAdES, document time stamps, certification) and
 //! validation.
 //!
-//! The structure follows the original's pipeline: a signature field is created, its `/V`
+//! The pipeline: a signature field is created, its `/V`
 //! dictionary is written with a fixed-size `/Contents` placeholder and a fixed-width `/ByteRange`,
 //! the file is saved as an incremental update (so earlier signatures stay valid), the real
 //! `/ByteRange` is patched in, and the CMS signature over the two byte ranges is written into the
@@ -25,31 +25,31 @@ use crate::geometry::{fmt, Rect};
 use crate::pdf::Pdf;
 use crate::revisions::{decode_text, encode_text, parse_pdf_date, pdf_date_now};
 
-/// Verbatim strings from the original.
+/// User-facing messages.
 pub mod messages {
-    pub const UNSIGNED_FIELD: &str = "Unsigned signature field (Click to sign)";
-    pub const NOT_YET_VERIFIED: &str = "Signature not yet verified";
-    pub const VALID: &str = "Signature is valid";
-    pub const VALIDITY_UNKNOWN: &str = "Signature validity is unknown";
-    pub const INVALID: &str = "Signature is invalid";
-    pub const REVISION_UNALTERED: &str = "This revision of the document has not been altered";
-    pub const SUBSEQUENT_CHANGES: &str = "There have been subsequence changes to the document";
-    pub const NOT_MODIFIED: &str = "Document has not been modified since this signature was applied";
-    pub const IDENTITY_UNKNOWN: &str = "Signer's identity is unknown because it was not included in your list of trusted certificates and none of its parent certificates are trusted certificates";
-    pub const IDENTITY_EXPIRED: &str = "Signer's identity is invalid because it has expired or is not yet valid";
-    pub const DOCUMENT_ALTERED: &str = "The document is corrupt or has been altered since the signature was applied.";
-    pub const BAD_BYTE_RANGE: &str = "Signature Invalid: Invalid Byte Range!";
-    pub const CORRUPTED: &str = "Signature Invalid: Signature Corrupted!";
-    pub const FILTER_NOT_SUPPORTED: &str = "Signature Invalid: Filter Not Supported!";
-    pub const SIGNED_IN_FUTURE: &str = "Signature seems to be signed in the future.";
-    pub const NOTICE_NOT_VERIFIED: &str = "At least one signature requires validating.";
-    pub const NOTICE_PROBLEMS: &str = "This document is signed. At least one signature has problems.";
+    pub const UNSIGNED_FIELD: &str = "Empty signature field. Click to sign.";
+    pub const NOT_YET_VERIFIED: &str = "This signature has not been checked yet";
+    pub const VALID: &str = "The signature is valid";
+    pub const VALIDITY_UNKNOWN: &str = "The signature could not be fully validated";
+    pub const INVALID: &str = "The signature is not valid";
+    pub const REVISION_UNALTERED: &str = "The signed version of the document is unchanged";
+    pub const SUBSEQUENT_CHANGES: &str = "The document was changed after it was signed";
+    pub const NOT_MODIFIED: &str = "The document has not changed since it was signed";
+    pub const IDENTITY_UNKNOWN: &str = "The signer's identity is not confirmed: neither the certificate nor any certificate above it is in your trusted list";
+    pub const IDENTITY_EXPIRED: &str = "The signer's certificate has expired or is not valid yet";
+    pub const DOCUMENT_ALTERED: &str = "The document is damaged or was changed after signing.";
+    pub const BAD_BYTE_RANGE: &str = "Invalid signature: the signed byte range is wrong.";
+    pub const CORRUPTED: &str = "Invalid signature: the signature data is damaged.";
+    pub const FILTER_NOT_SUPPORTED: &str = "Invalid signature: this signature handler is not supported.";
+    pub const SIGNED_IN_FUTURE: &str = "The signing time is in the future.";
+    pub const NOTICE_NOT_VERIFIED: &str = "Some signatures still need to be validated.";
+    pub const NOTICE_PROBLEMS: &str = "This document is signed, but at least one signature has a problem.";
     pub const NOTICE_CHANGED_AFTER_LAST: &str =
-        "Signed and all signatures are valid, but there were changes in the document after last signature was applied.";
-    pub const NOTICE_UPDATED: &str = "Signed and all signatures are valid, document was updated after signing.";
-    pub const NOTICE_ALL_VALID: &str = "This document is signed. All signatures are valid.";
-    pub const FIELD_ALREADY_SIGNED: &str = "Field is already signed.";
-    pub const TIME_STAMPED: &str = "Signature is Time Stamped.";
+        "Signed with valid signatures, but the document changed after the last signature.";
+    pub const NOTICE_UPDATED: &str = "Signed with valid signatures; the document was updated after signing.";
+    pub const NOTICE_ALL_VALID: &str = "This document is signed and every signature is valid.";
+    pub const FIELD_ALREADY_SIGNED: &str = "This field has already been signed.";
+    pub const TIME_STAMPED: &str = "The signature carries a time stamp.";
 }
 
 // ---- identity ------------------------------------------------------------------------------
@@ -643,7 +643,7 @@ fn appearance_lines(name: String, signing_time: &str, options: &SignOptions<'_>)
 
 // ---- validation ----------------------------------------------------------------------------
 
-/// Handler validity state (the original's `A`).
+/// Handler validity state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Validity {
     Blank = 0,
@@ -653,7 +653,7 @@ pub enum Validity {
     Valid = 4,
 }
 
-/// Detail code (the original's `B`).
+/// Detail code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detail {
     NotVerified = 0,
@@ -705,7 +705,7 @@ impl SignatureReport {
         }
     }
 
-    /// The panel's description lines, in the original's wording.
+    /// The panel's description lines.
     pub fn description_lines(&self) -> Vec<&'static str> {
         let mut lines = Vec::new();
         let modification = if self.modified_after_signing {
@@ -743,7 +743,7 @@ impl SignatureReport {
     }
 }
 
-/// The notice bar text for a set of reports (the original's aggregation order).
+/// The notice bar text for a set of reports: the most serious condition wins.
 pub fn notice_text(reports: &[SignatureReport]) -> Option<&'static str> {
     let mut signed: Vec<&SignatureReport> = reports.iter().filter(|r| r.validity != Validity::Blank).collect();
     if signed.is_empty() {

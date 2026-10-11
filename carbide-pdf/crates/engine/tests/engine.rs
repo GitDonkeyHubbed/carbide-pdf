@@ -476,14 +476,14 @@ fn autosave_survives_restart_and_follows_the_removal_rules() {
     let rows = store.panel_rows();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].kind, RowKind::Original);
-    assert_eq!(rows[0].name, "contract.pdf [Original]");
+    assert_eq!(rows[0].name, "contract.pdf (saved)");
     assert_eq!(rows[1].kind, RowKind::Recovered);
-    assert_eq!(rows[1].name, "contract.pdf [Recovered]");
+    assert_eq!(rows[1].name, "contract.pdf (recovered)");
     assert_eq!(rows[1].save_time, 2_200);
 
     let loaded_id = rows[1].record;
     let (mut recovered, title) = store.open_recovered(loaded_id, None).unwrap();
-    assert_eq!(title, "contract.pdf [Recovered]");
+    assert_eq!(title, "contract.pdf (recovered)");
     assert!(page_text(&r, &mut recovered, 0).contains("unsaved work"));
     assert!(page_text(&r, &mut recovered, 0).contains("000001"), "recovery copy has the latest edits");
 
@@ -540,9 +540,9 @@ fn autosave_cleans_up_on_save_and_close_but_never_touches_originals() {
 fn a_damaged_index_is_ignored() {
     let dir = scratch_dir("autosave-bad");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("ZAutoSave.xml"), "<Something><AutoSaveItem RecoveredFile=\"/nope\"/></Something>").unwrap();
+    std::fs::write(dir.join(carbide_engine::autosave::INDEX_FILE_NAME), "<Something><AutoSaveItem RecoveredFile=\"/nope\"/></Something>").unwrap();
     assert!(AutoSaveStore::open(&dir).unwrap().records().is_empty());
-    std::fs::write(dir.join("ZAutoSave.xml"), "not xml at all").unwrap();
+    std::fs::write(dir.join(carbide_engine::autosave::INDEX_FILE_NAME), "not xml at all").unwrap();
     assert!(AutoSaveStore::open(&dir).unwrap().records().is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -662,7 +662,7 @@ fn imposition_reports_progress_and_can_be_cancelled() {
     assert!(source.impose(&options, Some(&mut stop)).is_err());
 
     let broken = ImpositionOptions { media: Media::None, ..Default::default() };
-    assert!(source.impose(&broken, None).unwrap_err().to_string().starts_with("No media size"));
+    assert!(source.impose(&broken, None).unwrap_err().to_string().starts_with("Choose a media size"));
     let _ = (Binding::Saddle, Style::Sheetwise);
 }
 
@@ -781,7 +781,7 @@ fn reduce_refuses_when_nothing_gets_smaller_and_for_protected_documents() {
     }
     let mut portfolio = text_pdf(&[&["x"]]);
     portfolio.document_mut().catalog_mut().unwrap().set("Collection", dictionary! {});
-    assert_eq!(portfolio.reduce(&ReduceOptions::default(), None).unwrap_err().to_string(), "Ignored");
+    assert_eq!(portfolio.reduce(&ReduceOptions::default(), None).unwrap_err().to_string(), reduce_messages::PORTFOLIO);
 }
 
 #[test]

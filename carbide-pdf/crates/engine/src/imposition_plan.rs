@@ -1,10 +1,10 @@
 //! Imposition planning: which source page lands in which cell of which printed side.
 //!
-//! This module is pure (no PDF objects), so every layout can be checked against the worked
-//! examples recovered from the original feature.
+//! This module is pure (no PDF objects), so every layout can be checked against worked
+//! examples in the tests.
 //!
 //! Terms: a *plate* is one printed side of one sheet and becomes one output page. Source pages are
-//! numbered from 1 in the formulas (as in the original) and exposed as 0-based indexes in [`Cell`].
+//! numbered from 1 in the formulas and exposed as 0-based indexes in [`Cell`].
 
 use crate::error::{Error, Result};
 
@@ -335,7 +335,7 @@ fn layout_block(options: &PlanOptions, block: &Block) -> Vec<Plate> {
     }
 }
 
-/// Creep steps for every cell of a block (arithmetic recovered from the original).
+/// Creep steps for every cell of a block.
 ///
 /// With `G` = spreads across, `R` = rows and `K` = sheets in the block (limited to the sheets per
 /// fold when perfect bound), `U = G*R*K` (halved for work-and-turn/tumble). A page's distance from
@@ -411,7 +411,7 @@ fn plan_booklet(options: &PlanOptions, total: usize) -> Result<Vec<Plate>> {
 /// For each output page `i`, the plate that is printed there.
 ///
 /// The remap only applies for double-sided output and when the style is sheetwise or the layout
-/// is perfect bound (`sheets_per_fold_active`), exactly as in the original.
+/// is perfect bound (`sheets_per_fold_active`).
 pub fn output_order(
     plate_count: usize,
     mode: PrintingOrder,

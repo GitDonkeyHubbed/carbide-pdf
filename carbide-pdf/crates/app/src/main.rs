@@ -978,7 +978,7 @@ impl CarbideApp {
     }
 }
 
-/// Notice bar text for a document that carries signatures, in the original's wording.
+/// Notice bar text for a document that carries signatures.
 fn signature_notice(doc: &OpenDoc) -> Option<String> {
     if !doc.pdf.has_signatures() {
         return None;

@@ -28,7 +28,7 @@ fn settings_file() -> PathBuf {
     data_dir().join("settings.ini")
 }
 
-/// Domain "ZAutoSave", keys `EnableAutoSave` and `AutoSaveInterval` as in the original.
+/// Keys `EnableAutoSave` and `AutoSaveInterval`.
 pub fn load_autosave_settings() -> AutoSaveSettings {
     let mut settings = AutoSaveSettings::default();
     let Ok(text) = std::fs::read_to_string(settings_file()) else { return settings };
@@ -52,7 +52,7 @@ pub fn load_autosave_settings() -> AutoSaveSettings {
 pub fn save_autosave_settings(settings: &AutoSaveSettings) {
     let _ = std::fs::create_dir_all(data_dir());
     let text = format!(
-        "[ZAutoSave]\nEnableAutoSave={}\nAutoSaveInterval={}\n",
+        "[AutoSave]\nEnableAutoSave={}\nAutoSaveInterval={}\n",
         if settings.enabled { 1 } else { 0 },
         settings.interval_minutes
     );

@@ -1,6 +1,6 @@
 //! Auto Save / Auto Recovery.
 //!
-//! Behaviour follows the original feature: a global enable flag and interval (1 to 120 minutes,
+//! Behaviour: a global enable flag and interval (1 to 120 minutes,
 //! default on / 10), one repeating timer per modified document, a full recovery copy written to an
 //! application folder, an XML index that survives restarts, and a recovery list shown at launch.
 //! Passwords are never written to disk.
@@ -18,36 +18,36 @@ use crate::pdf::Pdf;
 pub const MIN_INTERVAL_MINUTES: u32 = 1;
 pub const MAX_INTERVAL_MINUTES: u32 = 120;
 pub const DEFAULT_INTERVAL_MINUTES: u32 = 10;
-pub const INDEX_FILE_NAME: &str = "ZAutoSave.xml";
+pub const INDEX_FILE_NAME: &str = "AutoRecovery.xml";
 
-/// Verbatim strings from the original.
+/// User-facing messages.
 pub mod messages {
     pub const PREFERENCE_TITLE: &str = "Auto Save";
-    pub const PREFERENCE_CHECKBOX: &str = "Automatically save document info with Auto Recovery every:";
+    pub const PREFERENCE_CHECKBOX: &str = "Keep a recovery copy of open documents, updated every";
     pub const PREFERENCE_UNIT: &str = "minutes";
-    pub const INTERVAL_RANGE: &str = "You must enter a value between 1 and 120.";
+    pub const INTERVAL_RANGE: &str = "Enter a whole number from 1 to 120.";
     pub const PANEL_TITLE: &str = "Auto Recovery";
     pub const MENU_LABEL: &str = "Auto Recovery";
-    pub const MENU_HELP: &str = "See the list of auto-recovered files.";
+    pub const MENU_HELP: &str = "Show the documents recovered automatically.";
     pub const CLEAR_ALL: &str = "Clear all";
-    pub const DELETE_ALL: &str = "Are you sure you want to delete all recovered documents?";
-    pub const TOOLTIP_ORIGINAL: &str = "This is the original version.";
-    pub const TOOLTIP_RECOVERED: &str = "This is a recovered version.";
-    pub const LAST_SAVED_BY_USER: &str = "Last saved by user";
-    pub const LAST_SAVED_AUTO: &str = "Last saved with Auto Recovery";
-    pub const APP_CLOSE: &str = "The Auto Recovery panel contains some recovered files that have not been opened. \
-Click 'Yes' to keep these files for later view. Click 'No' if the files are already saved and you want to remove them.";
+    pub const DELETE_ALL: &str = "Delete every recovered document?";
+    pub const TOOLTIP_ORIGINAL: &str = "The file as you last saved it.";
+    pub const TOOLTIP_RECOVERED: &str = "A copy kept automatically by Auto Recovery.";
+    pub const LAST_SAVED_BY_USER: &str = "Saved by you";
+    pub const LAST_SAVED_AUTO: &str = "Saved automatically";
+    pub const APP_CLOSE: &str = "Some recovered documents have not been opened yet. Choose Yes to keep them for later, \
+or No to discard them if your work is already saved.";
 
     pub fn cannot_open_recovered(reason: &str) -> String {
-        format!("The recovered document cannot be opened. ({reason})")
+        format!("This recovered document could not be opened ({reason}).")
     }
     pub fn delete_recovered(name: &str) -> String {
-        format!("Are you sure you want to delete {name} (Recovered)?")
+        format!("Delete the recovered copy of {name}?")
     }
     pub fn document_close(name: &str) -> String {
         format!(
-            "'{name} (Recovered)' is an automatically created file by Auto Recovery and may contain unsaved \
-changes to the document '{name}'. Do you want to save the recovered file? Doing so will not affect the original file."
+            "Auto Recovery kept a copy of '{name}' that may hold unsaved changes. \
+Save the recovered copy? Your original file is not affected."
         )
     }
 }
@@ -165,7 +165,7 @@ pub enum RowKind {
 pub struct PanelRow {
     pub record: RecordId,
     pub kind: RowKind,
-    /// `<name> [Original]` or `<name> [Recovered]`.
+    /// `<name> (saved)` or `<name> (recovered)`.
     pub name: String,
     pub tooltip: &'static str,
     pub last_saved: &'static str,
@@ -218,7 +218,7 @@ impl AutoSaveStore {
                 rows.push(PanelRow {
                     record: record.id,
                     kind: RowKind::Original,
-                    name: format!("{name} [Original]"),
+                    name: format!("{name} (saved)"),
                     tooltip: messages::TOOLTIP_ORIGINAL,
                     last_saved: messages::LAST_SAVED_BY_USER,
                     save_time: original.save_time,
@@ -228,7 +228,7 @@ impl AutoSaveStore {
                 rows.push(PanelRow {
                     record: record.id,
                     kind: RowKind::Recovered,
-                    name: format!("{name} [Recovered]"),
+                    name: format!("{name} (recovered)"),
                     tooltip: messages::TOOLTIP_RECOVERED,
                     last_saved: messages::LAST_SAVED_AUTO,
                     save_time: recovered.save_time,
@@ -365,7 +365,7 @@ impl AutoSaveStore {
 
     // ---- opening ---------------------------------------------------------------------------
 
-    /// Loads the recovered copy. The title shown for it is `<name> [Recovered]`.
+    /// Loads the recovered copy. The title shown for it is `<name> (recovered)`.
     pub fn open_recovered(&self, id: RecordId, password: Option<&str>) -> Result<(Pdf, String)> {
         let record = self.record(id).ok_or_else(|| Error::Other("unknown auto-save record".into()))?;
         let slot = record
@@ -379,7 +379,7 @@ impl AutoSaveStore {
             None => Pdf::from_bytes(&bytes),
         }
         .map_err(|e| Error::Other(messages::cannot_open_recovered(&e.to_string())))?;
-        Ok((pdf, format!("{} [Recovered]", record.display_name())))
+        Ok((pdf, format!("{} (recovered)", record.display_name())))
     }
 
     // ---- files and index -------------------------------------------------------------------
