@@ -312,6 +312,22 @@ fn encryption_requires_the_password() {
     assert!(page_text(&renderer(), &mut opened, 0).contains("private"));
 }
 
+#[test]
+fn saving_a_protected_document_does_not_write_the_plaintext() {
+    let mut pdf = text_pdf(&[&["private"]]);
+    let encrypted = pdf.to_encrypted_bytes(&ProtectionOptions::new("open-sesame", "owner-pw")).unwrap();
+    assert!(!encrypted.windows(7).any(|w| w == b"private"));
+    let mut opened = Pdf::from_bytes_with_password(&encrypted, "open-sesame").unwrap();
+    let leaked = opened.to_bytes().unwrap();
+    assert!(leaked.windows(7).any(|w| w == b"private"), "the decrypted document serializes as plaintext");
+    let saved = opened.bytes_for_save(Some(&encrypted), Some("open-sesame")).unwrap();
+    assert!(!saved.windows(7).any(|w| w == b"private"));
+    assert!(matches!(Pdf::from_bytes(&saved), Err(Error::PasswordRequired)));
+    let mut again = Pdf::from_bytes_with_password(&saved, "open-sesame").unwrap();
+    assert!(again.to_bytes().unwrap().windows(7).any(|w| w == b"private"));
+    assert!(matches!(Pdf::from_bytes_with_password(&saved, "owner-pw"), Err(Error::WrongPassword) | Err(Error::PasswordRequired)));
+}
+
 // ---- annotations ---------------------------------------------------------------------------
 
 #[test]
@@ -383,6 +399,68 @@ fn incremental_update_appends_without_touching_the_original_bytes() {
     assert!(page_text(&r, &mut reloaded, 0).contains("DRAFT"));
     assert!(page_text(&r, &mut reloaded, 1).contains("DRAFT"));
     assert!(page_text(&r, &mut reloaded, 0).contains("original text"));
+}
+
+#[test]
+fn saving_keeps_signatures_and_revision_prefixes() {
+    let mut doc = text_pdf(&[&["contract body"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    let trust = trust_test_identity();
+
+    let mut reopened = Pdf::from_bytes(&signed).unwrap();
+    // Opening a document re-serializes it in memory. That must not count as an edit.
+    let _ = reopened.to_bytes().unwrap();
+    let untouched = reopened.bytes_for_save(Some(&signed), None).unwrap();
+    assert_eq!(untouched, signed, "saving with no edits must not rewrite a signed file");
+    let reports = verify(&untouched, &trust);
+    assert_eq!(reports[0].validity, Validity::Valid);
+    assert!(!reports[0].modified_after_signing);
+
+    reopened.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
+    let flat = {
+        let mut copy = Pdf::from_bytes(&signed).unwrap();
+        copy.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
+        copy.to_bytes().unwrap()
+    };
+    let rewritten = Pdf::verify_signatures(&flat, &trust, chrono::Utc::now()).unwrap_or_default();
+    assert!(
+        rewritten.first().is_none_or(|r| r.validity != Validity::Valid),
+        "a full rewrite destroys the signature, which is the bug save must not hit"
+    );
+
+    let saved = reopened.bytes_for_save(Some(&signed), None).unwrap();
+    assert!(saved.starts_with(&signed), "the signed bytes have to stay a prefix");
+    assert!(saved.len() > signed.len());
+    let reports = verify(&saved, &trust);
+    assert_eq!(reports[0].validity, Validity::Valid);
+    assert!(reports[0].modified_after_signing);
+
+    let mut working = Pdf::from_bytes(&signed).unwrap();
+    working.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
+    let v1 = working.save_revision(&signed, "First draft", &pdf_date_now()).unwrap();
+    let mut working = Pdf::from_bytes(&v1).unwrap();
+    working.apply_bates(&BatesOptions::default()).unwrap();
+    let v2 = working.save_revision(&v1, "Second", &pdf_date_now()).unwrap();
+    let revisions = Pdf::from_bytes(&v2).unwrap().revisions();
+    assert!(revisions.len() >= 2);
+
+    let mut current = Pdf::from_bytes(&v2).unwrap();
+    current.apply_watermark(&WatermarkOptions::new("FINAL")).unwrap();
+    let saved = current.bytes_for_save(Some(&v2), None).unwrap();
+    assert!(saved.starts_with(&v2));
+    let after = Pdf::from_bytes(&saved).unwrap();
+    let opened = open_revision_bytes(&saved, &after.revisions()[0]).unwrap();
+    assert_eq!(opened.len(), after.revisions()[0].file_offset as usize);
+
+    let mut flattened = Pdf::from_bytes(&v2).unwrap();
+    flattened.apply_watermark(&WatermarkOptions::new("FINAL")).unwrap();
+    let flat_bytes = flattened.to_bytes().unwrap();
+    let flat_revisions = Pdf::from_bytes(&flat_bytes).unwrap().revisions();
+    assert!(
+        open_revision_bytes(&flat_bytes, &flat_revisions[0]).is_err(),
+        "rewriting the file makes the stored revision offset unusable"
+    );
 }
 
 #[test]

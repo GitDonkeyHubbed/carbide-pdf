@@ -440,14 +440,37 @@ impl CarbideApp {
     }
 
     /// Writes the document to `path` and updates the revision base.
+    ///
+    /// An existing file is updated in place by appending, so signatures and saved revisions keep
+    /// their byte offsets. A password-protected file is encrypted again with the password that
+    /// opened it; the decrypted in-memory copy is never written over the original.
     pub fn save_to(&mut self, path: &Path) {
         let Some(doc) = self.doc.as_mut() else { return };
-        let result = doc.pdf.to_bytes().and_then(|bytes| {
-            std::fs::write(path, &bytes)?;
+        let password = doc.password.clone();
+        let base = password.is_none().then(|| doc.saved_bytes.clone()).flatten();
+        let result = doc.pdf.bytes_for_save(base.as_deref(), password.as_deref()).and_then(|bytes| {
+            let unchanged = doc.path.as_deref() == Some(path) && doc.saved_bytes.as_deref() == Some(bytes.as_slice());
+            if !unchanged {
+                write_replacing(path, &bytes)?;
+            }
             Ok(bytes)
         });
+        let mut reload_error = None;
         match result {
             Ok(bytes) => {
+                let mut rerender = false;
+                if password.is_none() && doc.saved_bytes.as_ref() != Some(&bytes) {
+                    match Pdf::from_bytes(&bytes) {
+                        Ok(reloaded) => {
+                            doc.geometries = (0..reloaded.page_count()).filter_map(|i| reloaded.page_geometry(i).ok()).collect();
+                            doc.pdf = reloaded;
+                            doc.bytes = bytes.clone();
+                            doc.version = doc.version.wrapping_add(1);
+                            rerender = true;
+                        }
+                        Err(e) => reload_error = Some(e.to_string()),
+                    }
+                }
                 doc.path = Some(path.to_path_buf());
                 doc.saved_bytes = Some(bytes);
                 doc.dirty = false;
@@ -455,9 +478,16 @@ impl CarbideApp {
                     let _ = store.document_saved(id);
                     doc.record = Some(store.begin_document(Some(path), now_unix()));
                 }
+                if rerender {
+                    self.textures.clear();
+                    self.thumbs.clear();
+                }
                 self.status = format!("Saved {}", path.display());
             }
             Err(e) => self.alert(format!("Could not save {}: {e}", path.display())),
+        }
+        if let Some(error) = reload_error {
+            self.alert(format!("Saved {}, but could not reload it: {error}", path.display()));
         }
     }
 
@@ -486,7 +516,7 @@ impl CarbideApp {
             None => std::fs::read(&path).map_err(|e| e.to_string())?,
         };
         let updated = doc.pdf.save_revision(&base, label, &pdf_date_now()).map_err(|e| e.to_string())?;
-        std::fs::write(&path, &updated).map_err(|e| e.to_string())?;
+        write_replacing(&path, &updated).map_err(|e| e.to_string())?;
         let pdf = Pdf::from_bytes(&updated).map_err(|e| e.to_string())?;
         doc.pdf = pdf;
         doc.saved_bytes = Some(updated);
@@ -867,7 +897,7 @@ impl CarbideApp {
         let authority = request.timestamp_source();
         let options = request.options(identity.as_ref(), authority.as_ref());
         let result = doc.pdf.sign(&base, &options).map_err(|e| e.to_string()).and_then(|bytes| {
-            std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+            write_replacing(&path, &bytes).map_err(|e| e.to_string())?;
             let pdf = Pdf::from_bytes(&bytes).map_err(|e| e.to_string())?;
             Ok((pdf, bytes))
         });
@@ -976,6 +1006,18 @@ impl CarbideApp {
             Err(e) => self.alert(format!("Compare failed: {e}")),
         }
     }
+}
+
+/// Replaces `path` only after the new bytes are fully written, so a failed save leaves the
+/// previous file in place.
+fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("pdf.carbide-tmp");
+    std::fs::write(&tmp, bytes)?;
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Notice bar text for a document that carries signatures.

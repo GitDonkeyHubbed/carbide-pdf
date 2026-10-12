@@ -6,6 +6,7 @@ use lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 
 use crate::error::{Error, Result};
 use crate::geometry::{normalize_rotation, PageGeometry};
+use crate::security::ProtectionOptions;
 
 /// A PDF document. All page indexes in this API are zero-based.
 #[derive(Clone)]
@@ -76,6 +77,30 @@ impl Pdf {
         let bytes = self.to_bytes()?;
         std::fs::write(path, bytes)?;
         Ok(())
+    }
+
+    /// Bytes that should replace the file on disk.
+    ///
+    /// `base_bytes` is the file this document was loaded from. The result starts with those exact
+    /// bytes, so signatures and saved-revision prefixes stay valid, and a document with no changes
+    /// is returned unchanged. Pass `None` for a document that has never been saved.
+    ///
+    /// When `password` is set, the result is a new AES-256 file that still requires that password.
+    /// A decrypted document's ordinary serialization is plaintext; writing that over the original
+    /// would remove the protection. The in-memory document stays decrypted.
+    pub fn bytes_for_save(&mut self, base_bytes: Option<&[u8]>, password: Option<&str>) -> Result<Vec<u8>> {
+        if let Some(password) = password.map(str::trim).filter(|p| !p.is_empty()) {
+            let mut options = ProtectionOptions::new(password, password);
+            options.allow_printing = true;
+            options.allow_copying = true;
+            options.allow_modifying = true;
+            options.allow_annotating = true;
+            return self.to_encrypted_bytes(&options);
+        }
+        match base_bytes {
+            Some(base) => self.incremental_update(base),
+            None => self.to_bytes(),
+        }
     }
 
     pub fn is_encrypted(&self) -> bool {
