@@ -1071,6 +1071,11 @@ fn reduce_dialog(app: &mut CarbideApp, ctx: &egui::Context, form: &mut ReduceFor
 /// Single-document flow: choose the output path, reduce, report. Returns `true` when finished.
 fn reduce_current(app: &mut CarbideApp, slider: u8) -> bool {
     let Some(doc) = app.doc.as_ref() else { return true };
+    // The reduced copy is not encrypted, and its suggested name is the protected original's.
+    if doc.saved.as_ref().is_some_and(|s| s.is_protected()) {
+        app.alert("Reduce File Size is not available for password-protected documents.".into());
+        return true;
+    }
     let name = doc.title();
     let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name(name).save_file() else {
         return false;
