@@ -516,6 +516,57 @@ fn revisions_are_prefixes_of_the_file_and_open_as_they_were() {
     assert!(open_revision_bytes(&v2, &broken).is_err());
 }
 
+// ---- saving over the file ----------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn replacing_a_file_keeps_its_mode_and_follows_symbolic_links() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use carbide_engine::fs::write_replacing;
+    let dir = scratch_dir("replace");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    let set_mode = |path: &std::path::Path, mode: u32| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+    // A private file stays private.
+    let private = dir.join("private.pdf");
+    std::fs::write(&private, b"old").unwrap();
+    set_mode(&private, 0o600);
+    write_replacing(&private, b"new").unwrap();
+    assert_eq!(std::fs::read(&private).unwrap(), b"new");
+    assert_eq!(mode(&private), 0o600);
+
+    // Saving through a link replaces the file it points to, and the link stays a link.
+    let target = dir.join("target.pdf");
+    std::fs::write(&target, b"old").unwrap();
+    set_mode(&target, 0o640);
+    let link = dir.join("link.pdf");
+    symlink("target.pdf", &link).unwrap();
+    write_replacing(&link, b"through the link").unwrap();
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read(&target).unwrap(), b"through the link");
+    assert_eq!(mode(&target), 0o640);
+
+    // A read-only file is refused and left alone.
+    let locked = dir.join("locked.pdf");
+    std::fs::write(&locked, b"keep").unwrap();
+    set_mode(&locked, 0o444);
+    assert!(write_replacing(&locked, b"replaced").is_err());
+    assert_eq!(std::fs::read(&locked).unwrap(), b"keep");
+    assert_eq!(mode(&locked), 0o444);
+
+    // A new file is simply created.
+    let fresh = dir.join("fresh.pdf");
+    write_replacing(&fresh, b"first").unwrap();
+    assert_eq!(std::fs::read(&fresh).unwrap(), b"first");
+
+    // No temporary file is left behind.
+    let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    assert_eq!(names, ["fresh.pdf", "link.pdf", "locked.pdf", "private.pdf", "target.pdf"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---- auto save / auto recovery -------------------------------------------------------------
 
 fn scratch_dir(tag: &str) -> PathBuf {

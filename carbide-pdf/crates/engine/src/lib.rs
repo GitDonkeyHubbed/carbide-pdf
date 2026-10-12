@@ -11,6 +11,7 @@ mod der;
 pub mod error;
 pub mod export;
 pub mod fonts;
+pub mod fs;
 pub mod geometry;
 pub mod imposition;
 pub mod imposition_plan;
