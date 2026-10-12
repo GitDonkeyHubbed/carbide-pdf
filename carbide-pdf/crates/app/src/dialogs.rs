@@ -408,7 +408,8 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                 }
                 let (unlock, cancel) = buttons(ui, "Unlock", !input.is_empty());
                 if unlock {
-                    if app.open_with_password(path.clone(), std::mem::take(bytes), input.clone()) {
+                    // The bytes stay here for another try if the password is wrong.
+                    if app.open_with_password(path.clone(), bytes.clone(), input.clone()) {
                         open = false;
                     } else {
                         *failed = true;
