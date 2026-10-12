@@ -141,6 +141,15 @@ pub enum Dialog {
     Signatures { reports: Vec<SignatureReport>, notice: String },
     Message(String),
     Password { path: PathBuf, bytes: Vec<u8>, input: String, failed: bool },
+    /// Saving to `path` has to write the whole file again, which costs its signatures or its saved
+    /// revisions. `then_sign` is a signing request waiting for the save.
+    ConfirmRewrite {
+        path: PathBuf,
+        content_removed: bool,
+        breaks_signatures: bool,
+        drops_revisions: bool,
+        then_sign: Option<Box<SignRequest>>,
+    },
     Watermark(WatermarkForm),
     Bates(BatesForm),
     Protect(ProtectForm),
@@ -408,6 +417,31 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                 if cancel {
                     open = false;
                 }
+            });
+        }
+
+        Dialog::ConfirmRewrite { path, content_removed, breaks_signatures, drops_revisions, then_sign } => {
+            window("Save").show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                ui.label(if *content_removed {
+                    format!("Saving \"{name}\" removes the content you deleted or redacted permanently, by writing the whole file again.")
+                } else {
+                    format!("\"{name}\" cannot be updated in place, so saving writes the whole file again.")
+                });
+                if *breaks_signatures {
+                    ui.label("Its existing signatures will no longer validate.");
+                }
+                if *drops_revisions {
+                    ui.label("Its saved revisions will be dropped.");
+                }
+                let (ok, cancel) = buttons(ui, "Save", true);
+                if ok {
+                    let (path, then_sign) = (path.clone(), then_sign.take());
+                    app.write_to(&path, true, then_sign);
+                    open = false;
+                }
+                open &= !cancel;
             });
         }
 
@@ -1040,7 +1074,7 @@ fn reduce_current(app: &mut CarbideApp, slider: u8) -> bool {
     let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name(name).save_file() else {
         return false;
     };
-    let before = doc.saved_bytes.as_ref().map(|b| b.len());
+    let before = doc.saved.as_ref().map(|s| s.bytes().len());
     let mut copy = doc.pdf.clone();
     match copy.reduce(&ReduceOptions { image_factor: slider }, before) {
         Ok((bytes, report)) => match std::fs::write(&path, bytes) {

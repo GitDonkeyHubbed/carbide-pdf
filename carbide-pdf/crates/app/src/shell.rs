@@ -284,7 +284,7 @@ impl CarbideApp {
 
             Cmd::PageInsert => self.edit("Insert page", move |p| p.insert_blank_page(page + 1, None)),
             Cmd::PageExtract => self.extract_current(),
-            Cmd::PageDelete => self.edit("Delete page", move |p| p.delete_pages(&[page])),
+            Cmd::PageDelete => self.edit_removing("Delete page", move |p| p.delete_pages(&[page])),
             Cmd::Merge => self.merge_files(),
             Cmd::Split => self.dialog = Some(Dialog::Split { ranges: "1-2".into() }),
             Cmd::Imposition => self.dialog = Some(Dialog::impose()),
@@ -563,6 +563,11 @@ impl CarbideApp {
                 for index in indices {
                     self.activate(Some(index));
                     self.save();
+                    // This one asks before rewriting the file: answer that first, then quit again.
+                    if matches!(self.dialog, Some(Dialog::ConfirmRewrite { .. })) {
+                        self.shell.quit_prompt = false;
+                        return;
+                    }
                 }
                 // A cancelled Save As leaves a document modified: keep the prompt up then.
                 if !(0..self.tabs.len()).any(|i| self.tab_label(i).1) {
