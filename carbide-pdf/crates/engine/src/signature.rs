@@ -662,10 +662,11 @@ impl Pdf {
         Ok(file)
     }
 
-    /// True if the document already contains a signature dictionary.
+    /// True if the document already contains a signature dictionary, or a signature field with a
+    /// value (even one that no longer reads as a signature).
     pub fn has_signatures(&self) -> bool {
         self.doc.objects.values().any(|o| match o {
-            Object::Dictionary(d) => d.has(b"ByteRange") && d.has(b"Contents") && d.has(b"SubFilter"),
+            Object::Dictionary(d) => is_signature_dictionary(d) || signature_field_value(d).is_some(),
             _ => false,
         })
     }
@@ -891,7 +892,56 @@ pub struct SignatureReport {
     pub revision_end: usize,
 }
 
+/// A dictionary holding a signature value: `/ByteRange`, `/Contents` and `/SubFilter`.
+fn is_signature_dictionary(d: &Dictionary) -> bool {
+    d.has(b"ByteRange") && d.has(b"Contents") && d.has(b"SubFilter")
+}
+
+/// The object a signature field's `/V` names, for a field (or merged field and widget) of type
+/// `/Sig`.
+fn signature_field_value(d: &Dictionary) -> Option<ObjectId> {
+    let is_signature = d.get(b"FT").ok().and_then(|o| o.as_name().ok()) == Some(b"Sig".as_slice());
+    match d.get(b"V") {
+        Ok(Object::Reference(value)) if is_signature => Some(*value),
+        _ => None,
+    }
+}
+
 impl SignatureReport {
+    /// A report for `field_name` that has not been checked yet.
+    fn new(field_name: String) -> SignatureReport {
+        SignatureReport {
+            field_name,
+            signer: None,
+            claimed_name: None,
+            sub_filter: None,
+            reason: None,
+            location: None,
+            signing_time: None,
+            validity: Validity::Unknown,
+            detail: Detail::NotVerified,
+            modified_after_signing: false,
+            certifying: false,
+            document_time_stamp: false,
+            has_embedded_timestamp: false,
+            embedded_timestamp_trusted: false,
+            weak_algorithm: false,
+            revision_end: 0,
+        }
+    }
+
+    /// Takes what the signature dictionary `v` says about itself: its handler, type, and the
+    /// signer's claims (name, reason, location, time).
+    fn describe(&mut self, v: &Dictionary) {
+        self.sub_filter = v.get(b"SubFilter").ok().and_then(|o| o.as_name().ok()).map(|n| String::from_utf8_lossy(n).into_owned());
+        self.claimed_name = text_of(v, b"Name");
+        self.reason = text_of(v, b"Reason");
+        self.location = text_of(v, b"Location");
+        self.signing_time = text_of(v, b"M");
+        self.document_time_stamp = v.get(b"Type").ok().and_then(|o| o.as_name().ok()) == Some(b"DocTimeStamp".as_slice())
+            || self.sub_filter.as_deref() == Some("ETSI.RFC3161");
+    }
+
     /// The panel's status line.
     pub fn status_line(&self) -> &'static str {
         let (valid, unknown, invalid) = if self.document_time_stamp {
@@ -1362,10 +1412,29 @@ impl Pdf {
         let mut reports = Vec::new();
         for (id, object) in &pdf.doc.objects {
             let Object::Dictionary(v) = object else { continue };
-            if !(v.has(b"ByteRange") && v.has(b"Contents") && v.has(b"SubFilter")) {
+            if !is_signature_dictionary(v) {
                 continue;
             }
             reports.push(verify_one(&pdf, *id, v, names.get(id).cloned(), file_bytes, file_end, trust, now));
+        }
+        // A signature field whose value is gone or no longer reads as a signature (bytes written
+        // into the gap broke its dictionary, say) is still a signature, and a damaged one.
+        for field in pdf.doc.objects.values() {
+            let Object::Dictionary(field) = field else { continue };
+            let Some(value) = signature_field_value(field) else { continue };
+            match pdf.doc.objects.get(&value) {
+                Some(Object::Dictionary(v)) if is_signature_dictionary(v) => {}
+                Some(Object::Dictionary(v)) if v.has(b"ByteRange") => {
+                    reports.push(verify_one(&pdf, value, v, names.get(&value).cloned(), file_bytes, file_end, trust, now));
+                }
+                _ => {
+                    let mut report = SignatureReport::new(text_of(field, b"T").unwrap_or_else(|| format!("object {}", value.0)));
+                    report.validity = Validity::Invalid;
+                    report.detail = Detail::Corrupt;
+                    report.revision_end = file_end;
+                    reports.push(report);
+                }
+            }
         }
         reports.sort_by_key(|r| r.revision_end);
         Ok(reports)
@@ -1380,7 +1449,7 @@ impl Pdf {
         let trust = TrustStore::default();
         self.doc.objects.iter().any(|(id, object)| {
             let Object::Dictionary(v) = object else { return false };
-            if !(v.has(b"ByteRange") && v.has(b"Contents") && v.has(b"SubFilter")) {
+            if !is_signature_dictionary(v) {
                 return false;
             }
             let report = verify_one(self, *id, v, None, file_bytes, file_end, &trust, Utc::now());
@@ -1400,25 +1469,8 @@ fn verify_one(
     trust: &TrustStore,
     now: DateTime<Utc>,
 ) -> SignatureReport {
-    let sub_filter = v.get(b"SubFilter").ok().and_then(|o| o.as_name().ok()).map(|n| String::from_utf8_lossy(n).into_owned());
-    let mut report = SignatureReport {
-        field_name: name.unwrap_or_else(|| format!("object {}", id.0)),
-        signer: None,
-        claimed_name: text_of(v, b"Name"),
-        sub_filter: sub_filter.clone(),
-        reason: text_of(v, b"Reason"),
-        location: text_of(v, b"Location"),
-        signing_time: text_of(v, b"M"),
-        validity: Validity::Unknown,
-        detail: Detail::NotVerified,
-        modified_after_signing: false,
-        certifying: pdf.is_certifying_signature(id),
-        document_time_stamp: v.get(b"Type").ok().and_then(|o| o.as_name().ok()) == Some(b"DocTimeStamp"),
-        has_embedded_timestamp: false,
-        embedded_timestamp_trusted: false,
-        weak_algorithm: false,
-        revision_end: 0,
-    };
+    let mut report = SignatureReport::new(name.unwrap_or_else(|| format!("object {}", id.0)));
+    report.describe(v);
 
     let invalid = |report: &mut SignatureReport, detail: Detail| {
         report.validity = Validity::Invalid;
@@ -1427,7 +1479,8 @@ fn verify_one(
 
     // 1. Sub-filter.
     const SUPPORTED: [&str; 3] = ["adbe.pkcs7.detached", "ETSI.CAdES.detached", "ETSI.RFC3161"];
-    if !sub_filter.as_deref().is_some_and(|f| SUPPORTED.contains(&f)) {
+    let supported = |report: &SignatureReport| report.sub_filter.as_deref().is_some_and(|f| SUPPORTED.contains(&f));
+    if !supported(&report) {
         invalid(&mut report, Detail::UnsupportedFilter);
         return report;
     }
@@ -1441,13 +1494,49 @@ fn verify_one(
     };
     report.revision_end = c + d;
     report.modified_after_signing = report.revision_end < file_end;
-    let bound = signature_value_span(pdf, id, file) == Some((b, c))
-        && (pdf.doc.encryption_state.is_some() || parsed_contents_length(v).is_some_and(|len| 2 * len + 2 == c - b))
-        && revision_is_self_contained(file, b, c, c + d);
+    if !revision_is_self_contained(file, b, c, c + d) {
+        invalid(&mut report, Detail::BadByteRange);
+        return report;
+    }
+    // The dictionary itself is read again from the signed revision alone. A later update can file
+    // another copy under the same object number (an entry whose bytes say "N 0 obj"), and that
+    // copy, outside the signed bytes, must not supply the date, reason or names.
+    let reloaded;
+    let revision = if report.modified_after_signing {
+        match Pdf::from_bytes(&file[..c + d]) {
+            Ok(pdf) => {
+                reloaded = pdf;
+                &reloaded
+            }
+            Err(_) => {
+                invalid(&mut report, Detail::BadByteRange);
+                return report;
+            }
+        }
+    } else {
+        pdf
+    };
+    let signed = match revision.doc.objects.get(&id) {
+        Some(Object::Dictionary(signed)) if signed_range(signed, file) == Some((b, c, d)) => signed,
+        _ => {
+            invalid(&mut report, Detail::BadByteRange);
+            return report;
+        }
+    };
+    let bound = signature_value_span(revision, id, file) == Some((b, c))
+        && (revision.doc.encryption_state.is_some()
+            || parsed_contents_length(signed).is_some_and(|len| 2 * len + 2 == c - b));
     let Some(contents) = bound.then(|| hex_value(&file[b + 1..c - 1])).flatten() else {
         invalid(&mut report, Detail::BadByteRange);
         return report;
     };
+    // From here on, what the report says about the signature comes from the signed dictionary.
+    report.describe(signed);
+    report.certifying = revision.is_certifying_signature(id);
+    if !supported(&report) {
+        invalid(&mut report, Detail::UnsupportedFilter);
+        return report;
+    }
 
     // 3. Parse the CMS (or time-stamp token). Only zero padding may follow it.
     if der::read_ber(&contents).is_none_or(|(_, rest)| rest.iter().any(|byte| *byte != 0)) {
@@ -1456,7 +1545,6 @@ fn verify_one(
     }
 
     // A document time stamp is an RFC 3161 token, not an ordinary signature.
-    report.document_time_stamp = report.document_time_stamp || sub_filter.as_deref() == Some("ETSI.RFC3161");
     if report.document_time_stamp {
         return verify_document_timestamp(report, &contents, file, b, c, d, trust, now);
     }

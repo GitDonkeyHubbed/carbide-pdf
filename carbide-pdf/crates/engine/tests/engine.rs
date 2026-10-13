@@ -1929,6 +1929,138 @@ fn a_signature_object_moved_after_the_gap_is_rejected() {
     assert_eq!(reports[0].detail, Detail::BadByteRange, "relocated signature object was {:?}", reports[0].validity);
 }
 
+/// The two numbers after the last `/key` in `file` (a trailer reference such as `/Root 5 0 R`), or
+/// just the first for a number such as `/Size`.
+fn trailer_numbers(file: &[u8], key: &str) -> (u32, u32) {
+    let needle = format!("/{key}");
+    let at = file.windows(needle.len()).rposition(|w| w == needle.as_bytes()).unwrap() + needle.len();
+    let text = String::from_utf8_lossy(&file[at..at + 40]).into_owned();
+    let numbers: Vec<u32> = text.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).take(2).map(|s| s.parse().unwrap()).collect();
+    (numbers[0], numbers.get(1).copied().unwrap_or(0))
+}
+
+/// `file` with one more revision appended by hand: `objects` are complete `N G obj ... endobj`
+/// texts, each filed under the paired number in a classic cross-reference section. `extra` goes
+/// into the trailer as it is.
+fn append_revision(file: &[u8], objects: &[(u32, String)], extra: &str) -> Vec<u8> {
+    let (root, root_generation) = trailer_numbers(file, "Root");
+    let size = objects.iter().map(|(n, _)| n + 1).max().unwrap_or(0).max(trailer_numbers(file, "Size").0);
+    let prev = startxref(file);
+    let mut out = file.to_vec();
+    out.push(b'\n');
+    let mut entries = String::new();
+    for (number, text) in objects {
+        entries += &format!("{number} 1\n{:010} 00000 n \n", out.len());
+        out.extend_from_slice(text.as_bytes());
+        out.push(b'\n');
+    }
+    let xref_at = out.len();
+    out.extend_from_slice(
+        format!("xref\n{entries}trailer\n<</Size {size}/Root {root} {root_generation} R/Prev {prev}{extra}>>\nstartxref\n{xref_at}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn a_second_copy_of_the_signature_dictionary_after_the_signed_revision_is_ignored() {
+    let mut doc = text_pdf(&[&["the contract"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    let original = verify(&signed, &trust_test_identity()).remove(0);
+    let [_, b, c, d] = byte_range(&signed);
+    let id = signature_object_number(&signed);
+    let gap = String::from_utf8(signed[b + 1..c - 1].to_vec()).unwrap();
+
+    // An update files a new object number under bytes that claim to be the signature dictionary,
+    // with the same byte range and value but the attacker's date, name and reason. The loader
+    // keeps the later copy.
+    let alias = format!(
+        "{id} 0 obj\n<</Type/Sig/Filter/Adobe.PPKLite/SubFilter/adbe.pkcs7.detached/ByteRange[0 {b} {c} {d}]/Contents<{gap}>/M(D:19990101000000Z)/Name(Mallory)/Reason(I reject this contract)/Location(Nowhere)>>\nendobj"
+    );
+    let forged = append_revision(&signed, &[(trailer_numbers(&signed, "Size").0, alias)], "");
+    let report = verify(&forged, &trust_test_identity()).remove(0);
+    assert!(report.modified_after_signing);
+    assert_eq!((report.validity, report.detail), (Validity::Valid, Detail::TrustedDirectly));
+    assert_eq!(report.reason.as_deref(), Some("I approve"));
+    assert_eq!((&report.location, &report.signing_time), (&original.location, &original.signing_time));
+    assert_eq!(report.claimed_name, None, "the signed /Name matches the certificate");
+}
+
+#[test]
+fn bytes_written_into_the_gap_never_make_a_signature_disappear() {
+    let mut doc = text_pdf(&[&["gap"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    let [_, b, c, _] = byte_range(&signed);
+    let (size, (root, _)) = (trailer_numbers(&signed, "Size").0, trailer_numbers(&signed, "Root"));
+
+    // A whole revision inside the gap: the hex string and the dictionary are closed early, then
+    // come an object, its cross-reference section and a trailer, and a comment hides the rest.
+    let at = b + 1;
+    let mut revision = ">>>\nendobj\n".to_string();
+    let object_at = at + revision.len();
+    revision += &format!("{size} 0 obj\n<</Length 0>>stream\n\nendstream\nendobj\n");
+    let xref_at = at + revision.len();
+    revision += &format!(
+        "xref\n{size} 1\n{object_at:010} 00000 n \ntrailer\n<</Size {}/Root {root} 0 R/Prev {}>>\nstartxref\n{xref_at}\n%%EOF\n%",
+        size + 1,
+        startxref(&signed)
+    );
+    assert!(revision.len() < c - 1 - at);
+    let mut in_gap = signed.clone();
+    in_gap[at..at + revision.len()].copy_from_slice(revision.as_bytes());
+
+    // Two bytes that leave the dictionary unparseable.
+    let mut unbalanced = signed.clone();
+    unbalanced[c - 3..c - 1].copy_from_slice(b">(");
+
+    for (label, forged) in [("revision in the gap", in_gap), ("unbalanced", unbalanced)] {
+        let reports = verify(&forged, &trust_test_identity());
+        assert!(!reports.is_empty(), "{label}: the signature vanished");
+        assert!(reports.iter().all(|r| r.validity == Validity::Invalid), "{label}: {:?}", reports.iter().map(|r| r.detail).collect::<Vec<_>>());
+        assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_PROBLEMS), "{label}");
+        assert!(Pdf::from_bytes(&forged).unwrap().has_signatures(), "{label}");
+    }
+}
+
+#[test]
+fn signatures_on_owner_password_protected_files_verify() {
+    // Protected with an owner password only, so it opens without one. Its strings and streams are
+    // encrypted, but a signature value never is.
+    let plain = text_pdf(&[&["protected and signed"]]).to_bytes().unwrap();
+    let protected = Pdf::from_bytes(&plain).unwrap().to_encrypted_bytes(&ProtectionOptions::new("", "owner")).unwrap();
+    let (encrypt, generation) = trailer_numbers(&protected, "Encrypt");
+    let id = trailer_numbers(&protected, "Size").0;
+    let placeholder = "0".repeat(2 * 4096);
+    let dictionary = format!(
+        "{id} 0 obj\n<</Type/Sig/Filter/Adobe.PPKLite/SubFilter/adbe.pkcs7.detached/ByteRange[0000000000 0000000000 0000000000 0000000000]/Contents<{placeholder}>>>\nendobj"
+    );
+    let mut signed = append_revision(&protected, &[(id, dictionary)], &format!("/Encrypt {encrypt} {generation} R"));
+    let b = signed.windows(placeholder.len() + 1).rposition(|w| w[0] == b'<' && w[1..].iter().all(|x| *x == b'0')).unwrap();
+    let c = b + placeholder.len() + 2;
+    let d = signed.len() - c;
+    set_byte_range(&mut signed, [0, b, c, d]);
+
+    // Sign the covered bytes directly (no signed attributes).
+    use rsa::pkcs8::DecodePrivateKey;
+    let key = rsa::RsaPrivateKey::from_pkcs8_der(&test_identity().pkcs8).unwrap();
+    let covered = covered_bytes(&signed);
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(&covered);
+    let signature = key.sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &digest).unwrap();
+    let cms = detached_cms(&test_identity().certificate, SHA256_OID, &[1, 2, 840, 113549, 1, 1, 11], None, &signature);
+    put_signature_value(&mut signed, &cms);
+
+    let reports = verify(&signed, &trust_test_identity());
+    assert_eq!(reports.len(), 1);
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
+
+    // And the covered (encrypted) bytes are still bound to it.
+    let mut tampered = signed.clone();
+    let middle = b / 2;
+    tampered[middle] ^= 0x01;
+    assert_ne!(verify(&tampered, &trust_test_identity()).first().map(|r| r.validity), Some(Validity::Valid));
+}
+
 // ---- algorithm coverage (S7, S6) ----------------------------------------------------------
 
 mod algo {
