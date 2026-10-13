@@ -115,10 +115,16 @@ impl Pdf {
             });
         }
         if let Some(mut tree) = self.name_tree(b"Dests") {
-            prune_pairs(&mut self.doc, &mut tree, b"Names", &|name, _| matches!(name, Object::String(n, _) if gone.contains(n)), 0);
+            let held = prune_pairs(&mut self.doc, &mut tree, b"Names", &|name, _| matches!(name, Object::String(n, _) if gone.contains(n)), 0);
             let names_entry = self.doc.get_dictionary(catalog_id).and_then(|c| c.get(b"Names")).cloned();
             if let Ok(names) = names_entry {
-                edit_dictionary(&mut self.doc, catalog_id, b"Names", names, |dict| dict.set("Dests", tree));
+                edit_dictionary(&mut self.doc, catalog_id, b"Names", names, |dict| match held {
+                    // A tree left without a name goes altogether.
+                    Held::Nothing => {
+                        dict.remove(b"Dests");
+                    }
+                    _ => dict.set("Dests", tree),
+                });
             }
         }
     }
@@ -423,29 +429,55 @@ pub(crate) fn collect_pairs(doc: &Document, node: &Object, key: &[u8], out: &mut
     }
 }
 
+/// What a node of a name or number tree holds once pruned.
+enum Held {
+    /// No key at all: the node can go.
+    Nothing,
+    /// Its first and last key, in tree order.
+    Keys(Box<(Object, Object)>),
+    /// A node that could not be read, or too deep, is left as it is.
+    Unknown,
+}
+
 /// Removes the pairs of a name or number tree that `goes` gives up, wherever in the tree they are.
-pub(crate) fn prune_pairs(doc: &mut Document, node: &mut Object, key: &[u8], goes: &dyn Fn(&Object, &Object) -> bool, depth: usize) {
+/// Kids left without a key are taken out, and every node that has /Limits gets them set to the
+/// first and last key it still holds, so no key that went stays there.
+fn prune_pairs(doc: &mut Document, node: &mut Object, key: &[u8], goes: &dyn Fn(&Object, &Object) -> bool, depth: usize) -> Held {
     if depth > MAX_DEPTH {
-        return;
+        return Held::Unknown;
     }
     let (id, mut dict) = match node {
         Object::Reference(id) => match doc.get_dictionary(*id) {
             Ok(dict) => (Some(*id), dict.clone()),
-            Err(_) => return,
+            Err(_) => return Held::Unknown,
         },
         Object::Dictionary(dict) => (None, dict.clone()),
-        _ => return,
+        _ => return Held::Unknown,
     };
+    let mut held: Vec<Held> = Vec::new();
     if let Ok(mut kids) = dict.get(b"Kids").cloned() {
         if let Object::Reference(kids_id) = kids {
             kids = doc.get_object(kids_id).cloned().unwrap_or(Object::Null);
         }
-        if let Object::Array(items) = &mut kids {
-            for kid in items.iter_mut() {
-                prune_pairs(doc, kid, key, goes, depth + 1);
+        if let Object::Array(items) = kids {
+            let mut kept = Vec::with_capacity(items.len());
+            for mut kid in items {
+                match prune_pairs(doc, &mut kid, key, goes, depth + 1) {
+                    Held::Nothing => {}
+                    other => {
+                        held.push(other);
+                        kept.push(kid);
+                    }
+                }
             }
+            if kept.is_empty() {
+                dict.remove(b"Kids");
+            } else {
+                dict.set("Kids", kept);
+            }
+        } else {
+            held.push(Held::Unknown);
         }
-        dict.set("Kids", kids);
     }
     if let Ok(mut pairs) = dict.get(key).cloned() {
         if let Object::Reference(pairs_id) = pairs {
@@ -460,8 +492,25 @@ pub(crate) fn prune_pairs(doc: &mut Document, node: &mut Object, key: &[u8], goe
                     kept.push(value.clone());
                 }
             }
+            if let (Some(first), Some(last)) = (kept.first(), kept.len().checked_sub(2).and_then(|i| kept.get(i))) {
+                held.push(Held::Keys(Box::new((first.clone(), last.clone()))));
+            }
             dict.set(key.to_vec(), kept);
+        } else {
+            held.push(Held::Unknown);
         }
+    }
+    let held = match (held.first(), held.last()) {
+        _ if held.iter().any(|h| matches!(h, Held::Unknown)) => Held::Unknown,
+        (Some(Held::Keys(first)), Some(Held::Keys(last))) => Held::Keys(Box::new((first.0.clone(), last.1.clone()))),
+        _ => Held::Nothing,
+    };
+    match &held {
+        Held::Keys(keys) if dict.has(b"Limits") => dict.set("Limits", vec![keys.0.clone(), keys.1.clone()]),
+        Held::Nothing => {
+            dict.remove(b"Limits");
+        }
+        _ => {}
     }
     match id {
         Some(id) => {
@@ -469,4 +518,5 @@ pub(crate) fn prune_pairs(doc: &mut Document, node: &mut Object, key: &[u8], goe
         }
         None => *node = Object::Dictionary(dict),
     }
+    held
 }

@@ -716,6 +716,61 @@ fn page_labels_carry_on_where_a_page_was_deleted() {
     assert_eq!(outline(&pdf, catalog.get(b"Outlines").unwrap().as_reference().unwrap()).len(), 3);
 }
 
+/// The node `id` of a name tree: its /Limits as text, and how many kids it has.
+fn tree_node(pdf: &Pdf, id: lopdf::ObjectId) -> (Vec<String>, usize) {
+    let dict = pdf.document().get_dictionary(id).unwrap();
+    let text = |o: &Object| String::from_utf8_lossy(o.as_str().unwrap()).into_owned();
+    let limits = dict.get(b"Limits").map(|l| l.as_array().unwrap().iter().map(text).collect()).unwrap_or_default();
+    (limits, dict.get(b"Kids").map(|k| k.as_array().unwrap().len()).unwrap_or(0))
+}
+
+#[test]
+fn deleted_destinations_leave_no_name_in_the_limits_of_their_name_tree() {
+    // Named destinations in a tree of several levels, as long documents have them, each node
+    // naming the first and last name below it.
+    let mut pdf = text_pdf(&[&["first"], &["second"], &["third"]]);
+    let pages = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let name = |n: &str| Object::string_literal(n);
+    let to = |page| Object::Array(vec![Object::Reference(page), "Fit".into()]);
+    let leaf = |doc: &mut Document, names: &[(&str, lopdf::ObjectId)]| {
+        let limits = vec![name(names[0].0), name(names[names.len() - 1].0)];
+        let pairs: Vec<Object> = names.iter().flat_map(|(n, page)| [name(n), to(*page)]).collect();
+        doc.add_object(dictionary! { "Limits" => limits, "Names" => pairs })
+    };
+    let first = leaf(doc, &[("Alpha", pages[0]), ("SecretMergerTarget", pages[1])]);
+    let second = leaf(doc, &[("SecretZeta", pages[1]), ("Zulu", pages[2])]);
+    let third = leaf(doc, &[("ZzSecretLast", pages[1])]);
+    let middle = doc.add_object(dictionary! {
+        "Limits" => vec![name("Alpha"), name("ZzSecretLast")],
+        "Kids" => vec![first.into(), second.into(), third.into()],
+    });
+    let root = doc.add_object(dictionary! { "Kids" => vec![middle.into()] });
+    doc.catalog_mut().unwrap().set("Names", dictionary! { "Dests" => root });
+
+    pdf.delete_pages(&[1]).unwrap();
+    let bytes = file_bytes(&mut pdf);
+    assert_gone(&bytes, "Secret");
+    let pdf = Pdf::from_bytes(&bytes).unwrap();
+    assert_eq!(tree_node(&pdf, first), (vec!["Alpha".into(), "Alpha".into()], 0));
+    assert_eq!(tree_node(&pdf, second), (vec!["Zulu".into(), "Zulu".into()], 0));
+    assert_eq!(tree_node(&pdf, middle), (vec!["Alpha".into(), "Zulu".into()], 2), "the emptied leaf is taken out");
+    assert_eq!(tree_node(&pdf, root), (vec![], 1), "the root has no limits");
+
+    // A tree left without a name goes altogether.
+    let mut pdf = text_pdf(&[&["first"], &["second"]]);
+    let gone_to = pdf.page_ids()[1];
+    let doc = pdf.document_mut();
+    let only = doc.add_object(dictionary! { "Limits" => vec![name("OnlySecret"), name("OnlySecret")], "Names" => vec![name("OnlySecret"), to(gone_to)] });
+    let root = doc.add_object(dictionary! { "Kids" => vec![only.into()] });
+    doc.catalog_mut().unwrap().set("Names", dictionary! { "Dests" => root });
+    pdf.delete_pages(&[1]).unwrap();
+    let bytes = file_bytes(&mut pdf);
+    assert_gone(&bytes, "OnlySecret");
+    let catalog = Pdf::from_bytes(&bytes).unwrap().document().catalog().unwrap().clone();
+    assert!(!catalog.get(b"Names").unwrap().as_dict().unwrap().has(b"Dests"));
+}
+
 /// One page showing "visible text", and hidden information of every kind, each holding
 /// `SECRET-<kind>`: document information, XMP, an attachment and a file attachment comment,
 /// document JavaScript run on opening and on a page event, a filled text field, a note with its
