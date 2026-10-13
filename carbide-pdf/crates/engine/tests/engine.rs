@@ -2407,6 +2407,61 @@ fn a_sound_page_tree_is_not_rewritten_by_the_repair() {
     assert_ne!(pdf.save_plan(Some(&saved), false).unwrap(), SavePlan::Unchanged);
 }
 
+// ---- resource limits -----------------------------------------------------------------------
+
+/// A Flate stream of `size` spaces: a few hundred kilobytes in the file, `size` bytes decoded.
+fn flate_bomb(size: usize) -> Stream {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    let chunk = vec![b' '; 1 << 20];
+    for _ in 0..size.div_ceil(chunk.len()) {
+        encoder.write_all(&chunk).unwrap();
+    }
+    Stream::new(dictionary! { "Filter" => "FlateDecode" }, encoder.finish().unwrap()).with_compression(false)
+}
+
+/// Two pages, the second drawn by its own content followed by `bomb` (`joined`), or by `bomb`
+/// alone.
+fn bombed(bomb: &Stream, joined: bool) -> Pdf {
+    let mut pdf = text_pdf(&[&["SMALL PAGE"], &["BOMB PAGE"]]);
+    let ids = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let bomb = doc.add_object(bomb.clone());
+    let own = doc.get_dictionary(ids[1]).unwrap().get(b"Contents").unwrap().clone();
+    let contents: Object = if joined { vec![own, bomb.into()].into() } else { bomb.into() };
+    doc.get_dictionary_mut(ids[1]).unwrap().set("Contents", contents);
+    pdf
+}
+
+#[test]
+fn decompression_bombs_are_refused_or_never_decoded() {
+    let bomb = flate_bomb(300 << 20);
+    assert!(bomb.content.len() < 4 << 20, "the fixture is small in the file");
+    let too_large = |result: Result<(), Error>, what: &str| match result {
+        Err(Error::TooLarge(message)) => assert_eq!(message, carbide_engine::limits::messages::TOO_LARGE, "{what}"),
+        other => panic!("{what}: {other:?}"),
+    };
+
+    // Content split over several streams has to be decoded, and is refused past the limit.
+    let pdf = bombed(&bomb, true);
+    too_large(pdf.impose(&ImpositionOptions::default(), None).map(|_| ()), "impose");
+    too_large(pdf.clone().reduce(&ReduceOptions::default(), None).map(|_| ()), "reduce");
+    // Removing another page still works; the page whose content is too large keeps its resources.
+    let mut deleted = pdf.clone();
+    deleted.delete_pages(&[0]).unwrap();
+    assert_eq!(deleted.page_count(), 1);
+    assert!(!deleted.document().get_dictionary(deleted.page_ids()[0]).unwrap().get(b"Resources").unwrap().as_dict().unwrap().is_empty());
+
+    // A single content stream goes onto the imposed sheet as it is stored, never decoded.
+    let pdf = bombed(&bomb, false);
+    let options = ImpositionOptions { plan: PlanOptions { layout: LayoutKind::Sequential, ..Default::default() }, ..Default::default() };
+    let sheets = pdf.impose(&options, None).unwrap();
+    let carried = sheets.document().objects.values().filter_map(|o| o.as_stream().ok()).any(|stream| {
+        stream.dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Form") && stream.content == bomb.content
+    });
+    assert!(carried, "the content stream was not carried over as it was stored");
+}
+
 // ---- inherited page attributes -------------------------------------------------------------
 
 /// `numbered_pages(4)` with /Rotate 90 and /CropBox [0 300 500 792] (which still shows the text)

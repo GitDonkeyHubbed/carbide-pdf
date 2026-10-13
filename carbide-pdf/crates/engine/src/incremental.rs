@@ -40,7 +40,7 @@ impl Pdf {
     /// `base_bytes` must be the file this document was loaded from (or a later save of it).
     /// Encrypted files are not supported, including those that open without a password.
     pub fn incremental_update(&self, base_bytes: &[u8]) -> Result<Vec<u8>> {
-        let base = Document::load_mem(base_bytes)?;
+        let base = crate::crypt::load_bounded(base_bytes)?;
         if base.is_encrypted() || base.was_encrypted() || self.doc.is_encrypted() {
             return Err(Error::Unsupported("incremental updates of encrypted files are not supported".into()));
         }

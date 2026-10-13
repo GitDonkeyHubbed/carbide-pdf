@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::fonts::{literal_string, win_ansi, StandardFont};
 use crate::geometry::{fmt, PageGeometry};
 use crate::imposition_plan::{output_order, plan_plates, LayoutKind, Plate, PlanOptions, Style};
+use crate::limits::DecodeBudget;
 use crate::pdf::Pdf;
 
 pub mod messages {
@@ -288,24 +289,33 @@ fn real_array(values: &[f32]) -> Object {
 
 impl Pdf {
     /// Wraps the source page `page_id`, of `geometry`, in a form XObject whose coordinates are the
-    /// displayed page (origin bottom-left, rotation and crop box applied).
-    fn page_as_form(&mut self, page_id: ObjectId, geometry: PageGeometry) -> Result<ObjectId> {
-        let content = self.doc.get_page_content(page_id);
+    /// displayed page (origin bottom-left, rotation and crop box applied). Drawing a form saves and
+    /// restores the graphics state around it, so the page's content cannot affect what follows.
+    ///
+    /// A page drawn by one content stream lends that stream to the form as it is stored, still
+    /// compressed, so nothing is decoded however large it would be. Content split over several
+    /// streams is decoded within `budget` and joined.
+    fn page_as_form(&mut self, page_id: ObjectId, geometry: PageGeometry, budget: &mut DecodeBudget) -> Result<ObjectId> {
         let resources = self.inherited(page_id, b"Resources").unwrap_or(Object::Dictionary(Dictionary::new()));
         let (w, h) = (geometry.box_width, geometry.box_height);
-        let mut body = b"q\n".to_vec();
-        body.extend_from_slice(&content);
-        body.extend_from_slice(b"\nQ\n");
-        let form = Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Form",
-                "BBox" => real_array(&[geometry.x0, geometry.y0, geometry.x0 + w, geometry.y0 + h]),
-                "Matrix" => real_array(&invert_matrix(geometry.display_to_user())),
-                "Resources" => resources,
+        let mut form = match self.doc.get_page_contents(page_id).as_slice() {
+            [single] => match self.doc.get_object(*single) {
+                Ok(Object::Stream(stream)) => {
+                    let mut stream = stream.clone();
+                    let encoding: Dictionary =
+                        stream.dict.iter().filter(|(key, _)| matches!(key.as_slice(), b"Filter" | b"DecodeParms" | b"Length" | b"DL")).map(|(k, v)| (k.clone(), v.clone())).collect();
+                    stream.dict = encoding;
+                    stream
+                }
+                _ => Stream::new(Dictionary::new(), Vec::new()),
             },
-            body,
-        );
+            _ => Stream::new(Dictionary::new(), budget.page_content(&self.doc, page_id)?),
+        };
+        form.dict.set("Type", "XObject");
+        form.dict.set("Subtype", "Form");
+        form.dict.set("BBox", real_array(&[geometry.x0, geometry.y0, geometry.x0 + w, geometry.y0 + h]));
+        form.dict.set("Matrix", real_array(&invert_matrix(geometry.display_to_user())));
+        form.dict.set("Resources", resources);
         Ok(self.doc.add_object(form))
     }
 
@@ -331,6 +341,7 @@ impl Pdf {
         let root_id = out.pages_root()?;
         let ids = out.page_ids();
         let geometries: Vec<PageGeometry> = ids.iter().map(|&id| out.geometry_of(id)).collect();
+        let mut budget = DecodeBudget::new();
         let mut forms: Vec<Option<ObjectId>> = vec![None; total];
         let mut new_pages: Vec<Object> = Vec::with_capacity(order.len());
         let cells_total: usize = order.iter().map(|&p| plates[p].cells.len()).sum();
@@ -359,7 +370,7 @@ impl Pdf {
                     let form_id = match forms[page] {
                         Some(id) => id,
                         None => {
-                            let id = out.page_as_form(ids[page], geometries[page])?;
+                            let id = out.page_as_form(ids[page], geometries[page], &mut budget)?;
                             forms[page] = Some(id);
                             id
                         }
@@ -461,7 +472,7 @@ impl Pdf {
             }
         }
         crate::save::prune(&mut out.doc);
-        // Form XObjects hold decoded page content; store it compressed again.
+        // Forms made of several content streams hold them decoded; store them compressed again.
         out.doc.compress();
         Ok(out)
     }

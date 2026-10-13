@@ -12,6 +12,7 @@ use lopdf::content::Content;
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::error::Result;
+use crate::limits::DecodeBudget;
 use crate::pdf::Pdf;
 
 /// Resource categories whose entries content refers to by name.
@@ -158,10 +159,11 @@ impl Pdf {
             }
         }
         let mut changes = Vec::new();
+        let mut scan = NameScan { budget: DecodeBudget::new(), names: HashMap::new() };
         for page in &pages {
             let Some(Object::Dictionary(resources)) = self.inherited(*page, b"Resources") else { continue };
             let own = self.doc.get_dictionary(*page)?.get(b"Resources").ok().cloned();
-            let kept = match self.names_used_by_page(*page, &resources) {
+            let kept = match self.names_used_by_page(*page, &resources, &mut scan) {
                 Some(names) => self.keep_named(&resources, &names),
                 None => resources.clone(),
             };
@@ -197,12 +199,12 @@ impl Pdf {
 
     /// The resource names the page's content refers to, following forms, patterns and Type 3
     /// fonts that use the page's resources instead of their own. `None` when some content cannot
-    /// be read.
-    fn names_used_by_page(&self, page: ObjectId, resources: &Dictionary) -> Option<HashSet<Vec<u8>>> {
+    /// be read, or when decoding it would go past the limits in [`crate::limits`].
+    fn names_used_by_page(&self, page: ObjectId, resources: &Dictionary, scan: &mut NameScan) -> Option<HashSet<Vec<u8>>> {
         let mut names = HashSet::new();
         for stream in self.doc.get_page_contents(page) {
-            let content = self.doc.get_object(stream).and_then(Object::as_stream).ok()?.get_plain_content().ok()?;
-            collect_names(&content, &mut names)?;
+            let content = self.doc.get_object(stream).and_then(Object::as_stream).ok()?;
+            names.extend(scan.names_in(Some(stream), content)?);
         }
         // Resources that are drawn without resources of their own use the page's.
         let mut followed = HashSet::new();
@@ -216,26 +218,20 @@ impl Pdf {
                     if !names.contains(name) || !followed.insert((category, name.clone())) {
                         continue;
                     }
-                    let resolved = self.resolve(value);
+                    let Some(resolved) = self.resolved(value) else { continue };
                     // Names in the resource's own dictionary: an image's colour space, say.
                     if let Some(dict) = resolved.as_dict().ok().or_else(|| resolved.as_stream().ok().map(|s| &s.dict)) {
                         more.extend(dict.iter().filter_map(|(_, v)| v.as_name().ok().map(<[u8]>::to_vec)));
                     }
-                    match &resolved {
+                    match resolved {
                         Object::Stream(stream) if !stream.dict.has(b"Resources") => {
-                            let plain = stream.get_plain_content().ok()?;
-                            let mut found = HashSet::new();
-                            collect_names(&plain, &mut found)?;
-                            more.extend(found);
+                            more.extend(scan.names_in(value.as_reference().ok(), stream)?);
                         }
                         Object::Dictionary(font) if font.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Type3") && !font.has(b"Resources") => {
                             let Object::Dictionary(procs) = font.get(b"CharProcs").map(|o| self.resolve(o)).unwrap_or(Object::Null) else { continue };
                             for (_, glyph) in procs.iter() {
-                                if let Object::Stream(stream) = self.resolve(glyph) {
-                                    let plain = stream.get_plain_content().ok()?;
-                                    let mut found = HashSet::new();
-                                    collect_names(&plain, &mut found)?;
-                                    more.extend(found);
+                                if let Some(Object::Stream(stream)) = self.resolved(glyph) {
+                                    more.extend(scan.names_in(glyph.as_reference().ok(), stream)?);
                                 }
                             }
                         }
@@ -283,6 +279,41 @@ impl Pdf {
             })
             .filter(|(_, value)| !matches!(value, Object::Dictionary(d) if d.is_empty()))
             .collect()
+    }
+}
+
+impl Pdf {
+    /// `object`, or the object it refers to, without copying it.
+    fn resolved<'a>(&'a self, object: &'a Object) -> Option<&'a Object> {
+        match object {
+            Object::Reference(id) => self.doc.get_object(*id).ok(),
+            other => Some(other),
+        }
+    }
+}
+
+/// The names each content stream uses, found once per stream however many pages draw it, and
+/// decoded within one budget for the whole document.
+struct NameScan {
+    budget: DecodeBudget,
+    names: HashMap<ObjectId, Option<HashSet<Vec<u8>>>>,
+}
+
+impl NameScan {
+    /// The names `stream` (object `id`, when it is one of its own) uses as operands; `None` when
+    /// it cannot be read or decoding it would go past the budget.
+    fn names_in(&mut self, id: Option<ObjectId>, stream: &lopdf::Stream) -> Option<HashSet<Vec<u8>>> {
+        if let Some(found) = id.and_then(|id| self.names.get(&id)) {
+            return found.clone();
+        }
+        let found = self.budget.stream(stream).ok().and_then(|plain| {
+            let mut names = HashSet::new();
+            collect_names(&plain, &mut names).map(|_| names)
+        });
+        if let Some(id) = id {
+            self.names.insert(id, found.clone());
+        }
+        found
     }
 }
 

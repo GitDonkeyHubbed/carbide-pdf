@@ -23,6 +23,10 @@ pub enum Error {
     #[error("rendering backend: {0}")]
     Render(String),
 
+    /// The document would need more memory than is safe to give it (see [`crate::limits`]).
+    #[error("{0}")]
+    TooLarge(String),
+
     #[error("{0}")]
     Unsupported(String),
 

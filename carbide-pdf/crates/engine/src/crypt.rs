@@ -12,16 +12,17 @@ use std::collections::{BTreeMap, HashMap};
 
 use lopdf::encryption::decrypt_object;
 use lopdf::xref::XrefEntry;
-use lopdf::{Document, Object, ObjectId, ObjectStream};
+use lopdf::{Document, LoadOptions, Object, ObjectId, ObjectStream};
 use md5::{Digest, Md5};
 
 use crate::error::{Error, Result};
+use crate::limits::MAX_STREAM_ON_LOAD;
 
 /// Loads `bytes`, decrypting them when the file is encrypted. Without a password only files that
 /// open with an empty one (permission-only protection) can be read.
 pub(crate) fn load(bytes: &[u8], password: Option<&str>) -> Result<Document> {
     let Some(mut doc) = load_still_encrypted(bytes)? else {
-        let doc = Document::load_mem(bytes)?;
+        let doc = load_bounded(bytes)?;
         if doc.is_encrypted() || doc.was_encrypted() {
             // The encryption dictionary is named in a way the loader above did not find.
             return Err(Error::Unsupported("this file's encryption could not be read".into()));
@@ -72,13 +73,19 @@ enum Candidate {
 fn load_still_encrypted(bytes: &[u8]) -> Result<Option<Document>> {
     let Some(hidden) = rename_key(bytes, ENCRYPT, HIDDEN_ENCRYPT) else { return Ok(None) };
     let hidden = rename_key(&hidden, OBJECT_STREAM, HIDDEN_OBJECT_STREAM).unwrap_or(hidden);
-    let mut doc = Document::load_mem(&hidden)?;
+    let mut doc = load_bounded(&hidden)?;
     let Some(encrypt) = doc.trailer.remove(&HIDDEN_ENCRYPT[1..]) else { return Ok(None) };
     doc.trailer.set("Encrypt", encrypt);
     for object in doc.objects.values_mut() {
         restore(object);
     }
     Ok(Some(doc))
+}
+
+/// `bytes` read as a document, each object and cross-reference stream decoded within
+/// [`MAX_STREAM_ON_LOAD`].
+pub(crate) fn load_bounded(bytes: &[u8]) -> Result<Document> {
+    Ok(Document::load_mem_with_options(bytes, LoadOptions::with_max_decompressed_size(MAX_STREAM_ON_LOAD))?)
 }
 
 const ENCRYPT: &[u8] = b"/Encrypt";
@@ -289,7 +296,7 @@ fn unpack_object_streams(doc: &mut Document) {
             doc.objects
                 .get(&(container, 0))
                 .and_then(|object| object.as_stream().ok())
-                .and_then(|stream| ObjectStream::new(stream).ok())
+                .and_then(|stream| ObjectStream::new_with_limit(stream, Some(MAX_STREAM_ON_LOAD)).ok())
                 .map(|stream| stream.objects)
                 .unwrap_or_default()
         });

@@ -21,6 +21,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::error::{Error, Result};
 use crate::fs::Existing;
+use crate::limits::DecodeBudget;
 use crate::pdf::Pdf;
 
 pub const DEFAULT_IMAGE_FACTOR: u8 = 50;
@@ -170,19 +171,27 @@ fn matrix_from(object: Option<&Object>) -> [f32; 6] {
     [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
 }
 
+/// What scanning the content of a document for drawn image sizes has decoded so far.
+struct Scan {
+    budget: DecodeBudget,
+    forms: HashMap<ObjectId, std::rc::Rc<Vec<u8>>>,
+}
+
 impl Pdf {
     /// Largest drawn size, in points, of every image XObject (page content and nested forms).
-    fn drawn_sizes(&self) -> HashMap<ObjectId, (f32, f32)> {
+    /// Content is decoded within one budget for the whole document (see [`crate::limits`]).
+    fn drawn_sizes(&self) -> Result<HashMap<ObjectId, (f32, f32)>> {
         let mut sizes: HashMap<ObjectId, (f32, f32)> = HashMap::new();
+        let mut scan = Scan { budget: DecodeBudget::new(), forms: HashMap::new() };
         for page_id in self.page_ids() {
             let resources = self
                 .inherited(page_id, b"Resources")
                 .and_then(|o| o.as_dict().ok().cloned())
                 .unwrap_or_default();
-            let content = self.doc.get_page_content(page_id);
-            self.scan_content(&content, &resources, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], 0, &mut sizes);
+            let content = scan.budget.page_content(&self.doc, page_id)?;
+            self.scan_content(&content, &resources, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], 0, &mut sizes, &mut scan)?;
         }
-        sizes
+        Ok(sizes)
     }
 
     fn scan_content(
@@ -192,14 +201,15 @@ impl Pdf {
         base: [f32; 6],
         depth: usize,
         sizes: &mut HashMap<ObjectId, (f32, f32)>,
-    ) {
+        scan: &mut Scan,
+    ) -> Result<()> {
         if depth > 8 {
-            return;
+            return Ok(());
         }
-        let Ok(parsed) = Content::decode(content) else { return };
+        let Ok(parsed) = Content::decode(content) else { return Ok(()) };
         let xobjects = match resources.get(b"XObject").map(|o| self.resolve(o)) {
             Ok(Object::Dictionary(d)) => d,
-            _ => return,
+            _ => return Ok(()),
         };
         let mut ctm = base;
         let mut stack: Vec<[f32; 6]> = Vec::new();
@@ -236,8 +246,19 @@ impl Pdf {
                                 _ => resources.clone(),
                             };
                             let matrix = matrix_from(stream.dict.get(b"Matrix").ok());
-                            let body = stream.get_plain_content().unwrap_or_default();
-                            self.scan_content(&body, &form_resources, multiply(matrix, ctm), depth + 1, sizes);
+                            // A form drawn on every page is decoded once.
+                            let body = match scan.forms.get(&id) {
+                                Some(body) => body.clone(),
+                                None => {
+                                    let body = match scan.budget.stream(stream) {
+                                        Err(Error::TooLarge(message)) => return Err(Error::TooLarge(message)),
+                                        other => std::rc::Rc::new(other.unwrap_or_default()),
+                                    };
+                                    scan.forms.insert(id, body.clone());
+                                    body
+                                }
+                            };
+                            self.scan_content(&body, &form_resources, multiply(matrix, ctm), depth + 1, sizes, scan)?;
                         }
                         _ => {}
                     }
@@ -245,6 +266,7 @@ impl Pdf {
                 _ => {}
             }
         }
+        Ok(())
     }
 
     /// Objects used as soft masks or stencil masks. They are only re-Flated, never JPEG-encoded
@@ -381,8 +403,9 @@ fn decode_image(doc: &Document, stream: &Stream) -> Option<Decoded> {
             })
         }
         [f] if f == b"FlateDecode" && bpc == 8 && !dict.has(b"DecodeParms") => {
-            let samples = stream.get_plain_content().ok()?;
+            // The samples of an image this size, and no more.
             let expected = (width * height * components) as usize;
+            let samples = stream.get_plain_content_with_limit(expected).ok()?;
             (samples.len() == expected).then_some(Decoded { width, height, components, samples, source: Source::Flate })
         }
         [f] if f == b"DCTDecode" && bpc == 8 => {
@@ -407,8 +430,8 @@ fn encode_jpeg(samples: &[u8], width: u32, height: u32, components: u32, quality
 
 impl Pdf {
     /// Re-encodes images in place. Returns (recompressed, downsampled).
-    fn recompress_images(&mut self, options: &ReduceOptions) -> (usize, usize) {
-        let drawn = self.drawn_sizes();
+    fn recompress_images(&mut self, options: &ReduceOptions) -> Result<(usize, usize)> {
+        let drawn = self.drawn_sizes()?;
         let masks = self.mask_ids();
         let ids: Vec<ObjectId> = self
             .doc
@@ -503,7 +526,7 @@ impl Pdf {
                 }
             }
         }
-        (recompressed, downsampled)
+        Ok((recompressed, downsampled))
     }
 
     /// Re-Flates other streams stored uncompressed or with an older filter.
@@ -557,7 +580,7 @@ impl Pdf {
         let mut work = self.clone();
         let mut report = ReduceReport { size_before: before, ..Default::default() };
         report.streams_merged = work.merge_identical_streams();
-        let (recompressed, downsampled) = work.recompress_images(options);
+        let (recompressed, downsampled) = work.recompress_images(options)?;
         report.images_recompressed = recompressed;
         report.images_downsampled = downsampled;
         report.streams_recompressed = work.reflate_streams();

@@ -18,6 +18,7 @@ pub mod geometry;
 pub mod imposition;
 pub mod imposition_plan;
 pub mod incremental;
+pub mod limits;
 mod navigation;
 pub mod ocr;
 pub mod pagetree;
