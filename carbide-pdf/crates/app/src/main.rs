@@ -118,6 +118,13 @@ impl OpenDoc {
         Ok(())
     }
 
+    /// Forgets the edit history. After a signature or a revision is written into the file, going
+    /// back past it would take it out of the document again, and the next save would drop it.
+    fn forget_history(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
+
     /// Replaces the document with `bytes`, a serialized state of it from its edit history. That
     /// serialization is unencrypted, so the protection it is written with is carried over.
     fn restore(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
@@ -850,6 +857,7 @@ impl CarbideApp {
         let updated = doc.pdf.save_revision(&base, label, &pdf_date_now()).map_err(|e| e.to_string())?;
         carbide_engine::fs::write_replacing(&path, &updated).map_err(|e| e.to_string())?;
         let reloaded = doc.adopt_saved(updated);
+        doc.forget_history();
         self.after_writing(&path);
         reloaded.map_err(|e| format!("The revision was saved, but the file could not be read back: {e}"))?;
         self.status = format!("Saved revision {label:?}.");
@@ -1294,6 +1302,7 @@ impl CarbideApp {
         let Some(doc) = self.doc.as_mut() else { return };
         let result = signed.and_then(|bytes| {
             carbide_engine::fs::write_replacing(path, &bytes).map_err(|e| e.to_string())?;
+            doc.forget_history();
             Ok(doc.adopt_saved(bytes).map_err(|e| format!("Signed {}, but could not read it back: {e}", path.display())))
         });
         let result = match result {

@@ -504,3 +504,31 @@ fn recovered_work_is_deleted_only_after_confirming() {
     assert!(app.autosave.as_ref().unwrap().panel_rows().is_empty());
     assert!(a.exists(), "the user's own file is never touched");
 }
+
+#[test]
+fn undo_cannot_go_back_past_a_saved_revision_or_a_signature() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["A"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    app.save_revision("v1").unwrap();
+    assert!(!app.cmd_enabled(Cmd::Undo) && !app.cmd_enabled(Cmd::Redo));
+    app.undo();
+    let doc = app.doc.as_ref().unwrap();
+    assert_eq!((doc.pdf.page_rotation(0).unwrap(), doc.pdf.revisions().len(), doc.dirty), (90, 1, false));
+
+    // A signature written into the file: an edit and a save before it can no longer be undone.
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    app.save();
+    assert!(app.cmd_enabled(Cmd::Undo), "a plain save keeps the history");
+    let doc = app.doc.as_ref().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.sign_job = Some(SignJob { doc: doc.id, version: doc.version, path: a.clone(), done: "Signed".into(), receiver, result: None });
+    sender.send(Ok(document(&["SIGNED"]).to_bytes().unwrap())).unwrap();
+    app.poll_sign();
+    assert_eq!(app.status, "Signed");
+    assert!(!app.cmd_enabled(Cmd::Undo));
+    app.undo();
+    assert!(contains(&app.doc.as_ref().unwrap().bytes, "SIGNED"));
+}
