@@ -2035,6 +2035,37 @@ fn a_damaged_index_is_ignored() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn the_index_of_earlier_versions_is_taken_over_only_once_it_stops_changing() {
+    let dir = scratch_dir("autosave-earlier");
+    std::fs::create_dir_all(&dir).unwrap();
+    let copy = dir.join("ZASolder1.asd");
+    std::fs::write(&copy, text_pdf(&[&["older window"]]).to_bytes().unwrap()).unwrap();
+    let index = dir.join(carbide_engine::autosave::INDEX_FILE_NAME);
+    let item = format!("<AutoSaveItem RecoveredFile=\"{}\" RecoveredSaveTime=\"5\" IsNewDoc=\"1\"/>", copy.display());
+    std::fs::write(&index, format!("<?xml version=\"1.0\"?>\n<AutoSave version=\"1.0\">{item}</AutoSave>\n")).unwrap();
+
+    // Just written: a window of an earlier version may still be running and using them.
+    let mut store = AutoSaveStore::open(&dir).unwrap();
+    assert!(store.panel_rows().is_empty());
+    assert_eq!(store.remove_all_loaded().unwrap(), 0);
+    drop(store);
+    assert!(index.exists() && copy.exists());
+
+    // Unchanged for longer than any window waits between two auto-saves: that window is gone.
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 3600);
+    for path in [&index, &copy] {
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(long_ago).unwrap();
+    }
+    let mut store = AutoSaveStore::open(&dir).unwrap();
+    assert_eq!(store.panel_rows().len(), 1);
+    assert!(!index.exists());
+    assert_eq!(store.remove_all_loaded().unwrap(), 1);
+    assert!(!copy.exists());
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 // ---- imposition ----------------------------------------------------------------------------
 
 fn numbered_pages(n: usize) -> Pdf {

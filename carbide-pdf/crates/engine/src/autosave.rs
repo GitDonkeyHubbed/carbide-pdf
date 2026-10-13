@@ -24,9 +24,12 @@ use crate::pdf::Pdf;
 pub const MIN_INTERVAL_MINUTES: u32 = 1;
 pub const MAX_INTERVAL_MINUTES: u32 = 120;
 pub const DEFAULT_INTERVAL_MINUTES: u32 = 10;
-/// The index of earlier versions, which kept one for every window; it is taken over like the index
-/// of a window that is gone.
+/// The index of earlier versions, which kept one for every window. Those windows hold no lock, so
+/// it is only taken over, like the index of a window that is gone, once neither it nor the copies
+/// it lists have changed for longer than any window waits between two auto-saves.
 pub const INDEX_FILE_NAME: &str = "AutoRecovery.xml";
+/// How long the index of earlier versions has to be left unchanged before it is taken over.
+const EARLIER_INDEX_QUIET: Duration = Duration::from_secs((MAX_INTERVAL_MINUTES as u64 + 10) * 60);
 /// Each store's own index is `AutoRecovery-<token>.xml`, next to its lock `AutoRecovery-<token>.lock`.
 const OWN_PREFIX: &str = "AutoRecovery-";
 /// Held briefly while a store opens, so two stores never take over the same records.
@@ -301,9 +304,7 @@ impl AutoSaveStore {
             Some(slot) => slot.path.clone(),
             None => self.reserve_file()?,
         };
-        let temp = path.with_extension("asd.tmp");
-        write_private(&temp, &bytes)?;
-        fs::rename(&temp, &path)?;
+        replace_private(&path, &path.with_extension("asd.tmp"), &bytes)?;
 
         let record = self.records.iter_mut().find(|r| r.id == id).expect("record exists");
         match &mut record.recovered {
@@ -450,8 +451,8 @@ impl AutoSaveStore {
         }
     }
 
-    /// Writes this store's own index in one step (a temporary file renamed over it), or removes it
-    /// when there are no records.
+    /// Writes this store's own index in one step (a temporary file flushed to disk and renamed over
+    /// it), or removes it when there are no records.
     fn write_index(&self) -> Result<()> {
         if self.records.is_empty() {
             match fs::remove_file(&self.index) {
@@ -477,17 +478,14 @@ impl AutoSaveStore {
         }
         xml.push_str("</AutoSave>\n");
 
-        let temp = self.index.with_extension("xml.tmp");
-        write_private(&temp, xml.as_bytes())?;
-        fs::rename(&temp, &self.index)?;
-        Ok(())
+        replace_private(&self.index, &self.index.with_extension("xml.tmp"), xml.as_bytes())
     }
 
     /// Takes over the records in the indexes of windows that are gone: an index whose lock file is
-    /// free or missing, or the one index of earlier versions. Their records become this store's
-    /// loaded records, and their index and lock files are removed once this store's index holds
-    /// them. Indexes of running windows are left alone. The caller holds the folder lock, so no
-    /// other store takes over the same records meanwhile.
+    /// free or missing, or the index of earlier versions once it has stopped changing. Their records
+    /// become this store's loaded records, and their index and lock files are removed once this
+    /// store's index holds them. Indexes of running windows are left alone. The caller holds the
+    /// folder lock, so no other store takes over the same records meanwhile.
     fn take_over_ended_windows(&mut self) {
         let Ok(entries) = fs::read_dir(&self.dir) else { return };
         let mut taken: Vec<PathBuf> = Vec::new();
@@ -514,6 +512,10 @@ impl AutoSaveStore {
             }
             let Ok(text) = fs::read_to_string(&index) else { continue };
             let Some(items) = parse_index(&text) else { continue };
+            // A window of an earlier version that still runs keeps writing its index and copies.
+            if lock.is_none() && !quiet(&index, &items) {
+                continue;
+            }
             for (original, recovered, is_new_doc) in items {
                 let duplicate = recovered.as_ref().is_some_and(|r| {
                     self.records.iter().any(|existing| existing.recovered.as_ref().is_some_and(|e| e.path == r.path))
@@ -597,6 +599,19 @@ fn create_owner(dir: &Path) -> Result<(PathBuf, Option<fs::File>)> {
     Err(Error::Other("could not create an auto-save lock file".into()))
 }
 
+/// True when neither `index` nor any recovery copy it lists has changed for [`EARLIER_INDEX_QUIET`].
+/// A time that cannot be read counts as recent.
+fn quiet(index: &Path, items: &[IndexItem]) -> bool {
+    let copies = items.iter().filter_map(|(_, recovered, _)| recovered.as_ref().map(|r| r.path.as_path()));
+    std::iter::once(index).chain(copies).all(|path| {
+        fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= EARLIER_INDEX_QUIET)
+    })
+}
+
 /// One record of an index: the original, the recovered copy, and whether it is a new document.
 type IndexItem = (Option<OriginalSlot>, Option<RecoveredSlot>, bool);
 
@@ -633,15 +648,28 @@ fn parse_index(text: &str) -> Option<Vec<IndexItem>> {
     Some(items)
 }
 
-/// Writes `bytes` to a file only the user can read, replacing one that is there.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Puts `bytes` at `path` in one step, through `temp`, a file only the user can read: written and
+/// flushed to disk, then renamed over `path`, and the folder flushed too. After a crash or a power
+/// loss `path` holds either what it held before or all of `bytes`, never an empty or torn file.
+fn replace_private(path: &Path, temp: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(temp);
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options.open(path)?.write_all(bytes)?;
+    let written = options.open(temp).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
+    if let Err(e) = written.and_then(|()| fs::rename(temp, path)) {
+        let _ = fs::remove_file(temp);
+        return Err(e.into());
+    }
+    // Makes the rename itself durable. Not every platform can flush a folder, so this is best effort.
+    if let Some(Ok(folder)) = path.parent().map(fs::File::open) {
+        let _ = folder.sync_all();
+    }
     Ok(())
 }
 

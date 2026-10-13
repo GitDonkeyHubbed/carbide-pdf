@@ -121,7 +121,7 @@ carbide ocr scan.pdf scan-searchable.pdf --dpi 300 --pages 1-4
 - Extracted pages, split parts, imposed sheets and merged documents made from a protected document keep its passwords and permissions. Documents protected in different ways are only merged without protection, which the GUI asks about and the CLI needs `--unprotected` for. Exporting images or text of a protected document asks first in the GUI.
 - Signing and saving revisions of encrypted files are not supported. Reduce File Size refuses encrypted files, and Auto Recovery keeps no copy of them.
 - Reduce File Size writes its results under new names next to the originals by default; replacing the originals is a separate choice. A batch in which two files would be written to the same file is refused before anything is reduced.
-- Auto Recovery: each window keeps its own recovery records, and only those of windows that are no longer running are offered for recovery. A recovered document opens as an unsaved document; Save asks before replacing the file it was recovered for, and refuses while that file is open in another tab with unsaved changes. Deleting recovered copies asks first.
+- Auto Recovery: each window keeps its own recovery records, and only those of windows that are no longer running are offered for recovery. Records an earlier version of the app kept (it had no per-window lock) are offered once they have not changed for longer than the longest auto-save interval. A recovered document opens as an unsaved document; Save asks before replacing the file it was recovered for, and refuses while that file is open in another tab with unsaved changes. Deleting recovered copies asks first.
 
 Interface differences, as found in the code:
 
