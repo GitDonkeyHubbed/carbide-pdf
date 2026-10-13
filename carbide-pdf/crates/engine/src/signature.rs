@@ -232,15 +232,11 @@ fn check_timestamp_response(token: &[u8], digest: &[u8; 32], nonce: &[u8]) -> Re
     if tst.hashed_message != digest {
         return Err(Error::Other("the time stamp token covers the wrong digest".into()));
     }
-    // TSTInfo: version, policy, messageImprint, serialNumber, genTime, [optional] accuracy, ordering,
-    // nonce. If a nonce is present it must equal the one sent.
-    if let Some(returned) = der::children(&info).into_iter().find(|e| e.tag == der::INTEGER).map(|_| ()) {
-        let _ = returned;
-        let nonce_value = der::read(nonce).map(|(e, _)| e.content.to_vec()).unwrap_or_default();
-        let has_matching = der::children(&info).iter().any(|e| e.tag == der::INTEGER && e.content == nonce_value.as_slice());
-        if !has_matching {
-            return Err(Error::Other("the time stamp authority returned a mismatched nonce".into()));
-        }
+    // The token must echo the nonce we sent (RFC 3161 requires it when the request carried one).
+    // The nonce is a large random INTEGER, so finding it among the TSTInfo integers is unambiguous.
+    let nonce_value = der::read(nonce).map(|(e, _)| e.content.to_vec()).unwrap_or_default();
+    if !der::children(&info).iter().any(|e| e.tag == der::INTEGER && e.content == nonce_value.as_slice()) {
+        return Err(Error::Other("the time stamp authority returned a mismatched nonce".into()));
     }
     if !timestamp_signature_ok(&cms, &info) {
         return Err(Error::Other("the time stamp token did not verify".into()));
@@ -941,9 +937,8 @@ fn trust_level(signer: &Certificate, embedded: &[Certificate], store: &TrustStor
         return Some(Detail::TrustedDirectly);
     }
     let mut current = signer.clone();
-    // The number of CA certificates between the leaf and the issuer under consideration.
-    let mut intermediates = 0usize;
-    for _ in 0..8 {
+    // `intermediates` is the number of CA certificates between the leaf and the issuer considered.
+    for intermediates in 0..8 {
         let der = current.to_der().ok()?;
         let parent = trusted.iter().chain(embedded.iter()).find(|candidate| {
             candidate.to_der().ok().as_ref() != Some(&der)
@@ -954,7 +949,6 @@ fn trust_level(signer: &Certificate, embedded: &[Certificate], store: &TrustStor
             return Some(Detail::TrustedViaChain);
         }
         current = parent.clone();
-        intermediates += 1;
     }
     None
 }
@@ -1052,7 +1046,7 @@ fn parsed_contents_length(v: &Dictionary) -> Option<usize> {
 
 /// Hex digits only, an even number of them.
 fn hex_value(text: &[u8]) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     let digit = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
@@ -1417,6 +1411,7 @@ fn verify_one(
     report
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_document_timestamp(
     mut report: SignatureReport,
     token: &[u8],

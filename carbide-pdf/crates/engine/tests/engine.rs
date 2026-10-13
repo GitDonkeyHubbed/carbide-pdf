@@ -2047,7 +2047,7 @@ fn ecdsa_p256_signatures_verify_and_name_comes_from_the_certificate() {
     let covered = covered_bytes(&probe);
     let digest = <sha2::Sha256 as sha2::Digest>::digest(&covered);
     let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
-    let cms = detached_cms(&cert, &[2, 16, 840, 1, 101, 3, 4, 2, 1], &[1, 2, 840, 10045, 4, 3, 2], None, &signature.to_der().as_bytes());
+    let cms = detached_cms(&cert, &[2, 16, 840, 1, 101, 3, 4, 2, 1], &[1, 2, 840, 10045, 4, 3, 2], None, signature.to_der().as_bytes());
     let signed = resign_with(&doc, &base, &cms);
 
     // /Name still says the Carbide identity; the certificate subject is the ECDSA one.
@@ -2252,6 +2252,24 @@ fn a_time_stamp_authority_refuses_credentials_over_plain_http() {
 }
 
 #[test]
+fn an_intact_but_untrusted_signature_is_not_called_valid() {
+    let mut doc = text_pdf(&[&["notice"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+
+    // Digest and signature hold, but the self-signed certificate is not trusted.
+    let reports = verify(&signed, &TrustStore::default());
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::ValidityUnknown, Detail::DigestOkUntrusted));
+    assert_eq!(reports[0].status_line(), sig_messages::VALIDITY_UNKNOWN);
+    assert!(reports[0].description_lines().contains(&sig_messages::IDENTITY_UNKNOWN));
+    // The notice bar must not claim every signature is valid.
+    assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_NOT_CONFIRMED));
+
+    // Once the signer is trusted, the same signature gives the all-valid notice.
+    assert_eq!(notice_text(&verify(&signed, &trust_test_identity())), Some(sig_messages::NOTICE_ALL_VALID));
+}
+
+#[test]
 fn an_identity_whose_key_does_not_match_its_certificate_is_rejected() {
     use rsa::pkcs8::EncodePrivateKey;
     // A certificate for one key, paired with a different key.
@@ -2367,7 +2385,7 @@ fn a_ca_issued_signer_is_trusted_through_its_chain() {
     let intermediate = int_params.signed_by(&int_pair, &root_issuer).unwrap().der().to_vec();
     let int_issuer = Issuer::new(int_params, int_pair);
 
-    let (identity, _) = chain_identity(&int_issuer, &[intermediate.clone()]);
+    let (identity, _) = chain_identity(&int_issuer, std::slice::from_ref(&intermediate));
     let signed = sign_with(&identity);
     let reports = verify(&signed, &TrustStore { certificates: vec![root] });
     assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedViaChain));

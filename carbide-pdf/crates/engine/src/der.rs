@@ -168,7 +168,10 @@ pub fn children_ber(content: &[u8]) -> Vec<Element<'_>> {
     children_with(content, read_ber)
 }
 
-fn children_with<'a>(content: &'a [u8], read: fn(&'a [u8]) -> Option<(Element<'a>, &'a [u8])>) -> Vec<Element<'a>> {
+/// A reader function (`read` or `read_ber`).
+type Reader = for<'a> fn(&'a [u8]) -> Option<(Element<'a>, &'a [u8])>;
+
+fn children_with(content: &[u8], read: Reader) -> Vec<Element<'_>> {
     let mut out = Vec::new();
     let mut rest = content;
     while !rest.is_empty() {
