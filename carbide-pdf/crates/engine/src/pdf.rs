@@ -206,6 +206,11 @@ impl Pdf {
         let root = self.doc.get_dictionary_mut(root_id)?;
         root.set("Kids", ids.iter().map(|id| Object::Reference(*id)).collect::<Vec<_>>());
         root.set("Count", ids.len() as i64);
+        // Every page holds its own values now. Left on the root they would also reach pages added
+        // later, which have their own size and orientation.
+        for key in INHERITABLE {
+            root.remove(key);
+        }
         Ok(())
     }
 
@@ -261,10 +266,13 @@ impl Pdf {
         };
         self.flatten_page_tree()?;
         let root_id = self.pages_root()?;
+        let page_box = vec![0.into(), 0.into(), Object::Real(width), Object::Real(height)];
         let page_id = self.doc.add_object(dictionary! {
             "Type" => "Page",
             "Parent" => root_id,
-            "MediaBox" => vec![0.into(), 0.into(), Object::Real(width), Object::Real(height)],
+            "MediaBox" => page_box.clone(),
+            "CropBox" => page_box,
+            "Rotate" => 0,
             "Resources" => Dictionary::new(),
         });
         let root = self.doc.get_dictionary_mut(root_id)?;

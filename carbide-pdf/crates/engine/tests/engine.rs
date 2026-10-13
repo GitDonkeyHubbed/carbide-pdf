@@ -1387,6 +1387,92 @@ fn imposition_reports_progress_and_can_be_cancelled() {
     let _ = (Binding::Saddle, Style::Sheetwise);
 }
 
+// ---- inherited page attributes -------------------------------------------------------------
+
+/// `numbered_pages(4)` with /Rotate 90 and /CropBox [0 300 500 792] (which still shows the text)
+/// set only on a page-tree node: the root, or a node between the root and the pages.
+fn inherited_geometry(on_root: bool) -> Pdf {
+    let mut pdf = numbered_pages(4);
+    let doc = pdf.document_mut();
+    let root_id = doc.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+    let crop: Vec<Object> = vec![0.into(), 300.into(), 500.into(), 792.into()];
+    if on_root {
+        let root = doc.get_dictionary_mut(root_id).unwrap();
+        root.set("Rotate", 90);
+        root.set("CropBox", crop);
+    } else {
+        let kids = doc.get_dictionary(root_id).unwrap().get(b"Kids").unwrap().clone();
+        let middle = doc.add_object(dictionary! {
+            "Type" => "Pages", "Parent" => root_id, "Kids" => kids.clone(), "Count" => 4, "Rotate" => 90, "CropBox" => crop,
+        });
+        for kid in kids.as_array().unwrap() {
+            doc.get_dictionary_mut(kid.as_reference().unwrap()).unwrap().set("Parent", middle);
+        }
+        doc.get_dictionary_mut(root_id).unwrap().set("Kids", vec![Object::Reference(middle)]);
+    }
+    let bytes = pdf.to_bytes().unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
+/// Width and height of a page as PDFium draws it at 72 dpi.
+fn rendered_size(pdf: &mut Pdf, page: usize) -> (u32, u32) {
+    render(renderer(), pdf, page).dimensions()
+}
+
+#[test]
+fn new_and_rebuilt_pages_do_not_pick_up_an_inherited_rotation_or_crop_box() {
+    let r = renderer();
+    let source = inherited_geometry(true);
+    let geometry = source.page_geometry(0).unwrap();
+    assert_eq!((geometry.rotation, geometry.display_size()), (90, (492.0, 500.0)), "the fixture inherits both");
+
+    // An inserted blank page has the size it was given, upright; the other pages keep theirs.
+    let mut blank = source.clone();
+    blank.insert_blank_page(4, Some((612.0, 792.0))).unwrap();
+    let geometry = blank.page_geometry(4).unwrap();
+    assert_eq!((geometry.rotation, geometry.display_size()), (0, (612.0, 792.0)));
+    assert_eq!(rendered_size(&mut blank, 4), (612, 792));
+    let geometry = blank.page_geometry(1).unwrap();
+    assert_eq!((geometry.rotation, geometry.display_size()), (90, (492.0, 500.0)));
+    assert_eq!(rendered_size(&mut blank, 1), (492, 500));
+
+    // Imposed Letter sheets are Letter landscape, not rotated or cropped like the source pages.
+    let options = ImpositionOptions { media: Media::Named("Letter".into()), ..Default::default() };
+    let mut sheets = source.impose(&options, None).unwrap();
+    for sheet in 0..sheets.page_count() {
+        let geometry = sheets.page_geometry(sheet).unwrap();
+        assert_eq!((geometry.rotation, geometry.display_size()), (0, (792.0, 612.0)), "sheet {sheet}");
+        assert_eq!(rendered_size(&mut sheets, sheet), (792, 612), "sheet {sheet}");
+    }
+    assert!(page_text(r, &mut sheets, 0).contains("PAGE1X"));
+
+    // A redacted page shows exactly what it showed before, whichever node the values came from.
+    for on_root in [true, false] {
+        let mut pdf = inherited_geometry(on_root);
+        let mut before = render(r, &mut pdf, 0);
+        let text_area = Rect::new(0.0, 0.0, 492.0, 500.0);
+        let marked = Rect::new(380.0, 20.0, 80.0, 60.0);
+        pdf.apply_redactions(r, &[Redaction { page: 0, rect: marked }], 150.0).unwrap();
+        let geometry = pdf.page_geometry(0).unwrap();
+        assert_eq!((geometry.rotation, geometry.display_size()), (0, (492.0, 500.0)), "on root: {on_root}");
+        let after = render(r, &mut pdf, 0);
+        assert_eq!(after.dimensions(), (492, 500), "on root: {on_root}");
+        assert!(brightness(&after, marked) < 30.0, "on root: {on_root}: the marked area is not black");
+        // Black the same area in the earlier render: the rest of the page has to match it.
+        for y in (500.0 - marked.max_y()) as u32..(500.0 - marked.y) as u32 {
+            for x in marked.x as u32..marked.max_x() as u32 {
+                before.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+            }
+        }
+        let (a, b) = (brightness(&before, text_area), brightness(&after, text_area));
+        assert!((a - b).abs() < 3.0, "on root: {on_root}: the page changed outside the marked area ({a} -> {b})");
+        // The text at (72, 700), turned a quarter clockwise: a vertical line near x 400.
+        let text_line = Rect::new(390.0, 350.0, 30.0, 85.0);
+        let (a, b) = (brightness(&before, text_line), brightness(&after, text_line));
+        assert!(a < 245.0 && (a - b).abs() < 25.0, "on root: {on_root}: the text moved ({a} -> {b})");
+    }
+}
+
 // ---- reduce file size ----------------------------------------------------------------------
 
 /// One page with two byte-identical, uncompressed 1200x900 RGB "photos" drawn at 200x150 pt.
