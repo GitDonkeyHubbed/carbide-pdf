@@ -18,7 +18,8 @@ pub const CATALOG_KEY: &[u8] = b"CarbideRevisions";
 /// Shown when the label is empty after trimming.
 pub const EMPTY_LABEL_MESSAGE: &str = "Enter a label for the revision.";
 
-const LENGTH_PLACEHOLDER: &[u8] = b"(0000000000)";
+/// Width of a revision record's Length, which is written as a string of digits.
+const LENGTH_DIGITS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Revision {
@@ -145,6 +146,35 @@ impl Pdf {
         if self.doc.is_encrypted() {
             return Err(Error::Unsupported("revisions are not supported for encrypted documents".into()));
         }
+        // The record's Length is the size of the file it ends, which is only known once the update
+        // is written: it starts as a fixed-width placeholder and is patched afterwards. The update is
+        // written twice, with the placeholder all zeros and then all ones, so the bytes that differ
+        // are exactly where the writer put the digits. Searching the update for the placeholder
+        // instead could hit page text that happens to hold the same characters.
+        let mut bytes = self.update_with_record(base_bytes, label, date, b'0')?;
+        let other = self.update_with_record(base_bytes, label, date, b'1')?;
+        let differing: Vec<usize> = (0..bytes.len().min(other.len())).filter(|&i| bytes[i] != other[i]).collect();
+        let at = match differing[..] {
+            [first, .., last] if other.len() == bytes.len()
+                && last - first + 1 == LENGTH_DIGITS
+                && differing.len() == LENGTH_DIGITS
+                && first >= base_bytes.len() =>
+            {
+                first
+            }
+            _ => return Err(Error::Other("could not locate the revision length field".into())),
+        };
+        let digits = format!("{:0width$}", bytes.len(), width = LENGTH_DIGITS);
+        if digits.len() != LENGTH_DIGITS {
+            return Err(Error::Other("the file is too large for a revision record".into()));
+        }
+        bytes[at..at + LENGTH_DIGITS].copy_from_slice(digits.as_bytes());
+        Ok(bytes)
+    }
+
+    /// `base_bytes` plus an update holding this document's pending edits and a new revision record
+    /// whose Length is `digit` repeated.
+    fn update_with_record(&self, base_bytes: &[u8], label: &str, date: &str, digit: u8) -> Result<Vec<u8>> {
         let mut next = self.clone();
         let mut records: Vec<Object> = match next.doc.catalog()?.get(CATALOG_KEY) {
             Ok(entry) => match next.resolve(entry) {
@@ -156,21 +186,10 @@ impl Pdf {
         records.push(Object::Dictionary(dictionary! {
             "Label" => Object::String(encode_text(label), StringFormat::Hexadecimal),
             "Date" => Object::String(date.as_bytes().to_vec(), StringFormat::Literal),
-            // Fixed-width placeholder, patched below once the final file size is known.
-            "Length" => Object::String(b"0000000000".to_vec(), StringFormat::Literal),
+            "Length" => Object::String(vec![digit; LENGTH_DIGITS], StringFormat::Literal),
         }));
         next.doc.catalog_mut()?.set(CATALOG_KEY.to_vec(), Object::Array(records));
-
-        let mut bytes = next.incremental_update(base_bytes)?;
-        let total = bytes.len();
-        let appended = &mut bytes[base_bytes.len()..];
-        let position = appended
-            .windows(LENGTH_PLACEHOLDER.len())
-            .rposition(|w| w == LENGTH_PLACEHOLDER)
-            .ok_or_else(|| Error::Other("could not locate the revision length field".into()))?;
-        let digits = format!("{total:010}");
-        appended[position + 1..position + 11].copy_from_slice(digits.as_bytes());
-        Ok(bytes)
+        next.incremental_update(base_bytes)
     }
 }
 

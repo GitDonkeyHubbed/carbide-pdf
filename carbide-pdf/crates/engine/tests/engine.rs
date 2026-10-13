@@ -460,6 +460,30 @@ fn revisions_are_prefixes_of_the_file_and_open_as_they_were() {
     assert!(open_revision_bytes(&v2, &broken).is_err());
 }
 
+#[test]
+fn page_text_that_looks_like_the_length_placeholder_is_left_alone() {
+    let r = renderer();
+    let base = text_pdf(&[&["numbered page"]]).to_bytes().unwrap();
+    let mut working = Pdf::from_bytes(&base).unwrap();
+    // Ten-digit Bates numbers from zero: the page content holds "(0000000000)", written after the
+    // catalog in the update.
+    working.apply_bates(&BatesOptions { start_number: 0, digits: 10, ..Default::default() }).unwrap();
+    let file = working.save_revision(&base, "Numbered", &pdf_date_now()).unwrap();
+    let appended = &file[base.len()..];
+    let catalog_at = appended.windows(16).position(|w| w == b"CarbideRevisions").expect("the record is in the update");
+    assert!(
+        appended.windows(12).rposition(|w| w == b"(0000000000)").is_some_and(|at| at > catalog_at),
+        "the fixture puts the page text after the record"
+    );
+
+    let mut saved = Pdf::from_bytes(&file).unwrap();
+    let revisions = saved.revisions();
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0].file_offset as usize, file.len());
+    assert_eq!(open_revision_bytes(&file, &revisions[0]).unwrap(), file);
+    assert!(page_text(r, &mut saved, 0).contains("0000000000"), "the page text was patched");
+}
+
 // ---- saving over the file ----------------------------------------------------------------
 
 fn contains(bytes: &[u8], needle: &[u8]) -> bool {
