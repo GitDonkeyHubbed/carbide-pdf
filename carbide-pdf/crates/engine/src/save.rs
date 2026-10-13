@@ -153,12 +153,11 @@ impl SavedFile {
         })
     }
 
-    /// The file as a document again, decrypted with the same password.
+    /// The file as a document again, decrypted with the same password. Its page tree is left as
+    /// stored, so that repairs made when the document was opened count as changes and an update
+    /// appended to the file carries them.
     fn load(&self) -> Result<Document> {
-        match &self.password {
-            Some(password) => Ok(Pdf::from_bytes_with_password(&self.bytes, password)?.doc),
-            None => Ok(Pdf::from_bytes(&self.bytes)?.doc),
-        }
+        Pdf::load_unrepaired(&self.bytes, self.password.as_deref())
     }
 }
 
@@ -282,12 +281,12 @@ impl Pdf {
 
     /// The whole document, pruned, encrypted again when `protection` is given.
     fn rewrite(&mut self, protection: Option<&Protection>) -> Result<Vec<u8>> {
-        self.doc.prune_objects();
+        prune(&mut self.doc);
         let mut copy = self.doc.clone();
         // Saved revisions are byte offsets into the old file and mean nothing in the new one.
         if let Ok(catalog) = copy.catalog_mut() {
             if catalog.remove(CATALOG_KEY).is_some() {
-                copy.prune_objects();
+                prune(&mut copy);
             }
         }
         let mut out = Vec::new();
@@ -367,6 +366,18 @@ pub(crate) fn reachable(doc: &Document) -> HashSet<ObjectId> {
         }
     }
     seen
+}
+
+/// Removes every object that is not reachable from the trailer, and returns their ids in order.
+/// lopdf's own `prune_objects` keeps its list of reachable objects in a vector, which makes it take
+/// time in proportion to the square of the number of objects.
+pub(crate) fn prune(doc: &mut Document) -> Vec<ObjectId> {
+    let keep = reachable(doc);
+    let gone: Vec<ObjectId> = doc.objects.keys().filter(|id| !keep.contains(id)).copied().collect();
+    for id in &gone {
+        doc.objects.remove(id);
+    }
+    gone
 }
 
 /// How many updates were appended to the file `bytes`, whose last cross-reference section starts

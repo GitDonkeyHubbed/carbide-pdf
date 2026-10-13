@@ -77,9 +77,10 @@ impl Pdf {
         let drop = options.font.cap_height() * options.font_size / 2.0;
         let [r, g, b] = options.color;
 
+        let ids = self.page_ids();
         for index in selected {
-            let page_id = self.page_id(index)?;
-            let geometry = self.page_geometry(index)?;
+            let page_id = *ids.get(index).ok_or(Error::PageOutOfRange { index, count })?;
+            let geometry = self.geometry_of(page_id);
             let (w, h) = geometry.display_size();
             let font_name = self.add_standard_font(page_id, options.font)?;
             let state_name = self.add_alpha_state(page_id, options.opacity.clamp(0.0, 1.0))?;
@@ -153,9 +154,8 @@ impl BatesOptions {
 impl Pdf {
     /// Stamps a sequential label on every page.
     pub fn apply_bates(&mut self, options: &BatesOptions) -> Result<()> {
-        for index in 0..self.page_count() {
-            let page_id = self.page_id(index)?;
-            let geometry = self.page_geometry(index)?;
+        for (index, page_id) in self.page_ids().into_iter().enumerate() {
+            let geometry = self.geometry_of(page_id);
             let (w, h) = geometry.display_size();
             let label = options.label(index);
             let text_width = options.font.text_width(&label, options.font_size);

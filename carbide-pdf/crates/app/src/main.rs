@@ -88,7 +88,7 @@ impl OpenDoc {
     fn new(mut pdf: Pdf, path: Option<PathBuf>, saved: Option<SavedFile>) -> Result<Self, EngineError> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let bytes = pdf.to_bytes()?;
-        let geometries = (0..pdf.page_count()).filter_map(|i| pdf.page_geometry(i).ok()).collect();
+        let geometries = pdf.page_geometries();
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             pdf,
@@ -113,7 +113,7 @@ impl OpenDoc {
     /// Re-derives bytes and geometry after the PDF object changed.
     fn refresh(&mut self) -> Result<(), EngineError> {
         self.bytes = self.pdf.to_bytes()?;
-        self.geometries = (0..self.pdf.page_count()).filter_map(|i| self.pdf.page_geometry(i).ok()).collect();
+        self.geometries = self.pdf.page_geometries();
         self.version += 1;
         Ok(())
     }

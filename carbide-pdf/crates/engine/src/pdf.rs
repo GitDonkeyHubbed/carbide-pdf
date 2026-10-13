@@ -6,6 +6,7 @@ use lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 
 use crate::error::{Error, Result};
 use crate::geometry::{normalize_rotation, PageGeometry};
+use crate::pagetree::INHERITABLE;
 use crate::scrub::widget_area;
 
 /// A PDF document. All page indexes in this API are zero-based.
@@ -13,8 +14,6 @@ use crate::scrub::widget_area;
 pub struct Pdf {
     pub(crate) doc: Document,
 }
-
-const INHERITABLE: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
 
 impl Pdf {
     // ---- creation, loading, saving -------------------------------------------------------
@@ -48,23 +47,35 @@ impl Pdf {
     }
 
     /// Opens a file. An encrypted one opens only when it needs no password to be read (its
-    /// restrictions are kept and saving encrypts it again).
+    /// restrictions are kept and saving encrypts it again). A damaged page tree is repaired as it
+    /// is read (see [`crate::pagetree`]), or refused when that cannot be done safely.
     pub fn from_bytes(bytes: &[u8]) -> Result<Pdf> {
-        Ok(Pdf { doc: crate::crypt::load(bytes, None)? })
+        let mut doc = Self::load_unrepaired(bytes, None)?;
+        crate::pagetree::repair(&mut doc)?;
+        Ok(Pdf { doc })
     }
 
     /// Opens a file with its open password or its owner password, used exactly as given.
     pub fn from_bytes_with_password(bytes: &[u8], password: &str) -> Result<Pdf> {
-        match crate::crypt::load(bytes, Some(password)) {
-            Ok(doc) => Ok(Pdf { doc }),
-            Err(Error::Pdf(lopdf::Error::InvalidPassword | lopdf::Error::Decryption(_))) => Err(Error::WrongPassword),
-            Err(other) => Err(other),
+        let mut doc = Self::load_unrepaired(bytes, Some(password))?;
+        crate::pagetree::repair(&mut doc)?;
+        Ok(Pdf { doc })
+    }
+
+    /// The file's objects exactly as stored (decrypted), without repairing the page tree: what an
+    /// update appended to the file has to be compared with, so that repairs are written too.
+    pub(crate) fn load_unrepaired(bytes: &[u8], password: Option<&str>) -> Result<Document> {
+        match crate::crypt::load(bytes, password) {
+            Err(Error::Pdf(lopdf::Error::InvalidPassword | lopdf::Error::Decryption(_))) if password.is_some() => {
+                Err(Error::WrongPassword)
+            }
+            other => other,
         }
     }
 
     /// Serializes the document, dropping objects that are no longer reachable.
     pub fn to_bytes(&mut self) -> Result<Vec<u8>> {
-        self.doc.prune_objects();
+        crate::save::prune(&mut self.doc);
         let mut out = Vec::new();
         self.doc.save_to(&mut out)?;
         Ok(out)
@@ -95,17 +106,20 @@ impl Pdf {
     // ---- pages ---------------------------------------------------------------------------
 
     pub fn page_count(&self) -> usize {
-        self.doc.get_pages().len()
+        self.doc.page_iter().count()
     }
 
-    /// Page object ids in document order.
+    /// Page object ids in document order. Code that visits every page takes this list once
+    /// instead of asking for each page by index, which walks the page tree each time.
     pub fn page_ids(&self) -> Vec<ObjectId> {
-        self.doc.get_pages().values().copied().collect()
+        self.doc.page_iter().collect()
     }
 
     pub fn page_id(&self, index: usize) -> Result<ObjectId> {
-        let ids = self.page_ids();
-        ids.get(index).copied().ok_or(Error::PageOutOfRange { index, count: ids.len() })
+        match self.doc.page_iter().nth(index) {
+            Some(id) => Ok(id),
+            None => Err(Error::PageOutOfRange { index, count: self.page_count() }),
+        }
     }
 
     /// Looks `key` up on the page, then up the `/Parent` chain, and returns a dereferenced clone.
@@ -154,7 +168,16 @@ impl Pdf {
     }
 
     pub fn page_geometry(&self, index: usize) -> Result<PageGeometry> {
-        let id = self.page_id(index)?;
+        Ok(self.geometry_of(self.page_id(index)?))
+    }
+
+    /// The geometry of every page, in page order.
+    pub fn page_geometries(&self) -> Vec<PageGeometry> {
+        self.page_ids().into_iter().map(|id| self.geometry_of(id)).collect()
+    }
+
+    /// The geometry of the page object `id`.
+    pub(crate) fn geometry_of(&self, id: ObjectId) -> PageGeometry {
         let media = self.rect_from(self.inherited(id, b"MediaBox")).unwrap_or([0.0, 0.0, 612.0, 792.0]);
         let crop = self.rect_from(self.inherited(id, b"CropBox"));
         let visible = match crop {
@@ -173,7 +196,7 @@ impl Pdf {
             .and_then(|o| o.as_i64().ok())
             .map(normalize_rotation)
             .unwrap_or(0);
-        Ok(PageGeometry::new(visible[0], visible[1], w, h, rotation))
+        PageGeometry::new(visible[0], visible[1], w, h, rotation)
     }
 
     pub fn page_rotation(&self, index: usize) -> Result<i32> {
@@ -222,9 +245,10 @@ impl Pdf {
     }
 
     pub fn rotate_pages(&mut self, pages: &[usize], degrees: i32) -> Result<()> {
+        let ids = self.page_ids();
         for &index in pages {
-            let id = self.page_id(index)?;
-            let current = self.page_rotation(index)?;
+            let id = *ids.get(index).ok_or(Error::PageOutOfRange { index, count: ids.len() })?;
+            let current = self.geometry_of(id).rotation;
             let next = normalize_rotation((current + degrees) as i64);
             self.doc.get_dictionary_mut(id)?.set("Rotate", next as i64);
         }
@@ -254,8 +278,13 @@ impl Pdf {
         self.drop_structure_of(&doomed);
         self.drop_navigation_to(&doomed);
         let labels = self.page_labels_without(&unique);
-        let numbers: Vec<u32> = unique.iter().map(|&p| p as u32 + 1).collect();
-        self.doc.delete_pages(&numbers);
+        // The pages leave every /Kids and everything else that names them in one pass, and the
+        // counts are taken again from the tree itself; nothing follows /Parent, which can loop.
+        self.drop_references_to(&doomed);
+        for id in &doomed {
+            self.doc.objects.remove(id);
+        }
+        crate::pagetree::repair(&mut self.doc)?;
         if let Some(labels) = labels {
             self.doc.catalog_mut()?.set("PageLabels", labels);
         }
@@ -346,7 +375,7 @@ impl Pdf {
             copy.doc.objects.remove(id);
         }
         copy.trim_resources()?;
-        copy.doc.prune_objects();
+        crate::save::prune(&mut copy.doc);
         Ok(copy)
     }
 

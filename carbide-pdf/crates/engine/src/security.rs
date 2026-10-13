@@ -57,7 +57,7 @@ impl Pdf {
         if options.owner_password.is_empty() {
             return Err(Error::Other("an owner password is required".into()));
         }
-        self.doc.prune_objects();
+        crate::save::prune(&mut self.doc);
         let mut copy = self.doc.clone();
 
         let mut key = [0u8; 32];

@@ -253,8 +253,8 @@ impl Pdf {
     /// in page order, for a comments panel.
     pub fn annotation_summaries(&self) -> Vec<AnnotationSummary> {
         let mut out = Vec::new();
-        for page in 0..self.page_count() {
-            let Ok(annotations) = self.annotations(page) else { continue };
+        for (page, page_id) in self.page_ids().into_iter().enumerate() {
+            let Ok(annotations) = self.doc.get_page_annotations(page_id) else { continue };
             for dict in annotations {
                 let kind = dict
                     .get(b"Subtype")

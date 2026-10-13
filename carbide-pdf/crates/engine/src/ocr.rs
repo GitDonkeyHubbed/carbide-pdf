@@ -126,7 +126,8 @@ impl Pdf {
         let models = locate_models(options.models_dir.as_deref())?;
         let engine = engine(&models)?;
         let snapshot = self.to_bytes()?;
-        let count = self.page_count();
+        let ids = self.page_ids();
+        let count = ids.len();
         let wanted: Vec<usize> = options.pages.clone().unwrap_or_else(|| (0..count).collect());
         let mut report = OcrReport::default();
 
@@ -139,7 +140,8 @@ impl Pdf {
                 report.skipped_pages.push(page);
                 continue;
             }
-            let geometry = self.page_geometry(page)?;
+            let page_id = ids[page];
+            let geometry = self.geometry_of(page_id);
             let (_, height) = geometry.display_size();
             let image = renderer.render_page(&snapshot, page, options.dpi)?;
             let lines = recognize(&engine, &image, options.dpi, height)?;
@@ -148,7 +150,6 @@ impl Pdf {
                 continue;
             }
 
-            let page_id = self.page_id(page)?;
             let font_name = self.add_standard_font(page_id, StandardFont::Helvetica)?;
             let mut content: Vec<u8> = format!("q\n{}\nBT\n3 Tr\n", matrix_string(geometry.display_to_user())).into_bytes();
             for line in &lines {

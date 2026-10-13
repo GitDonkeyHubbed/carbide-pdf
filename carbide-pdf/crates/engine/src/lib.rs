@@ -20,6 +20,7 @@ pub mod imposition_plan;
 pub mod incremental;
 mod navigation;
 pub mod ocr;
+pub mod pagetree;
 pub mod pdf;
 pub mod redact;
 pub mod reduce;

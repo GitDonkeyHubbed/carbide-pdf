@@ -42,10 +42,11 @@ impl Pdf {
         // and appearances those hold would otherwise stay in the form. A signature field goes
         // only when its signature is drawn inside a redacted area; otherwise it stays (it no
         // longer validates, which saving says).
+        let ids = self.page_ids();
         let mut redacted: HashMap<ObjectId, Vec<Rect>> = HashMap::new();
         for item in redactions {
-            let geometry = self.page_geometry(item.page)?;
-            redacted.entry(self.page_id(item.page)?).or_default().push(geometry.map_rect(item.rect));
+            let geometry = self.geometry_of(ids[item.page]);
+            redacted.entry(ids[item.page]).or_default().push(geometry.map_rect(item.rect));
         }
         let rebuilt: HashSet<ObjectId> = redacted.keys().copied().collect();
         self.drop_form_fields_on(&rebuilt, &|page, widget, signature| {
@@ -58,7 +59,8 @@ impl Pdf {
         });
 
         for page in pages {
-            let geometry = self.page_geometry(page)?;
+            let page_id = ids[page];
+            let geometry = self.geometry_of(page_id);
             let (display_w, display_h) = geometry.display_size();
             let mut image = renderer.render_page(&snapshot, page, dpi)?;
             let sx = image.width() as f32 / display_w;
@@ -98,7 +100,6 @@ impl Pdf {
             let content = format!("q {} 0 0 {} 0 0 cm /CarbideRedacted Do Q\n", fmt(display_w), fmt(display_h));
             let content_id = self.doc.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
 
-            let page_id = self.page_id(page)?;
             let dict = self.doc.get_dictionary_mut(page_id)?;
             for key in [
                 &b"Annots"[..], b"TrimBox", b"BleedBox", b"ArtBox", b"Thumb", b"B", b"AA", b"StructParents", b"Group",

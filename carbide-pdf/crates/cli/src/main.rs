@@ -674,8 +674,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Command::Info { input, pw } => {
             let pdf = open(&input, &pw)?;
             println!("{}: {} page(s)", input.display(), pdf.page_count());
-            for i in 0..pdf.page_count() {
-                let g = pdf.page_geometry(i)?;
+            for (i, g) in pdf.page_geometries().into_iter().enumerate() {
                 let (w, h) = g.display_size();
                 println!("  page {}: {:.0} x {:.0} pt, rotation {}", i + 1, w, h, g.rotation);
             }

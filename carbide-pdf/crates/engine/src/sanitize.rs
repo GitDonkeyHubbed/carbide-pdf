@@ -146,7 +146,7 @@ impl Pdf {
         if chosen(HiddenItem::UnusedObjects) {
             let structure = file_structure(&self.doc);
             self.trim_resources()?;
-            let removed = self.doc.prune_objects().into_iter().filter(|id| !structure.contains(id) && !in_file.contains(id)).count();
+            let removed = crate::save::prune(&mut self.doc).into_iter().filter(|id| !structure.contains(id) && !in_file.contains(id)).count();
             report.removed.push((HiddenItem::UnusedObjects, removed));
         }
         for item in HiddenItem::ALL.into_iter().filter(|&i| chosen(i) && i != HiddenItem::UnusedObjects) {
@@ -169,7 +169,7 @@ impl Pdf {
             report.removed.push((item, count));
         }
         // What the removals left unused goes too, so it is not written out with the document.
-        self.doc.prune_objects();
+        crate::save::prune(&mut self.doc);
         Ok(report)
     }
 

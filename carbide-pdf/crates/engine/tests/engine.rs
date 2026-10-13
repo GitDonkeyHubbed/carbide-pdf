@@ -2222,6 +2222,191 @@ fn imposition_reports_progress_and_can_be_cancelled() {
     let _ = (Binding::Saddle, Style::Sheetwise);
 }
 
+// ---- damaged page trees --------------------------------------------------------------------
+
+/// Three pages showing "AAA first", "BBB SECRET" and "CCC third", with `damage` done to the page
+/// tree (given the root and the page ids) and written out as is, the way another program would.
+fn damaged_tree(damage: impl FnOnce(&mut Document, lopdf::ObjectId, &[lopdf::ObjectId])) -> Vec<u8> {
+    let mut pdf = text_pdf(&[&["AAA first"], &["BBB SECRET"], &["CCC third"]]);
+    let ids = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let root = doc.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+    damage(doc, root, &ids);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn set_kids(doc: &mut Document, node: lopdf::ObjectId, kids: Vec<Object>) {
+    doc.get_dictionary_mut(node).unwrap().set("Kids", kids);
+}
+
+/// Runs `work` on another thread and fails the test if it does not finish within half a minute.
+fn finishes<T: Send + 'static>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver.recv_timeout(std::time::Duration::from_secs(30)).unwrap_or_else(|_| panic!("{what} did not finish"))
+}
+
+/// The text of every page, after checking that PDFium finds exactly the pages the engine finds.
+fn texts_seen_by_both(pdf: &mut Pdf) -> Vec<String> {
+    let bytes = pdf.to_bytes().unwrap();
+    assert_eq!(renderer().page_count(&bytes).unwrap(), pdf.page_count(), "PDFium and the engine count different pages");
+    (0..pdf.page_count()).map(|page| renderer().page_text(&bytes, page).unwrap().trim().to_string()).collect()
+}
+
+#[test]
+fn damaged_page_trees_read_the_same_to_the_engine_and_to_pdfium() {
+    type Damage = fn(&mut Document, lopdf::ObjectId, &[lopdf::ObjectId]);
+    let all = ["AAA first", "BBB SECRET", "CCC third"];
+    let cases: Vec<(&str, Damage, Vec<&str>)> = vec![
+        ("untyped page", |doc, _, ids| {
+            doc.get_dictionary_mut(ids[1]).unwrap().remove(b"Type");
+        }, all.to_vec()),
+        ("page typed as a node", |doc, _, ids| {
+            doc.get_dictionary_mut(ids[1]).unwrap().set("Type", "Pages");
+        }, all.to_vec()),
+        ("untyped node", |doc, root, ids| {
+            let node = doc.add_object(dictionary! { "Parent" => root, "Kids" => vec![ids[1].into(), ids[2].into()], "Count" => 2 });
+            set_kids(doc, root, vec![ids[0].into(), node.into()]);
+        }, all.to_vec()),
+        ("page given directly", |doc, root, ids| {
+            let direct = doc.get_dictionary(ids[1]).unwrap().clone();
+            set_kids(doc, root, vec![ids[0].into(), Object::Dictionary(direct), ids[2].into()]);
+        }, all.to_vec()),
+        ("loop through a node", |doc, root, ids| {
+            let node = doc.add_object(dictionary! { "Type" => "Pages", "Parent" => root, "Kids" => vec![ids[1].into(), root.into()], "Count" => 1 });
+            set_kids(doc, root, vec![ids[0].into(), node.into(), ids[2].into()]);
+        }, all.to_vec()),
+        ("root lists itself", |doc, root, ids| {
+            set_kids(doc, root, vec![ids[0].into(), root.into(), ids[1].into(), ids[2].into()]);
+        }, all.to_vec()),
+        ("huge count", |doc, root, _| {
+            doc.get_dictionary_mut(root).unwrap().set("Count", 1_000_000);
+        }, all.to_vec()),
+        ("missing and non-dictionary kids", |doc, root, ids| {
+            let number = doc.add_object(Object::Integer(7));
+            set_kids(doc, root, vec![ids[0].into(), (9999, 0).into(), ids[1].into(), number.into(), Object::Null, ids[2].into()]);
+        }, all.to_vec()),
+        ("page listed twice", |doc, root, ids| {
+            set_kids(doc, root, vec![ids[0].into(), ids[1].into(), ids[1].into(), ids[2].into()]);
+        }, vec!["AAA first", "BBB SECRET", "BBB SECRET", "CCC third"]),
+        ("parent loops", |doc, root, ids| {
+            doc.get_dictionary_mut(root).unwrap().set("Parent", root);
+            let node = doc.add_object(dictionary! { "Type" => "Pages", "Kids" => vec![ids[1].into()], "Count" => 1 });
+            doc.get_dictionary_mut(node).unwrap().set("Parent", ids[1]);
+            doc.get_dictionary_mut(ids[1]).unwrap().set("Parent", node);
+            set_kids(doc, root, vec![ids[0].into(), node.into(), ids[2].into()]);
+        }, all.to_vec()),
+    ];
+    for (what, damage, expected) in cases {
+        let bytes = damaged_tree(damage);
+        let mut pdf = Pdf::from_bytes(&bytes).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(texts_seen_by_both(&mut pdf), expected, "{what}");
+
+        // Structural edits keep every page and finish, whatever /Parent says.
+        let mut inserted = pdf.clone();
+        inserted.insert_blank_page(0, None).unwrap();
+        assert_eq!(texts_seen_by_both(&mut inserted)[1..], expected[..], "{what}: insert");
+        let mut deleted = finishes(what, move || {
+            pdf.delete_pages(&[0]).unwrap();
+            pdf
+        });
+        assert_eq!(texts_seen_by_both(&mut deleted), expected[1..], "{what}: delete");
+    }
+
+    // A page listed twice became two pages: rotating one leaves the other alone.
+    let mut twice = Pdf::from_bytes(&damaged_tree(|doc, root, ids| {
+        set_kids(doc, root, vec![ids[0].into(), ids[1].into(), ids[1].into(), ids[2].into()]);
+    }))
+    .unwrap();
+    twice.rotate_pages(&[1], 90).unwrap();
+    assert_eq!((twice.page_rotation(1).unwrap(), twice.page_rotation(2).unwrap()), (90, 0));
+}
+
+#[test]
+fn redaction_lands_on_the_page_shown_even_when_the_tree_is_damaged() {
+    let r = renderer();
+    let bytes = damaged_tree(|doc, _, ids| {
+        doc.get_dictionary_mut(ids[1]).unwrap().remove(b"Type");
+    });
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+    pdf.apply_redactions(r, &[Redaction { page: 1, rect: Rect::new(60.0, 692.0, 300.0, 28.0) }], 150.0).unwrap();
+    let out = pdf.to_bytes().unwrap();
+    assert_eq!(r.page_count(&out).unwrap(), 3);
+    assert_eq!(r.page_text(&out, 0).unwrap().trim(), "AAA first");
+    assert_eq!(r.page_text(&out, 1).unwrap().trim(), "", "the page shown second was not redacted");
+    assert_eq!(r.page_text(&out, 2).unwrap().trim(), "CCC third", "another page was redacted instead");
+    assert!(!contains(&out, b"BBB SECRET"));
+}
+
+#[test]
+fn deleting_pages_finishes_when_parent_chains_loop_after_loading() {
+    for (what, damage) in [
+        ("root names itself", 0usize),
+        ("page names itself", 1),
+        ("page and node name each other", 2),
+    ] {
+        let mut pdf = text_pdf(&[&["ONE"], &["TWO"], &["THREE"]]);
+        let ids = pdf.page_ids();
+        let doc = pdf.document_mut();
+        let root = doc.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+        match damage {
+            0 => doc.get_dictionary_mut(root).unwrap().set("Parent", root),
+            1 => doc.get_dictionary_mut(ids[1]).unwrap().set("Parent", ids[1]),
+            _ => {
+                doc.get_dictionary_mut(root).unwrap().set("Parent", ids[1]);
+                doc.get_dictionary_mut(ids[1]).unwrap().set("Parent", root);
+            }
+        }
+        let mut pdf = finishes(what, move || {
+            pdf.delete_pages(&[1]).unwrap();
+            pdf
+        });
+        assert_eq!(pdf.page_count(), 2, "{what}");
+        let bytes = pdf.to_bytes().unwrap();
+        assert_eq!(renderer().page_count(&bytes).unwrap(), 2, "{what}");
+        assert!(!contains(&bytes, b"TWO"), "{what}");
+    }
+}
+
+#[test]
+fn page_trees_that_cannot_be_read_safely_are_refused() {
+    use carbide_engine::pagetree::{messages, MAX_DEPTH};
+    let deep = damaged_tree(|doc, root, ids| {
+        let mut below: Object = ids[0].into();
+        for _ in 0..MAX_DEPTH + 5 {
+            below = doc.add_object(dictionary! { "Type" => "Pages", "Kids" => vec![below], "Count" => 1 }).into();
+        }
+        set_kids(doc, root, vec![below]);
+    });
+    assert_eq!(Pdf::from_bytes(&deep).unwrap_err().to_string(), messages::TOO_DEEP);
+
+    let shared = damaged_tree(|doc, root, ids| {
+        let node = doc.add_object(dictionary! { "Type" => "Pages", "Parent" => root, "Kids" => vec![ids[1].into()], "Count" => 1 });
+        set_kids(doc, root, vec![ids[0].into(), node.into(), node.into()]);
+    });
+    assert_eq!(Pdf::from_bytes(&shared).unwrap_err().to_string(), messages::SHARED_BRANCH);
+}
+
+#[test]
+fn a_sound_page_tree_is_not_rewritten_by_the_repair() {
+    // Nested nodes with inherited values: opening changes no object, and saving writes nothing new.
+    let bytes = inherited_geometry(false).to_bytes().unwrap();
+    let (pdf, saved) = SavedFile::open(bytes.clone(), None).unwrap();
+    assert_eq!(pdf.document().objects, Document::load_mem(&bytes).unwrap().objects);
+    assert_eq!(pdf.save_plan(Some(&saved), false).unwrap(), SavePlan::Unchanged);
+
+    // A damaged one is repaired when saved, also when the save appends an update.
+    let damaged = damaged_tree(|doc, root, _| {
+        doc.get_dictionary_mut(root).unwrap().set("Count", 1_000_000);
+    });
+    let (pdf, saved) = SavedFile::open(damaged, None).unwrap();
+    assert_ne!(pdf.save_plan(Some(&saved), false).unwrap(), SavePlan::Unchanged);
+}
+
 // ---- inherited page attributes -------------------------------------------------------------
 
 /// `numbered_pages(4)` with /Rotate 90 and /CropBox [0 300 500 792] (which still shows the text)

@@ -8,7 +8,7 @@ use lopdf::{dictionary, Dictionary, Object, ObjectId, Stream};
 
 use crate::error::{Error, Result};
 use crate::fonts::{literal_string, win_ansi, StandardFont};
-use crate::geometry::fmt;
+use crate::geometry::{fmt, PageGeometry};
 use crate::imposition_plan::{output_order, plan_plates, LayoutKind, Plate, PlanOptions, Style};
 use crate::pdf::Pdf;
 
@@ -287,11 +287,9 @@ fn real_array(values: &[f32]) -> Object {
 }
 
 impl Pdf {
-    /// Wraps source page `index` in a form XObject whose coordinates are the displayed page
-    /// (origin bottom-left, rotation and crop box applied).
-    fn page_as_form(&mut self, index: usize) -> Result<ObjectId> {
-        let page_id = self.page_id(index)?;
-        let geometry = self.page_geometry(index)?;
+    /// Wraps the source page `page_id`, of `geometry`, in a form XObject whose coordinates are the
+    /// displayed page (origin bottom-left, rotation and crop box applied).
+    fn page_as_form(&mut self, page_id: ObjectId, geometry: PageGeometry) -> Result<ObjectId> {
         let content = self.doc.get_page_content(page_id);
         let resources = self.inherited(page_id, b"Resources").unwrap_or(Object::Dictionary(Dictionary::new()));
         let (w, h) = (geometry.box_width, geometry.box_height);
@@ -331,6 +329,8 @@ impl Pdf {
         let mut out = self.clone();
         out.flatten_page_tree()?;
         let root_id = out.pages_root()?;
+        let ids = out.page_ids();
+        let geometries: Vec<PageGeometry> = ids.iter().map(|&id| out.geometry_of(id)).collect();
         let mut forms: Vec<Option<ObjectId>> = vec![None; total];
         let mut new_pages: Vec<Object> = Vec::with_capacity(order.len());
         let cells_total: usize = order.iter().map(|&p| plates[p].cells.len()).sum();
@@ -359,12 +359,12 @@ impl Pdf {
                     let form_id = match forms[page] {
                         Some(id) => id,
                         None => {
-                            let id = out.page_as_form(page)?;
+                            let id = out.page_as_form(ids[page], geometries[page])?;
                             forms[page] = Some(id);
                             id
                         }
                     };
-                    let (pw, ph) = out.page_geometry(page)?.display_size();
+                    let (pw, ph) = geometries[page].display_size();
                     let (mut sx, mut sy) = if options.fit_to_media {
                         let s = (grid.cell_w / pw).min(grid.cell_h / ph);
                         (s, s)
@@ -460,7 +460,7 @@ impl Pdf {
                 }
             }
         }
-        out.doc.prune_objects();
+        crate::save::prune(&mut out.doc);
         // Form XObjects hold decoded page content; store it compressed again.
         out.doc.compress();
         Ok(out)

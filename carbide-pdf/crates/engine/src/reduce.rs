@@ -561,7 +561,7 @@ impl Pdf {
         report.images_recompressed = recompressed;
         report.images_downsampled = downsampled;
         report.streams_recompressed = work.reflate_streams();
-        work.doc.prune_objects();
+        crate::save::prune(&mut work.doc);
 
         let save = lopdf::SaveOptions::builder()
             .use_object_streams(true)
