@@ -12,7 +12,7 @@ use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, FontId, Frame, Key, Margin, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui,
 };
 
-use crate::dialogs::{AfterSave, Dialog};
+use crate::dialogs::{AfterSave, Dialog, Export};
 use crate::icons::{self, Glyph};
 use crate::ribbon::{self, Cmd, RibbonTab};
 use crate::{paths, theme, CarbideApp, Tool};
@@ -337,8 +337,8 @@ impl CarbideApp {
             }
             Cmd::Compare => self.compare_with(),
             Cmd::Ocr => self.start_ocr(),
-            Cmd::ExportImages => self.export_images(),
-            Cmd::ExportText => self.export_text(),
+            Cmd::ExportImages => self.export(Export::Images),
+            Cmd::ExportText => self.export(Export::Text),
             Cmd::SaveRevision => self.dialog = Some(Dialog::SaveRevision { label: String::new(), error: None }),
             Cmd::OpenRevision => {
                 let items = self.doc.as_ref().map(|d| d.pdf.revisions()).unwrap_or_default();

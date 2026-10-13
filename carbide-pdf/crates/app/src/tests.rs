@@ -10,7 +10,7 @@ use carbide_engine::ocr::OcrReport;
 use carbide_engine::{pdf_date_now, Pdf, ProtectionOptions};
 use eframe::egui;
 
-use crate::dialogs::{AfterSave, Dialog};
+use crate::dialogs::{AfterSave, Dialog, Export};
 use crate::{CarbideApp, OcrJob, SignJob};
 
 /// A folder of its own for one test.
@@ -302,4 +302,80 @@ fn a_revision_opens_from_a_private_copy_as_a_new_document() {
     // No file behind it: Save asks where to put it instead of writing into the temporary folder.
     assert!(doc.path.is_none() && doc.saved.is_none() && !doc.dirty);
     assert!(!copy.exists() && !copy.parent().unwrap().exists(), "the copy was left in the temporary folder");
+}
+
+/// `labels` protected with the open password `user` (none when empty) and the owner password
+/// "owner pw", with copying not allowed.
+fn protected(dir: &Path, name: &str, labels: &[&str], user: &str) -> PathBuf {
+    let mut options = ProtectionOptions::new(user, "owner pw");
+    options.allow_copying = false;
+    let path = dir.join(name);
+    std::fs::write(&path, document(labels).to_encrypted_bytes(&options).unwrap()).unwrap();
+    path
+}
+
+fn file_key(bytes: &[u8], password: &str) -> Vec<u8> {
+    let pdf = Pdf::from_bytes_with_password(bytes, password).unwrap();
+    pdf.document().encryption_state.as_ref().expect("encrypted").file_encryption_key().to_vec()
+}
+
+#[test]
+fn files_made_from_a_protected_document_keep_its_protection() {
+    let dir = scratch();
+    let source = protected(&dir, "locked.pdf", &["SECRET ONE", "SECRET TWO"], "open pw");
+    let original = std::fs::read(&source).unwrap();
+    let mut app = app(&dir);
+    assert!(app.open_with_password(source.clone(), original.clone(), "open pw".into()));
+    // Even after an edit is undone, which reloads the document from its history.
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    app.undo();
+
+    let page = dir.join("page.pdf");
+    app.extract_page_to(1, &page);
+    let bytes = std::fs::read(&page).unwrap();
+    assert!(matches!(Pdf::from_bytes(&bytes), Err(carbide_engine::Error::PasswordRequired)));
+    assert_eq!(file_key(&bytes, "open pw"), file_key(&original, "owner pw"));
+    assert!(!contains(&bytes, "SECRET"));
+
+    // Exporting it unprotected asks first.
+    app.export(Export::Text);
+    assert!(matches!(app.dialog, Some(Dialog::ConfirmExport { export: Export::Text, .. })));
+}
+
+#[test]
+fn merging_in_a_protected_file_asks_and_combining_keeps_a_shared_protection() {
+    let dir = scratch();
+    let plain_path = plain(&dir, "plain.pdf", &["PLAIN"]);
+    let locked = protected(&dir, "locked.pdf", &["LOCKED"], "");
+    let mut app = app(&dir);
+
+    // Appending a protected file to an unprotected document would save its pages unprotected.
+    app.open_path(&plain_path);
+    app.merge_into_current(vec![Pdf::open(&locked).unwrap()], vec!["locked.pdf".into()], false);
+    let Some(Dialog::ConfirmMerge { protected: names, keeps_protection, .. }) = &app.dialog else { panic!("merging did not ask") };
+    assert_eq!((names.as_slice(), *keeps_protection), (["locked.pdf".to_string()].as_slice(), false));
+    assert_eq!(app.doc.as_ref().unwrap().pdf.page_count(), 1, "merged before the answer");
+    app.dialog = None;
+    app.merge_into_current(vec![Pdf::open(&locked).unwrap()], vec!["locked.pdf".into()], true);
+    assert_eq!(app.doc.as_ref().unwrap().pdf.page_count(), 2);
+    assert!(!app.doc.as_ref().unwrap().is_protected());
+
+    // Combining keeps the protection the files share, also when the new document is saved.
+    app.combine(vec![Pdf::open(&plain_path).unwrap(), Pdf::open(&locked).unwrap()], false);
+    assert!(app.doc.as_ref().unwrap().is_protected());
+    let combined = dir.join("combined.pdf");
+    app.write_to(&combined, None, AfterSave::Nothing);
+    let bytes = std::fs::read(&combined).unwrap();
+    assert!(!contains(&bytes, "LOCKED") && !contains(&bytes, "PLAIN"));
+    assert_eq!(file_key(&bytes, "owner pw"), file_key(&std::fs::read(&locked).unwrap(), "owner pw"));
+
+    // Files protected in different ways only combine without protection, when that is agreed to.
+    let other = protected(&dir, "other.pdf", &["OTHER"], "");
+    let tabs = app.tabs.len();
+    app.combine(vec![Pdf::open(&locked).unwrap(), Pdf::open(&other).unwrap()], false);
+    let Some(Dialog::ConfirmCombine { documents }) = app.dialog.take() else { panic!("combining did not ask") };
+    assert_eq!(app.tabs.len(), tabs);
+    app.combine(documents, true);
+    assert_eq!(app.tabs.len(), tabs + 1);
+    assert!(!app.doc.as_ref().unwrap().is_protected());
 }

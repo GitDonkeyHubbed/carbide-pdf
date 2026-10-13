@@ -145,6 +145,13 @@ pub enum Writing {
     Split { folder: PathBuf, ranges: String },
 }
 
+/// What a document is exported as.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Export {
+    Images,
+    Text,
+}
+
 /// What is carried out once a save has written the file.
 pub enum AfterSave {
     Nothing,
@@ -174,6 +181,14 @@ pub enum Dialog {
     },
     /// Writing files for document `doc` would replace the files `taken`.
     ExistingFiles { doc: u64, writing: Writing, taken: Vec<PathBuf> },
+    /// Exporting the protected document `doc` gives files that are not protected.
+    ConfirmExport { doc: u64, export: Export },
+    /// Appending `others` (named `names`) to document `doc`: `protected` are protected in a way it
+    /// does not share, so their pages would be saved with its protection (`keeps_protection`) or
+    /// none.
+    ConfirmMerge { doc: u64, others: Vec<Pdf>, names: Vec<String>, protected: Vec<String>, keeps_protection: bool },
+    /// The files to combine are protected in different ways, so the result cannot keep them all.
+    ConfirmCombine { documents: Vec<Pdf> },
     Watermark(WatermarkForm),
     Bates(BatesForm),
     Protect(ProtectForm),
@@ -193,7 +208,10 @@ impl Dialog {
     /// is in front.
     pub fn document(&self) -> Option<u64> {
         match self {
-            Dialog::ConfirmRewrite { doc, .. } | Dialog::ExistingFiles { doc, .. } => Some(*doc),
+            Dialog::ConfirmRewrite { doc, .. }
+            | Dialog::ExistingFiles { doc, .. }
+            | Dialog::ConfirmExport { doc, .. }
+            | Dialog::ConfirmMerge { doc, .. } => Some(*doc),
             _ => None,
         }
     }
@@ -523,6 +541,60 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                     app.continue_writing(*doc, writing, existing);
                     open = false;
                 }
+            });
+        }
+
+        Dialog::ConfirmExport { doc, export } => {
+            window("Export").show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                let what = match export {
+                    Export::Images => "images",
+                    Export::Text => "text",
+                };
+                let name = app.doc.as_ref().map(|d| d.title()).unwrap_or_default();
+                ui.label(format!("\"{name}\" is password-protected, but the exported {what} will not be."));
+                ui.label("Anyone who can open the exported files can read the content.");
+                let (ok, cancel) = buttons(ui, "Export Anyway", true);
+                if ok {
+                    app.export_confirmed(*doc, *export);
+                    open = false;
+                }
+                open &= !cancel;
+            });
+        }
+
+        Dialog::ConfirmMerge { doc, others, names, protected, keeps_protection } => {
+            window("Merge PDFs").show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                let list = protected.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+                ui.label(format!("{list} {} password-protected.", if protected.len() == 1 { "is" } else { "are" }));
+                ui.label(if *keeps_protection {
+                    "Merged into this document, those pages are saved with this document's passwords and permissions instead."
+                } else {
+                    "This document is not protected, so merged into it those pages are saved without protection."
+                });
+                let (ok, cancel) = buttons(ui, "Merge", true);
+                if ok {
+                    if app.doc.as_ref().map(|d| d.id) == Some(*doc) {
+                        app.merge_into_current(std::mem::take(others), std::mem::take(names), true);
+                    }
+                    open = false;
+                }
+                open &= !cancel;
+            });
+        }
+
+        Dialog::ConfirmCombine { documents } => {
+            window("Combine Files").show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label("These files are protected with different passwords or permissions, so one document cannot keep the protection of all of them.");
+                ui.label("Combine them into a document without protection?");
+                let (ok, cancel) = buttons(ui, "Combine Without Protection", true);
+                if ok {
+                    app.combine(std::mem::take(documents), true);
+                    open = false;
+                }
+                open &= !cancel;
             });
         }
 
@@ -1010,8 +1082,10 @@ fn run_imposition(app: &mut CarbideApp, form: &ImposeForm) -> Result<(), String>
     let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name("New Imposition.pdf").save_file() else {
         return Err("No output file was chosen.".into());
     };
+    // The sheets are protected like the document.
     let mut imposed = doc.pdf.impose(&form.options, None).map_err(|e| e.to_string())?;
-    imposed.save(&path).map_err(|e| e.to_string())?;
+    let bytes = doc.derived_bytes(&mut imposed).map_err(|e| e.to_string())?;
+    carbide_engine::fs::write_replacing(&path, &bytes).map_err(|e| e.to_string())?;
     app.spawn_window(&path);
     Ok(())
 }

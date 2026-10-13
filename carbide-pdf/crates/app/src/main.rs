@@ -18,9 +18,9 @@ use carbide_engine::autosave::{now_unix, AutoSaveSettings, AutoSaveStore, Record
 use carbide_engine::fs::Existing;
 use carbide_engine::{
     open_revision_bytes, pdf_date_now, revision_display_name, Error as EngineError, MarkupStyle, Pdf, PageGeometry,
-    Rect, Redaction, Renderer, Revision, SavePlan, SavedFile,
+    Protection, Rect, Redaction, Renderer, Revision, SavePlan, SavedFile,
 };
-use dialogs::{AfterSave, Dialog, Writing};
+use dialogs::{AfterSave, Dialog, Export, Writing};
 use eframe::egui;
 
 const MAX_UNDO: usize = 10;
@@ -104,6 +104,36 @@ impl OpenDoc {
         self.geometries = (0..self.pdf.page_count()).filter_map(|i| self.pdf.page_geometry(i).ok()).collect();
         self.version += 1;
         Ok(())
+    }
+
+    /// Replaces the document with `bytes`, a serialized state of it from its edit history. That
+    /// serialization is unencrypted, so the protection it is written with is carried over.
+    fn restore(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
+        let mut pdf = Pdf::from_bytes(bytes)?;
+        pdf.set_protection(self.pdf.protection());
+        self.pdf = pdf;
+        self.refresh()
+    }
+
+    /// The protection a new file made from this document gets (that of its file, or the one it
+    /// carries when it has none yet), and the password that opened it.
+    pub fn protection(&self) -> (Option<Protection>, Option<String>) {
+        let protection = match &self.saved {
+            Some(saved) => saved.protection().cloned(),
+            None => self.pdf.protection(),
+        };
+        (protection, self.saved.as_ref().and_then(|s| s.password()).map(str::to_owned))
+    }
+
+    pub fn is_protected(&self) -> bool {
+        self.protection().0.is_some()
+    }
+
+    /// The bytes of `part`, a new document made from this one, protected like this document.
+    pub fn derived_bytes(&self, part: &mut Pdf) -> Result<Vec<u8>, EngineError> {
+        let (protection, password) = self.protection();
+        part.set_protection(protection);
+        part.to_file_bytes(password.as_deref())
     }
 
     /// Whether the document lost content the file on disk holds: `explicit` for edits known to
@@ -479,15 +509,33 @@ impl CarbideApp {
                 Err(e) => return self.alert(format!("{}: {e}", file.display())),
             }
         }
+        self.combine(documents, false);
+    }
+
+    /// Joins `documents` into a new untitled document. It keeps the protection the protected ones
+    /// share; when they are protected in different ways the user is asked whether to combine them
+    /// without protection, which `unprotected` says was agreed to.
+    pub fn combine(&mut self, mut documents: Vec<Pdf>, unprotected: bool) {
         if documents.is_empty() {
             return;
         }
+        if unprotected {
+            documents.iter_mut().for_each(|d| d.set_protection(None));
+        }
         let refs: Vec<&Pdf> = documents.iter().collect();
+        if Pdf::shared_protection(&refs).is_err() {
+            self.dialog = Some(Dialog::ConfirmCombine { documents });
+            return;
+        }
         match Pdf::merge(&refs) {
             Ok(pdf) => {
+                let protected = pdf.is_protected();
                 self.install(pdf, None, None);
                 if let Some(doc) = self.doc.as_mut() {
                     doc.dirty = true;
+                }
+                if protected {
+                    self.status = "Combined. The new document keeps the password protection of the files.".into();
                 }
             }
             Err(e) => self.alert(format!("Could not combine the files: {e}")),
@@ -528,10 +576,7 @@ impl CarbideApp {
             }
             Err(e) => {
                 // Put the document back exactly as it was.
-                if let Ok(pdf) = Pdf::from_bytes(&snapshot.bytes) {
-                    doc.pdf = pdf;
-                    let _ = doc.refresh();
-                }
+                let _ = doc.restore(&snapshot.bytes);
                 let message = format!("{label} failed: {e}");
                 self.alert(message);
             }
@@ -552,10 +597,8 @@ impl CarbideApp {
         let target = if undo { doc.undo.pop() } else { doc.redo.pop() };
         let Some(snapshot) = target else { return };
         let current = Snapshot { bytes: doc.bytes.clone(), content_removed: doc.content_removed };
-        match Pdf::from_bytes(&snapshot.bytes) {
-            Ok(pdf) => {
-                doc.pdf = pdf;
-                let _ = doc.refresh();
+        match doc.restore(&snapshot.bytes) {
+            Ok(()) => {
                 doc.content_removed = doc.removes_content(snapshot.content_removed);
                 if undo {
                     doc.redo.push(current);
@@ -781,7 +824,7 @@ impl CarbideApp {
         for doc in self.doc.iter_mut().chain(self.tabs.iter_mut().flatten()) {
             let Some(id) = doc.record else { continue };
             // Its recovery copy would hold the content unencrypted.
-            if doc.saved.as_ref().is_some_and(SavedFile::is_protected) {
+            if doc.is_protected() {
                 continue;
             }
             if carbide_engine::autosave::can_do_autosave(doc.dirty, false) {
@@ -1224,12 +1267,33 @@ impl CarbideApp {
 
     // ---- file helpers ------------------------------------------------------------------
 
-    fn export_images(&mut self) {
-        if self.renderer.is_none() || self.doc.is_none() {
+    /// Exports the active document as images or text. The exported files are not protected, so
+    /// for a protected document the user is asked first.
+    pub fn export(&mut self, export: Export) {
+        let Some(doc) = self.doc.as_ref() else { return };
+        if doc.is_protected() {
+            self.dialog = Some(Dialog::ConfirmExport { doc: doc.id, export });
             return;
         }
-        let Some(folder) = rfd::FileDialog::new().set_title("Export Here").pick_folder() else { return };
-        self.export_images_to(folder, None);
+        self.export_confirmed(doc.id, export);
+    }
+
+    /// Carries on exporting the document `doc`, once exporting it unprotected was agreed to.
+    pub fn export_confirmed(&mut self, doc: u64, export: Export) {
+        if self.doc.as_ref().map(|d| d.id) != Some(doc) {
+            self.status = "Nothing was exported: the question was about a document that is no longer in front.".into();
+            return;
+        }
+        if self.renderer.is_none() {
+            return;
+        }
+        match export {
+            Export::Images => {
+                let Some(folder) = rfd::FileDialog::new().set_title("Export Here").pick_folder() else { return };
+                self.export_images_to(folder, None);
+            }
+            Export::Text => self.export_text(),
+        }
     }
 
     /// Exports every page of the active document as an image into `folder`. When files of those
@@ -1283,7 +1347,7 @@ impl CarbideApp {
             let result = doc
                 .pdf
                 .extract_pages(&range.clone().collect::<Vec<_>>())
-                .and_then(|mut part| part.to_bytes())
+                .and_then(|mut part| doc.derived_bytes(&mut part))
                 .and_then(|bytes| Ok(carbide_engine::fs::write_file(target, &bytes, existing)?));
             if let Err(e) = result {
                 let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1321,13 +1385,34 @@ impl CarbideApp {
     fn merge_files(&mut self) {
         let Some(files) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).pick_files() else { return };
         let mut others = Vec::new();
-        for file in files {
-            match Pdf::open(&file) {
+        for file in &files {
+            match Pdf::open(file) {
                 Ok(p) => others.push(p),
                 Err(e) => return self.alert(format!("{}: {e}", file.display())),
             }
         }
+        let names = files.iter().map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+        self.merge_into_current(others, names, false);
+    }
+
+    /// Appends `others` (named `names`) to the active document, which keeps its own protection.
+    /// The pages of a protected file that does not share it would be saved with this document's
+    /// protection or none, so the user is asked first; `confirmed` says that was agreed to.
+    pub fn merge_into_current(&mut self, mut others: Vec<Pdf>, names: Vec<String>, confirmed: bool) {
+        let Some(doc) = self.doc.as_ref() else { return };
+        let (protection, _) = doc.protection();
+        let differs = |other: &Pdf| other.protection().is_some_and(|p| !protection.as_ref().is_some_and(|own| own.same_as(&p)));
+        if !confirmed && others.iter().any(differs) {
+            let protected =
+                others.iter().zip(&names).filter(|(other, _)| differs(other)).map(|(_, name)| name.clone()).collect();
+            self.dialog = Some(Dialog::ConfirmMerge { doc: doc.id, others, names, protected, keeps_protection: protection.is_some() });
+            return;
+        }
+        for other in others.iter_mut().filter(|other| differs(other)) {
+            other.set_protection(None);
+        }
         self.edit("Merge", move |pdf| {
+            pdf.set_protection(protection);
             let mut all = vec![pdf.clone()];
             all.extend(others);
             let refs: Vec<&Pdf> = all.iter().collect();
@@ -1338,10 +1423,27 @@ impl CarbideApp {
 
     fn extract_current(&mut self) {
         let page = self.current_page;
-        let Some(doc) = self.doc.as_ref() else { return };
+        if self.doc.is_none() {
+            return;
+        }
         let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name(format!("Page {}.pdf", page + 1)).save_file() else { return };
-        match doc.pdf.extract_pages(&[page]).and_then(|mut p| p.save(&path)) {
-            Ok(()) => self.status = format!("Extracted page {} to {}", page + 1, path.display()),
+        self.extract_page_to(page, &path);
+    }
+
+    /// Writes page `page` of the active document to `path` as a new file, protected like the
+    /// document.
+    pub fn extract_page_to(&mut self, page: usize, path: &Path) {
+        let Some(doc) = self.doc.as_ref() else { return };
+        let written = doc
+            .pdf
+            .extract_pages(&[page])
+            .and_then(|mut part| doc.derived_bytes(&mut part))
+            .and_then(|bytes| Ok(carbide_engine::fs::write_replacing(path, &bytes)?));
+        match written {
+            Ok(()) => {
+                let protected = if doc.is_protected() { ", password-protected like this document" } else { "" };
+                self.status = format!("Extracted page {} to {}{protected}", page + 1, path.display());
+            }
             Err(e) => self.alert(format!("Could not extract: {e}")),
         }
     }
