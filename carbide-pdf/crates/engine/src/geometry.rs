@@ -32,6 +32,17 @@ impl Rect {
         self.width <= 0.0 || self.height <= 0.0
     }
 
+    /// True when every coordinate is a finite number.
+    pub fn is_finite(&self) -> bool {
+        [self.x, self.y, self.width, self.height].iter().all(|v| v.is_finite())
+    }
+
+    /// The same area with a non-negative width and height: a rect given with a negative width
+    /// (dragged or typed from right to left) starts at its other corner.
+    pub fn normalized(&self) -> Rect {
+        Rect::from_corners((self.x, self.y), (self.x + self.width, self.y + self.height))
+    }
+
     /// Shrinks the rect by `amount` on every side (grows it when negative).
     pub fn inset(&self, amount: f32) -> Rect {
         Rect::new(self.x + amount, self.y + amount, self.width - 2.0 * amount, self.height - 2.0 * amount)
@@ -50,9 +61,24 @@ pub struct PageGeometry {
     pub rotation: i32,
 }
 
+/// `degrees` as one of 0, 90, 180 or 270, the way viewers read a page's `/Rotate`: whole quarter
+/// turns, rounded toward zero (45 is 0 and -135 is 270), for any value without overflowing.
 pub fn normalize_rotation(degrees: i64) -> i32 {
-    let snapped = ((degrees as f64 / 90.0).round() as i64) * 90;
-    (((snapped % 360) + 360) % 360) as i32
+    ((degrees / 90).rem_euclid(4) * 90) as i32
+}
+
+/// A page's `/Rotate` value read the way PDFium reads it, normalized as [`normalize_rotation`]
+/// does. PDFium reads the digits of an integer into 32 bits: a positive one that does not fit in
+/// 32 unsigned bits is 0 and one past the signed range wraps around, a negative one below the
+/// signed range is 0. A real is taken toward zero, saturating. Anything else counts as 0.
+pub fn rotation_value(value: &lopdf::Object) -> i32 {
+    let degrees = match *value {
+        lopdf::Object::Integer(v) if v >= 0 => u32::try_from(v).map_or(0, |v| v as i32),
+        lopdf::Object::Integer(v) => i32::try_from(v).unwrap_or(0),
+        lopdf::Object::Real(v) => v as i32,
+        _ => 0,
+    };
+    normalize_rotation(degrees as i64)
 }
 
 impl PageGeometry {
@@ -168,6 +194,39 @@ mod tests {
         assert_eq!(normalize_rotation(-90), 270);
         assert_eq!(normalize_rotation(450), 90);
         assert_eq!(normalize_rotation(0), 0);
+        assert_eq!(normalize_rotation(i64::MAX), 0);
+        assert_eq!(normalize_rotation(i64::MIN), 0);
+    }
+
+    #[test]
+    fn rotate_values_are_read_like_viewers_read_them() {
+        use lopdf::Object::{Integer, Real};
+        let cases = [
+            (Integer(90), 90),
+            (Real(90.0), 90),
+            (Real(270.9), 270),
+            (Integer(45), 0),
+            (Integer(135), 90),
+            (Integer(-90), 270),
+            (Integer(-135), 270),
+            (Integer(i64::MAX), 0),
+            (Integer(3_000_000_000), 270),
+            (Integer(-3_000_000_000), 0),
+            (Integer(-2_147_483_648), 270),
+            (Real(1.0e30), 90),
+            (Real(f32::NAN), 0),
+            (lopdf::Object::Name(b"Ninety".to_vec()), 0),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(rotation_value(&value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn rects_given_from_the_other_corner_are_normalized() {
+        assert_eq!(Rect::new(500.0, 700.0, -200.0, -50.0).normalized(), Rect::new(300.0, 650.0, 200.0, 50.0));
+        assert_eq!(Rect::new(1.0, 2.0, 3.0, 4.0).normalized(), Rect::new(1.0, 2.0, 3.0, 4.0));
+        assert!(!Rect::new(f32::NAN, 0.0, 1.0, 1.0).is_finite());
     }
 
     #[test]

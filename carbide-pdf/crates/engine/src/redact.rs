@@ -24,7 +24,14 @@ pub struct Redaction {
     pub rect: Rect,
 }
 
+pub mod messages {
+    pub const BAD_AREA: &str = "A redaction area has to be given in numbers and have a width and a height.";
+}
+
 impl Pdf {
+    /// Removes what lies under each area. An area given from its other corner (a negative width
+    /// or height) is the same area; one that is not a number, or has no width or height, is
+    /// refused before anything changes, since it would black out nothing.
     pub fn apply_redactions(&mut self, renderer: &Renderer, redactions: &[Redaction], dpi: f32) -> Result<()> {
         if redactions.is_empty() {
             return Ok(());
@@ -33,6 +40,11 @@ impl Pdf {
         if let Some(bad) = redactions.iter().find(|r| r.page >= count) {
             return Err(Error::PageOutOfRange { index: bad.page, count });
         }
+        if redactions.iter().any(|r| !r.rect.is_finite() || r.rect.normalized().is_empty()) {
+            return Err(Error::Other(messages::BAD_AREA.into()));
+        }
+        let redactions: Vec<Redaction> = redactions.iter().map(|r| Redaction { page: r.page, rect: r.rect.normalized() }).collect();
+        let redactions = redactions.as_slice();
         let snapshot = self.to_bytes()?;
 
         let mut pages: Vec<usize> = redactions.iter().map(|r| r.page).collect();

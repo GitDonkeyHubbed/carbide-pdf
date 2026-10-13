@@ -12,14 +12,17 @@
 //! own, a node that refers back to one of its ancestors loses that reference, a page listed twice
 //! becomes two pages, every node is typed by whether it has `/Kids`, every `/Count` says how many
 //! pages are really below it, and every `/Parent` names the node the page is listed under (with
-//! what the page inherited through the old `/Parent` copied onto it first). A tree nested deeper
-//! than [`MAX_DEPTH`], or one that lists the same branch twice, is refused.
+//! what the page inherited through the old `/Parent` copied onto it first). A `/Rotate` that is
+//! not a whole number of quarter turns written as a plain integer is replaced by the turn PDFium
+//! reads from it, so that the file written afterwards says the same to every reader. A tree
+//! nested deeper than [`MAX_DEPTH`], or one that lists the same branch twice, is refused.
 
 use std::collections::HashSet;
 
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 
 use crate::error::{Error, Result};
+use crate::geometry::rotation_value;
 
 /// Deeper page trees are refused. Real files are a handful of levels deep.
 pub const MAX_DEPTH: usize = 128;
@@ -60,6 +63,7 @@ pub(crate) fn repair(doc: &mut Document) -> Result<()> {
     if doc.get_dictionary(root)?.has(b"Parent") {
         reparent(doc, root, None)?;
     }
+    plain_rotation(doc, root)?;
     let mut walk = Walk { placed: HashSet::from([root]), path: vec![root] };
     walk.node(doc, root)?;
     Ok(())
@@ -120,6 +124,7 @@ impl Walk {
             if doc.get_dictionary(kid_id)?.get(b"Parent").ok() != Some(&Object::Reference(id)) {
                 reparent(doc, kid_id, Some(id))?;
             }
+            plain_rotation(doc, kid_id)?;
             listed.push(Object::Reference(kid_id));
             pages += if is_node {
                 self.path.push(kid_id);
@@ -158,6 +163,18 @@ fn set_type(doc: &mut Document, id: ObjectId, kind: &[u8]) -> Result<()> {
     if dict.get(b"Type").and_then(Object::as_name).ok() != Some(kind) {
         dict.set("Type", Object::Name(kind.to_vec()));
     }
+    Ok(())
+}
+
+/// Rewrites `/Rotate` of `id` as the plain integer PDFium reads from it, unless it already is a
+/// whole number of quarter turns that every reader takes the same way.
+fn plain_rotation(doc: &mut Document, id: ObjectId) -> Result<()> {
+    let Ok(value) = doc.get_dictionary(id)?.get(b"Rotate") else { return Ok(()) };
+    if matches!(value, Object::Integer(v) if v % 90 == 0 && i32::try_from(*v).is_ok()) {
+        return Ok(());
+    }
+    let turn = resolve(doc, Some(value)).map_or(0, |value| rotation_value(&value));
+    doc.get_dictionary_mut(id)?.set("Rotate", turn as i64);
     Ok(())
 }
 
@@ -275,6 +292,25 @@ mod tests {
         let page = doc.get_dictionary((2, 0)).unwrap();
         assert_eq!(page.get(b"Parent").unwrap(), &Object::Reference((1, 0)));
         assert_eq!(page.get(b"Rotate").unwrap(), &Object::Integer(270));
+    }
+
+    #[test]
+    fn rotations_are_rewritten_as_the_turn_viewers_read() {
+        let turned = |rotate: Object| Object::Dictionary(dictionary! { "Type" => "Page", "Parent" => (1, 0), "Rotate" => rotate });
+        let mut doc = document(vec![
+            (1, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![(2, 0).into(), (3, 0).into(), (4, 0).into(), (5, 0).into()], "Count" => 4, "Rotate" => Object::Real(180.0) })),
+            (2, turned(Object::Integer(-90))),
+            (3, turned(Object::Real(90.5))),
+            (4, turned(Object::Integer(i64::MAX))),
+            (5, turned(Object::Integer(45))),
+        ]);
+        repair(&mut doc).unwrap();
+        let rotate = |id: u32| doc.get_dictionary((id, 0)).unwrap().get(b"Rotate").unwrap().clone();
+        // A plain quarter turn is left as written; the rest become the turn PDFium reads.
+        let expected = [(1, 180), (2, -90), (3, 90), (4, 0), (5, 0)];
+        for (id, turn) in expected {
+            assert_eq!(rotate(id), Object::Integer(turn), "object {id}");
+        }
     }
 
     #[test]

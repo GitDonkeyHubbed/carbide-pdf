@@ -5,7 +5,7 @@ use std::path::Path;
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 
 use crate::error::{Error, Result};
-use crate::geometry::{normalize_rotation, PageGeometry};
+use crate::geometry::{normalize_rotation, rotation_value, PageGeometry};
 use crate::pagetree::INHERITABLE;
 use crate::scrub::widget_area;
 
@@ -191,11 +191,7 @@ impl Pdf {
         };
         let (w, h) = (visible[2] - visible[0], visible[3] - visible[1]);
         let (visible, w, h) = if w > 0.0 && h > 0.0 { (visible, w, h) } else { (media, media[2] - media[0], media[3] - media[1]) };
-        let rotation = self
-            .inherited(id, b"Rotate")
-            .and_then(|o| o.as_i64().ok())
-            .map(normalize_rotation)
-            .unwrap_or(0);
+        let rotation = self.inherited(id, b"Rotate").map(|o| rotation_value(&o)).unwrap_or(0);
         PageGeometry::new(visible[0], visible[1], w, h, rotation)
     }
 
@@ -244,12 +240,20 @@ impl Pdf {
         Ok(catalog.get(b"Pages")?.as_reference()?)
     }
 
+    /// Turns pages clockwise by `degrees`, a multiple of 90 (negative turns them the other way).
+    /// A page listed more than once is turned once.
     pub fn rotate_pages(&mut self, pages: &[usize], degrees: i32) -> Result<()> {
+        if degrees % 90 != 0 {
+            return Err(Error::Other(format!("pages can only be turned by a multiple of 90 degrees, not {degrees}")));
+        }
         let ids = self.page_ids();
-        for &index in pages {
-            let id = *ids.get(index).ok_or(Error::PageOutOfRange { index, count: ids.len() })?;
+        if let Some(&index) = pages.iter().find(|&&p| p >= ids.len()) {
+            return Err(Error::PageOutOfRange { index, count: ids.len() });
+        }
+        for index in once_each(pages) {
+            let id = ids[index];
             let current = self.geometry_of(id).rotation;
-            let next = normalize_rotation((current + degrees) as i64);
+            let next = normalize_rotation(current as i64 + degrees as i64);
             self.doc.get_dictionary_mut(id)?.set("Rotate", next as i64);
         }
         Ok(())
@@ -349,6 +353,8 @@ impl Pdf {
         if let Some(&bad) = pages.iter().find(|&&p| p >= count) {
             return Err(Error::PageOutOfRange { index: bad, count });
         }
+        // A page object can only be in the new document once; a page asked for twice is taken once.
+        let pages = once_each(pages);
         let mut copy = self.clone();
         copy.flatten_page_tree()?;
         let ids = copy.page_ids();
@@ -395,7 +401,7 @@ impl Pdf {
     /// ways are refused (see [`Pdf::shared_protection`]).
     pub fn merge(documents: &[&Pdf]) -> Result<Pdf> {
         if documents.is_empty() {
-            return Ok(Pdf::new());
+            return Err(Error::InvalidRange("there are no documents to merge".into()));
         }
         let protection = Pdf::shared_protection(documents)?;
         // The new document already owns a few low object ids (catalog, page tree); the inputs
@@ -441,6 +447,14 @@ impl Pdf {
         Ok(result)
     }
 
+    /// Parses a page list such as `1-3, 5, 3` (one-based) into zero-based pages, each once, in the
+    /// order they are first named: for edits that act on each page (rotate, watermark, recognize
+    /// text, extract), where doing a page twice would turn it twice or stamp it twice.
+    pub fn parse_pages(text: &str, page_count: usize) -> Result<Vec<usize>> {
+        let all: Vec<usize> = Self::parse_ranges(text, page_count)?.into_iter().flatten().collect();
+        Ok(once_each(&all))
+    }
+
     /// Parses `1-3, 5, 8-10` (one-based, inclusive) into zero-based ranges validated against `page_count`.
     pub fn parse_ranges(text: &str, page_count: usize) -> Result<Vec<RangeInclusive<usize>>> {
         let mut ranges = Vec::new();
@@ -466,6 +480,12 @@ impl Pdf {
         }
         Ok(ranges)
     }
+}
+
+/// `pages` with each page kept the first time it appears.
+pub(crate) fn once_each(pages: &[usize]) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    pages.iter().copied().filter(|page| seen.insert(*page)).collect()
 }
 
 impl std::fmt::Debug for Pdf {

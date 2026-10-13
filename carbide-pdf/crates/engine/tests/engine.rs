@@ -2482,6 +2482,119 @@ fn huge_pages_render_within_the_pixel_limit() {
     }
 }
 
+// ---- input validation ----------------------------------------------------------------------
+
+#[test]
+fn rotate_values_are_read_the_way_pdfium_reads_them() {
+    let mut pdf = text_pdf(&[&["ONE"], &["TWO"], &["THREE"], &["FOUR"], &["FIVE"]]);
+    let ids = pdf.page_ids();
+    let doc = pdf.document_mut();
+    doc.get_dictionary_mut(ids[0]).unwrap().set("Rotate", Object::Real(90.0));
+    doc.get_dictionary_mut(ids[1]).unwrap().set("Rotate", 45);
+    doc.get_dictionary_mut(ids[2]).unwrap().set("Rotate", 135);
+    doc.get_dictionary_mut(ids[3]).unwrap().set("Rotate", -90);
+    doc.get_dictionary_mut(ids[4]).unwrap().set("Rotate", i64::MAX);
+    let bytes = pdf.to_bytes().unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+    let rotations: Vec<i32> = (0..5).map(|page| pdf.page_rotation(page).unwrap()).collect();
+    // An integer too large for 32 bits reads as 0 to PDFium.
+    assert_eq!(rotations, [90, 0, 90, 270, 0]);
+    // PDFium turns each page the same way: the render has the displayed size.
+    for (page, geometry) in pdf.page_geometries().into_iter().enumerate() {
+        let (w, h) = geometry.display_size();
+        assert_eq!(render(renderer(), &mut pdf, page).dimensions(), (w as u32, h as u32), "page {page}");
+    }
+}
+
+#[test]
+fn turns_are_whole_quarters_and_each_page_turns_once() {
+    let mut pdf = text_pdf(&[&["ONE"], &["TWO"]]);
+    for degrees in [45, 1, -91, i32::MAX, i32::MIN] {
+        assert!(pdf.rotate_pages(&[0], degrees).is_err(), "{degrees}");
+    }
+    assert_eq!(pdf.page_rotation(0).unwrap(), 0);
+    pdf.rotate_pages(&[1, 1, 1], -90).unwrap();
+    assert_eq!(pdf.page_rotation(1).unwrap(), 270, "turned once");
+    // 270 and 23860929 quarter turns: no overflow, and a whole number of turns plus one quarter.
+    pdf.rotate_pages(&[1], 90 * 23_860_929).unwrap();
+    assert_eq!(pdf.page_rotation(1).unwrap(), 0);
+    assert!(pdf.rotate_pages(&[0, 2], 90).is_err());
+    assert_eq!(pdf.page_rotation(0).unwrap(), 0, "nothing turns when a page is out of range");
+}
+
+#[test]
+fn repeated_pages_are_handled_once() {
+    assert_eq!(Pdf::parse_pages("1-3, 2, 1, 5", 5).unwrap(), vec![0, 1, 2, 4]);
+    let pdf = text_pdf(&[&["ONE"], &["TWO"], &["THREE"]]);
+    let mut extracted = pdf.extract_pages(&[1, 1, 0]).unwrap();
+    assert_eq!(texts_seen_by_both(&mut extracted), ["TWO", "ONE"]);
+
+    let mut stamped = pdf.clone();
+    let mut options = WatermarkOptions::new("ONCE");
+    options.pages = Some(vec![0, 0, 0]);
+    stamped.apply_watermark(&options).unwrap();
+    assert_eq!(page_text(renderer(), &mut stamped, 0).matches("ONCE").count(), 1);
+}
+
+#[test]
+fn merging_nothing_is_refused() {
+    assert!(matches!(Pdf::merge(&[]), Err(Error::InvalidRange(_))));
+}
+
+#[test]
+fn bates_numbers_that_cannot_be_stamped_are_refused_before_anything_changes() {
+    let mut pdf = text_pdf(&[&["ONE"], &["TWO"]]);
+    let before = pdf.document().objects.clone();
+    for options in [
+        BatesOptions { digits: 70_000, ..Default::default() },
+        BatesOptions { digits: 0, ..Default::default() },
+        BatesOptions { start_number: u64::MAX, ..Default::default() },
+    ] {
+        assert!(pdf.apply_bates(&options).is_err(), "{options:?}");
+        assert_eq!(pdf.document().objects, before);
+    }
+    pdf.apply_bates(&BatesOptions { start_number: u64::MAX - 1, digits: 20, ..Default::default() }).unwrap();
+    assert!(page_text(renderer(), &mut pdf, 1).contains("18446744073709551615"));
+}
+
+#[test]
+fn areas_given_from_the_other_corner_are_the_same_area() {
+    let r = renderer();
+    // The first line of text, from (60, 692) to (360, 720), given from its top-right corner.
+    let backwards = Rect::new(360.0, 720.0, -300.0, -28.0);
+    let mut pdf = text_pdf(&[&["SECRET LINE"]]);
+    pdf.apply_redactions(r, &[Redaction { page: 0, rect: backwards }], 150.0).unwrap();
+    assert_eq!(page_text(r, &mut pdf, 0).trim(), "");
+    assert!(!contains(&pdf.to_bytes().unwrap(), b"SECRET"));
+
+    let mut pdf = text_pdf(&[&["SECRET LINE"]]);
+    for nothing in [Rect::new(100.0, 100.0, 0.0, 50.0), Rect::new(f32::NAN, 0.0, 10.0, 10.0), Rect::new(0.0, 0.0, f32::INFINITY, 10.0)] {
+        let refused = pdf.apply_redactions(r, &[Redaction { page: 0, rect: nothing }], 150.0).unwrap_err();
+        assert_eq!(refused.to_string(), carbide_engine::redact::messages::BAD_AREA);
+    }
+    assert!(page_text(r, &mut pdf, 0).contains("SECRET"), "a refused redaction changed the page");
+
+    pdf.add_markup(0, &[Rect::new(300.0, 720.0, -200.0, -20.0)], MarkupStyle::Highlight, None).unwrap();
+    let annotation = &pdf.annotations(0).unwrap()[0];
+    let bounds: Vec<f32> = annotation.get(b"Rect").unwrap().as_array().unwrap().iter().map(|v| v.as_float().unwrap()).collect();
+    assert_eq!(bounds, [100.0, 700.0, 300.0, 720.0]);
+    assert!(pdf.add_markup(0, &[Rect::new(f32::NAN, 0.0, 1.0, 1.0)], MarkupStyle::Highlight, None).is_err());
+    assert!(pdf.add_note(0, f32::INFINITY, 0.0, "x").is_err());
+}
+
+#[test]
+fn notes_on_turned_pages_are_turned_only_by_their_appearance() {
+    let mut pdf = text_pdf(&[&["TURNED"]]);
+    pdf.rotate_pages(&[0], 90).unwrap();
+    pdf.add_note(0, 100.0, 300.0, "upright").unwrap();
+    let note = &pdf.annotations(0).unwrap()[0];
+    let flags = note.get(b"F").unwrap().as_i64().unwrap();
+    assert_eq!(flags & 16, 0, "NoRotate would turn the icon a second time in viewers that honour it");
+    let appearance = note.get(b"AP").unwrap().as_dict().unwrap().get(b"N").unwrap().as_reference().unwrap();
+    let matrix = pdf.document().get_object(appearance).unwrap().as_stream().unwrap().dict.get(b"Matrix").unwrap().clone();
+    assert_eq!(matrix.as_array().unwrap().len(), 6, "the appearance is turned upright by its matrix");
+}
+
 // ---- inherited page attributes -------------------------------------------------------------
 
 /// `numbered_pages(4)` with /Rotate 90 and /CropBox [0 300 500 792] (which still shows the text)

@@ -131,7 +131,8 @@ impl Pdf {
         let snapshot = self.to_bytes()?;
         let ids = self.page_ids();
         let count = ids.len();
-        let wanted: Vec<usize> = options.pages.clone().unwrap_or_else(|| (0..count).collect());
+        // A page listed twice is recognized once, so it gets one text layer.
+        let wanted: Vec<usize> = options.pages.as_deref().map(crate::pdf::once_each).unwrap_or_else(|| (0..count).collect());
         let mut report = OcrReport::default();
 
         for page in wanted {

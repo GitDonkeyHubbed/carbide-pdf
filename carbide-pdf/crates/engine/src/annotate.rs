@@ -3,7 +3,7 @@
 
 use lopdf::{dictionary, Dictionary, Object, ObjectId, Stream, StringFormat};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::fonts::{literal_string, win_ansi, StandardFont};
 use crate::geometry::{fmt, PageGeometry, Rect};
 use crate::pdf::Pdf;
@@ -41,6 +41,8 @@ impl MarkupStyle {
         }
     }
 }
+
+const NOT_A_NUMBER: &str = "Annotation positions and sizes have to be numbers, and text sizes larger than 0.";
 
 fn real_array(values: &[f32]) -> Object {
     Object::Array(values.iter().map(|v| Object::Real(*v)).collect())
@@ -95,8 +97,12 @@ impl Pdf {
     }
 
     /// Adds a highlight, underline or strikeout covering `rects` (display space, one per text line).
+    /// A rect given from its other corner covers the same area.
     pub fn add_markup(&mut self, page: usize, rects: &[Rect], style: MarkupStyle, color: Option<[f32; 3]>) -> Result<()> {
-        let rects: Vec<Rect> = rects.iter().copied().filter(|r| !r.is_empty()).collect();
+        if !rects.iter().all(Rect::is_finite) {
+            return Err(Error::Other(NOT_A_NUMBER.into()));
+        }
+        let rects: Vec<Rect> = rects.iter().map(Rect::normalized).filter(|r| !r.is_empty()).collect();
         if rects.is_empty() {
             return Ok(());
         }
@@ -159,8 +165,13 @@ impl Pdf {
         self.push_annotation(page_id, annotation)
     }
 
-    /// A 24x24 sticky note whose top-left corner is at (`x`, `y`) in display space.
+    /// A 24x24 sticky note whose top-left corner is at (`x`, `y`) in display space. Its icon is
+    /// drawn upright on the displayed page through its appearance's `/Matrix`; the NoRotate flag
+    /// is left off, since a viewer that honours it would turn the icon a second time.
     pub fn add_note(&mut self, page: usize, x: f32, y: f32, text: &str) -> Result<()> {
+        if !(x.is_finite() && y.is_finite()) {
+            return Err(Error::Other(NOT_A_NUMBER.into()));
+        }
         let page_id = self.page_id(page)?;
         let geometry = self.page_geometry(page)?;
         const SIZE: f32 = 24.0;
@@ -184,8 +195,8 @@ impl Pdf {
             "Name" => "Note",
             "C" => real_array(&[1.0, 0.9, 0.2]),
             "Open" => false,
-            // Print + NoZoom + NoRotate
-            "F" => 28,
+            // Print + NoZoom
+            "F" => 12,
             "AP" => dictionary! { "N" => appearance },
         });
         self.push_annotation(page_id, annotation)
@@ -193,6 +204,9 @@ impl Pdf {
 
     /// Free text ("typewriter") with its top-left corner at (`x`, `y`) in display space.
     pub fn add_text_box(&mut self, page: usize, x: f32, y: f32, text: &str, font_size: f32) -> Result<()> {
+        if !(x.is_finite() && y.is_finite() && font_size.is_finite() && font_size > 0.0) {
+            return Err(Error::Other(NOT_A_NUMBER.into()));
+        }
         let page_id = self.page_id(page)?;
         let geometry = self.page_geometry(page)?;
         let font = StandardFont::Helvetica;

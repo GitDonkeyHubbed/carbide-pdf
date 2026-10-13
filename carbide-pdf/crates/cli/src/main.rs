@@ -52,6 +52,7 @@ enum Command {
     /// result keeps; --password opens every protected input.
     Merge {
         output: PathBuf,
+        #[arg(required = true)]
         inputs: Vec<PathBuf>,
         #[command(flatten)]
         out: Unprotected,
@@ -83,8 +84,16 @@ enum Command {
     },
     /// Delete pages.
     Delete { input: PathBuf, pages: String, output: PathBuf, #[command(flatten)] pw: Password },
-    /// Rotate pages by a multiple of 90 degrees.
-    Rotate { input: PathBuf, pages: String, degrees: i32, output: PathBuf, #[command(flatten)] pw: Password },
+    /// Rotate pages clockwise by a multiple of 90 degrees (negative turns them the other way).
+    Rotate {
+        input: PathBuf,
+        pages: String,
+        #[arg(allow_negative_numbers = true)]
+        degrees: i32,
+        output: PathBuf,
+        #[command(flatten)]
+        pw: Password,
+    },
     /// Insert a blank page so that it becomes page AT.
     Blank { input: PathBuf, at: usize, output: PathBuf, #[command(flatten)] pw: Password },
     /// Move a page to a new position.
@@ -511,8 +520,9 @@ fn renderer() -> Result<&'static Renderer, Failure> {
     Ok(Renderer::global()?)
 }
 
+/// A page list such as "1-3,5": each page once, however often it is named.
 fn pages_arg(text: &str, pdf: &Pdf) -> Result<Vec<usize>, Failure> {
-    Ok(Pdf::parse_ranges(text, pdf.page_count())?.into_iter().flatten().collect())
+    Ok(Pdf::parse_pages(text, pdf.page_count())?)
 }
 
 fn one_based(n: usize, what: &str) -> Result<usize, Failure> {
@@ -522,18 +532,24 @@ fn one_based(n: usize, what: &str) -> Result<usize, Failure> {
 fn parse_numbers(text: &str, expected: usize) -> Result<Vec<f32>, Failure> {
     let values: Result<Vec<f32>, _> = text.split(',').map(|s| s.trim().parse::<f32>()).collect();
     let values = values.map_err(|_| format!("expected {expected} numbers, got {text:?}"))?;
-    if values.len() != expected {
+    // "nan" and "inf" parse as numbers, but mean no place on a page.
+    if values.len() != expected || !values.iter().all(|v| v.is_finite()) {
         return Err(format!("expected {expected} numbers, got {text:?}").into());
     }
     Ok(values)
 }
 
-/// `PAGE:X,Y,W,H` -> (zero-based page, rect)
+/// `PAGE:X,Y,W,H` -> (zero-based page, rect). A negative width or height counts from the other
+/// corner, so the rect always comes back with a positive size.
 fn parse_rect(text: &str) -> Result<(usize, Rect), Failure> {
     let (page, numbers) = text.split_once(':').ok_or("rectangle must look like PAGE:X,Y,W,H")?;
     let page = one_based(page.trim().parse::<usize>()?, "page")?;
     let v = parse_numbers(numbers, 4)?;
-    Ok((page, Rect::new(v[0], v[1], v[2], v[3])))
+    let rect = Rect::new(v[0], v[1], v[2], v[3]).normalized();
+    if rect.is_empty() {
+        return Err(format!("rectangle {text:?} has no width or no height").into());
+    }
+    Ok((page, rect))
 }
 
 fn parse_point(text: &str) -> Result<(usize, f32, f32), Failure> {
