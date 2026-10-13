@@ -2017,9 +2017,11 @@ fn self_signed(pair: &rcgen::KeyPair, common_name: &str) -> Vec<u8> {
     params.self_signed(pair).unwrap().der().to_vec()
 }
 
-/// Signs `base`, then replaces the CMS in /Contents with `cms`, keeping the byte range.
+/// Signs `base`, then replaces the CMS in /Contents with `cms`, keeping the byte range. The signing
+/// time is fixed, so a probe signing and the real one cover exactly the same bytes.
 fn resign_with(doc: &Pdf, base: &[u8], cms: &[u8]) -> Vec<u8> {
-    let mut signed = doc.sign(base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    let options = SignOptions { signing_time: Some("D:20261001000000Z".into()), ..sign_options(SubFilter::Pkcs7Detached) };
+    let mut signed = doc.sign(base, &options).unwrap();
     put_signature_value(&mut signed, cms);
     signed
 }
@@ -2084,6 +2086,116 @@ fn rsa_pss_signatures_verify() {
 
     let reports = verify(&signed, &TrustStore { certificates: vec![cert] });
     assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly), "{:?}", reports[0].detail);
+    assert!(!reports[0].weak_algorithm);
+}
+
+/// `RSASSA-PSS-params` naming `hash`, MGF1 over `mask_hash`, and `salt` bytes of salt.
+fn pss_params(hash: &[u32], mask_hash: &[u32], salt: u8) -> Vec<u8> {
+    use algo::*;
+    let hash = seq(&[&oid(hash), &null()]);
+    let mask_hash = seq(&[&oid(mask_hash), &null()]);
+    seq(&[&ctx(0, &hash), &ctx(1, &seq(&[&oid(&[1, 2, 840, 113549, 1, 1, 8]), &mask_hash])), &ctx(2, &[0x02, 0x01, salt])])
+}
+
+const SHA1_OID: &[u32] = &[1, 3, 14, 3, 2, 26];
+const SHA224_OID: &[u32] = &[2, 16, 840, 1, 101, 3, 4, 2, 4];
+const SHA256_OID: &[u32] = &[2, 16, 840, 1, 101, 3, 4, 2, 1];
+const RSA_PSS_OID: &[u32] = &[1, 2, 840, 113549, 1, 1, 10];
+
+#[test]
+fn rsa_pss_parameters_are_honoured_or_reported_as_unsupported() {
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let cert = self_signed(&pair, "PSS Signer");
+    let trust = TrustStore { certificates: vec![cert.clone()] };
+    let mut doc = text_pdf(&[&["pss parameters"]]);
+    let base = file_bytes(&mut doc);
+    let covered = covered_bytes(&resign_with(&doc, &base, &[0x30, 0x00]));
+    let check = |signature: &[u8], params: Option<Vec<u8>>| {
+        let cms = detached_cms(&cert, SHA256_OID, RSA_PSS_OID, params, signature);
+        verify(&resign_with(&doc, &base, &cms), &trust).remove(0)
+    };
+
+    // Parameters left out mean SHA-1, MGF1-SHA-1 and 20 bytes of salt: valid, and flagged weak.
+    let sha1 = rsa::pss::SigningKey::<sha1::Sha1>::new(key.clone()).sign_with_rng(&mut rand::rngs::OsRng, &covered).to_vec();
+    let report = check(&sha1, None);
+    assert_eq!((report.validity, report.detail), (Validity::Valid, Detail::TrustedDirectly), "PSS defaults");
+    assert!(report.weak_algorithm, "SHA-1 inside PSS parameters is weak");
+    assert!(report.description_lines().contains(&sig_messages::WEAK_ALGORITHM));
+
+    // A mask hash that differs from the message hash, or a hash this build does not know, cannot
+    // be checked: validity unknown, never "altered".
+    let sha256 = rsa::pss::SigningKey::<sha2::Sha256>::new(key.clone()).sign_with_rng(&mut rand::rngs::OsRng, &covered).to_vec();
+    for (label, params) in [
+        ("MGF1 over SHA-1", pss_params(SHA256_OID, SHA1_OID, 32)),
+        ("SHA-224", pss_params(SHA224_OID, SHA224_OID, 28)),
+    ] {
+        let report = check(&sha256, Some(params));
+        assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm), "{label}");
+        assert!(!report.description_lines().contains(&sig_messages::DOCUMENT_ALTERED), "{label}");
+    }
+}
+
+#[test]
+fn certificates_with_rsassa_pss_keys_verify_pss_signatures() {
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    use x509_cert::der::{Decode, Encode};
+    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    // The same key, published under id-RSASSA-PSS instead of rsaEncryption (RFC 4055). The
+    // certificate is trusted directly, so its own signature is not what is being tested.
+    let mut certificate = x509_cert::Certificate::from_der(&self_signed(&pair, "PSS Key")).unwrap();
+    certificate.tbs_certificate.subject_public_key_info.algorithm =
+        x509_cert::spki::AlgorithmIdentifierOwned { oid: "1.2.840.113549.1.1.10".parse().unwrap(), parameters: None };
+    let cert = certificate.to_der().unwrap();
+
+    let mut doc = text_pdf(&[&["pss key"]]);
+    let base = file_bytes(&mut doc);
+    let covered = covered_bytes(&resign_with(&doc, &base, &[0x30, 0x00]));
+    let signature = rsa::pss::SigningKey::<sha2::Sha256>::new(key).sign_with_rng(&mut rand::rngs::OsRng, &covered).to_vec();
+    let cms = detached_cms(&cert, SHA256_OID, RSA_PSS_OID, Some(pss_params(SHA256_OID, SHA256_OID, 32)), &signature);
+    let reports = verify(&resign_with(&doc, &base, &cms), &TrustStore { certificates: vec![cert] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
+}
+
+#[test]
+fn ecdsa_variants_verify() {
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    let mut doc = text_pdf(&[&["ecdsa variants"]]);
+    let base = file_bytes(&mut doc);
+    let covered = covered_bytes(&resign_with(&doc, &base, &[0x30, 0x00]));
+
+    // P-384 with SHA-1: the 20-byte digest is shorter than half the curve's field.
+    {
+        use p384::pkcs8::DecodePrivateKey;
+        let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let signing = p384::ecdsa::SigningKey::from_pkcs8_der(&pair.serialize_der()).unwrap();
+        let cert = self_signed(&pair, "P-384 Signer");
+        let mut digest = <sha1::Sha1 as sha2::Digest>::digest(&covered).to_vec();
+        digest.splice(0..0, [0u8; 4]); // the same integer, at a length the signer accepts
+        let signature: p384::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
+        let cms = detached_cms(&cert, SHA1_OID, &[1, 2, 840, 10045, 4, 1], None, signature.to_der().as_bytes());
+        let reports = verify(&resign_with(&doc, &base, &cms), &TrustStore { certificates: vec![cert] });
+        assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly), "P-384 SHA-1");
+        assert!(reports[0].weak_algorithm);
+    }
+
+    // P-256 named by its key OID, id-ecPublicKey, with the SignerInfo digest saying SHA-256.
+    {
+        use p256::pkcs8::DecodePrivateKey;
+        let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let signing = p256::ecdsa::SigningKey::from_pkcs8_der(&pair.serialize_der()).unwrap();
+        let cert = self_signed(&pair, "Key OID Signer");
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(&covered);
+        let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
+        let cms = detached_cms(&cert, SHA256_OID, &[1, 2, 840, 10045, 2, 1], None, signature.to_der().as_bytes());
+        let reports = verify(&resign_with(&doc, &base, &cms), &TrustStore { certificates: vec![cert] });
+        assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly), "id-ecPublicKey");
+        assert!(!reports[0].weak_algorithm);
+    }
 }
 
 #[test]

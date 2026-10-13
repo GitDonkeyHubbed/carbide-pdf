@@ -1313,7 +1313,8 @@ fn verify_one(
     }
 
     let digest_oid = &signer_info.digest_algorithm;
-    report.weak_algorithm = sigcrypto::is_weak_digest(digest_oid) || sigcrypto::uses_sha1(&signer_info.signature_algorithm);
+    report.weak_algorithm = sigcrypto::is_weak_digest(digest_oid)
+        || sigcrypto::uses_sha1(&signer_info.signature_algorithm, signer_info.signature_parameters.as_deref(), digest_oid);
 
     // 4. Integrity: message digest and signature value. The signed input is the DER SET OF signed
     //    attributes, or, when there are none, the covered bytes directly.
