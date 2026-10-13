@@ -1,18 +1,20 @@
 //! Redaction that removes content instead of covering it.
 //!
 //! Each affected page is rasterized, the marked areas are painted black in the bitmap, and the page
-//! is rebuilt around that single image. Nothing of the original page content, annotations or
-//! thumbnails remains in the saved file.
+//! is rebuilt around that single image. Nothing of the original page content, annotations, form
+//! field values or thumbnails remains in the saved file.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 use image::{codecs::jpeg::JpegEncoder, ExtendedColorType, Rgba};
-use lopdf::{dictionary, Dictionary, Object, Stream};
+use lopdf::{dictionary, Dictionary, Object, ObjectId, Stream};
 
 use crate::error::{Error, Result};
 use crate::geometry::{fmt, Rect};
 use crate::pdf::Pdf;
 use crate::render::Renderer;
+use crate::scrub::widget_area;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Redaction {
@@ -36,6 +38,24 @@ impl Pdf {
         let mut pages: Vec<usize> = redactions.iter().map(|r| r.page).collect();
         pages.sort_unstable();
         pages.dedup();
+        // The rebuilt pages lose their annotations, and with them their form fields: the values
+        // and appearances those hold would otherwise stay in the form. A signature field goes
+        // only when its signature is drawn inside a redacted area; otherwise it stays (it no
+        // longer validates, which saving says).
+        let mut redacted: HashMap<ObjectId, Vec<Rect>> = HashMap::new();
+        for item in redactions {
+            let geometry = self.page_geometry(item.page)?;
+            redacted.entry(self.page_id(item.page)?).or_default().push(geometry.map_rect(item.rect));
+        }
+        let rebuilt: HashSet<ObjectId> = redacted.keys().copied().collect();
+        self.drop_form_fields_on(&rebuilt, &|page, widget, signature| {
+            !signature
+                || widget_area(widget).is_some_and(|[x0, y0, x1, y1]| {
+                    redacted.get(&page).is_some_and(|areas| {
+                        areas.iter().any(|a| a.x < x1 && x0 < a.max_x() && a.y < y1 && y0 < a.max_y())
+                    })
+                })
+        });
 
         for page in pages {
             let geometry = self.page_geometry(page)?;
@@ -106,6 +126,7 @@ impl Pdf {
                 catalog.remove(b"MarkInfo");
             }
         }
-        Ok(())
+        // Images and forms only the old page content drew can sit in resources other pages share.
+        self.trim_resources()
     }
 }

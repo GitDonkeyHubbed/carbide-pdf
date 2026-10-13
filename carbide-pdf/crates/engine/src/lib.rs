@@ -24,6 +24,7 @@ pub mod reduce;
 pub mod render;
 pub mod revisions;
 pub mod save;
+mod scrub;
 pub mod security;
 pub mod signature;
 pub mod stamp;

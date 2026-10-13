@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::RangeInclusive;
 use std::path::Path;
 
@@ -6,6 +6,7 @@ use lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 
 use crate::error::{Error, Result};
 use crate::geometry::{normalize_rotation, PageGeometry};
+use crate::scrub::widget_area;
 
 /// A PDF document. All page indexes in this API are zero-based.
 #[derive(Clone)]
@@ -222,7 +223,8 @@ impl Pdf {
         Ok(())
     }
 
-    /// Deletes pages. A document must keep at least one page.
+    /// Deletes pages. A document must keep at least one page. Nothing of a deleted page stays in
+    /// the document: its form fields, its tags and the resources only it used go with it.
     pub fn delete_pages(&mut self, pages: &[usize]) -> Result<()> {
         let count = self.page_count();
         let mut unique: Vec<usize> = pages.to_vec();
@@ -234,9 +236,15 @@ impl Pdf {
         if unique.len() >= count {
             return Err(Error::Other("a document needs at least one page".into()));
         }
+        let ids = self.page_ids();
+        let doomed: HashSet<ObjectId> = unique.iter().map(|&p| ids[p]).collect();
+        // What refers to the pages is found through them, so this comes first. An invisible
+        // signature only sits on a page because every field has to; it is not the page's content.
+        self.drop_form_fields_on(&doomed, &|_, widget, signature| !signature || widget_area(widget).is_some());
+        self.drop_structure_of(&doomed);
         let numbers: Vec<u32> = unique.iter().map(|&p| p as u32 + 1).collect();
         self.doc.delete_pages(&numbers);
-        Ok(())
+        self.trim_resources()
     }
 
     /// Inserts a blank page so that it ends up at `index`. Size defaults to the neighbouring page.
@@ -283,7 +291,8 @@ impl Pdf {
         Ok(())
     }
 
-    /// A new document holding only the given pages, in the given order.
+    /// A new document holding only the given pages, in the given order. Nothing of the other
+    /// pages is carried along, not through form fields, tags, links or shared resources either.
     pub fn extract_pages(&self, pages: &[usize]) -> Result<Pdf> {
         let count = self.page_count();
         if pages.is_empty() {
@@ -295,20 +304,29 @@ impl Pdf {
         let mut copy = self.clone();
         copy.flatten_page_tree()?;
         let ids = copy.page_ids();
+        let kept: HashSet<ObjectId> = pages.iter().map(|&p| ids[p]).collect();
+        let dropped: HashSet<ObjectId> = ids.iter().copied().filter(|id| !kept.contains(id)).collect();
+        copy.drop_form_fields_on(&dropped, &|_, _, _| true);
         let root_id = copy.pages_root()?;
         let kids: Vec<Object> = pages.iter().map(|&p| Object::Reference(ids[p])).collect();
         let root = copy.doc.get_dictionary_mut(root_id)?;
         root.set("Count", kids.len() as i64);
         root.set("Kids", kids);
-        // Outlines would point at pages that no longer exist.
+        // Outlines and page labels would describe pages that no longer exist, and the structure
+        // tree holds the tagged content of every page.
         if let Ok(catalog_id) = copy.doc.trailer.get(b"Root").and_then(|o| o.as_reference()) {
             if let Ok(catalog) = copy.doc.get_dictionary_mut(catalog_id) {
-                catalog.remove(b"Outlines");
-                catalog.remove(b"Names");
-                catalog.remove(b"Dests");
-                catalog.remove(b"OpenAction");
+                for key in [&b"Outlines"[..], b"Names", b"Dests", b"OpenAction", b"PageLabels", b"StructTreeRoot", b"MarkInfo"] {
+                    catalog.remove(key);
+                }
             }
         }
+        // Links, beads and anything else that still points at a dropped page loses that target.
+        copy.drop_references_to(&dropped);
+        for id in &dropped {
+            copy.doc.objects.remove(id);
+        }
+        copy.trim_resources()?;
         copy.doc.prune_objects();
         Ok(copy)
     }

@@ -524,6 +524,183 @@ fn deleted_pages_leave_nothing_behind() {
     assert_eq!(Pdf::from_bytes(&bytes).unwrap().page_count(), 1);
 }
 
+/// One page per label, built the way word processors and form tools write them, so that other
+/// parts of the document point into every page:
+/// - each page draws its label, and a form XObject showing `FORM-<label>` from a resource
+///   dictionary all pages share (only that page draws its form);
+/// - each page has a filled text field whose value and appearance are `FIELD-<label>`;
+/// - a structure tree has an element per page whose ActualText is `TAG-<label>`;
+/// - the first page links to the last.
+fn layered_pdf(labels: &[&str]) -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica", "Encoding" => "WinAnsiEncoding",
+    });
+    let forms: Vec<(String, Object)> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let content = format!("BT /F1 12 Tf 72 400 Td (FORM-{label}) Tj ET");
+            let form = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+                },
+                content.into_bytes(),
+            ));
+            (format!("Fm{i}"), Object::Reference(form))
+        })
+        .collect();
+    let shared = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font },
+        "XObject" => Object::Dictionary(forms.into_iter().collect()),
+    });
+    let tree_root = doc.new_object_id();
+    let document_element = doc.new_object_id();
+    let (mut kids, mut widgets, mut elements, mut parents) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (i, label) in labels.iter().enumerate() {
+        let page_id = doc.new_object_id();
+        let content = format!("/P <</MCID 0>> BDC BT /F1 18 Tf 72 700 Td ({label}) Tj ET EMC /Fm{i} Do");
+        let content_id = doc.add_object(Stream::new(lopdf::Dictionary::new(), content.into_bytes()));
+        let appearance = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 200.into(), 20.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+            },
+            format!("BT /F1 12 Tf 2 5 Td (FIELD-{label}) Tj ET").into_bytes(),
+        ));
+        let widget = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx",
+            "T" => Object::string_literal(format!("field{i}")),
+            "V" => Object::string_literal(format!("FIELD-{label}")),
+            "Rect" => vec![72.into(), 600.into(), 272.into(), 620.into()],
+            "P" => page_id,
+            "AP" => dictionary! { "N" => appearance },
+        });
+        widgets.push(Object::Reference(widget));
+        let mut annots = vec![Object::Reference(widget)];
+        if i == 0 && labels.len() > 1 {
+            annots.push(Object::Reference(doc.add_object(dictionary! {
+                "Type" => "Annot", "Subtype" => "Link", "Rect" => vec![72.into(), 650.into(), 200.into(), 670.into()],
+                // Pointed at the last page below, once that exists.
+                "Dest" => Object::Null,
+            })));
+        }
+        let element = doc.add_object(dictionary! {
+            "Type" => "StructElem", "S" => "P", "P" => document_element, "Pg" => page_id, "K" => 0,
+            "ActualText" => Object::string_literal(format!("TAG-{label}")),
+        });
+        elements.push(Object::Reference(element));
+        parents.push(Object::Integer(i as i64));
+        parents.push(Object::Array(vec![Object::Reference(element)]));
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page", "Parent" => pages_id, "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Contents" => content_id, "Resources" => shared, "Annots" => annots, "StructParents" => i as i64,
+            }),
+        );
+        kids.push(Object::Reference(page_id));
+    }
+    // The link on the first page points at the last page.
+    let last = kids.last().and_then(|k| k.as_reference().ok()).unwrap();
+    for object in doc.objects.values_mut() {
+        if let Object::Dictionary(d) = object {
+            if d.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Link") {
+                d.set("Dest", vec![Object::Reference(last), "Fit".into()]);
+            }
+        }
+    }
+    doc.objects.insert(document_element, Object::Dictionary(dictionary! {
+        "Type" => "StructElem", "S" => "Document", "P" => tree_root, "K" => elements,
+    }));
+    doc.objects.insert(tree_root, Object::Dictionary(dictionary! {
+        "Type" => "StructTreeRoot", "K" => document_element,
+        "ParentTree" => dictionary! { "Nums" => parents }, "ParentTreeNextKey" => labels.len() as i64,
+    }));
+    doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+        "Type" => "Pages", "Kids" => kids.clone(), "Count" => kids.len() as i64,
+    }));
+    let catalog = doc.add_object(dictionary! {
+        "Type" => "Catalog", "Pages" => pages_id, "StructTreeRoot" => tree_root,
+        "MarkInfo" => dictionary! { "Marked" => true },
+        "AcroForm" => dictionary! { "Fields" => widgets, "DA" => Object::string_literal("/F1 12 Tf 0 g") },
+    });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// Number of fields left in the document's form.
+fn form_fields(pdf: &Pdf) -> usize {
+    let doc = pdf.document();
+    let Ok(Object::Dictionary(form)) = doc.catalog().unwrap().get(b"AcroForm").map(|f| match f {
+        Object::Reference(id) => doc.get_object(*id).unwrap().clone(),
+        other => other.clone(),
+    }) else {
+        return 0;
+    };
+    form.get(b"Fields").and_then(Object::as_array).map(Vec::len).unwrap_or(0)
+}
+
+#[test]
+fn deleting_a_page_takes_its_fields_tags_and_drawings_along() {
+    let r = renderer();
+    let base = layered_pdf(&["ALPHA", "BRAVO", "CHARLIE"]);
+    let (mut pdf, saved) = SavedFile::open(base, None).unwrap();
+    pdf.delete_pages(&[1]).unwrap();
+    assert_eq!(form_fields(&pdf), 2, "the other pages keep their fields");
+    let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, true);
+    assert_eq!(plan, CLEAN);
+    assert_gone(&bytes, "BRAVO");
+    for kept in ["ALPHA", "CHARLIE"] {
+        assert!(contains(&bytes, format!("FIELD-{kept}").as_bytes()) && contains(&bytes, format!("TAG-{kept}").as_bytes()));
+    }
+    // The pages that stay still draw their own forms.
+    let mut reopened = Pdf::from_bytes(&bytes).unwrap();
+    let text = page_text(r, &mut reopened, 1);
+    assert!(text.contains("CHARLIE") && text.contains("FORM-CHARLIE"), "{text:?}");
+}
+
+#[test]
+fn redaction_takes_the_page_fields_and_drawings_along() {
+    let r = renderer();
+    let base = layered_pdf(&["ALPHA", "BRAVO", "CHARLIE"]);
+    let (mut pdf, saved) = SavedFile::open(base, None).unwrap();
+    pdf.apply_redactions(r, &[Redaction { page: 1, rect: Rect::new(0.0, 0.0, 612.0, 792.0) }], 72.0).unwrap();
+    assert_eq!(form_fields(&pdf), 2);
+    let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, true);
+    assert_eq!(plan, CLEAN);
+    assert_gone(&bytes, "BRAVO");
+    let mut reopened = Pdf::from_bytes(&bytes).unwrap();
+    assert_eq!(reopened.page_count(), 3);
+    for (page, kept) in [(0, "ALPHA"), (2, "CHARLIE")] {
+        let text = page_text(r, &mut reopened, page);
+        assert!(text.contains(kept) && text.contains(&format!("FORM-{kept}")), "{text:?}");
+    }
+}
+
+#[test]
+fn extracted_pages_carry_nothing_of_the_other_pages() {
+    let r = renderer();
+    let source = Pdf::from_bytes(&layered_pdf(&["ALPHA", "BRAVO", "CHARLIE"])).unwrap();
+    let mut part = source.extract_pages(&[0]).unwrap();
+    assert_eq!(form_fields(&part), 1);
+    let bytes = part.to_bytes().unwrap();
+    assert_gone(&bytes, "BRAVO");
+    assert_gone(&bytes, "CHARLIE");
+    let text = page_text(r, &mut part, 0);
+    assert!(text.contains("ALPHA") && text.contains("FORM-ALPHA"), "{text:?}");
+
+    let mut last = source.extract_pages(&[2]).unwrap();
+    let bytes = last.to_bytes().unwrap();
+    assert_gone(&bytes, "ALPHA");
+    assert_gone(&bytes, "BRAVO");
+    assert!(page_text(r, &mut last, 0).contains("FORM-CHARLIE"));
+}
+
 /// A signed one-page file whose page carries an ink drawing: numbers only, no appearance stream.
 fn signed_with_ink() -> (Vec<u8>, Vec<Object>) {
     let mut doc = text_pdf(&[&["contract body"]]);
@@ -585,6 +762,20 @@ fn a_signature_the_file_already_fails_is_not_kept_by_appending() {
     let (mut pdf, saved) = SavedFile::open(rewritten, None).unwrap();
     pdf.add_note(0, 100.0, 100.0, "after the rewrite").unwrap();
     assert_eq!(pdf.save_plan(Some(&saved), false).unwrap(), CLEAN);
+}
+
+#[test]
+fn redacting_a_drawn_signature_takes_the_signature_along() {
+    let r = renderer();
+    let mut doc = text_pdf(&[&["contract body"]]);
+    let base = file_bytes(&mut doc);
+    let mut options = sign_options(SubFilter::Pkcs7Detached);
+    options.appearance = Some((0, Rect::new(300.0, 100.0, 200.0, 60.0)));
+    let signed = doc.sign(&base, &options).unwrap();
+    let (mut pdf, saved) = SavedFile::open(signed, None).unwrap();
+    pdf.apply_redactions(r, &[Redaction { page: 0, rect: Rect::new(290.0, 90.0, 220.0, 80.0) }], 72.0).unwrap();
+    let (_, bytes) = plan_and_bytes(&mut pdf, &saved, true);
+    assert!(verify(&bytes, &trust_test_identity()).is_empty(), "the blacked-out signature still names its signer");
 }
 
 #[test]
