@@ -80,24 +80,13 @@ pub fn load_trust_store() -> carbide_engine::signature::TrustStore {
     store
 }
 
-/// Adds a PEM or DER certificate file to the trusted list. Returns how many were added.
+/// Adds the X.509 certificate(s) in a PEM or DER file to the trusted list. Returns how many were
+/// added, or an error when the file holds no certificate (so a key or PKCS#12 chosen by mistake is
+/// not copied into the trust directory).
 pub fn trust_certificate_file(path: &std::path::Path) -> std::io::Result<usize> {
-    use base64::Engine;
     let bytes = std::fs::read(path)?;
-    let mut ders: Vec<Vec<u8>> = Vec::new();
-    if let Ok(text) = std::str::from_utf8(&bytes) {
-        for block in text.split("-----BEGIN CERTIFICATE-----").skip(1) {
-            if let Some(body) = block.split("-----END CERTIFICATE-----").next() {
-                let cleaned: String = body.chars().filter(|c| !c.is_whitespace()).collect();
-                if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(cleaned) {
-                    ders.push(der);
-                }
-            }
-        }
-    }
-    if ders.is_empty() {
-        ders.push(bytes);
-    }
+    let ders = carbide_engine::signature::read_certificates(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     std::fs::create_dir_all(trusted_dir())?;
     let count = ders.len();
     for der in ders {

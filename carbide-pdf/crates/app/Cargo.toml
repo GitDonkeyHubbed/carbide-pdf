@@ -13,7 +13,6 @@ carbide-engine = { path = "../engine" }
 eframe.workspace = true
 rfd.workspace = true
 image.workspace = true
-base64.workspace = true
 chrono.workspace = true
 
 # Only used to make the application menu's Quit go through the window's close request.

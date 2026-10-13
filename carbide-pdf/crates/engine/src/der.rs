@@ -1,5 +1,9 @@
 //! Minimal DER encoding and walking, enough to build and read CMS SignedData and RFC 3161
-//! messages. (The original also encodes these structures by hand.)
+//! messages.
+//!
+//! `read` accepts DER only. CMS from other signers often comes in BER, with indefinite lengths;
+//! `read_ber` and `children_ber` accept that too, and `normalize` turns such an element back into
+//! DER where its encoding is hashed.
 
 pub const SEQUENCE: u8 = 0x30;
 pub const SET: u8 = 0x31;
@@ -106,8 +110,34 @@ pub struct Element<'a> {
 
 /// Reads one element from the front of `data`, returning it and the remaining bytes.
 pub fn read(data: &[u8]) -> Option<(Element<'_>, &[u8])> {
+    read_with(data, None)
+}
+
+/// Like `read`, but also accepts the indefinite length BER allows for constructed elements. The
+/// element's `content` then runs up to its end-of-contents marker, which `raw` includes.
+pub fn read_ber(data: &[u8]) -> Option<(Element<'_>, &[u8])> {
+    read_with(data, Some(0))
+}
+
+/// How deeply indefinite-length elements may nest (and how deep `normalize` goes).
+const MAX_DEPTH: usize = 64;
+
+/// `ber_depth` is `None` for DER, else how many indefinite-length elements enclose this one.
+fn read_with(data: &[u8], ber_depth: Option<usize>) -> Option<(Element<'_>, &[u8])> {
     let tag = *data.first()?;
     let first = *data.get(1)?;
+    if first == 0x80 {
+        let depth = ber_depth?;
+        if tag & 0x20 == 0 || depth >= MAX_DEPTH {
+            return None;
+        }
+        let mut rest = &data[2..];
+        while !rest.starts_with(&[0, 0]) {
+            rest = read_with(rest, Some(depth + 1))?.1;
+        }
+        let content_end = data.len() - rest.len();
+        return Some((Element { tag, content: &data[2..content_end], raw: &data[..content_end + 2] }, &rest[2..]));
+    }
     let (len, header) = if first < 0x80 {
         (first as usize, 2)
     } else {
@@ -128,12 +158,12 @@ pub fn read(data: &[u8]) -> Option<(Element<'_>, &[u8])> {
     Some((Element { tag, content: &data[header..end], raw: &data[..end] }, &data[end..]))
 }
 
-/// All elements directly inside `content`.
-pub fn children(content: &[u8]) -> Vec<Element<'_>> {
+/// All elements directly inside `content`, which may be BER.
+pub fn children_ber(content: &[u8]) -> Vec<Element<'_>> {
     let mut out = Vec::new();
     let mut rest = content;
     while !rest.is_empty() {
-        match read(rest) {
+        match read_ber(rest) {
             Some((element, next)) => {
                 out.push(element);
                 rest = next;
@@ -142,6 +172,68 @@ pub fn children(content: &[u8]) -> Vec<Element<'_>> {
         }
     }
     out
+}
+
+/// The value of a small non-negative INTEGER element's content.
+pub fn small_unsigned(content: &[u8]) -> Option<u64> {
+    if content.is_empty() || content[0] & 0x80 != 0 || content.len() > 9 {
+        return None;
+    }
+    let digits = if content.len() == 9 && content[0] == 0 { &content[1..] } else { content };
+    if digits.len() > 8 {
+        return None;
+    }
+    Some(digits.iter().fold(0u64, |value, b| (value << 8) | *b as u64))
+}
+
+/// The DER encoding of a (possibly BER) element: definite lengths throughout, and a string sent
+/// in pieces joined into one. `None` when it nests too deeply or does not parse.
+pub fn normalize(element: &Element<'_>) -> Option<Vec<u8>> {
+    normalize_at(element, 0)
+}
+
+fn normalize_at(element: &Element<'_>, depth: usize) -> Option<Vec<u8>> {
+    if element.tag & 0x20 == 0 {
+        return Some(tlv(element.tag, element.content));
+    }
+    if depth >= MAX_DEPTH {
+        return None;
+    }
+    // Constructed OCTET STRING and BIT STRING are BER only; DER sends them in one piece.
+    if matches!(element.tag, 0x24 | 0x23) {
+        return Some(tlv(element.tag & !0x20, &string_value(element)?));
+    }
+    let mut content = Vec::with_capacity(element.content.len());
+    let mut rest = element.content;
+    while !rest.is_empty() {
+        let (child, next) = read_ber(rest)?;
+        content.extend(normalize_at(&child, depth + 1)?);
+        rest = next;
+    }
+    Some(tlv(element.tag, &content))
+}
+
+/// The bytes of a string element (OCTET STRING, or an implicitly tagged one), joining the pieces of
+/// a constructed (BER) string.
+pub fn string_value(element: &Element<'_>) -> Option<Vec<u8>> {
+    string_value_at(element, 0)
+}
+
+fn string_value_at(element: &Element<'_>, depth: usize) -> Option<Vec<u8>> {
+    if element.tag & 0x20 == 0 {
+        return Some(element.content.to_vec());
+    }
+    if depth >= MAX_DEPTH {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut rest = element.content;
+    while !rest.is_empty() {
+        let (piece, next) = read_ber(rest)?;
+        out.extend(string_value_at(&piece, depth + 1)?);
+        rest = next;
+    }
+    Some(out)
 }
 
 /// Decodes an OID element's content to dotted-decimal text.
@@ -190,13 +282,47 @@ mod tests {
     }
 
     #[test]
+    fn indefinite_lengths_are_read_as_ber_only() {
+        let ber = [0x30, 0x80, 0x02, 0x01, 0x07, 0x00, 0x00, 0xAA];
+        assert!(read(&ber).is_none(), "DER has no indefinite lengths");
+        let (element, rest) = read_ber(&ber).unwrap();
+        assert_eq!(element.content, &[0x02, 0x01, 0x07]);
+        assert_eq!(element.raw, &ber[..7]);
+        assert_eq!(rest, &[0xAA]);
+        assert_eq!(normalize(&element).unwrap(), vec![0x30, 0x03, 0x02, 0x01, 0x07]);
+
+        // Nested indefinite lengths, a constructed OCTET STRING sent in two pieces.
+        let nested = [0xA0, 0x80, 0x24, 0x80, 0x04, 0x01, b'a', 0x04, 0x02, b'b', b'c', 0x00, 0x00, 0x00, 0x00];
+        let (outer, rest) = read_ber(&nested).unwrap();
+        assert!(rest.is_empty());
+        let inner = children_ber(outer.content);
+        assert_eq!(inner.len(), 1);
+        assert_eq!(string_value(&inner[0]).unwrap(), b"abc");
+        assert_eq!(normalize(&outer).unwrap(), vec![0xA0, 0x05, 0x04, 0x03, b'a', b'b', b'c']);
+
+        // Primitive elements cannot be indefinite, and nesting is bounded.
+        assert!(read_ber(&[0x04, 0x80, 0x00, 0x00]).is_none());
+        let mut deep: Vec<u8> = std::iter::repeat_n([0x30, 0x80], 200).flatten().collect();
+        deep.extend(std::iter::repeat_n(0, 400));
+        assert!(read_ber(&deep).is_none());
+    }
+
+    #[test]
+    fn small_integers() {
+        assert_eq!(small_unsigned(&[0x14]), Some(20));
+        assert_eq!(small_unsigned(&[0x00, 0x80]), Some(128));
+        assert_eq!(small_unsigned(&[0x80]), None);
+        assert_eq!(small_unsigned(&[]), None);
+    }
+
+    #[test]
     fn walk_nested_structures() {
         let data = sequence(&[&integer_small(7), &set(&[&octet_string(b"abc")])]);
         let (root, rest) = read(&data).unwrap();
         assert!(rest.is_empty());
-        let kids = children(root.content);
+        let kids = children_ber(root.content);
         assert_eq!(kids.len(), 2);
         assert_eq!(kids[0].tag, INTEGER);
-        assert_eq!(children(kids[1].content)[0].content, b"abc");
+        assert_eq!(children_ber(kids[1].content)[0].content, b"abc");
     }
 }

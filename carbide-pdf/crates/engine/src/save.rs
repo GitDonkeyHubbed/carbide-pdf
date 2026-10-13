@@ -129,7 +129,7 @@ impl Pdf {
         }
         // A signature the file already fails (after an earlier rewrite, say) is not worth keeping
         // the old bytes for.
-        let signed = base.has_intact_signatures(&saved.bytes);
+        let signed = base.has_intact_signatures(&saved.bytes, saved.password());
         let revisions = !base.revisions().is_empty();
         let removed = content_removed || saved.removed_from(self);
         // A file whose cross-reference table had to be rebuilt has nothing for an update to point

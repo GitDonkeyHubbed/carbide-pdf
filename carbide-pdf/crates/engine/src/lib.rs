@@ -5,6 +5,7 @@
 
 pub mod annotate;
 pub mod autosave;
+mod cms;
 pub mod compare;
 mod content;
 mod crypt;
@@ -27,6 +28,7 @@ pub mod save;
 mod scrub;
 pub mod security;
 pub mod signature;
+mod sigcrypto;
 pub mod stamp;
 
 pub use annotate::{AnnotationSummary, MarkupStyle};

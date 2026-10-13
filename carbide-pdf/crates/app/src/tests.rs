@@ -11,7 +11,7 @@ use carbide_engine::{pdf_date_now, Pdf, ProtectionOptions};
 use eframe::egui;
 
 use crate::dialogs::{AfterSave, Dialog};
-use crate::{CarbideApp, OcrJob};
+use crate::{CarbideApp, OcrJob, SignJob};
 
 /// A folder of its own for one test.
 fn scratch() -> PathBuf {
@@ -221,6 +221,43 @@ fn ocr_results_only_replace_the_unchanged_document_they_came_from() {
     app.poll_ocr();
     assert!(app.ocr_job.is_none());
     assert_eq!(app.doc.as_ref().unwrap().pdf.page_rotation(0).unwrap(), 180);
+}
+
+#[test]
+fn a_time_stamped_signature_is_written_only_over_the_unchanged_document() {
+    let dir = scratch();
+    let mut app = app(&dir);
+    let start = |app: &mut CarbideApp, path: &Path| {
+        let doc = app.doc.as_ref().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let done = "Signed".to_string();
+        app.sign_job = Some(SignJob { doc: doc.id, version: doc.version, path: path.to_path_buf(), done, receiver, result: None });
+        sender
+    };
+    let signed = || document(&["STAMPED"]).to_bytes().unwrap();
+
+    // The document is edited while the authority answers: its file is left alone.
+    let a = plain(&dir, "a.pdf", &["ORIGINAL"]);
+    app.open_path(&a);
+    let sender = start(&mut app, &a);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    sender.send(Ok(signed())).unwrap();
+    app.poll_sign();
+    assert!(app.sign_job.is_none());
+    assert!(!contains(&std::fs::read(&a).unwrap(), "STAMPED"), "an edited document's file was replaced");
+
+    // Unchanged: the signed bytes replace the file, and the document is reloaded from them.
+    let b = plain(&dir, "b.pdf", &["ORIGINAL"]);
+    app.open_path(&b);
+    let sender = start(&mut app, &b);
+    app.poll_sign();
+    assert!(app.sign_job.is_some(), "nothing has arrived yet");
+    sender.send(Ok(signed())).unwrap();
+    app.poll_sign();
+    assert!(app.sign_job.is_none());
+    assert!(contains(&std::fs::read(&b).unwrap(), "STAMPED"));
+    assert_eq!(app.status, "Signed");
+    assert!(!app.doc.as_ref().unwrap().dirty);
 }
 
 #[test]

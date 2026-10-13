@@ -8,8 +8,8 @@ use carbide_engine::autosave::{AutoSaveStore, RowKind};
 use carbide_engine::imposition::{ImpositionOptions, Margins, Media};
 use carbide_engine::ocr::OcrOptions;
 use carbide_engine::signature::{
-    messages as sig_messages, notice_text, CertifyLevel, Detail, Identity, SignOptions, SubFilter, TimestampSource,
-    TrustStore, Validity,
+    messages as sig_messages, notice_text, CertifyLevel, Detail, HttpTimestampSource, Identity, SignOptions, SubFilter,
+    TimestampSource, TrustStore, Validity,
 };
 use carbide_engine::reduce::{messages as reduce_messages, reduce_files, OutputOptions, ReduceOptions};
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PlanOptions, PrintingOrder, Style};
@@ -1775,49 +1775,1134 @@ fn certifying_signature_records_docmdp_and_must_come_first() {
     assert!(err.contains("first signature"), "{err}");
 }
 
-struct FakeAuthority;
+/// The `/ByteRange` of the last signature in `file`.
+fn byte_range(file: &[u8]) -> [usize; 4] {
+    let at = file.windows(10).rposition(|w| w == b"/ByteRange").unwrap();
+    let open = at + file[at..].iter().position(|b| *b == b'[').unwrap();
+    let close = open + file[open..].iter().position(|b| *b == b']').unwrap();
+    let numbers: Vec<usize> =
+        std::str::from_utf8(&file[open + 1..close]).unwrap().split_whitespace().map(|n| n.parse().unwrap()).collect();
+    numbers.try_into().unwrap()
+}
 
-impl TimestampSource for FakeAuthority {
-    fn token_for_digest(&self, digest: &[u8; 32]) -> carbide_engine::Result<Vec<u8>> {
-        // Not a real token: a ContentInfo-shaped blob that embeds the imprint it was asked for.
-        let mut inner = vec![0x04, 32];
-        inner.extend_from_slice(digest);
-        let mut blob = vec![0x30, (inner.len() + 2) as u8, 0x06, 0x00];
-        blob.extend(inner);
-        let mut out = vec![0x30];
-        out.push(blob.len() as u8);
-        out.extend(blob);
-        Ok(out)
+/// Tag, header length and total length of the DER element at the front of `data`.
+fn der_header(data: &[u8]) -> (u8, usize, usize) {
+    let first = data[1] as usize;
+    if first < 0x80 {
+        return (data[0], 2, 2 + first);
+    }
+    let n = first & 0x7F;
+    let len = data[2..2 + n].iter().fold(0usize, |len, b| (len << 8) | *b as usize);
+    (data[0], 2 + n, 2 + n + len)
+}
+
+/// The CMS in the last signature's `/Contents`, without the zero padding after it.
+fn signature_value(file: &[u8]) -> Vec<u8> {
+    let [_, b, c, _] = byte_range(file);
+    let hex = std::str::from_utf8(&file[b + 1..c - 1]).unwrap();
+    let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+    let (_, _, total) = der_header(&bytes);
+    bytes[..total].to_vec()
+}
+
+/// Writes `cms` into the last signature's `/Contents`, zero-padded to the reserved size.
+fn put_signature_value(file: &mut [u8], cms: &[u8]) {
+    let [_, b, c, _] = byte_range(file);
+    let hex: String = cms.iter().map(|b| format!("{b:02X}")).collect();
+    assert!(hex.len() <= c - b - 2, "the signature does not fit");
+    let slot = &mut file[b + 1..c - 1];
+    slot.fill(b'0');
+    slot[..hex.len()].copy_from_slice(hex.as_bytes());
+}
+
+/// `der` written again with indefinite lengths on every constructed element, as BER signers do,
+/// except the elements `keep` selects by their path of child positions (and what is inside them).
+fn to_ber(der: &[u8], path: &mut Vec<usize>, keep: &dyn Fn(&[usize]) -> bool) -> Vec<u8> {
+    let (tag, header, total) = der_header(der);
+    if tag & 0x20 == 0 || keep(path) {
+        return der[..total].to_vec();
+    }
+    let mut out = vec![tag, 0x80];
+    let mut rest = &der[header..total];
+    for index in 0.. {
+        if rest.is_empty() {
+            break;
+        }
+        let (_, _, len) = der_header(rest);
+        path.push(index);
+        let child = to_ber(&rest[..len], path, keep);
+        path.pop();
+        out.extend(child);
+        rest = &rest[len..];
+    }
+    out.extend([0, 0]);
+    out
+}
+
+#[test]
+fn signatures_in_ber_with_indefinite_lengths_verify() {
+    let mut doc = text_pdf(&[&["ber"]]);
+    let base = file_bytes(&mut doc);
+    for sub_filter in [SubFilter::Pkcs7Detached, SubFilter::CadesDetached] {
+        let mut signed = doc.sign(&base, &sign_options(sub_filter)).unwrap();
+        let der = signature_value(&signed);
+        // Every wrapper, the signer info and the signed attributes become indefinite-length; the
+        // certificates themselves stay DER, as they must for their own signatures to hold.
+        let ber = to_ber(&der, &mut Vec::new(), &|path: &[usize]| path.len() == 4 && path[..3] == [1, 0, 3]);
+        assert_ne!(ber, der);
+        assert_eq!(&ber[..2], &[0x30, 0x80]);
+        put_signature_value(&mut signed, &ber);
+        let reports = verify(&signed, &trust_test_identity());
+        assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly), "{sub_filter:?}");
+    }
+}
+
+/// Rewrites the four `/ByteRange` numbers in place (same widths), leaving every other byte and
+/// every cross-reference offset intact so the file still parses.
+fn set_byte_range(file: &mut [u8], range: [usize; 4]) {
+    let text = format!("{:010} {:010} {:010} {:010}", range[0], range[1], range[2], range[3]);
+    let at = file.windows(10).rposition(|w| w == b"/ByteRange").unwrap();
+    let open = at + file[at..].iter().position(|x| *x == b'[').unwrap() + 1;
+    file[open..open + text.len()].copy_from_slice(text.as_bytes());
+}
+
+#[test]
+fn tampering_with_a_signed_file_comes_out_invalid() {
+    let mut doc = text_pdf(&[&["pay 100 dollars"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    assert_eq!(verify(&signed, &trust_test_identity())[0].validity, Validity::Valid);
+    let [a, b, c, d] = byte_range(&signed);
+
+    // The gap is widened past the hex /Contents it must enclose: the claimed gap now runs two
+    // bytes beyond the closing '>'.
+    let mut widened = signed.clone();
+    set_byte_range(&mut widened, [a, b, c + 2, d - 2]);
+    let reports = verify(&widened, &trust_test_identity());
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Invalid, Detail::BadByteRange), "widened gap");
+
+    // The /Contents value is changed in place (a hex digit flipped), offsets untouched.
+    let mut swapped = signed.clone();
+    swapped[b + 1] = if swapped[b + 1] == b'0' { b'1' } else { b'0' };
+    assert_ne!(verify(&swapped, &trust_test_identity())[0].validity, Validity::Valid, "altered /Contents");
+}
+
+/// The signature dictionary's object number, read from its `N 0 obj` header before `/ByteRange`.
+fn signature_object_number(file: &[u8]) -> u32 {
+    let at = file.windows(10).rposition(|w| w == b"/ByteRange").unwrap();
+    let obj = file[..at].windows(4).rposition(|w| w == b" obj").unwrap();
+    let line = file[..obj].iter().rposition(|b| matches!(b, b'\n' | b'\r' | b'>')).map(|p| p + 1).unwrap_or(0);
+    std::str::from_utf8(&file[line..obj]).unwrap().split_whitespace().next().unwrap().parse().unwrap()
+}
+
+/// The offset the file's last `startxref` names.
+fn startxref(file: &[u8]) -> usize {
+    let at = file.windows(9).rposition(|w| w == b"startxref").unwrap();
+    std::str::from_utf8(&file[at + 9..]).unwrap().split_whitespace().next().unwrap().parse().unwrap()
+}
+
+#[test]
+fn a_signature_object_moved_after_the_gap_is_rejected() {
+    // A signature-wrapping layout: an appended revision redefines the signature dictionary so its
+    // bytes now sit after the gap its own ByteRange covers. The verifier must not accept it.
+    let mut doc = text_pdf(&[&["original"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    assert_eq!(verify(&signed, &trust_test_identity())[0].validity, Validity::Valid);
+
+    let id = signature_object_number(&signed);
+    let hex: String = signature_value(&signed).iter().map(|b| format!("{b:02X}")).collect();
+    let [_, b, c, _] = byte_range(&signed);
+    let prev = startxref(&signed);
+
+    let mut forged = signed.clone();
+    forged.push(b'\n');
+    let obj_at = forged.len();
+    forged.extend_from_slice(
+        format!("{id} 0 obj\n<</Type/Sig/Filter/Adobe.PPKLite/SubFilter/adbe.pkcs7.detached/ByteRange[0 {b} {c} 0]/Contents<{hex}>>>\nendobj\n").as_bytes(),
+    );
+    let xref_at = forged.len();
+    forged.extend_from_slice(
+        format!("xref\n{id} 1\n{obj_at:010} 00000 n \ntrailer\n<</Size {}/Root 1 0 R/Prev {prev}>>\nstartxref\n{xref_at}\n%%EOF", id + 1).as_bytes(),
+    );
+    let reports = verify(&forged, &trust_test_identity());
+    assert_eq!(reports[0].detail, Detail::BadByteRange, "relocated signature object was {:?}", reports[0].validity);
+}
+
+/// The two numbers after the last `/key` in `file` (a trailer reference such as `/Root 5 0 R`), or
+/// just the first for a number such as `/Size`.
+fn trailer_numbers(file: &[u8], key: &str) -> (u32, u32) {
+    let needle = format!("/{key}");
+    let at = file.windows(needle.len()).rposition(|w| w == needle.as_bytes()).unwrap() + needle.len();
+    let text = String::from_utf8_lossy(&file[at..(at + 40).min(file.len())]).into_owned();
+    let numbers: Vec<u32> = text.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).take(2).map(|s| s.parse().unwrap()).collect();
+    (numbers[0], numbers.get(1).copied().unwrap_or(0))
+}
+
+/// `file` with one more revision appended by hand: `objects` are complete `N G obj ... endobj`
+/// texts, each filed under the paired number in a classic cross-reference section. `extra` goes
+/// into the trailer as it is.
+fn append_revision(file: &[u8], objects: &[(u32, String)], extra: &str) -> Vec<u8> {
+    let (root, root_generation) = trailer_numbers(file, "Root");
+    let size = objects.iter().map(|(n, _)| n + 1).max().unwrap_or(0).max(trailer_numbers(file, "Size").0);
+    let prev = startxref(file);
+    let mut out = file.to_vec();
+    out.push(b'\n');
+    let mut entries = String::new();
+    for (number, text) in objects {
+        entries += &format!("{number} 1\n{:010} 00000 n \n", out.len());
+        out.extend_from_slice(text.as_bytes());
+        out.push(b'\n');
+    }
+    let xref_at = out.len();
+    out.extend_from_slice(
+        format!("xref\n{entries}trailer\n<</Size {size}/Root {root} {root_generation} R/Prev {prev}{extra}>>\nstartxref\n{xref_at}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn a_second_copy_of_the_signature_dictionary_after_the_signed_revision_is_ignored() {
+    let mut doc = text_pdf(&[&["the contract"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    let original = verify(&signed, &trust_test_identity()).remove(0);
+    let [_, b, c, d] = byte_range(&signed);
+    let id = signature_object_number(&signed);
+    let gap = String::from_utf8(signed[b + 1..c - 1].to_vec()).unwrap();
+
+    // An update files a new object number under bytes that claim to be the signature dictionary,
+    // with the same byte range and value but the attacker's date, name and reason. The loader
+    // keeps the later copy.
+    let alias = format!(
+        "{id} 0 obj\n<</Type/Sig/Filter/Adobe.PPKLite/SubFilter/adbe.pkcs7.detached/ByteRange[0 {b} {c} {d}]/Contents<{gap}>/M(D:19990101000000Z)/Name(Mallory)/Reason(I reject this contract)/Location(Nowhere)>>\nendobj"
+    );
+    let forged = append_revision(&signed, &[(trailer_numbers(&signed, "Size").0, alias)], "");
+    let report = verify(&forged, &trust_test_identity()).remove(0);
+    assert!(report.modified_after_signing);
+    assert_eq!((report.validity, report.detail), (Validity::Valid, Detail::TrustedDirectly));
+    assert_eq!(report.reason.as_deref(), Some("I approve"));
+    assert_eq!((&report.location, &report.signing_time), (&original.location, &original.signing_time));
+    assert_eq!(report.claimed_name, None, "the signed /Name matches the certificate");
+}
+
+#[test]
+fn bytes_written_into_the_gap_never_make_a_signature_disappear() {
+    let mut doc = text_pdf(&[&["gap"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    let [_, b, c, _] = byte_range(&signed);
+    let (size, (root, _)) = (trailer_numbers(&signed, "Size").0, trailer_numbers(&signed, "Root"));
+
+    // A whole revision inside the gap: the hex string and the dictionary are closed early, then
+    // come an object, its cross-reference section and a trailer, and a comment hides the rest.
+    let at = b + 1;
+    let mut revision = ">>>\nendobj\n".to_string();
+    let object_at = at + revision.len();
+    revision += &format!("{size} 0 obj\n<</Length 0>>stream\n\nendstream\nendobj\n");
+    let xref_at = at + revision.len();
+    revision += &format!(
+        "xref\n{size} 1\n{object_at:010} 00000 n \ntrailer\n<</Size {}/Root {root} 0 R/Prev {}>>\nstartxref\n{xref_at}\n%%EOF\n%",
+        size + 1,
+        startxref(&signed)
+    );
+    assert!(revision.len() < c - 1 - at);
+    let mut in_gap = signed.clone();
+    in_gap[at..at + revision.len()].copy_from_slice(revision.as_bytes());
+
+    // Two bytes that leave the dictionary unparseable.
+    let mut unbalanced = signed.clone();
+    unbalanced[c - 3..c - 1].copy_from_slice(b">(");
+
+    for (label, forged) in [("revision in the gap", in_gap), ("unbalanced", unbalanced)] {
+        let reports = verify(&forged, &trust_test_identity());
+        assert!(!reports.is_empty(), "{label}: the signature vanished");
+        assert!(reports.iter().all(|r| r.validity == Validity::Invalid), "{label}: {:?}", reports.iter().map(|r| r.detail).collect::<Vec<_>>());
+        assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_PROBLEMS), "{label}");
+        assert!(Pdf::from_bytes(&forged).unwrap().has_signatures(), "{label}");
+    }
+}
+
+/// `protected` (an encrypted file) with a signature over all of it appended by hand, as another
+/// signer would: a signature dictionary holds no encrypted strings, and its value never is.
+fn sign_protected(protected: &[u8]) -> Vec<u8> {
+    let (encrypt, generation) = trailer_numbers(protected, "Encrypt");
+    let id = trailer_numbers(protected, "Size").0;
+    let placeholder = "0".repeat(2 * 4096);
+    let dictionary = format!(
+        "{id} 0 obj\n<</Type/Sig/Filter/Adobe.PPKLite/SubFilter/adbe.pkcs7.detached/ByteRange[0000000000 0000000000 0000000000 0000000000]/Contents<{placeholder}>>>\nendobj"
+    );
+    let mut signed = append_revision(protected, &[(id, dictionary)], &format!("/Encrypt {encrypt} {generation} R"));
+    let b = signed.windows(placeholder.len() + 1).rposition(|w| w[0] == b'<' && w[1..].iter().all(|x| *x == b'0')).unwrap();
+    let c = b + placeholder.len() + 2;
+    let d = signed.len() - c;
+    set_byte_range(&mut signed, [0, b, c, d]);
+
+    // Sign the covered bytes directly (no signed attributes).
+    use rsa::pkcs8::DecodePrivateKey;
+    let key = rsa::RsaPrivateKey::from_pkcs8_der(&test_identity().pkcs8).unwrap();
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(covered_bytes(&signed));
+    let signature = key.sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &digest).unwrap();
+    let cms = detached_cms(&test_identity().certificate, SHA256_OID, &[1, 2, 840, 113549, 1, 1, 11], None, &signature);
+    put_signature_value(&mut signed, &cms);
+    signed
+}
+
+#[test]
+fn signatures_on_owner_password_protected_files_verify() {
+    // Protected with an owner password only, so it opens without one. Its strings and streams are
+    // encrypted, but the signature value is not.
+    let plain = text_pdf(&[&["protected and signed"]]).to_bytes().unwrap();
+    let protected = Pdf::from_bytes(&plain).unwrap().to_encrypted_bytes(&ProtectionOptions::new("", "owner")).unwrap();
+    let signed = sign_protected(&protected);
+    let reports = verify(&signed, &trust_test_identity());
+    assert_eq!(reports.len(), 1);
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
+
+    // And the covered (encrypted) bytes are still bound to it: one bit of the page content's
+    // ciphertext changes, which leaves the file's structure as it was.
+    let mut tampered = signed.clone();
+    let data = signed.windows(7).position(|w| w == b"stream\n").unwrap() + 7;
+    tampered[data + 4] ^= 0x01;
+    let reports = verify(&tampered, &trust_test_identity());
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Invalid, Detail::DigestMismatch));
+}
+
+#[test]
+fn a_signed_file_with_an_open_password_and_a_later_update_takes_appended_edits() {
+    let plain = text_pdf(&[&["locked and signed"]]).to_bytes().unwrap();
+    let protected = Pdf::from_bytes(&plain).unwrap().to_encrypted_bytes(&ProtectionOptions::new("user", "owner")).unwrap();
+    let signed = sign_protected(&protected);
+    // An update after the signature, so its revision has to be read on its own, with the password.
+    let (encrypt, generation) = trailer_numbers(&signed, "Encrypt");
+    let n = trailer_numbers(&signed, "Size").0;
+    let note = format!("{n} 0 obj\n<</Type/Annot/Subtype/Square/Rect[0 0 1 1]>>\nendobj");
+    let updated = append_revision(&signed, &[(n, note)], &format!("/Encrypt {encrypt} {generation} R"));
+    let (mut pdf, saved) = SavedFile::open(updated, Some("user".into())).unwrap();
+    pdf.rotate_pages(&[0], 90).unwrap();
+    assert_eq!(pdf.save_plan(Some(&saved), false).unwrap(), SavePlan::Incremental, "the intact signature was treated as broken");
+}
+
+// ---- algorithm coverage (S7, S6) ----------------------------------------------------------
+
+mod algo {
+    //! Minimal DER, enough to wrap a signature of any algorithm into a detached CMS whose signer
+    //! certificate the verifier reads.
+    pub fn len(n: usize) -> Vec<u8> {
+        if n < 0x80 {
+            vec![n as u8]
+        } else {
+            let bytes = n.to_be_bytes();
+            let skip = bytes.iter().take_while(|b| **b == 0).count();
+            let mut out = vec![0x80 | (bytes.len() - skip) as u8];
+            out.extend_from_slice(&bytes[skip..]);
+            out
+        }
+    }
+    pub fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend(len(body.len()));
+        out.extend_from_slice(body);
+        out
+    }
+    pub fn seq(parts: &[&[u8]]) -> Vec<u8> {
+        tlv(0x30, &parts.concat())
+    }
+    pub fn set(parts: &[&[u8]]) -> Vec<u8> {
+        tlv(0x31, &parts.concat())
+    }
+    pub fn ctx(n: u8, body: &[u8]) -> Vec<u8> {
+        tlv(0xA0 | n, body)
+    }
+    pub fn oid(arcs: &[u32]) -> Vec<u8> {
+        let mut content = vec![(arcs[0] * 40 + arcs[1]) as u8];
+        for &arc in &arcs[2..] {
+            let mut stack = vec![(arc & 0x7F) as u8];
+            let mut rest = arc >> 7;
+            while rest > 0 {
+                stack.push(0x80 | (rest & 0x7F) as u8);
+                rest >>= 7;
+            }
+            stack.reverse();
+            content.extend(stack);
+        }
+        tlv(0x06, &content)
+    }
+    pub fn null() -> Vec<u8> {
+        vec![0x05, 0x00]
+    }
+}
+
+/// A detached CMS SignedData with one signer, no signed attributes: the signature covers the
+/// content directly. `cert_der` is embedded and named as the signer.
+fn detached_cms(cert_der: &[u8], digest_oid: &[u32], sig_oid: &[u32], sig_params: Option<Vec<u8>>, signature: &[u8]) -> Vec<u8> {
+    use algo::*;
+    use x509_cert::der::{Decode, Encode};
+    let cert = x509_cert::Certificate::from_der(cert_der).unwrap();
+    let issuer = cert.tbs_certificate.issuer.to_der().unwrap();
+    let serial = cert.tbs_certificate.serial_number.to_der().unwrap();
+    let issuer_and_serial = seq(&[&issuer, &serial]);
+    let digest_algo = seq(&[&oid(digest_oid), &null()]);
+    let sig_algo = match sig_params {
+        Some(params) => seq(&[&oid(sig_oid), &params]),
+        None => seq(&[&oid(sig_oid)]),
+    };
+    let signer_info = seq(&[
+        &tlv(0x02, &[1]),
+        &issuer_and_serial,
+        &digest_algo,
+        &sig_algo,
+        &tlv(0x04, signature),
+    ]);
+    let signed_data = seq(&[
+        &tlv(0x02, &[1]),
+        &set(&[&digest_algo]),
+        &seq(&[&oid(&[1, 2, 840, 113549, 1, 7, 1])]), // id-data
+        &ctx(0, cert_der),
+        &set(&[&signer_info]),
+    ]);
+    seq(&[&oid(&[1, 2, 840, 113549, 1, 7, 2]), &ctx(0, &signed_data)]) // id-signedData
+}
+
+/// A self-signed certificate for `pair`, with `common_name`.
+fn self_signed(pair: &rcgen::KeyPair, common_name: &str) -> Vec<u8> {
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(rcgen::DnType::CommonName, common_name);
+    params.self_signed(pair).unwrap().der().to_vec()
+}
+
+/// Signs `base`, then replaces the CMS in /Contents with `cms`, keeping the byte range. The signing
+/// time is fixed, so a probe signing and the real one cover exactly the same bytes.
+fn resign_with(doc: &Pdf, base: &[u8], cms: &[u8]) -> Vec<u8> {
+    let options = SignOptions { signing_time: Some("D:20261001000000Z".into()), ..sign_options(SubFilter::Pkcs7Detached) };
+    let mut signed = doc.sign(base, &options).unwrap();
+    put_signature_value(&mut signed, cms);
+    signed
+}
+
+/// The bytes a detached signature over `signed` covers.
+fn covered_bytes(signed: &[u8]) -> Vec<u8> {
+    let [_, b, c, d] = byte_range(signed);
+    let mut out = signed[..b].to_vec();
+    out.extend_from_slice(&signed[c..c + d]);
+    out
+}
+
+#[test]
+fn ecdsa_p256_signatures_verify_and_name_comes_from_the_certificate() {
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    use p256::pkcs8::DecodePrivateKey;
+    let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let signing = p256::ecdsa::SigningKey::from_pkcs8_der(&pair.serialize_der()).unwrap();
+    let cert = self_signed(&pair, "Elliptic Signer");
+
+    let mut doc = text_pdf(&[&["ecdsa"]]);
+    let base = file_bytes(&mut doc);
+    // Build the signed file first so the covered bytes are known, then sign those.
+    let probe = resign_with(&doc, &base, &[0x30, 0x00]);
+    let covered = covered_bytes(&probe);
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(&covered);
+    let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
+    let cms = detached_cms(&cert, &[2, 16, 840, 1, 101, 3, 4, 2, 1], &[1, 2, 840, 10045, 4, 3, 2], None, signature.to_der().as_bytes());
+    let signed = resign_with(&doc, &base, &cms);
+
+    // /Name still says the Carbide identity; the certificate subject is the ECDSA one.
+    let reports = verify(&signed, &TrustStore { certificates: vec![cert.clone()] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
+    assert_eq!(reports[0].signer.as_deref(), Some("Elliptic Signer"));
+    assert_eq!(reports[0].claimed_name.as_deref(), Some("Carbide Test Signer"));
+}
+
+#[test]
+fn signer_names_are_read_from_the_certificate_attributes() {
+    use rcgen::DnType;
+    let email = DnType::CustomDnType(vec![1, 2, 840, 113549, 1, 9, 1]);
+    let cases: [(&[(DnType, &str)], &str); 3] = [
+        // A comma inside the common name is part of the name, not a separator.
+        (&[(DnType::CommonName, "Doe, John"), (DnType::OrganizationName, "Acme")], "Doe, John"),
+        // No common name: the email address.
+        (&[(email, "jane@example.com")], "jane@example.com"),
+        // Text in another attribute that looks like a common name does not become one.
+        (&[(DnType::OrganizationName, "Evil Inc,CN=Bank of America")], ""),
+    ];
+    for (attributes, expected) in cases {
+        use rsa::pkcs8::EncodePrivateKey;
+        let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+        let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new(); // no default common name
+        for (kind, value) in attributes {
+            params.distinguished_name.push(kind.clone(), *value);
+        }
+        let cert = params.self_signed(&pair).unwrap().der().to_vec();
+        let identity = Identity::new(vec![cert.clone()], key).unwrap();
+        let mut doc = text_pdf(&[&["names"]]);
+        let base = file_bytes(&mut doc);
+        let signed = doc.sign(&base, &SignOptions { identity: Some(&identity), ..Default::default() }).unwrap();
+        let report = verify(&signed, &TrustStore { certificates: vec![cert] }).remove(0);
+        let signer = report.signer.unwrap();
+        if expected.is_empty() {
+            assert_ne!(signer, "Bank of America");
+            assert!(signer.contains("Evil Inc"), "{signer}");
+        } else {
+            assert_eq!(signer, expected);
+        }
+        assert_eq!(identity.common_name(), signer);
+        // /Name is written from the same certificate, so it is not repeated as a claimed name.
+        assert_eq!(report.claimed_name, None, "{signer}");
     }
 }
 
 #[test]
-fn time_stamps_are_embedded_and_document_time_stamps_check_the_imprint() {
+fn rsa_pss_signatures_verify() {
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let cert = self_signed(&pair, "PSS Signer");
+
+    let mut doc = text_pdf(&[&["pss"]]);
+    let base = file_bytes(&mut doc);
+    let probe = resign_with(&doc, &base, &[0x30, 0x00]);
+    let covered = covered_bytes(&probe);
+    let signing = rsa::pss::SigningKey::<sha2::Sha256>::new(key);
+    let signature = signing.sign_with_rng(&mut rand::rngs::OsRng, &covered).to_vec();
+    // RSASSA-PSS-params: SHA-256, MGF1-SHA-256, salt 32.
+    use algo::*;
+    let sha256 = seq(&[&oid(&[2, 16, 840, 1, 101, 3, 4, 2, 1]), &null()]);
+    let params = seq(&[
+        &ctx(0, &sha256),
+        &ctx(1, &seq(&[&oid(&[1, 2, 840, 113549, 1, 1, 8]), &sha256])),
+        &ctx(2, &tlv(0x02, &[32])),
+    ]);
+    let cms = detached_cms(&cert, &[2, 16, 840, 1, 101, 3, 4, 2, 1], &[1, 2, 840, 113549, 1, 1, 10], Some(params), &signature);
+    let signed = resign_with(&doc, &base, &cms);
+
+    let reports = verify(&signed, &TrustStore { certificates: vec![cert] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly), "{:?}", reports[0].detail);
+    assert!(!reports[0].weak_algorithm);
+}
+
+/// `RSASSA-PSS-params` naming `hash`, MGF1 over `mask_hash`, and `salt` bytes of salt.
+fn pss_params(hash: &[u32], mask_hash: &[u32], salt: u8) -> Vec<u8> {
+    use algo::*;
+    let hash = seq(&[&oid(hash), &null()]);
+    let mask_hash = seq(&[&oid(mask_hash), &null()]);
+    seq(&[&ctx(0, &hash), &ctx(1, &seq(&[&oid(&[1, 2, 840, 113549, 1, 1, 8]), &mask_hash])), &ctx(2, &[0x02, 0x01, salt])])
+}
+
+const SHA1_OID: &[u32] = &[1, 3, 14, 3, 2, 26];
+const SHA224_OID: &[u32] = &[2, 16, 840, 1, 101, 3, 4, 2, 4];
+const SHA256_OID: &[u32] = &[2, 16, 840, 1, 101, 3, 4, 2, 1];
+const RSA_PSS_OID: &[u32] = &[1, 2, 840, 113549, 1, 1, 10];
+
+#[test]
+fn rsa_pss_parameters_are_honoured_or_reported_as_unsupported() {
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let cert = self_signed(&pair, "PSS Signer");
+    let trust = TrustStore { certificates: vec![cert.clone()] };
+    let mut doc = text_pdf(&[&["pss parameters"]]);
+    let base = file_bytes(&mut doc);
+    let covered = covered_bytes(&resign_with(&doc, &base, &[0x30, 0x00]));
+    let check = |signature: &[u8], params: Option<Vec<u8>>| {
+        let cms = detached_cms(&cert, SHA256_OID, RSA_PSS_OID, params, signature);
+        verify(&resign_with(&doc, &base, &cms), &trust).remove(0)
+    };
+
+    // Parameters left out mean SHA-1, MGF1-SHA-1 and 20 bytes of salt: valid, and flagged weak.
+    let sha1 = rsa::pss::SigningKey::<sha1::Sha1>::new(key.clone()).sign_with_rng(&mut rand::rngs::OsRng, &covered).to_vec();
+    let report = check(&sha1, None);
+    assert_eq!((report.validity, report.detail), (Validity::Valid, Detail::TrustedDirectly), "PSS defaults");
+    assert!(report.weak_algorithm, "SHA-1 inside PSS parameters is weak");
+    assert!(report.description_lines().contains(&sig_messages::WEAK_ALGORITHM));
+
+    // A mask hash that differs from the message hash, or a hash this build does not know, cannot
+    // be checked: validity unknown, never "altered".
+    let sha256 = rsa::pss::SigningKey::<sha2::Sha256>::new(key.clone()).sign_with_rng(&mut rand::rngs::OsRng, &covered).to_vec();
+    for (label, params) in [
+        ("MGF1 over SHA-1", pss_params(SHA256_OID, SHA1_OID, 32)),
+        ("SHA-224", pss_params(SHA224_OID, SHA224_OID, 28)),
+    ] {
+        let report = check(&sha256, Some(params));
+        assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm), "{label}");
+        assert!(!report.description_lines().contains(&sig_messages::DOCUMENT_ALTERED), "{label}");
+    }
+}
+
+#[test]
+fn certificates_with_rsassa_pss_keys_verify_pss_signatures() {
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    use x509_cert::der::{Decode, Encode};
+    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    // The same key, published under id-RSASSA-PSS instead of rsaEncryption (RFC 4055). The
+    // certificate is trusted directly, so its own signature is not what is being tested.
+    let mut certificate = x509_cert::Certificate::from_der(&self_signed(&pair, "PSS Key")).unwrap();
+    certificate.tbs_certificate.subject_public_key_info.algorithm =
+        x509_cert::spki::AlgorithmIdentifierOwned { oid: "1.2.840.113549.1.1.10".parse().unwrap(), parameters: None };
+    let cert = certificate.to_der().unwrap();
+
+    let mut doc = text_pdf(&[&["pss key"]]);
+    let base = file_bytes(&mut doc);
+    let covered = covered_bytes(&resign_with(&doc, &base, &[0x30, 0x00]));
+    let signature = rsa::pss::SigningKey::<sha2::Sha256>::new(key).sign_with_rng(&mut rand::rngs::OsRng, &covered).to_vec();
+    let cms = detached_cms(&cert, SHA256_OID, RSA_PSS_OID, Some(pss_params(SHA256_OID, SHA256_OID, 32)), &signature);
+    let reports = verify(&resign_with(&doc, &base, &cms), &TrustStore { certificates: vec![cert] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
+}
+
+#[test]
+fn ecdsa_variants_verify() {
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    let mut doc = text_pdf(&[&["ecdsa variants"]]);
+    let base = file_bytes(&mut doc);
+    let covered = covered_bytes(&resign_with(&doc, &base, &[0x30, 0x00]));
+
+    // P-384 with SHA-1: the 20-byte digest is shorter than half the curve's field.
+    {
+        use p384::pkcs8::DecodePrivateKey;
+        let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let signing = p384::ecdsa::SigningKey::from_pkcs8_der(&pair.serialize_der()).unwrap();
+        let cert = self_signed(&pair, "P-384 Signer");
+        let mut digest = <sha1::Sha1 as sha2::Digest>::digest(&covered).to_vec();
+        digest.splice(0..0, [0u8; 4]); // the same integer, at a length the signer accepts
+        let signature: p384::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
+        let cms = detached_cms(&cert, SHA1_OID, &[1, 2, 840, 10045, 4, 1], None, signature.to_der().as_bytes());
+        let reports = verify(&resign_with(&doc, &base, &cms), &TrustStore { certificates: vec![cert] });
+        assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly), "P-384 SHA-1");
+        assert!(reports[0].weak_algorithm);
+    }
+
+    // P-256 named by its key OID, id-ecPublicKey, with the SignerInfo digest saying SHA-256.
+    {
+        use p256::pkcs8::DecodePrivateKey;
+        let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let signing = p256::ecdsa::SigningKey::from_pkcs8_der(&pair.serialize_der()).unwrap();
+        let cert = self_signed(&pair, "Key OID Signer");
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(&covered);
+        let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
+        let cms = detached_cms(&cert, SHA256_OID, &[1, 2, 840, 10045, 2, 1], None, signature.to_der().as_bytes());
+        let reports = verify(&resign_with(&doc, &base, &cms), &TrustStore { certificates: vec![cert] });
+        assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly), "id-ecPublicKey");
+        assert!(!reports[0].weak_algorithm);
+    }
+}
+
+#[test]
+fn an_unsupported_algorithm_is_reported_as_unknown_not_altered() {
+    // An Ed25519 signer: the algorithm is one this build cannot check.
+    let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(rcgen::DnType::CommonName, "Edward Signer");
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+
+    let mut doc = text_pdf(&[&["ed25519"]]);
+    let base = file_bytes(&mut doc);
+    // Ed25519 OID 1.3.101.112 for both digest and signature; the signature need not verify.
+    let cms = detached_cms(&cert, &[1, 3, 101, 112], &[1, 3, 101, 112], None, &[0u8; 64]);
+    let signed = resign_with(&doc, &base, &cms);
+
+    let reports = verify(&signed, &TrustStore { certificates: vec![cert] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm));
+    assert_ne!(reports[0].status_line(), sig_messages::INVALID);
+    let lines = reports[0].description_lines();
+    assert!(lines.contains(&sig_messages::UNSUPPORTED_ALGORITHM));
+    assert!(!lines.contains(&sig_messages::DOCUMENT_ALTERED));
+    // Nothing was checked, so nothing claims the document is unchanged or the signer unconfirmed.
+    assert!(!lines.contains(&sig_messages::NOT_MODIFIED) && !lines.contains(&sig_messages::IDENTITY_UNKNOWN), "{lines:?}");
+    assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_NOT_CHECKED));
+}
+
+#[test]
+fn flipping_an_unsigned_algorithm_identifier_does_not_hide_tampering() {
+    // The algorithm identifiers sit in the unsigned gap, so anyone can change them. Changing one to
+    // an algorithm this build does not check, then changing the signed content, must not make the
+    // document read as unchanged.
+    let sha256 = [0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+    let sha256_rsa = [0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B];
+    let mut doc = text_pdf(&[&["pay 100 dollars"]]);
+    let base = file_bytes(&mut doc);
+    for (sub_filter, oid, replacement) in [
+        (SubFilter::CadesDetached, &sha256[..], 0x04),     // digestAlgorithm SHA-256 -> SHA-224
+        (SubFilter::Pkcs7Detached, &sha256_rsa[..], 0x0E), // sha256WithRSA -> sha224WithRSA
+    ] {
+        let mut forged = doc.sign(&base, &sign_options(sub_filter)).unwrap();
+        let mut cms = signature_value(&forged);
+        // The SignerInfo comes after the certificates, so it holds the last occurrence.
+        let at = cms.windows(oid.len()).rposition(|w| w == oid).unwrap();
+        cms[at + oid.len() - 1] = replacement;
+        put_signature_value(&mut forged, &cms);
+        let position = forged.windows(11).position(|w| w == b"pay 100 dol").unwrap();
+        forged[position + 4] = b'9';
+
+        let reports = verify(&forged, &trust_test_identity());
+        assert_ne!(reports[0].validity, Validity::Valid, "{sub_filter:?}");
+        let lines = reports[0].description_lines();
+        assert!(!lines.contains(&sig_messages::NOT_MODIFIED) && !lines.contains(&sig_messages::REVISION_UNALTERED), "{sub_filter:?}: {lines:?}");
+        assert_ne!(notice_text(&reports), Some(sig_messages::NOTICE_ALL_VALID), "{sub_filter:?}");
+    }
+}
+
+
+// ---- time stamps (S3, S8) -----------------------------------------------------------------
+
+/// A test RFC 3161 authority: it signs real time-stamp tokens with an RSA key whose certificate
+/// carries the time-stamping extended key usage, critical and alone as RFC 3161 asks.
+struct TestTsa {
+    key: rsa::RsaPrivateKey,
+    cert: Vec<u8>,
+    /// The genTime its tokens give.
+    gen_time: &'static str,
+}
+
+impl TestTsa {
+    /// An authority whose certificate is valid from 1 January of `from` to 1 January of `until`,
+    /// with its time-stamping purpose marked critical or not.
+    fn new(name: &str, (from, until): (i32, i32), critical: bool, gen_time: &'static str) -> TestTsa {
+        use rsa::pkcs8::EncodePrivateKey;
+        let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+        let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(rcgen::DnType::CommonName, name);
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.not_before = rcgen::date_time_ymd(from, 1, 1);
+        params.not_after = rcgen::date_time_ymd(until, 1, 1);
+        let purposes = algo::seq(&[&algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 8])]); // id-kp-timeStamping
+        let mut eku = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], purposes);
+        eku.set_criticality(critical);
+        params.custom_extensions.push(eku);
+        let cert = params.self_signed(&pair).unwrap().der().to_vec();
+        TestTsa { key, cert, gen_time }
+    }
+
+    /// A TimeStampToken over `imprint` (hashed with `hash_oid`), echoing `nonce` (the content of
+    /// an INTEGER) when given, whose ESS signing-certificate attribute hashes `ess_cert`.
+    fn token_with(&self, hash_oid: &[u32], imprint: &[u8], nonce: Option<&[u8]>, ess_cert: &[u8]) -> Vec<u8> {
+        use algo::*;
+        use rsa::Pkcs1v15Sign;
+        let sha256 = |data: &[u8]| <sha2::Sha256 as sha2::Digest>::digest(data).to_vec();
+        let sha256_alg = seq(&[&oid(SHA256_OID), &null()]);
+        let mut fields = vec![
+            tlv(0x02, &[1]),                                                // version
+            oid(&[1, 2, 3, 4]),                                             // policy (arbitrary)
+            seq(&[&seq(&[&oid(hash_oid), &null()]), &tlv(0x04, imprint)]), // messageImprint
+            tlv(0x02, &[1]),                                                // serialNumber
+            tlv(0x18, self.gen_time.as_bytes()),                            // genTime
+        ];
+        if let Some(nonce) = nonce {
+            fields.push(tlv(0x02, nonce));
+        }
+        let refs: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+        let tst_info = seq(&refs);
+        // Signed attributes: contentType = id-ct-TSTInfo, messageDigest = H(TSTInfo), and
+        // signingCertificateV2 naming the certificate by its SHA-256 hash.
+        let mut attrs = [
+            seq(&[&oid(&[1, 2, 840, 113549, 1, 9, 3]), &set(&[&oid(&[1, 2, 840, 113549, 1, 9, 16, 1, 4])])]),
+            seq(&[&oid(&[1, 2, 840, 113549, 1, 9, 4]), &set(&[&tlv(0x04, &sha256(&tst_info))])]),
+            seq(&[
+                &oid(&[1, 2, 840, 113549, 1, 9, 16, 2, 47]),
+                &set(&[&seq(&[&seq(&[&seq(&[&tlv(0x04, &sha256(ess_cert))])])])]),
+            ]),
+        ];
+        attrs.sort();
+        let to_sign = sha256(&set(&[&attrs[0], &attrs[1], &attrs[2]]));
+        let signature = self.key.sign(Pkcs1v15Sign::new::<sha2::Sha256>(), &to_sign).unwrap();
+
+        use x509_cert::der::{Decode, Encode};
+        let cert = x509_cert::Certificate::from_der(&self.cert).unwrap();
+        let issuer = cert.tbs_certificate.issuer.to_der().unwrap();
+        let serial = cert.tbs_certificate.serial_number.to_der().unwrap();
+        let signer_info = seq(&[
+            &tlv(0x02, &[1]),
+            &seq(&[&issuer, &serial]),
+            &sha256_alg,
+            &ctx(0, &attrs.concat()),
+            &seq(&[&oid(&[1, 2, 840, 113549, 1, 1, 11]), &null()]),
+            &tlv(0x04, &signature),
+        ]);
+        let encap = seq(&[&oid(&[1, 2, 840, 113549, 1, 9, 16, 1, 4]), &ctx(0, &tlv(0x04, &tst_info))]);
+        let signed_data = seq(&[&tlv(0x02, &[1]), &set(&[&sha256_alg]), &encap, &ctx(0, &self.cert), &set(&[&signer_info])]);
+        seq(&[&oid(&[1, 2, 840, 113549, 1, 7, 2]), &ctx(0, &signed_data)])
+    }
+
+    fn token(&self, hash_oid: &[u32], imprint: &[u8], nonce: Option<&[u8]>) -> Vec<u8> {
+        self.token_with(hash_oid, imprint, nonce, &self.cert)
+    }
+}
+
+fn test_tsa() -> &'static TestTsa {
+    static TSA: OnceLock<TestTsa> = OnceLock::new();
+    TSA.get_or_init(|| TestTsa::new("Test TSA", (2020, 2040), true, "20260101000000Z"))
+}
+
+impl TimestampSource for TestTsa {
+    fn token_for_digest(&self, digest: &[u8; 32]) -> carbide_engine::Result<Vec<u8>> {
+        Ok(self.token(SHA256_OID, digest, None))
+    }
+}
+
+/// A source whose tokens cover some other digest than the one asked for.
+struct WrongImprint<'a>(&'a TestTsa);
+
+impl TimestampSource for WrongImprint<'_> {
+    fn token_for_digest(&self, _digest: &[u8; 32]) -> carbide_engine::Result<Vec<u8>> {
+        Ok(self.0.token(SHA256_OID, &[0xAB; 32], None))
+    }
+}
+
+fn tsa_trust() -> TrustStore {
+    TrustStore { certificates: vec![test_identity().certificate.clone(), test_tsa().cert.clone()] }
+}
+
+#[test]
+fn an_embedded_time_stamp_is_reported_only_when_it_verifies() {
     let mut doc = text_pdf(&[&["stamped"]]);
     let base = file_bytes(&mut doc);
-    let authority = FakeAuthority;
-
+    let tsa = test_tsa();
     let mut options = sign_options(SubFilter::Pkcs7Detached);
-    options.timestamp = Some(&authority);
+    options.timestamp = Some(tsa);
     let signed = doc.sign(&base, &options).unwrap();
-    let reports = verify(&signed, &trust_test_identity());
-    assert!(reports[0].has_embedded_timestamp);
+
+    // A verifying time stamp from a trusted authority.
+    let reports = verify(&signed, &tsa_trust());
     assert_eq!(reports[0].validity, Validity::Valid);
+    assert!(reports[0].has_embedded_timestamp && reports[0].embedded_timestamp_trusted);
     assert!(reports[0].description_lines().contains(&sig_messages::TIME_STAMPED));
 
-    let stamp_only = SignOptions {
-        sub_filter: SubFilter::DocumentTimeStamp,
-        timestamp: Some(&authority),
-        ..Default::default()
+    // The same time stamp when its authority is not trusted: present, but not vouched for.
+    let reports = verify(&signed, &trust_test_identity());
+    assert!(reports[0].has_embedded_timestamp && !reports[0].embedded_timestamp_trusted);
+    let lines = reports[0].description_lines();
+    assert!(lines.contains(&sig_messages::TIME_STAMP_UNCONFIRMED) && !lines.contains(&sig_messages::TIME_STAMPED));
+
+    // A token over something else says nothing about a time stamp.
+    let wrong = WrongImprint(tsa);
+    let mut options = sign_options(SubFilter::Pkcs7Detached);
+    options.timestamp = Some(&wrong);
+    let reports = verify(&doc.sign(&base, &options).unwrap(), &tsa_trust());
+    assert_eq!(reports[0].validity, Validity::Valid);
+    assert!(!reports[0].has_embedded_timestamp);
+    let lines = reports[0].description_lines();
+    assert!(!lines.contains(&sig_messages::TIME_STAMPED) && !lines.contains(&sig_messages::TIME_STAMP_UNCONFIRMED));
+
+    // A signature with no time stamp says nothing about one.
+    let plain = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    assert!(!verify(&plain, &trust_test_identity())[0].has_embedded_timestamp);
+}
+
+#[test]
+fn only_a_trusted_time_stamp_moves_the_certificate_validity_check() {
+    // A signer whose certificate expired long ago signs today. Without a time stamp that is an
+    // expired signature.
+    let (pair, key) = rsa_key();
+    let mut params = cert_params("Expired Signer", IsCa::ExplicitNoCa, &[KeyUsagePurpose::DigitalSignature]);
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+    let identity = Identity::new(vec![cert.clone()], key).unwrap();
+    let mut doc = text_pdf(&[&["backdated"]]);
+    let base = file_bytes(&mut doc);
+    let sign = |tsa: &TestTsa| {
+        let options = SignOptions { identity: Some(&identity), timestamp: Some(tsa), ..Default::default() };
+        doc.sign(&base, &options).unwrap()
     };
-    let stamped = doc.sign(&base, &stamp_only).unwrap();
-    let reports = verify(&stamped, &TrustStore::default());
+
+    // A time stamp from an authority nobody trusts, claiming a time inside the certificate's
+    // validity: anyone could add it, so the signature is still expired.
+    let anyone = TestTsa::new("Nobody TSA", (2019, 2040), true, "20200601000000Z");
+    let report = verify(&sign(&anyone), &TrustStore { certificates: vec![cert.clone()] }).remove(0);
+    assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::Expired));
+
+    // The same time from a trusted authority shows the signature was made while it was valid.
+    let trusted = TestTsa::new("Trusted TSA", (2019, 2040), true, "20200601000000Z");
+    let report = verify(&sign(&trusted), &TrustStore { certificates: vec![cert, trusted.cert.clone()] }).remove(0);
+    assert_eq!((report.validity, report.detail), (Validity::Valid, Detail::TrustedDirectly));
+}
+
+#[test]
+fn a_document_time_stamp_verifies_as_a_time_stamp() {
+    let mut doc = text_pdf(&[&["stamped document"]]);
+    let base = file_bytes(&mut doc);
+    let tsa = test_tsa();
+    let options = SignOptions { sub_filter: SubFilter::DocumentTimeStamp, timestamp: Some(tsa), ..Default::default() };
+    let stamped = doc.sign(&base, &options).unwrap();
+
+    // Trusting the authority: a valid time stamp with its time, not an invalid signature.
+    let reports = verify(&stamped, &tsa_trust());
     assert!(reports[0].document_time_stamp);
-    assert_eq!(reports[0].detail, Detail::DigestOkUntrusted, "imprint matches the covered bytes");
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
+    assert_eq!(reports[0].status_line(), sig_messages::TIMESTAMP_VALID);
+    assert_eq!(reports[0].signer.as_deref(), Some("Test TSA"));
+    assert!(reports[0].signing_time.as_deref().is_some_and(|t| t.contains("20260101")));
+    assert!(reports[0].description_lines().contains(&sig_messages::DOCUMENT_TIME_STAMPED));
+    assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_ALL_VALID));
+
+    // Without trusting the authority: the token still verifies, but nothing vouches for its
+    // authority, and the notice must not call the document valid.
+    let untrusted = verify(&stamped, &TrustStore::default());
+    assert_eq!((untrusted[0].validity, untrusted[0].detail), (Validity::ValidityUnknown, Detail::DigestOkUntrusted));
+    assert_eq!(untrusted[0].status_line(), sig_messages::TIMESTAMP_VALIDITY_UNKNOWN);
+    let lines = untrusted[0].description_lines();
+    assert!(lines.contains(&sig_messages::TIMESTAMP_AUTHORITY_UNKNOWN) && !lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED));
+    assert_eq!(notice_text(&untrusted), Some(sig_messages::NOTICE_TIMESTAMP_NOT_CONFIRMED));
+
+    // Any change to the covered bytes breaks the message imprint.
     let mut tampered = stamped.clone();
-    let at = tampered.windows(7).position(|w| w == b"stamped").unwrap();
+    let at = tampered.windows(8).position(|w| w == b"stamped ").unwrap();
     tampered[at] = b'S';
-    assert_eq!(verify(&tampered, &TrustStore::default())[0].validity, Validity::Invalid);
+    let reports = verify(&tampered, &tsa_trust());
+    assert_eq!(reports[0].validity, Validity::Invalid);
+    assert!(!reports[0].description_lines().contains(&sig_messages::DOCUMENT_TIME_STAMPED));
+}
+
+#[test]
+fn an_untrusted_time_stamp_after_a_trusted_signature_is_not_called_valid() {
+    let mut doc = text_pdf(&[&["signed then stamped"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    let anyone = TestTsa::new("Self-made TSA", (2020, 2040), true, "20260101000000Z");
+    let options = SignOptions { sub_filter: SubFilter::DocumentTimeStamp, timestamp: Some(&anyone), ..Default::default() };
+    let stamped = Pdf::from_bytes(&signed).unwrap().sign(&signed, &options).unwrap();
+    let reports = verify(&stamped, &trust_test_identity());
+    assert_eq!(reports.len(), 2);
+    assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_TIMESTAMP_NOT_CONFIRMED));
+}
+
+#[test]
+fn a_time_stamp_authority_must_be_valid_and_for_time_stamping_at_its_time() {
+    let mut doc = text_pdf(&[&["authority rules"]]);
+    let base = file_bytes(&mut doc);
+    let cases = [
+        ("expired authority", TestTsa::new("Expired TSA", (2000, 2001), true, "20260101000000Z"), Detail::Expired),
+        ("authority not valid yet", TestTsa::new("Early TSA", (2030, 2040), true, "20260101000000Z"), Detail::Expired),
+        ("time in the future", TestTsa::new("Future TSA", (2020, 2200), true, "20990101000000Z"), Detail::SignedInFuture),
+        ("purpose not critical", TestTsa::new("Lax TSA", (2020, 2040), false, "20260101000000Z"), Detail::NotPermitted),
+    ];
+    for (label, tsa, detail) in cases {
+        let options = SignOptions { sub_filter: SubFilter::DocumentTimeStamp, timestamp: Some(&tsa), ..Default::default() };
+        let stamped = doc.sign(&base, &options).unwrap();
+        // Trusted directly, and still not a valid time stamp.
+        let report = verify(&stamped, &TrustStore { certificates: vec![tsa.cert.clone()] }).remove(0);
+        assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, detail), "{label}");
+        assert!(!report.description_lines().contains(&sig_messages::DOCUMENT_TIME_STAMPED), "{label}");
+    }
+}
+
+#[test]
+fn time_stamp_tokens_that_cannot_be_checked_or_name_another_certificate_are_not_valid() {
+    let mut doc = text_pdf(&[&["token checks"]]);
+    let base = file_bytes(&mut doc);
+    let tsa = test_tsa();
+    let options = SignOptions { sub_filter: SubFilter::DocumentTimeStamp, timestamp: Some(tsa), ..Default::default() };
+    let stamped = doc.sign(&base, &options).unwrap();
+    let covered = covered_bytes(&stamped);
+
+    // A message imprint with a hash this build does not compute: unknown, not damaged, and no
+    // claim of a time stamp.
+    let mut sha224 = stamped.clone();
+    let digest = <sha2::Sha224 as sha2::Digest>::digest(&covered);
+    put_signature_value(&mut sha224, &tsa.token(SHA224_OID, &digest, None));
+    let report = verify(&sha224, &tsa_trust()).remove(0);
+    assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm));
+    let lines = report.description_lines();
+    assert!(!lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED) && !lines.contains(&sig_messages::CORRUPTED), "{lines:?}");
+
+    // An ESS signing-certificate attribute naming a different certificate than the one that signed.
+    let mut other = stamped.clone();
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(&covered);
+    put_signature_value(&mut other, &tsa.token_with(SHA256_OID, &digest, None, &test_identity().certificate));
+    let report = verify(&other, &tsa_trust()).remove(0);
+    assert_eq!(report.validity, Validity::Invalid);
+}
+
+#[test]
+fn a_time_stamp_authority_refuses_credentials_over_plain_http() {
+    let insecure = HttpTimestampSource {
+        url: "http://tsa.example/".into(),
+        username: Some("user".into()),
+        password: Some("secret".into()),
+    };
+    let err = insecure.token_for_digest(&[0u8; 32]).unwrap_err().to_string();
+    assert!(err.contains("https") || err.contains("insecure"), "{err}");
+}
+
+/// Answers `requests` HTTP requests on localhost, each with the bytes `answer` gives for its body,
+/// and returns the URL to post to.
+fn serve(requests: usize, answer: impl Fn(&[u8]) -> Vec<u8> + Send + 'static) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(requests) {
+            let mut stream = stream.unwrap();
+            let (mut request, mut chunk) = (Vec::new(), [0u8; 4096]);
+            let body = loop {
+                let n = stream.read(&mut chunk).unwrap();
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length: usize =
+                        headers.lines().find_map(|l| l.strip_prefix("content-length:")).map_or(0, |v| v.trim().parse().unwrap());
+                    if request.len() >= end + 4 + length {
+                        break request[end + 4..end + 4 + length].to_vec();
+                    }
+                }
+                if n == 0 {
+                    break Vec::new();
+                }
+            };
+            let reply = answer(&body);
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/timestamp-reply\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len());
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&reply).unwrap();
+        }
+    });
+    url
+}
+
+/// The message imprint digest and the nonce (an INTEGER's content) of a TimeStampReq.
+fn timestamp_request_parts(request: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+    let children = |data: &[u8]| {
+        let (_, header, total) = der_header(data);
+        let mut rest = &data[header..total];
+        let mut out = Vec::new();
+        while !rest.is_empty() {
+            let (tag, header, total) = der_header(rest);
+            out.push((tag, rest[..total].to_vec(), rest[header..total].to_vec()));
+            rest = &rest[total..];
+        }
+        out
+    };
+    // version, messageImprint { algorithm, hashedMessage }, [reqPolicy], [nonce], [certReq]
+    let fields = children(request);
+    let digest = children(&fields[1].1)[1].2.clone();
+    let nonce = fields.iter().skip(2).find(|(tag, _, _)| *tag == 0x02).map(|(_, _, content)| content.clone());
+    (digest, nonce)
+}
+
+/// A TimeStampResp with `status` and, when given, a token.
+fn timestamp_response(status: u8, token: Option<&[u8]>) -> Vec<u8> {
+    use algo::*;
+    let status = seq(&[&tlv(0x02, &[status])]);
+    match token {
+        Some(token) => seq(&[&status, token]),
+        None => seq(&[&status]),
+    }
+}
+
+#[test]
+fn the_time_stamp_client_checks_what_the_authority_returns() {
+    let source = |url: String| HttpTimestampSource { url, username: None, password: None };
+    let digest = [7u8; 32];
+
+    // A well-behaved authority echoes the nonce over the digest asked for.
+    let url = serve(1, |body| {
+        let (digest, nonce) = timestamp_request_parts(body);
+        timestamp_response(0, Some(&test_tsa().token(SHA256_OID, &digest, nonce.as_deref())))
+    });
+    let token = source(url).token_for_digest(&digest).unwrap();
+    assert!(!token.is_empty());
+
+    // Everything else is refused before it can end up in a signature.
+    type Answer = Box<dyn Fn(&[u8]) -> Vec<u8> + Send>;
+    let cases: Vec<(&str, &str, Answer)> = vec![
+        ("wrong nonce", "nonce", Box::new(|body| {
+            let (digest, nonce) = timestamp_request_parts(body);
+            let mut nonce = nonce.unwrap();
+            *nonce.last_mut().unwrap() ^= 1;
+            timestamp_response(0, Some(&test_tsa().token(SHA256_OID, &digest, Some(&nonce))))
+        })),
+        ("no nonce", "nonce", Box::new(|body| {
+            let (digest, _) = timestamp_request_parts(body);
+            timestamp_response(0, Some(&test_tsa().token(SHA256_OID, &digest, None)))
+        })),
+        ("refused", "refused", Box::new(|_| timestamp_response(2, None))),
+        ("other digest", "wrong digest", Box::new(|body| {
+            let (_, nonce) = timestamp_request_parts(body);
+            timestamp_response(0, Some(&test_tsa().token(SHA256_OID, &[0u8; 32], nonce.as_deref())))
+        })),
+        ("token naming another certificate", "did not verify", Box::new(|body| {
+            let (digest, nonce) = timestamp_request_parts(body);
+            let token = test_tsa().token_with(SHA256_OID, &digest, nonce.as_deref(), &test_identity().certificate);
+            timestamp_response(0, Some(&token))
+        })),
+    ];
+    for (label, expected, answer) in cases {
+        let err = source(serve(1, answer)).token_for_digest(&digest).unwrap_err().to_string();
+        assert!(err.contains(expected), "{label}: {err}");
+    }
+
+    // Signing through the client: one request to size the signature, one for the real token.
+    let url = serve(2, |body| {
+        let (digest, nonce) = timestamp_request_parts(body);
+        timestamp_response(0, Some(&test_tsa().token(SHA256_OID, &digest, nonce.as_deref())))
+    });
+    let http = source(url);
+    let mut doc = text_pdf(&[&["stamped over http"]]);
+    let base = file_bytes(&mut doc);
+    let mut options = sign_options(SubFilter::CadesDetached);
+    options.timestamp = Some(&http);
+    let reports = verify(&doc.sign(&base, &options).unwrap(), &tsa_trust());
+    assert_eq!(reports[0].validity, Validity::Valid);
+    assert!(reports[0].has_embedded_timestamp && reports[0].embedded_timestamp_trusted);
+}
+
+#[test]
+fn an_intact_but_untrusted_signature_is_not_called_valid() {
+    let mut doc = text_pdf(&[&["notice"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+
+    // Digest and signature hold, but the self-signed certificate is not trusted.
+    let reports = verify(&signed, &TrustStore::default());
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::ValidityUnknown, Detail::DigestOkUntrusted));
+    assert_eq!(reports[0].status_line(), sig_messages::VALIDITY_UNKNOWN);
+    assert!(reports[0].description_lines().contains(&sig_messages::IDENTITY_UNKNOWN));
+    // The notice bar must not claim every signature is valid.
+    assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_NOT_CONFIRMED));
+
+    // Once the signer is trusted, the same signature gives the all-valid notice.
+    assert_eq!(notice_text(&verify(&signed, &trust_test_identity())), Some(sig_messages::NOTICE_ALL_VALID));
+}
+
+#[test]
+fn an_identity_whose_key_does_not_match_its_certificate_is_rejected() {
+    use rsa::pkcs8::EncodePrivateKey;
+    // A certificate for one key, paired with a different key.
+    let other = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let other_pair = rcgen::KeyPair::try_from(other.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(rcgen::DnType::CommonName, "Someone Else");
+    let foreign_cert = params.self_signed(&other_pair).unwrap().der().to_vec();
+
+    let mine = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let Err(err) = Identity::new(vec![foreign_cert.clone()], mine.clone()) else { panic!("mismatch accepted") };
+    assert!(err.to_string().contains("does not match"), "{err}");
+
+    // With the chain listed issuer-first, the signer certificate is found and moved to the front.
+    let my_pair = rcgen::KeyPair::try_from(mine.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let mut my_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    my_params.distinguished_name.push(rcgen::DnType::CommonName, "The Signer");
+    let my_cert = my_params.self_signed(&my_pair).unwrap().der().to_vec();
+    let identity = Identity::new(vec![foreign_cert, my_cert.clone()], mine).unwrap();
+    assert_eq!(identity.certificate_der(), my_cert.as_slice());
+    assert_eq!(identity.common_name(), "The Signer");
+}
+
+#[test]
+fn trusted_certificate_import_rejects_files_that_are_not_certificates() {
+    use carbide_engine::signature::read_certificates;
+    let id = test_identity();
+    // A PEM certificate and a bare DER certificate both parse.
+    assert_eq!(read_certificates(id.cert_pem.as_bytes()).unwrap().len(), 1);
+    assert_eq!(read_certificates(&id.certificate).unwrap(), vec![id.certificate.clone()]);
+    // A private key, or anything else, is refused instead of being stored.
+    assert!(read_certificates(id.key_pem.as_bytes()).is_err());
+    assert!(read_certificates(b"not a certificate at all").is_err());
 }
 
 #[test]
@@ -1844,6 +2929,275 @@ fn identities_load_from_pem_and_pkcs12() {
     let options = SignOptions { identity: Some(&loaded), ..Default::default() };
     let signed = doc.sign(&base, &options).unwrap();
     assert_eq!(verify(&signed, &trust_test_identity())[0].validity, Validity::Valid);
+}
+
+// ---- certificate chain rules (S4) ---------------------------------------------------------
+
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+
+/// A fresh RSA key as both an rcgen key pair (for issuing certificates) and an engine signing key.
+fn rsa_key() -> (KeyPair, rsa::RsaPrivateKey) {
+    use rsa::pkcs8::EncodePrivateKey;
+    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let pair = KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    (pair, key)
+}
+
+/// Certificate parameters with a common name, CA flag, key usages and a 2020..2040 validity.
+fn cert_params(cn: &str, is_ca: IsCa, usages: &[KeyUsagePurpose]) -> CertificateParams {
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(DnType::CommonName, cn);
+    params.is_ca = is_ca;
+    params.key_usages = usages.to_vec();
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2040, 1, 1);
+    params
+}
+
+/// Builds a signer identity whose leaf is issued by `issuer`, with the extra chain certificates
+/// (issuer first above the leaf) embedded, and returns the identity and the trust store `anchor`.
+fn chain_identity(issuer: &Issuer<'_, KeyPair>, above: &[Vec<u8>]) -> (Identity, rsa::RsaPrivateKey) {
+    let (leaf_pair, leaf_key) = rsa_key();
+    let params = cert_params("Chain Signer", IsCa::ExplicitNoCa, &[KeyUsagePurpose::DigitalSignature]);
+    let leaf = params.signed_by(&leaf_pair, issuer).unwrap().der().to_vec();
+    let mut chain = vec![leaf];
+    chain.extend_from_slice(above);
+    (Identity::new(chain, leaf_key.clone()).unwrap(), leaf_key)
+}
+
+fn sign_with(identity: &Identity) -> Vec<u8> {
+    let mut doc = text_pdf(&[&["chain"]]);
+    let base = file_bytes(&mut doc);
+    let options = SignOptions { identity: Some(identity), reason: Some("ok".into()), ..Default::default() };
+    doc.sign(&base, &options).unwrap()
+}
+
+#[test]
+fn a_ca_issued_signer_is_trusted_through_its_chain() {
+    // root (pathLen 1) -> intermediate CA -> leaf signer.
+    let (root_pair, _) = rsa_key();
+    let root_params = cert_params("Root CA", IsCa::Ca(BasicConstraints::Constrained(1)), &[KeyUsagePurpose::KeyCertSign]);
+    let root = root_params.self_signed(&root_pair).unwrap().der().to_vec();
+    let root_issuer = Issuer::new(root_params, root_pair);
+
+    let (int_pair, _) = rsa_key();
+    let int_params = cert_params("Intermediate CA", IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+    let intermediate = int_params.signed_by(&int_pair, &root_issuer).unwrap().der().to_vec();
+    let int_issuer = Issuer::new(int_params, int_pair);
+
+    let (identity, _) = chain_identity(&int_issuer, std::slice::from_ref(&intermediate));
+    let signed = sign_with(&identity);
+    let reports = verify(&signed, &TrustStore { certificates: vec![root] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedViaChain));
+}
+
+/// The chain reaches the trusted root by names and signatures but breaks an issuing rule: the
+/// panel says so, rather than that nothing in the chain is trusted.
+fn assert_rejected(report: &carbide_engine::signature::SignatureReport, label: &str) {
+    assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::ChainRejected), "{label}");
+    let lines = report.description_lines();
+    assert!(lines.contains(&sig_messages::CHAIN_REJECTED) && !lines.contains(&sig_messages::IDENTITY_UNKNOWN), "{label}");
+}
+
+#[test]
+fn chain_rules_reject_bad_issuers() {
+    let (root_pair, _) = rsa_key();
+    let root_params = cert_params("Root CA", IsCa::Ca(BasicConstraints::Constrained(0)), &[KeyUsagePurpose::KeyCertSign]);
+    let root = root_params.self_signed(&root_pair).unwrap().der().to_vec();
+    let root_issuer = Issuer::new(root_params, root_pair);
+    let trust = TrustStore { certificates: vec![root.clone()] };
+
+    // An issuer that is not a CA cannot vouch for a signer: root -> non-CA -> leaf.
+    {
+        let (mid_pair, _) = rsa_key();
+        let mid_params = cert_params("Not A CA", IsCa::ExplicitNoCa, &[KeyUsagePurpose::DigitalSignature]);
+        let mid = mid_params.signed_by(&mid_pair, &root_issuer).unwrap().der().to_vec();
+        let mid_issuer = Issuer::new(mid_params, mid_pair);
+        let (identity, _) = chain_identity(&mid_issuer, &[mid]);
+        let reports = verify(&sign_with(&identity), &trust);
+        assert_rejected(&reports[0], "non-CA issuer");
+    }
+
+    // A CA without keyCertSign in its key usage cannot issue.
+    {
+        let (mid_pair, _) = rsa_key();
+        let mid_params = cert_params("No Cert Sign", IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::DigitalSignature]);
+        let mid = mid_params.signed_by(&mid_pair, &root_issuer).unwrap().der().to_vec();
+        let mid_issuer = Issuer::new(mid_params, mid_pair);
+        let (identity, _) = chain_identity(&mid_issuer, &[mid]);
+        let reports = verify(&sign_with(&identity), &trust);
+        assert_rejected(&reports[0], "missing keyCertSign");
+    }
+
+    // pathLenConstraint exceeded: root pathLen 0 -> intermediate CA -> leaf.
+    {
+        let (int_pair, _) = rsa_key();
+        let int_params = cert_params("Intermediate CA", IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+        let intermediate = int_params.signed_by(&int_pair, &root_issuer).unwrap().der().to_vec();
+        let int_issuer = Issuer::new(int_params, int_pair);
+        let (identity, _) = chain_identity(&int_issuer, &[intermediate]);
+        let reports = verify(&sign_with(&identity), &trust);
+        assert_rejected(&reports[0], "pathLen exceeded");
+    }
+
+    // An expired intermediate is not accepted as an issuer at the signing time.
+    {
+        let (int_pair, _) = rsa_key();
+        let mut int_params = cert_params("Expired CA", IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+        int_params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        int_params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        // This intermediate is issued by a pathLen-permitting root.
+        let wide_params = cert_params("Wide Root", IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+        let (wide_pair, _) = rsa_key();
+        let wide = wide_params.self_signed(&wide_pair).unwrap().der().to_vec();
+        let wide_issuer = Issuer::new(wide_params, wide_pair);
+        let intermediate = int_params.signed_by(&int_pair, &wide_issuer).unwrap().der().to_vec();
+        let int_issuer = Issuer::new(int_params, int_pair);
+        let (identity, _) = chain_identity(&int_issuer, &[intermediate]);
+        let reports = verify(&sign_with(&identity), &TrustStore { certificates: vec![wide] });
+        assert_rejected(&reports[0], "expired intermediate");
+    }
+}
+
+#[test]
+fn a_cross_signed_intermediate_is_found_through_either_issuer() {
+    // One intermediate key, certified by two roots; only the second root is trusted, and the
+    // certificate from the first is listed first.
+    let roots: Vec<(Vec<u8>, Issuer<'static, KeyPair>)> = ["Root One", "Root Two"]
+        .into_iter()
+        .map(|name| {
+            let (pair, _) = rsa_key();
+            let params = cert_params(name, IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+            let der = params.self_signed(&pair).unwrap().der().to_vec();
+            (der, Issuer::new(params, pair))
+        })
+        .collect();
+    let (int_pair, _) = rsa_key();
+    let int_params = cert_params("Intermediate CA", IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+    let by_one = int_params.signed_by(&int_pair, &roots[0].1).unwrap().der().to_vec();
+    let by_two = int_params.signed_by(&int_pair, &roots[1].1).unwrap().der().to_vec();
+    let int_issuer = Issuer::new(int_params, int_pair);
+
+    let (identity, _) = chain_identity(&int_issuer, &[by_one, by_two]);
+    let reports = verify(&sign_with(&identity), &TrustStore { certificates: vec![roots[1].0.clone()] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedViaChain));
+}
+
+#[test]
+fn signer_key_usage_and_future_dates_are_named_as_such() {
+    // A trusted certificate whose key usage does not cover signing.
+    let (pair, key) = rsa_key();
+    let params = cert_params("Encryption Only", IsCa::ExplicitNoCa, &[KeyUsagePurpose::KeyEncipherment]);
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+    let identity = Identity::new(vec![cert.clone()], key).unwrap();
+    let report = verify(&sign_with(&identity), &TrustStore { certificates: vec![cert] }).remove(0);
+    assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::NotPermitted));
+    let lines = report.description_lines();
+    assert!(lines.contains(&sig_messages::SIGNER_NOT_PERMITTED) && !lines.contains(&sig_messages::IDENTITY_UNKNOWN));
+
+    // A signing time in the future.
+    let mut doc = text_pdf(&[&["later"]]);
+    let base = file_bytes(&mut doc);
+    let options = SignOptions { signing_time: Some("D:20991231000000Z".into()), ..sign_options(SubFilter::Pkcs7Detached) };
+    let report = verify(&doc.sign(&base, &options).unwrap(), &trust_test_identity()).remove(0);
+    assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::SignedInFuture));
+    assert!(report.description_lines().contains(&sig_messages::SIGNED_IN_FUTURE));
+}
+
+// ---- OpenSSL cross-checks ------------------------------------------------------------------
+
+/// Runs `openssl` with `args`; `None` when OpenSSL 3 is not on the PATH (the cross-checks are then
+/// skipped), else whether it succeeded.
+fn openssl(args: &[std::ffi::OsString]) -> Option<bool> {
+    let version = std::process::Command::new("openssl").arg("version").output().ok()?;
+    if !String::from_utf8_lossy(&version.stdout).starts_with("OpenSSL 3") {
+        return None;
+    }
+    let output = std::process::Command::new("openssl").args(args).output().ok()?;
+    if !output.status.success() {
+        eprintln!("openssl {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    Some(output.status.success())
+}
+
+#[test]
+fn signatures_agree_with_openssl_both_ways() {
+    let Some(true) = openssl(&["version".into()]) else {
+        eprintln!("OpenSSL 3 is not on the PATH; skipping the cross-checks");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name);
+    let arg = |text: &str| std::ffi::OsString::from(text);
+    let mut doc = text_pdf(&[&["cross-checked"]]);
+    let base = file_bytes(&mut doc);
+
+    // Carbide's signatures, checked by OpenSSL against the bytes they cover.
+    let mut stamped = sign_options(SubFilter::CadesDetached);
+    stamped.timestamp = Some(test_tsa());
+    for (label, options) in [
+        ("PKCS#7", sign_options(SubFilter::Pkcs7Detached)),
+        ("CAdES", sign_options(SubFilter::CadesDetached)),
+        ("CAdES with a time stamp", stamped),
+    ] {
+        let signed = doc.sign(&base, &options).unwrap();
+        std::fs::write(path("covered.bin"), covered_bytes(&signed)).unwrap();
+        std::fs::write(path("signature.der"), signature_value(&signed)).unwrap();
+        let verified = openssl(&[
+            arg("cms"), arg("-verify"), arg("-binary"), arg("-noverify"), arg("-inform"), arg("DER"),
+            arg("-in"), path("signature.der").into(), arg("-content"), path("covered.bin").into(),
+            arg("-out"), path("out.bin").into(),
+        ]);
+        assert_eq!(verified, Some(true), "OpenSSL rejects Carbide's {label} signature");
+    }
+
+    // OpenSSL's signatures, checked by Carbide. A time stamp on the placeholder signing reserves
+    // room for any of them; the fixed signing time keeps the covered bytes the same.
+    let roomy = |cms: &[u8]| {
+        let mut options = SignOptions { signing_time: Some("D:20261001000000Z".into()), ..sign_options(SubFilter::CadesDetached) };
+        options.timestamp = Some(test_tsa());
+        let mut signed = doc.sign(&base, &options).unwrap();
+        put_signature_value(&mut signed, cms);
+        signed
+    };
+    std::fs::write(path("covered.bin"), covered_bytes(&roomy(&[0x30, 0x00]))).unwrap();
+    let (rsa_pair, _) = rsa_key();
+    let p384_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+    let cases: [(&str, &KeyPair, &[&str], Validity, Detail); 4] = [
+        ("RSA, SHA-256", &rsa_pair, &["-md", "sha256"], Validity::Valid, Detail::TrustedDirectly),
+        ("P-384, SHA-1", &p384_pair, &["-md", "sha1"], Validity::Valid, Detail::TrustedDirectly),
+        ("RSA-PSS, SHA-256", &rsa_pair, &["-md", "sha256", "-keyopt", "rsa_padding_mode:pss"], Validity::Valid, Detail::TrustedDirectly),
+        (
+            "RSA-PSS, SHA-256 with MGF1 over SHA-1",
+            &rsa_pair,
+            &["-md", "sha256", "-keyopt", "rsa_padding_mode:pss", "-keyopt", "rsa_mgf1_md:sha1"],
+            Validity::ValidityUnknown,
+            Detail::UnsupportedAlgorithm,
+        ),
+    ];
+    for (label, pair, extra, validity, detail) in cases {
+        let cert = self_signed(pair, "OpenSSL Signer");
+        std::fs::write(path("cert.pem"), x509_pem(&cert)).unwrap();
+        std::fs::write(path("key.pem"), pair.serialize_pem()).unwrap();
+        let mut args = vec![
+            arg("cms"), arg("-sign"), arg("-binary"), arg("-nosmimecap"), arg("-outform"), arg("DER"),
+            arg("-in"), path("covered.bin").into(), arg("-signer"), path("cert.pem").into(),
+            arg("-inkey"), path("key.pem").into(), arg("-out"), path("openssl.der").into(),
+        ];
+        args.extend(extra.iter().map(|a| arg(a)));
+        assert_eq!(openssl(&args), Some(true), "{label}: OpenSSL could not sign");
+        let cms = std::fs::read(path("openssl.der")).unwrap();
+        let report = verify(&roomy(&cms), &TrustStore { certificates: vec![cert] }).remove(0);
+        assert_eq!((report.validity, report.detail), (validity, detail), "{label}");
+    }
+}
+
+/// A DER certificate as PEM.
+fn x509_pem(der: &[u8]) -> String {
+    use base64::Engine;
+    let text = base64::engine::general_purpose::STANDARD.encode(der);
+    let lines: Vec<&str> = text.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap()).collect();
+    format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", lines.join("\n"))
 }
 
 // ---- OCR -----------------------------------------------------------------------------------

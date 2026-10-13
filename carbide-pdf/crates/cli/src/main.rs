@@ -170,6 +170,7 @@ enum Command {
         tsa: String,
         #[arg(long)]
         tsa_user: Option<String>,
+        /// Time-stamp authority password (or set CARBIDE_TSA_PASSWORD).
         #[arg(long)]
         tsa_password: Option<String>,
     },
@@ -203,8 +204,9 @@ struct SignArgs {
     /// PKCS#12 identity file (.p12 / .pfx).
     #[arg(long)]
     p12: Option<PathBuf>,
-    #[arg(long, default_value = "")]
-    p12_password: String,
+    /// PKCS#12 password (or set CARBIDE_P12_PASSWORD).
+    #[arg(long)]
+    p12_password: Option<String>,
     /// PEM certificate chain (signer first) and PEM private key, instead of --p12.
     #[arg(long)]
     cert: Option<PathBuf>,
@@ -233,6 +235,7 @@ struct SignArgs {
     tsa: Option<String>,
     #[arg(long)]
     tsa_user: Option<String>,
+    /// Time-stamp authority password (or set CARBIDE_TSA_PASSWORD).
     #[arg(long)]
     tsa_password: Option<String>,
     #[command(flatten)]
@@ -373,6 +376,12 @@ enum OrderArg {
 }
 
 // ---- helpers -------------------------------------------------------------------------------
+
+/// A secret from a command-line flag when given, else from `env_var`. Keeping secrets out of argv
+/// (and shell history) is why the flags are optional.
+fn secret(flag: Option<String>, env_var: &str) -> Option<String> {
+    flag.or_else(|| std::env::var(env_var).ok())
+}
 
 fn open(path: &Path, pw: &Password) -> Result<Pdf, Failure> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -723,7 +732,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Command::Sign(a) => {
             let identity = match (&a.p12, &a.cert, &a.key) {
-                (Some(p12), _, _) => Identity::from_pkcs12(&std::fs::read(p12)?, &a.p12_password)?,
+                (Some(p12), _, _) => {
+                    let password = secret(a.p12_password.clone(), "CARBIDE_P12_PASSWORD").unwrap_or_default();
+                    Identity::from_pkcs12(&std::fs::read(p12)?, &password)?
+                }
                 (None, Some(cert), Some(key)) => {
                     Identity::from_pem(&std::fs::read_to_string(cert)?, &std::fs::read_to_string(key)?)?
                 }
@@ -734,7 +746,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let authority = a.tsa.as_ref().map(|url| HttpTimestampSource {
                 url: url.clone(),
                 username: a.tsa_user.clone(),
-                password: a.tsa_password.clone(),
+                password: secret(a.tsa_password.clone(), "CARBIDE_TSA_PASSWORD"),
             });
             let appearance = match &a.rect {
                 Some(text) => Some(parse_rect(text)?),
@@ -764,7 +776,8 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Command::Timestamp { input, output, tsa, tsa_user, tsa_password } => {
             let base = std::fs::read(&input)?;
             let pdf = Pdf::from_bytes(&base)?;
-            let authority = HttpTimestampSource { url: tsa, username: tsa_user, password: tsa_password };
+            let authority =
+                HttpTimestampSource { url: tsa, username: tsa_user, password: secret(tsa_password, "CARBIDE_TSA_PASSWORD") };
             let options = SignOptions {
                 sub_filter: SubFilter::DocumentTimeStamp,
                 timestamp: Some(&authority),
@@ -777,18 +790,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let bytes = std::fs::read(&input)?;
             let mut store = TrustStore::default();
             for path in trust {
-                let text = std::fs::read_to_string(&path)?;
-                let identity_like = Identity::from_pem(&text, "").ok();
-                drop(identity_like);
-                for block in text.split("-----BEGIN CERTIFICATE-----").skip(1) {
-                    if let Some(body) = block.split("-----END CERTIFICATE-----").next() {
-                        use base64::Engine;
-                        let cleaned: String = body.chars().filter(|c| !c.is_whitespace()).collect();
-                        if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(cleaned) {
-                            store.certificates.push(der);
-                        }
-                    }
-                }
+                let bytes = std::fs::read(&path)?;
+                let certificates = carbide_engine::signature::read_certificates(&bytes)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                store.certificates.extend(certificates);
             }
             let reports = Pdf::verify_signatures(&bytes, &store, chrono::Utc::now())?;
             if reports.is_empty() {
@@ -797,7 +802,13 @@ fn run(cli: Cli) -> Result<(), Failure> {
             for r in &reports {
                 println!("{}: {}", r.field_name, r.status_line());
                 if let Some(who) = &r.signer {
-                    println!("  signer: {who}");
+                    println!("  {}: {who}", if r.document_time_stamp { "time stamp authority" } else { "signer" });
+                }
+                if let Some(time) = r.signing_time.as_deref().filter(|_| r.document_time_stamp) {
+                    println!("  time stamp: {}", carbide_engine::revisions::pdf_date_to_local(time));
+                }
+                if let Some(claimed) = &r.claimed_name {
+                    println!("  name in signature (unverified): {claimed}");
                 }
                 for line in r.description_lines() {
                     println!("  {line}");
