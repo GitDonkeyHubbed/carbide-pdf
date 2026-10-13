@@ -28,6 +28,7 @@ pub mod save;
 mod scrub;
 pub mod security;
 pub mod signature;
+mod sigcrypto;
 pub mod stamp;
 
 pub use annotate::{AnnotationSummary, MarkupStyle};

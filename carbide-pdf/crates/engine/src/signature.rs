@@ -13,14 +13,15 @@ use chrono::{DateTime, TimeZone, Utc};
 use lopdf::xref::XrefEntry;
 use lopdf::{dictionary, Dictionary, Object, ObjectId, Stream, StringFormat};
 use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
-use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
-use sha2::{Digest, Sha256, Sha384, Sha512};
+use rsa::pkcs8::DecodePrivateKey;
+use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+use sha2::{Digest, Sha256};
 use x509_cert::der::{Decode, Encode};
 use x509_cert::Certificate;
 
 use crate::cms;
 use crate::der;
+use crate::sigcrypto::{self, Verified};
 use crate::error::{Error, Result};
 use crate::fonts::{literal_string, win_ansi};
 use crate::geometry::{fmt, Rect};
@@ -40,12 +41,16 @@ pub mod messages {
     pub const IDENTITY_UNKNOWN: &str = "The signer's identity is not confirmed: neither the certificate nor any certificate above it is in your trusted list";
     pub const IDENTITY_EXPIRED: &str = "The signer's certificate has expired or is not valid yet";
     pub const DOCUMENT_ALTERED: &str = "The document is damaged or was changed after signing.";
+    pub const UNSUPPORTED_ALGORITHM: &str = "This signature uses an algorithm this version cannot check.";
+    pub const WEAK_ALGORITHM: &str = "This signature uses SHA-1, which is no longer considered secure.";
     pub const BAD_BYTE_RANGE: &str = "Invalid signature: the signed byte range is wrong.";
     pub const CORRUPTED: &str = "Invalid signature: the signature data is damaged.";
     pub const FILTER_NOT_SUPPORTED: &str = "Invalid signature: this signature handler is not supported.";
     pub const SIGNED_IN_FUTURE: &str = "The signing time is in the future.";
     pub const NOTICE_NOT_VERIFIED: &str = "Some signatures still need to be validated.";
     pub const NOTICE_PROBLEMS: &str = "This document is signed, but at least one signature has a problem.";
+    pub const NOTICE_NOT_CONFIRMED: &str =
+        "This document is signed, but at least one signature's identity is not confirmed.";
     pub const NOTICE_CHANGED_AFTER_LAST: &str =
         "Signed with valid signatures, but the document changed after the last signature.";
     pub const NOTICE_UPDATED: &str = "Signed with valid signatures; the document was updated after signing.";
@@ -137,6 +142,21 @@ fn common_name(certificate: &Certificate) -> String {
         .split(',')
         .find_map(|part| part.trim().strip_prefix("CN=").map(|s| s.to_string()))
         .unwrap_or(subject)
+}
+
+/// The signer's display name: common name, else email address, else the whole subject.
+fn subject_name(certificate: &Certificate) -> String {
+    let subject = certificate.tbs_certificate.subject.to_string();
+    let field = |prefix: &str| subject.split(',').find_map(|part| part.trim().strip_prefix(prefix).map(str::to_string));
+    field("CN=").or_else(|| field("E=")).or_else(|| field("emailAddress=")).unwrap_or(subject)
+}
+
+/// The certificate's subjectKeyIdentifier extension value, if it has one.
+fn subject_key_id(certificate: &Certificate) -> Option<Vec<u8>> {
+    let extensions = certificate.tbs_certificate.extensions.as_ref()?;
+    let extension = extensions.iter().find(|e| e.extn_id.to_string() == "2.5.29.14")?;
+    // The extension value is an OCTET STRING wrapping the key identifier OCTET STRING.
+    der::read(extension.extn_value.as_bytes()).map(|(inner, _)| inner.content.to_vec())
 }
 
 // ---- time stamps ---------------------------------------------------------------------------
@@ -668,6 +688,7 @@ pub enum Detail {
     TrustedViaChain = 7,
     TrustedDirectly = 8,
     DigestOkUntrusted = 9,
+    UnsupportedAlgorithm = 10,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -680,6 +701,8 @@ pub struct TrustStore {
 pub struct SignatureReport {
     pub field_name: String,
     pub signer: Option<String>,
+    /// The signer's own `/Name`, kept only when it differs from the certificate subject.
+    pub claimed_name: Option<String>,
     pub sub_filter: Option<String>,
     pub reason: Option<String>,
     pub location: Option<String>,
@@ -691,6 +714,8 @@ pub struct SignatureReport {
     pub certifying: bool,
     pub document_time_stamp: bool,
     pub has_embedded_timestamp: bool,
+    /// The signature uses SHA-1, reported as a weak-algorithm note.
+    pub weak_algorithm: bool,
     /// File offset where this signature's revision ends (for ordering).
     pub revision_end: usize,
 }
@@ -725,10 +750,17 @@ impl SignatureReport {
             Validity::ValidityUnknown => {
                 if self.detail == Detail::Expired {
                     lines.push(messages::IDENTITY_EXPIRED);
+                } else if self.detail == Detail::UnsupportedAlgorithm {
+                    lines.push(modification);
+                    lines.push(messages::UNSUPPORTED_ALGORITHM);
                 } else {
                     lines.push(modification);
                     lines.push(messages::IDENTITY_UNKNOWN);
                 }
+            }
+            Validity::Unknown if self.detail == Detail::UnsupportedAlgorithm => {
+                lines.push(modification);
+                lines.push(messages::UNSUPPORTED_ALGORITHM);
             }
             Validity::Invalid => lines.push(match self.detail {
                 Detail::BadByteRange => messages::BAD_BYTE_RANGE,
@@ -737,6 +769,9 @@ impl SignatureReport {
                 _ => messages::DOCUMENT_ALTERED,
             }),
             _ => {}
+        }
+        if self.weak_algorithm {
+            lines.push(messages::WEAK_ALGORITHM);
         }
         if self.has_embedded_timestamp || self.document_time_stamp {
             lines.push(messages::TIME_STAMPED);
@@ -755,8 +790,14 @@ pub fn notice_text(reports: &[SignatureReport]) -> Option<&'static str> {
     if signed.iter().any(|r| r.validity == Validity::Unknown && r.detail == Detail::NotVerified) {
         return Some(messages::NOTICE_NOT_VERIFIED);
     }
+    // Anything that is neither cleanly valid nor merely identity-unknown (a bad digest, a damaged
+    // or unsupported signature) is a problem; a document time stamp counts as valid here.
     if signed.iter().any(|r| !matches!(r.validity, Validity::Valid | Validity::ValidityUnknown)) {
         return Some(messages::NOTICE_PROBLEMS);
+    }
+    // A signature whose digest holds but whose signer is not confirmed must not be called valid.
+    if signed.iter().any(|r| r.validity == Validity::ValidityUnknown && !r.document_time_stamp) {
+        return Some(messages::NOTICE_NOT_CONFIRMED);
     }
     if signed.last().is_some_and(|r| r.modified_after_signing) {
         return Some(messages::NOTICE_CHANGED_AFTER_LAST);
@@ -767,52 +808,22 @@ pub fn notice_text(reports: &[SignatureReport]) -> Option<&'static str> {
     Some(messages::NOTICE_ALL_VALID)
 }
 
-fn digest_by_oid(oid: &str, parts: &[&[u8]]) -> Option<Vec<u8>> {
-    fn run<D: Digest>(parts: &[&[u8]]) -> Vec<u8> {
-        let mut h = D::new();
-        for p in parts {
-            h.update(p);
-        }
-        h.finalize().to_vec()
-    }
-    match oid {
-        "2.16.840.1.101.3.4.2.1" => Some(run::<Sha256>(parts)),
-        "2.16.840.1.101.3.4.2.2" => Some(run::<Sha384>(parts)),
-        "2.16.840.1.101.3.4.2.3" => Some(run::<Sha512>(parts)),
-        _ => None,
-    }
-}
-
-fn rsa_verify(public_key: &RsaPublicKey, digest_oid: &str, digest: &[u8], signature: &[u8]) -> bool {
-    let scheme = match digest_oid {
-        "2.16.840.1.101.3.4.2.1" => Pkcs1v15Sign::new::<Sha256>(),
-        "2.16.840.1.101.3.4.2.2" => Pkcs1v15Sign::new::<Sha384>(),
-        "2.16.840.1.101.3.4.2.3" => Pkcs1v15Sign::new::<Sha512>(),
-        _ => return false,
-    };
-    public_key.verify(scheme, digest, signature).is_ok()
-}
-
-fn public_key_of(certificate: &Certificate) -> Option<RsaPublicKey> {
-    let spki = certificate.tbs_certificate.subject_public_key_info.to_der().ok()?;
-    RsaPublicKey::from_public_key_der(&spki).ok()
-}
-
 /// Does `child` carry a valid signature from `issuer`'s key?
 fn issued_by(child: &Certificate, issuer: &Certificate) -> bool {
     if child.tbs_certificate.issuer != issuer.tbs_certificate.subject {
         return false;
     }
-    let (Some(key), Ok(tbs)) = (public_key_of(issuer), child.tbs_certificate.to_der()) else { return false };
+    let Ok(tbs) = child.tbs_certificate.to_der() else { return false };
     let Some(signature) = child.signature.as_bytes() else { return false };
-    let algorithm = child.signature_algorithm.oid.to_string();
-    let digest_oid = match algorithm.as_str() {
-        "1.2.840.113549.1.1.11" => "2.16.840.1.101.3.4.2.1",
-        "1.2.840.113549.1.1.12" => "2.16.840.1.101.3.4.2.2",
-        "1.2.840.113549.1.1.13" => "2.16.840.1.101.3.4.2.3",
-        _ => return false,
-    };
-    digest_by_oid(digest_oid, &[&tbs]).is_some_and(|d| rsa_verify(&key, digest_oid, &d, signature))
+    let parameters = child.signature_algorithm.parameters.as_ref().and_then(|p| p.to_der().ok());
+    sigcrypto::verify(
+        issuer,
+        &child.signature_algorithm.oid.to_string(),
+        parameters.as_deref(),
+        "",
+        &[&tbs],
+        signature,
+    ) == Verified::Ok
 }
 
 fn trust_level(signer: &Certificate, embedded: &[Certificate], store: &TrustStore) -> Option<Detail> {
@@ -1086,7 +1097,8 @@ fn verify_one(
     let sub_filter = v.get(b"SubFilter").ok().and_then(|o| o.as_name().ok()).map(|n| String::from_utf8_lossy(n).into_owned());
     let mut report = SignatureReport {
         field_name: name.unwrap_or_else(|| format!("object {}", id.0)),
-        signer: text_of(v, b"Name"),
+        signer: None,
+        claimed_name: text_of(v, b"Name"),
         sub_filter: sub_filter.clone(),
         reason: text_of(v, b"Reason"),
         location: text_of(v, b"Location"),
@@ -1097,6 +1109,7 @@ fn verify_one(
         certifying: pdf.is_certifying_signature(id),
         document_time_stamp: v.get(b"Type").ok().and_then(|o| o.as_name().ok()) == Some(b"DocTimeStamp"),
         has_embedded_timestamp: false,
+        weak_algorithm: false,
         revision_end: 0,
     };
 
@@ -1145,13 +1158,13 @@ fn verify_one(
     let signer_info = &cms.signer;
     report.has_embedded_timestamp = !signer_info.unsigned_attributes.is_empty();
 
-    let covered: [&[u8]; 2] = [&file[..b], &file[c..c + d]];
-    let Some(content_digest) = digest_by_oid(&signer_info.digest_algorithm, &covered) else {
-        invalid(&mut report, Detail::UnsupportedFilter);
-        return report;
+    let unknown = |report: &mut SignatureReport, detail: Detail| {
+        report.validity = Validity::ValidityUnknown;
+        report.detail = detail;
     };
 
-    // Signer certificate: match issuer and serial, else the first embedded certificate.
+    // Signer certificate: match issuer and serial, or subject key identifier, else the first
+    // embedded certificate.
     let certificates: Vec<Certificate> = cms.certificates.iter().filter_map(|d| Certificate::from_der(d).ok()).collect();
     let signer = certificates
         .iter()
@@ -1160,45 +1173,68 @@ fn verify_one(
                 c.tbs_certificate.issuer.to_der().ok().as_ref() == Some(issuer)
                     && c.tbs_certificate.serial_number.to_der().ok().as_ref() == Some(serial)
             }
-            cms::SignerId::KeyIdentifier => false,
+            cms::SignerId::KeyIdentifier(id) => subject_key_id(c).as_deref() == Some(id),
         })
         .or_else(|| certificates.first());
     let Some(signer) = signer else {
         invalid(&mut report, Detail::Corrupt);
         return report;
     };
-    let Some(public_key) = public_key_of(signer) else {
-        invalid(&mut report, Detail::UnsupportedFilter);
-        return report;
-    };
-    if report.signer.is_none() {
-        report.signer = Some(common_name(signer));
+    report.signer = Some(subject_name(signer));
+    if report.claimed_name.as_deref() == Some(report.signer.as_deref().unwrap_or_default()) {
+        report.claimed_name = None;
     }
 
-    // 4. Integrity: message digest and signature value.
     let digest_oid = &signer_info.digest_algorithm;
-    let signature_ok = match &signer_info.signed_attributes {
+    report.weak_algorithm = sigcrypto::is_weak_digest(digest_oid) || sigcrypto::uses_sha1(&signer_info.signature_algorithm);
+
+    // 4. Integrity: message digest and signature value. The signed input is the DER SET OF signed
+    //    attributes, or, when there are none, the covered bytes directly.
+    let covered: [&[u8]; 2] = [&file[..b], &file[c..c + d]];
+    let inputs: Vec<Vec<u8>> = match &signer_info.signed_attributes {
         Some(_) => {
+            let Some(content_digest) = sigcrypto::digest(digest_oid, &covered) else {
+                unknown(&mut report, Detail::UnsupportedAlgorithm);
+                return report;
+            };
             if signer_info.message_digest.as_deref() != Some(content_digest.as_slice()) {
                 invalid(&mut report, Detail::DigestMismatch);
                 return report;
             }
-            signer_info.signed_attribute_encodings().iter().any(|set| {
-                digest_by_oid(digest_oid, &[set]).is_some_and(|d| rsa_verify(&public_key, digest_oid, &d, &signer_info.signature))
-            })
+            signer_info.signed_attribute_encodings()
         }
-        None => {
-            if !rsa_verify(&public_key, digest_oid, &content_digest, &signer_info.signature) {
-                // No message digest to compare: a failing signature means altered content.
-                invalid(&mut report, Detail::DigestMismatch);
-                return report;
-            }
-            true
-        }
+        None => vec![covered.concat()],
     };
-    if !signature_ok {
-        invalid(&mut report, Detail::Corrupt);
-        return report;
+    let mut outcome = Verified::Bad;
+    for input in &inputs {
+        outcome = sigcrypto::verify(
+            signer,
+            &signer_info.signature_algorithm,
+            signer_info.signature_parameters.as_deref(),
+            digest_oid,
+            &[input],
+            &signer_info.signature,
+        );
+        if outcome != Verified::Bad {
+            break;
+        }
+    }
+    match outcome {
+        Verified::Ok => {}
+        Verified::Unsupported => {
+            unknown(&mut report, Detail::UnsupportedAlgorithm);
+            return report;
+        }
+        // No signed attributes means no message digest to compare against, so a failing signature
+        // is the only sign the covered bytes changed.
+        Verified::Bad if signer_info.signed_attributes.is_none() => {
+            invalid(&mut report, Detail::DigestMismatch);
+            return report;
+        }
+        Verified::Bad => {
+            invalid(&mut report, Detail::Corrupt);
+            return report;
+        }
     }
 
     // 5. Trust and validity period.

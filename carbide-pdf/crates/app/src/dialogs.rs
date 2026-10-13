@@ -391,6 +391,9 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                             if let Some(who) = &report.signer {
                                 ui.label(format!("Signer: {who}"));
                             }
+                            if let Some(claimed) = &report.claimed_name {
+                                ui.weak(format!("Name in signature (unverified): {claimed}"));
+                            }
                             if let Some(reason) = &report.reason {
                                 ui.label(format!("Reason: {reason}"));
                             }

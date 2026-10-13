@@ -1974,6 +1974,185 @@ fn a_signature_object_moved_after_the_gap_is_rejected() {
     assert_eq!(reports[0].detail, Detail::BadByteRange, "relocated signature object was {:?}", reports[0].validity);
 }
 
+// ---- algorithm coverage (S7, S6) ----------------------------------------------------------
+
+mod algo {
+    //! Minimal DER, enough to wrap a signature of any algorithm into a detached CMS whose signer
+    //! certificate the verifier reads.
+    pub fn len(n: usize) -> Vec<u8> {
+        if n < 0x80 {
+            vec![n as u8]
+        } else {
+            let bytes = n.to_be_bytes();
+            let skip = bytes.iter().take_while(|b| **b == 0).count();
+            let mut out = vec![0x80 | (bytes.len() - skip) as u8];
+            out.extend_from_slice(&bytes[skip..]);
+            out
+        }
+    }
+    pub fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend(len(body.len()));
+        out.extend_from_slice(body);
+        out
+    }
+    pub fn seq(parts: &[&[u8]]) -> Vec<u8> {
+        tlv(0x30, &parts.concat())
+    }
+    pub fn set(parts: &[&[u8]]) -> Vec<u8> {
+        tlv(0x31, &parts.concat())
+    }
+    pub fn ctx(n: u8, body: &[u8]) -> Vec<u8> {
+        tlv(0xA0 | n, body)
+    }
+    pub fn oid(arcs: &[u32]) -> Vec<u8> {
+        let mut content = vec![(arcs[0] * 40 + arcs[1]) as u8];
+        for &arc in &arcs[2..] {
+            let mut stack = vec![(arc & 0x7F) as u8];
+            let mut rest = arc >> 7;
+            while rest > 0 {
+                stack.push(0x80 | (rest & 0x7F) as u8);
+                rest >>= 7;
+            }
+            stack.reverse();
+            content.extend(stack);
+        }
+        tlv(0x06, &content)
+    }
+    pub fn null() -> Vec<u8> {
+        vec![0x05, 0x00]
+    }
+}
+
+/// A detached CMS SignedData with one signer, no signed attributes: the signature covers the
+/// content directly. `cert_der` is embedded and named as the signer.
+fn detached_cms(cert_der: &[u8], digest_oid: &[u32], sig_oid: &[u32], sig_params: Option<Vec<u8>>, signature: &[u8]) -> Vec<u8> {
+    use algo::*;
+    use x509_cert::der::{Decode, Encode};
+    let cert = x509_cert::Certificate::from_der(cert_der).unwrap();
+    let issuer = cert.tbs_certificate.issuer.to_der().unwrap();
+    let serial = cert.tbs_certificate.serial_number.to_der().unwrap();
+    let issuer_and_serial = seq(&[&issuer, &serial]);
+    let digest_algo = seq(&[&oid(digest_oid), &null()]);
+    let sig_algo = match sig_params {
+        Some(params) => seq(&[&oid(sig_oid), &params]),
+        None => seq(&[&oid(sig_oid)]),
+    };
+    let signer_info = seq(&[
+        &tlv(0x02, &[1]),
+        &issuer_and_serial,
+        &digest_algo,
+        &sig_algo,
+        &tlv(0x04, signature),
+    ]);
+    let signed_data = seq(&[
+        &tlv(0x02, &[1]),
+        &set(&[&digest_algo]),
+        &seq(&[&oid(&[1, 2, 840, 113549, 1, 7, 1])]), // id-data
+        &ctx(0, cert_der),
+        &set(&[&signer_info]),
+    ]);
+    seq(&[&oid(&[1, 2, 840, 113549, 1, 7, 2]), &ctx(0, &signed_data)]) // id-signedData
+}
+
+/// A self-signed certificate for `pair`, with `common_name`.
+fn self_signed(pair: &rcgen::KeyPair, common_name: &str) -> Vec<u8> {
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(rcgen::DnType::CommonName, common_name);
+    params.self_signed(pair).unwrap().der().to_vec()
+}
+
+/// Signs `base`, then replaces the CMS in /Contents with `cms`, keeping the byte range.
+fn resign_with(doc: &Pdf, base: &[u8], cms: &[u8]) -> Vec<u8> {
+    let mut signed = doc.sign(base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    put_signature_value(&mut signed, cms);
+    signed
+}
+
+/// The bytes a detached signature over `signed` covers.
+fn covered_bytes(signed: &[u8]) -> Vec<u8> {
+    let [_, b, c, d] = byte_range(signed);
+    let mut out = signed[..b].to_vec();
+    out.extend_from_slice(&signed[c..c + d]);
+    out
+}
+
+#[test]
+fn ecdsa_p256_signatures_verify_and_name_comes_from_the_certificate() {
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    use p256::pkcs8::DecodePrivateKey;
+    let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let signing = p256::ecdsa::SigningKey::from_pkcs8_der(&pair.serialize_der()).unwrap();
+    let cert = self_signed(&pair, "Elliptic Signer");
+
+    let mut doc = text_pdf(&[&["ecdsa"]]);
+    let base = file_bytes(&mut doc);
+    // Build the signed file first so the covered bytes are known, then sign those.
+    let probe = resign_with(&doc, &base, &[0x30, 0x00]);
+    let covered = covered_bytes(&probe);
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(&covered);
+    let signature: p256::ecdsa::Signature = signing.sign_prehash(&digest).unwrap();
+    let cms = detached_cms(&cert, &[2, 16, 840, 1, 101, 3, 4, 2, 1], &[1, 2, 840, 10045, 4, 3, 2], None, &signature.to_der().as_bytes());
+    let signed = resign_with(&doc, &base, &cms);
+
+    // /Name still says the Carbide identity; the certificate subject is the ECDSA one.
+    let reports = verify(&signed, &TrustStore { certificates: vec![cert.clone()] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
+    assert_eq!(reports[0].signer.as_deref(), Some("Elliptic Signer"));
+    assert_eq!(reports[0].claimed_name.as_deref(), Some("Carbide Test Signer"));
+}
+
+#[test]
+fn rsa_pss_signatures_verify() {
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let cert = self_signed(&pair, "PSS Signer");
+
+    let mut doc = text_pdf(&[&["pss"]]);
+    let base = file_bytes(&mut doc);
+    let probe = resign_with(&doc, &base, &[0x30, 0x00]);
+    let covered = covered_bytes(&probe);
+    let signing = rsa::pss::SigningKey::<sha2::Sha256>::new(key);
+    let signature = signing.sign_with_rng(&mut rand::rngs::OsRng, &covered).to_vec();
+    // RSASSA-PSS-params: SHA-256, MGF1-SHA-256, salt 32.
+    use algo::*;
+    let sha256 = seq(&[&oid(&[2, 16, 840, 1, 101, 3, 4, 2, 1]), &null()]);
+    let params = seq(&[
+        &ctx(0, &sha256),
+        &ctx(1, &seq(&[&oid(&[1, 2, 840, 113549, 1, 1, 8]), &sha256])),
+        &ctx(2, &tlv(0x02, &[32])),
+    ]);
+    let cms = detached_cms(&cert, &[2, 16, 840, 1, 101, 3, 4, 2, 1], &[1, 2, 840, 113549, 1, 1, 10], Some(params), &signature);
+    let signed = resign_with(&doc, &base, &cms);
+
+    let reports = verify(&signed, &TrustStore { certificates: vec![cert] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly), "{:?}", reports[0].detail);
+}
+
+#[test]
+fn an_unsupported_algorithm_is_reported_as_unknown_not_altered() {
+    // An Ed25519 signer: the algorithm is one this build cannot check.
+    let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(rcgen::DnType::CommonName, "Edward Signer");
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+
+    let mut doc = text_pdf(&[&["ed25519"]]);
+    let base = file_bytes(&mut doc);
+    // Ed25519 OID 1.3.101.112 for both digest and signature; the signature need not verify.
+    let cms = detached_cms(&cert, &[1, 3, 101, 112], &[1, 3, 101, 112], None, &[0u8; 64]);
+    let signed = resign_with(&doc, &base, &cms);
+
+    let reports = verify(&signed, &TrustStore { certificates: vec![cert] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm));
+    assert_ne!(reports[0].status_line(), sig_messages::INVALID);
+    assert!(reports[0].description_lines().contains(&sig_messages::UNSUPPORTED_ALGORITHM));
+    assert!(!reports[0].description_lines().contains(&sig_messages::DOCUMENT_ALTERED));
+}
+
+
 #[test]
 fn identities_load_from_pem_and_pkcs12() {
     let id = test_identity();

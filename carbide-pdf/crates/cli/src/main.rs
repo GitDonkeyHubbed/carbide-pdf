@@ -799,6 +799,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 if let Some(who) = &r.signer {
                     println!("  signer: {who}");
                 }
+                if let Some(claimed) = &r.claimed_name {
+                    println!("  name in signature (unverified): {claimed}");
+                }
                 for line in r.description_lines() {
                     println!("  {line}");
                 }

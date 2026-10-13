@@ -23,7 +23,7 @@ pub(crate) enum SignerId {
     /// DER of the issuer's name and of the serial number INTEGER.
     IssuerAndSerial { issuer: Vec<u8>, serial: Vec<u8> },
     /// The signer certificate's subject key identifier.
-    KeyIdentifier,
+    KeyIdentifier(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -33,6 +33,9 @@ pub(crate) struct SignerInfo {
     /// Each signed attribute in DER, in the order they were sent.
     pub signed_attributes: Option<Vec<Vec<u8>>>,
     pub message_digest: Option<Vec<u8>>,
+    pub signature_algorithm: String,
+    /// DER of the signature algorithm's parameters, when it has any (RSASSA-PSS carries them).
+    pub signature_parameters: Option<Vec<u8>>,
     pub signature: Vec<u8>,
     /// Unsigned attributes: the type and the encoding of each value.
     pub unsigned_attributes: Vec<(String, Vec<Vec<u8>>)>,
@@ -98,7 +101,7 @@ fn parse_signer_info(signer: &Element<'_>) -> Option<SignerInfo> {
             let kids = der::children_ber(sid.content);
             SignerId::IssuerAndSerial { issuer: der::normalize(kids.first()?)?, serial: der::normalize(kids.get(1)?)? }
         }
-        0x80 | 0xA0 => SignerId::KeyIdentifier,
+        0x80 | 0xA0 => SignerId::KeyIdentifier(der::string_value(sid)?),
         _ => return None,
     };
     let (digest_algorithm, _) = algorithm(parts.get(2)?)?;
@@ -117,7 +120,7 @@ fn parse_signer_info(signer: &Element<'_>) -> Option<SignerInfo> {
         signed_attributes = Some(attributes);
         index += 1;
     }
-    algorithm(parts.get(index)?)?;
+    let (signature_algorithm, signature_parameters) = algorithm(parts.get(index)?)?;
     let signature = parts.get(index + 1).filter(|e| e.tag & !0x20 == der::OCTET_STRING)?;
     let signature = der::string_value(signature)?;
     let mut unsigned_attributes = Vec::new();
@@ -132,6 +135,8 @@ fn parse_signer_info(signer: &Element<'_>) -> Option<SignerInfo> {
         digest_algorithm,
         signed_attributes,
         message_digest,
+        signature_algorithm,
+        signature_parameters,
         signature,
         unsigned_attributes,
     })

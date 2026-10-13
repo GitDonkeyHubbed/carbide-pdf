@@ -183,6 +183,18 @@ fn children_with<'a>(content: &'a [u8], read: fn(&'a [u8]) -> Option<(Element<'a
     out
 }
 
+/// The value of a small non-negative INTEGER element's content.
+pub fn small_unsigned(content: &[u8]) -> Option<u64> {
+    if content.is_empty() || content[0] & 0x80 != 0 || content.len() > 9 {
+        return None;
+    }
+    let digits = if content.len() == 9 && content[0] == 0 { &content[1..] } else { content };
+    if digits.len() > 8 {
+        return None;
+    }
+    Some(digits.iter().fold(0u64, |value, b| (value << 8) | *b as u64))
+}
+
 /// The DER encoding of a (possibly BER) element: definite lengths throughout, and a string sent
 /// in pieces joined into one. `None` when it nests too deeply or does not parse.
 pub fn normalize(element: &Element<'_>) -> Option<Vec<u8>> {
@@ -302,6 +314,14 @@ mod tests {
         let mut deep: Vec<u8> = std::iter::repeat([0x30, 0x80]).take(200).flatten().collect();
         deep.extend(std::iter::repeat(0).take(400));
         assert!(read_ber(&deep).is_none());
+    }
+
+    #[test]
+    fn small_integers() {
+        assert_eq!(small_unsigned(&[0x14]), Some(20));
+        assert_eq!(small_unsigned(&[0x00, 0x80]), Some(128));
+        assert_eq!(small_unsigned(&[0x80]), None);
+        assert_eq!(small_unsigned(&[]), None);
     }
 
     #[test]
