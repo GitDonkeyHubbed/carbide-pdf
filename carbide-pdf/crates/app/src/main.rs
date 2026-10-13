@@ -56,6 +56,8 @@ pub struct OpenDoc {
     pub version: u64,
     pub record: Option<RecordId>,
     pub dirty: bool,
+    /// What a document without a file is called (an earlier revision, say); `None` for Untitled.
+    pub name: Option<String>,
     pub geometries: Vec<PageGeometry>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
@@ -86,6 +88,7 @@ impl OpenDoc {
             version: 0,
             record: None,
             dirty: false,
+            name: None,
             geometries,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -130,6 +133,7 @@ impl OpenDoc {
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
+            .or_else(|| self.name.clone())
             .unwrap_or_else(|| "Untitled".into())
     }
 }
@@ -209,7 +213,7 @@ pub struct CarbideApp {
 }
 
 impl CarbideApp {
-    fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, launch: Option<Launch>) -> Self {
         theme::apply(&cc.egui_ctx);
         route_quit_through_window_close();
         let (renderer, renderer_error) = match Renderer::global() {
@@ -218,8 +222,10 @@ impl CarbideApp {
         };
         let autosave = AutoSaveStore::open(paths::autosave_dir()).ok();
         let mut app = Self::with_parts(renderer, renderer_error, autosave, paths::load_autosave_settings());
-        if let Some(path) = initial {
-            app.open_path(&path);
+        match launch {
+            Some(Launch::File(path)) => app.open_path(&path),
+            Some(Launch::Copy(path)) => app.open_copy(&path),
+            None => {}
         }
         // Launch: show recovered documents waiting from an earlier session.
         if app.autosave.as_ref().is_some_and(|s| s.any_needs_save()) {
@@ -288,6 +294,27 @@ impl CarbideApp {
                 self.dialog = Some(Dialog::Password { path: path.to_path_buf(), bytes, input: String::new(), failed: false });
             }
             Err(e) => self.alert(format!("Could not open {}: {e}", path.display())),
+        }
+    }
+
+    /// Opens `path`, a private temporary copy another window wrote (an earlier revision), as a new
+    /// document that has no file yet: Save asks where to put it, so nothing is ever saved into the
+    /// temporary folder. The copy is removed once it has been read.
+    pub fn open_copy(&mut self, path: &Path) {
+        let bytes = std::fs::read(path);
+        if carbide_engine::fs::is_private_temp_file(path) {
+            let _ = carbide_engine::fs::remove_private_temp_file(path);
+        }
+        let opened = bytes.map_err(EngineError::from).and_then(|bytes| Pdf::from_bytes(&bytes));
+        match opened {
+            Ok(pdf) => {
+                self.install(pdf, None, None);
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                    self.status = format!("{} - {} page(s)", doc.title(), doc.pdf.page_count());
+                }
+            }
+            Err(e) => self.alert(format!("Could not open the copy: {e}")),
         }
     }
 
@@ -705,10 +732,12 @@ impl CarbideApp {
         };
         match open_revision_bytes(&bytes, revision) {
             Ok(prefix) => {
-                let name = revision_display_name(&doc.title(), revision).replace(['/', ':'], "-");
-                let target = std::env::temp_dir().join(format!("{name}.pdf"));
-                if std::fs::write(&target, prefix).is_ok() {
-                    self.spawn_window(&target);
+                // Handed to the new window as a private copy that it removes once read; the window
+                // shows it as a new document, so its Save never writes into the temporary folder.
+                let name = format!("{}.pdf", revision_display_name(&doc.title(), revision).replace(['/', ':'], "-"));
+                match carbide_engine::fs::private_temp_file(&name, &prefix) {
+                    Ok(copy) => self.spawn_copy_window(&copy),
+                    Err(e) => self.alert(format!("Could not open the revision: {e}")),
                 }
             }
             Err(e) => self.alert(e.to_string()),
@@ -719,6 +748,19 @@ impl CarbideApp {
         match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg(path).spawn()) {
             Ok(_) => self.status = format!("Opened {} in a new window.", path.display()),
             Err(e) => self.alert(format!("Could not open a new window: {e}")),
+        }
+    }
+
+    /// Opens `copy`, a private temporary file, in a new window as a new document (see `open_copy`).
+    fn spawn_copy_window(&mut self, copy: &Path) {
+        let spawned = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg(COPY_FLAG).arg(copy).spawn());
+        let name = copy.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match spawned {
+            Ok(_) => self.status = format!("Opened {name} in a new window."),
+            Err(e) => {
+                let _ = carbide_engine::fs::remove_private_temp_file(copy);
+                self.alert(format!("Could not open a new window: {e}"));
+            }
         }
     }
 
@@ -1268,7 +1310,9 @@ impl CarbideApp {
     fn export_text(&mut self) {
         let (Some(renderer), Some(doc)) = (self.renderer, self.doc.as_mut()) else { return };
         let Some(path) = rfd::FileDialog::new().add_filter("Text", &["txt"]).set_file_name("document.txt").save_file() else { return };
-        match carbide_engine::export_text(renderer, &mut doc.pdf).and_then(|t| std::fs::write(&path, t).map_err(Into::into)) {
+        let written = carbide_engine::export_text(renderer, &mut doc.pdf)
+            .and_then(|text| Ok(carbide_engine::fs::write_replacing(&path, text.as_bytes())?));
+        match written {
             Ok(()) => self.status = format!("Exported text to {}", path.display()),
             Err(e) => self.alert(format!("Export failed: {e}")),
         }
@@ -1372,6 +1416,17 @@ impl eframe::App for CarbideApp {
     }
 }
 
+/// `carbide-gui --copy FILE` opens FILE, a private temporary copy, as a new document and removes it.
+const COPY_FLAG: &str = "--copy";
+
+/// What a window opens when it starts.
+enum Launch {
+    /// A file on disk, which Save writes back to.
+    File(PathBuf),
+    /// A private temporary copy, opened as a new document (see `CarbideApp::open_copy`).
+    Copy(PathBuf),
+}
+
 /// `carbide-gui --icons` shows every icon with its name, for checking the drawings.
 struct IconSheet;
 
@@ -1441,7 +1496,12 @@ fn main() -> eframe::Result {
             }),
         );
     }
-    let initial = std::env::args_os().nth(1).map(PathBuf::from);
+    let mut args = std::env::args_os().skip(1);
+    let launch = match args.next() {
+        Some(flag) if flag == COPY_FLAG => args.next().map(|path| Launch::Copy(PathBuf::from(path))),
+        Some(path) => Some(Launch::File(PathBuf::from(path))),
+        None => None,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
@@ -1449,5 +1509,5 @@ fn main() -> eframe::Result {
             .with_title("Carbide PDF"),
         ..Default::default()
     };
-    eframe::run_native("Carbide PDF", options, Box::new(move |cc| Ok(Box::new(CarbideApp::new(cc, initial)))))
+    eframe::run_native("Carbide PDF", options, Box::new(move |cc| Ok(Box::new(CarbideApp::new(cc, launch)))))
 }

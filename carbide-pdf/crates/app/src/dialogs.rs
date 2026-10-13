@@ -978,7 +978,9 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
     ui.horizontal(|ui| {
         if ui.button("Save Settings...").clicked() {
             if let Some(path) = rfd::FileDialog::new().set_file_name("imposition.ini").save_file() {
-                let _ = std::fs::write(path, o.to_ini());
+                if let Err(e) = carbide_engine::fs::write_replacing(&path, o.to_ini().as_bytes()) {
+                    form.error = Some(format!("Could not save the settings: {e}"));
+                }
             }
         }
         if ui.button("Load Settings...").clicked() {

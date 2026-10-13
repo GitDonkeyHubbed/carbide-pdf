@@ -290,3 +290,16 @@ fn protected_documents_get_no_recovery_copy_and_saving_retires_one() {
     assert!(!app.doc.as_ref().unwrap().dirty);
     assert_eq!(recovery_copies(&dir), 0);
 }
+
+#[test]
+fn a_revision_opens_from_a_private_copy_as_a_new_document() {
+    let dir = scratch();
+    let mut app = app(&dir);
+    let copy = carbide_engine::fs::private_temp_file("a - First.pdf", &document(&["EARLIER"]).to_bytes().unwrap()).unwrap();
+    app.open_copy(&copy);
+    let doc = app.doc.as_ref().expect("the copy is open");
+    assert_eq!(doc.title(), "a - First.pdf");
+    // No file behind it: Save asks where to put it instead of writing into the temporary folder.
+    assert!(doc.path.is_none() && doc.saved.is_none() && !doc.dirty);
+    assert!(!copy.exists() && !copy.parent().unwrap().exists(), "the copy was left in the temporary folder");
+}
