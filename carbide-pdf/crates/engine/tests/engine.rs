@@ -1026,6 +1026,51 @@ fn older_encryption_opens_with_either_password_and_saves_with_the_same_key() {
 }
 
 #[test]
+fn protected_files_with_revisions_get_encrypted_updates_appended() {
+    let r = renderer();
+    // Protected after a revision was saved, as other software can do; the revision record stays.
+    let base = text_pdf(&[&["private words"]]).to_bytes().unwrap();
+    let mut working = Pdf::from_bytes(&base).unwrap();
+    working.apply_bates(&BatesOptions::default()).unwrap();
+    let v1 = working.save_revision(&base, "First", &pdf_date_now()).unwrap();
+    let modern = Pdf::from_bytes(&v1).unwrap().to_encrypted_bytes(&ProtectionOptions::new("user", "owner")).unwrap();
+    let older = {
+        let mut doc = Pdf::from_bytes(&v1).unwrap();
+        let bytes = doc.to_bytes().unwrap();
+        // The older revisions need a file identifier; give the plain file one before protecting it.
+        let mut plain = Document::load_mem(&bytes).unwrap();
+        let id = Object::String(b"carbide-test-id2".to_vec(), lopdf::StringFormat::Hexadecimal);
+        plain.trailer.set("ID", vec![id.clone(), id]);
+        let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V2 {
+            document: &plain,
+            owner_password: "owner",
+            user_password: "user",
+            key_length: 128,
+            permissions: lopdf::Permissions::PRINTABLE,
+        })
+        .unwrap();
+        let mut encrypted = plain.clone();
+        encrypted.encrypt(&state).unwrap();
+        let mut out = Vec::new();
+        encrypted.save_with_options(&mut out, lopdf::SaveOptions::builder().use_object_streams(false).use_xref_streams(false).build()).unwrap();
+        out
+    };
+    for (label, original) in [("AES-256", modern), ("RC4", older)] {
+        let (mut pdf, saved) = SavedFile::open(original.clone(), Some("owner".into())).unwrap();
+        assert_eq!(pdf.revisions().len(), 1, "{label}");
+        pdf.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
+        let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, false);
+        assert_eq!(plan, SavePlan::Incremental, "{label}");
+        assert!(bytes.starts_with(&original), "{label}: the protected original is not a prefix");
+        assert!(!contains(&bytes[original.len()..], b"DRAFT"), "{label}: the update is in the clear");
+        for password in ["user", "owner"] {
+            let text = r.page_text_with_password(&bytes, password, 0).unwrap_or_else(|e| panic!("{label}, {password}: {e}"));
+            assert!(text.contains("private words") && text.contains("DRAFT"), "{label}, {password}: {text:?}");
+        }
+    }
+}
+
+#[test]
 fn aes256_passwords_are_prepared_the_way_the_standard_says() {
     // Option+Space types a no-break space; accents can arrive composed or decomposed.
     for (set, typed) in [("my\u{a0}pass", "my\u{a0}pass"), ("café", "café"), ("café", "cafe\u{301}")] {
