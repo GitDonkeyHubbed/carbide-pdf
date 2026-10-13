@@ -1568,13 +1568,27 @@ impl CarbideApp {
             self.status = "Nothing was removed: the document is no longer in front.".into();
             return;
         }
+        // What only the file on disk holds is reported too; the save that has to follow leaves it out.
+        let file = self.doc.as_ref().and_then(|d| d.saved.clone());
+        let was_dirty = self.doc.as_ref().is_some_and(|d| d.dirty);
         let mut report = None;
         self.edit_removing("Remove hidden information", |pdf| {
-            report = Some(pdf.remove_hidden_information(&items)?);
+            report = Some(pdf.remove_hidden_information_from(&items, file.as_ref())?);
             Ok(())
         });
         match report {
-            Some(report) if report.is_empty() => self.status = "No hidden information was found.".into(),
+            Some(report) if report.is_empty() => {
+                // Nothing was found, so this was no edit: the document is put back exactly as it was,
+                // and a save has nothing to rewrite (which could cost a signature).
+                if let Some(doc) = self.doc.as_mut() {
+                    if let Some(snapshot) = doc.undo.pop() {
+                        let _ = doc.restore(&snapshot.bytes);
+                        doc.content_removed = snapshot.content_removed;
+                    }
+                    doc.dirty = was_dirty;
+                }
+                self.status = "No hidden information was found.".into();
+            }
             Some(report) => {
                 let lines = report.lines().iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n");
                 self.alert(format!("Removed from the document:\n{lines}\n\nSave the document to write it without them."));

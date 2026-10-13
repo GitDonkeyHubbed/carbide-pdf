@@ -405,12 +405,61 @@ fn hidden_information_is_removed_as_an_edit_and_offered_after_redacting() {
     app.save();
     assert!(!contains(&std::fs::read(&path).unwrap(), "SECRET NOTE"));
 
+    // Looking again finds nothing, and that is no edit: nothing to undo, and nothing for Save to
+    // rewrite, which for a signed file would cost its signatures.
+    let steps = app.doc.as_ref().unwrap().undo.len();
+    app.remove_hidden_information(active_id(&app), carbide_engine::HiddenItem::ALL.to_vec());
+    assert_eq!(app.status, "No hidden information was found.");
+    let open = app.doc.as_ref().unwrap();
+    assert!(!open.dirty && !open.content_removed && open.undo.len() == steps);
+    assert_eq!(open.pdf.save_plan(open.saved.as_ref(), open.content_removed).unwrap(), carbide_engine::SavePlan::Unchanged);
+
     // Applying redactions offers to look for the same text elsewhere.
     let Ok(renderer) = carbide_engine::Renderer::global() else { return };
     app.renderer = Some(renderer);
     app.pending_redactions = vec![carbide_engine::Redaction { page: 0, rect: carbide_engine::Rect::new(60.0, 690.0, 200.0, 40.0) }];
     app.run(Cmd::ApplyRedactions);
     assert!(matches!(app.dialog, Some(Dialog::SuggestRemoveHidden { doc }) if doc == active_id(&app)));
+}
+
+#[test]
+fn removing_hidden_information_also_rewrites_what_only_the_file_holds() {
+    let dir = scratch();
+    // A note taken off the page by an update appended later: the file still holds it.
+    let mut noted = document(&["PAGE TEXT"]);
+    noted.add_note(0, 100.0, 100.0, "SECRET-OLD-COMMENT").unwrap();
+    let base = noted.to_bytes().unwrap();
+    let mut later = Pdf::from_bytes(&base).unwrap();
+    let page = later.page_ids()[0];
+    let annotations = later.document().get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap().clone();
+    // Only the text box `document` draws its label with stays.
+    let kept: Vec<_> = annotations
+        .into_iter()
+        .filter(|a| {
+            let id = a.as_reference().unwrap();
+            later.document().get_dictionary(id).unwrap().get(b"Subtype").unwrap().as_name().unwrap() == b"FreeText"
+        })
+        .collect();
+    later.document_mut().get_dictionary_mut(page).unwrap().set("Annots", kept);
+    let path = dir.join("history.pdf");
+    std::fs::write(&path, later.incremental_update(&base).unwrap()).unwrap();
+    assert!(contains(&std::fs::read(&path).unwrap(), "SECRET-OLD-COMMENT"));
+
+    let mut app = app(&dir);
+    app.open_path(&path);
+    app.run(Cmd::RemoveHidden);
+    let Some(Dialog::RemoveHidden { doc, chosen }) = app.dialog.take() else { panic!("no dialog") };
+    // Text boxes are kept, so that nothing but the earlier version is found.
+    let items = chosen.iter().filter(|(item, on)| *on && *item != carbide_engine::HiddenItem::Comments).map(|(item, _)| *item).collect();
+    app.remove_hidden_information(doc, items);
+    let Some(Dialog::Message(report)) = &app.dialog else { panic!("nothing was reported: {}", app.status) };
+    assert!(report.contains(carbide_engine::sanitize::IN_FILE_LABEL), "{report}");
+    app.dialog = None;
+    app.save();
+    assert!(app.dialog.is_none(), "{:?}", app.status);
+    let written = std::fs::read(&path).unwrap();
+    assert!(!contains(&written, "SECRET-OLD-COMMENT"), "the earlier version is still in the file");
+    assert_eq!(Pdf::from_bytes(&written).unwrap().annotations(0).unwrap().len(), 1, "the text box was kept");
 }
 
 /// Simulates an earlier session that auto-saved `edited` copies of `originals` (a document never

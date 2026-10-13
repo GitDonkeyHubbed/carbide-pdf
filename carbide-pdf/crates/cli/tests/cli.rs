@@ -266,6 +266,25 @@ fn sanitize_removes_what_is_chosen_and_keeps_protection() {
     assert!(!has_note(&clean));
     assert!(has_note(&file), "the input was changed");
 
+    // A note an appended update took off the page is still in the file, in its earlier version:
+    // the output is written in full, without it, even when nothing else is chosen.
+    let history = dir.join("history.pdf");
+    let base = std::fs::read(&file).unwrap();
+    let mut later = Pdf::from_bytes(&base).unwrap();
+    let page = later.page_ids()[0];
+    later.document_mut().get_dictionary_mut(page).unwrap().remove(b"Annots");
+    std::fs::write(&history, later.incremental_update(&base).unwrap()).unwrap();
+    assert!(has_note(&history));
+    let out = dir.join("history-clean.pdf");
+    let output = carbide(&["sanitize", history.to_str().unwrap(), out.to_str().unwrap(), "--only", "thumbnails"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("removed Earlier versions and unused objects in the file"));
+    assert!(!has_note(&out), "the earlier version was written out again");
+    // In place too.
+    let output = carbide(&["sanitize", history.to_str().unwrap(), history.to_str().unwrap(), "--only", "thumbnails"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!has_note(&history));
+
     // A protected input comes out protected the same way.
     let locked = dir.join("locked.pdf");
     protected(&locked, "user pw", "owner pw");

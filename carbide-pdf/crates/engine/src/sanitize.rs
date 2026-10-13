@@ -3,15 +3,18 @@
 //! Metadata, attachments, scripts, form values, comments and the rest often repeat or reveal text
 //! that was redacted or deleted from the pages. Each kind is chosen on its own, and what was taken
 //! out is reported. The document has to be written in full afterwards (not as an appended update),
-//! or the removed information stays in the file.
+//! or the removed information stays in the file. Writing it in full also leaves out what only the
+//! file holds: earlier versions that appended updates kept, and objects nothing refers to.
 
 use std::collections::HashSet;
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::error::Result;
+use crate::incremental::file_structure;
 use crate::navigation::collect_pairs;
 use crate::pdf::Pdf;
+use crate::save::SavedFile;
 
 /// Deeper nesting than this is treated as damaged and left alone.
 const MAX_DEPTH: usize = 64;
@@ -77,10 +80,16 @@ impl HiddenItem {
     }
 }
 
+/// How [`HiddenReport::lines`] names what only the file holds.
+pub const IN_FILE_LABEL: &str = "Earlier versions and unused objects in the file";
+
 /// What [`Pdf::remove_hidden_information`] took out: how much of each item it found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HiddenReport {
     removed: Vec<(HiddenItem, usize)>,
+    /// Earlier versions and unused objects only the file holds. Writing the document in full
+    /// leaves them out, whatever was chosen.
+    in_file: usize,
 }
 
 impl HiddenReport {
@@ -90,14 +99,26 @@ impl HiddenReport {
         self.removed.iter().filter(|(i, _)| *i == item).map(|(_, n)| n).sum()
     }
 
-    /// True when nothing was found.
-    pub fn is_empty(&self) -> bool {
-        self.removed.iter().all(|(_, n)| *n == 0)
+    /// How many earlier versions (appended updates) and unused objects the file holds besides the
+    /// document; see [`Pdf::remove_hidden_information_from`].
+    pub fn in_file(&self) -> usize {
+        self.in_file
     }
 
-    /// One line per item that was found, such as "Attachments and embedded files: 2".
+    /// True when nothing was found.
+    pub fn is_empty(&self) -> bool {
+        self.in_file == 0 && self.removed.iter().all(|(_, n)| *n == 0)
+    }
+
+    /// One line per item that was found, such as "Attachments and embedded files: 2", and one for
+    /// what only the file holds.
     pub fn lines(&self) -> Vec<String> {
-        self.removed.iter().filter(|(_, n)| *n > 0).map(|(item, n)| format!("{}: {n}", item.label())).collect()
+        let mut lines: Vec<String> =
+            self.removed.iter().filter(|(_, n)| *n > 0).map(|(item, n)| format!("{}: {n}", item.label())).collect();
+        if self.in_file > 0 {
+            lines.push(format!("{IN_FILE_LABEL}: {}", self.in_file));
+        }
+        lines
     }
 }
 
@@ -106,12 +127,26 @@ impl Pdf {
     /// without their pop-ups; links and form fields are not comments and stay. Write the document
     /// in full afterwards: an appended update would leave the removed information in the file.
     pub fn remove_hidden_information(&mut self, items: &[HiddenItem]) -> Result<HiddenReport> {
+        self.remove_hidden_information_from(items, None)
+    }
+
+    /// [`Pdf::remove_hidden_information`] for a document opened from `file`, the file it is saved
+    /// over. What only that file holds is reported too: the earlier versions appended updates kept
+    /// in it and the objects nothing refers to, which the full rewrite that has to follow leaves
+    /// out. They are reported even when nothing else is found, since saving still removes them.
+    pub fn remove_hidden_information_from(&mut self, items: &[HiddenItem], file: Option<&SavedFile>) -> Result<HiddenReport> {
         let mut report = HiddenReport::default();
         let chosen = |item| items.contains(&item);
+        let empty = HashSet::new();
+        let in_file = file.map_or(&empty, SavedFile::unused_objects);
+        report.in_file = in_file.len() + file.map_or(0, SavedFile::appended_updates);
         // Objects already unused are counted before the other items leave more of them behind.
+        // Those the file holds unused are counted with the file; how the file was written (its
+        // cross-reference and object streams, linearization data, stream lengths) does not count.
         if chosen(HiddenItem::UnusedObjects) {
+            let structure = file_structure(&self.doc);
             self.trim_resources()?;
-            let removed = self.doc.prune_objects().len();
+            let removed = self.doc.prune_objects().into_iter().filter(|id| !structure.contains(id) && !in_file.contains(id)).count();
             report.removed.push((HiddenItem::UnusedObjects, removed));
         }
         for item in HiddenItem::ALL.into_iter().filter(|&i| chosen(i) && i != HiddenItem::UnusedObjects) {

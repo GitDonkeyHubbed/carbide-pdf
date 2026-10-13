@@ -14,6 +14,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use lopdf::{Document, EncryptionState, Object, ObjectId, SaveOptions};
 
 use crate::error::{Error, Result};
+use crate::incremental::file_structure;
 use crate::pdf::Pdf;
 use crate::revisions::CATALOG_KEY;
 
@@ -46,6 +47,11 @@ pub struct SavedFile {
     protection: Option<Protection>,
     /// Fingerprints of the text and data the file holds, per object.
     content: HashMap<ObjectId, Fingerprint>,
+    /// Objects the file holds that are not part of the document: nothing in it refers to them.
+    unused: HashSet<ObjectId>,
+    /// How many updates were appended to the file. Each keeps the earlier version of what it
+    /// changed in the file.
+    updates: usize,
 }
 
 /// How a protected file is encrypted: the values of its encryption dictionary and the file key its
@@ -85,11 +91,13 @@ impl SavedFile {
             state,
             id: pdf.doc.trailer.get(b"ID").ok().cloned(),
         });
-        let content = reachable(&pdf.doc)
-            .into_iter()
-            .filter_map(|id| Some((id, Fingerprint::of(pdf.doc.objects.get(&id)?)?)))
-            .collect();
-        SavedFile { bytes, password, protection, content }
+        let reachable = reachable(&pdf.doc);
+        let content = reachable.iter().filter_map(|&id| Some((id, Fingerprint::of(pdf.doc.objects.get(&id)?)?))).collect();
+        let structure = file_structure(&pdf.doc);
+        let unused =
+            pdf.doc.objects.keys().filter(|id| !reachable.contains(id) && !structure.contains(id)).copied().collect();
+        let updates = appended_updates(&bytes, pdf.doc.xref_start);
+        SavedFile { bytes, password, protection, content, unused, updates }
     }
 
     /// Opens `bytes` as a document and records them as its file. The password is used exactly as
@@ -119,6 +127,18 @@ impl SavedFile {
     /// How the file is encrypted, `None` for an unprotected one.
     pub fn protection(&self) -> Option<&Protection> {
         self.protection.as_ref()
+    }
+
+    /// Objects the file holds that nothing in the document refers to. Writing the document in
+    /// full leaves them out.
+    pub(crate) fn unused_objects(&self) -> &HashSet<ObjectId> {
+        &self.unused
+    }
+
+    /// How many updates were appended to the file, each keeping the earlier version of what it
+    /// changed. Writing the document in full leaves those versions out.
+    pub fn appended_updates(&self) -> usize {
+        self.updates
     }
 
     /// True when `pdf` has lost text or data this file holds: an object that is no longer part of
@@ -206,13 +226,15 @@ impl Pdf {
     /// record that an edit since the last save took content out (applying redactions, deleting
     /// pages); edits that dropped content of the file are also found by comparing with it.
     ///
-    /// Without a file the plan is always a full rewrite.
+    /// Without a file the plan is always a full rewrite. So it is after an edit that removed
+    /// content, even when the document itself shows no change: what was removed may be held only
+    /// by the file (an object nothing refers to, an earlier version an update left behind).
     pub fn save_plan(&self, saved: Option<&SavedFile>, content_removed: bool) -> Result<SavePlan> {
         let Some(saved) = saved else {
             return Ok(SavePlan::FullRewrite { breaks_signatures: false, drops_revisions: false });
         };
         let base = Pdf { doc: saved.load()? };
-        if self.changes_since(&base.doc).is_empty() {
+        if !content_removed && self.changes_since(&base.doc).is_empty() {
             return Ok(SavePlan::Unchanged);
         }
         // A signature the file already fails (after an earlier rewrite, say) is not worth keeping
@@ -345,6 +367,43 @@ pub(crate) fn reachable(doc: &Document) -> HashSet<ObjectId> {
         }
     }
     seen
+}
+
+/// How many updates were appended to the file `bytes`, whose last cross-reference section starts
+/// at `xref_start`. Counted by following the sections' /Prev links back to the first; the link from
+/// a linearized file's first-page section to its main section is not an update. A start of zero
+/// means the cross-reference table had to be rebuilt, which leaves nothing to follow.
+fn appended_updates(bytes: &[u8], xref_start: usize) -> usize {
+    let mut seen = HashSet::new();
+    let mut at = xref_start;
+    let mut links = 0;
+    while at != 0 && seen.insert(at) {
+        match previous_section(bytes, at) {
+            Some(previous) if previous < bytes.len() => {
+                links += 1;
+                at = previous;
+            }
+            _ => break,
+        }
+    }
+    let linearized = find(&bytes[..bytes.len().min(1024)], b"/Linearized").is_some();
+    links - usize::from(linearized && links > 0)
+}
+
+/// The /Prev entry of the cross-reference section at `at`: in the trailer that follows a table, or
+/// in the dictionary of a cross-reference stream.
+fn previous_section(bytes: &[u8], at: usize) -> Option<usize> {
+    let section = bytes.get(at..)?;
+    let end: &[u8] = if section.trim_ascii_start().starts_with(b"xref") { b"startxref" } else { b"stream" };
+    let dictionary = &section[..find(section, end)?];
+    let after = &dictionary[find(dictionary, b"/Prev")? + b"/Prev".len()..];
+    let digits: Vec<u8> =
+        after.iter().skip_while(|b| b.is_ascii_whitespace()).take_while(|b| b.is_ascii_digit()).copied().collect();
+    std::str::from_utf8(&digits).ok()?.parse().ok()
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The text and data of one object: hashes of its strings and of its stream content.

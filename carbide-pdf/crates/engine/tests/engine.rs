@@ -827,6 +827,119 @@ fn hidden_information_is_removed_as_chosen_and_reported() {
     assert!(pdf.remove_hidden_information(&HiddenItem::ALL).unwrap().is_empty(), "nothing is left to find");
 }
 
+/// A page with a note holding "SECRET-OLD-COMMENT" and the title "SECRET-OLD-TITLE", then an
+/// update appended that takes the note off the page and changes the title: both stay in the file,
+/// in its earlier version.
+fn file_with_history() -> Vec<u8> {
+    let mut pdf = text_pdf(&[&["page"]]);
+    pdf.add_note(0, 100.0, 100.0, "SECRET-OLD-COMMENT").unwrap();
+    let info = pdf.document_mut().add_object(dictionary! { "Title" => Object::string_literal("SECRET-OLD-TITLE") });
+    pdf.document_mut().trailer.set("Info", info);
+    let base = pdf.to_bytes().unwrap();
+    let mut later = Pdf::from_bytes(&base).unwrap();
+    let page = later.page_ids()[0];
+    later.document_mut().get_dictionary_mut(page).unwrap().remove(b"Annots");
+    later.document_mut().get_dictionary_mut(info).unwrap().set("Title", Object::string_literal("Final"));
+    later.incremental_update(&base).unwrap()
+}
+
+#[test]
+fn removing_hidden_information_leaves_nothing_behind_in_the_file_it_saves_over() {
+    // An object nothing refers to, written out as it is.
+    let mut orphaned = text_pdf(&[&["page"]]);
+    orphaned.document_mut().add_object(Stream::new(lopdf::Dictionary::new(), b"SECRET-ORPHAN".to_vec()).with_compression(false));
+    let mut orphan_file = Vec::new();
+    orphaned.document_mut().save_to(&mut orphan_file).unwrap();
+    let history_file = file_with_history();
+    for secret in ["SECRET-OLD-COMMENT", "SECRET-OLD-TITLE"] {
+        assert!(contains(&history_file, secret.as_bytes()), "the fixture lacks {secret}");
+    }
+    assert_eq!(SavedFile::open(history_file.clone(), None).unwrap().1.appended_updates(), 1);
+
+    let defaults: Vec<HiddenItem> = HiddenItem::ALL.into_iter().filter(|i| i.chosen_by_default()).collect();
+    for (file, secrets) in [(&orphan_file, &["SECRET-ORPHAN"][..]), (&history_file, &["SECRET-OLD-COMMENT", "SECRET-OLD-TITLE"])] {
+        for items in [&defaults[..], &[HiddenItem::Thumbnails]] {
+            let mut reported = Vec::new();
+            // As the command line opens a file, and as the app does, which drops what nothing
+            // refers to as it opens it: the same is reported either way.
+            for dropped_on_opening in [false, true] {
+                let (mut pdf, saved) = SavedFile::open(file.clone(), None).unwrap();
+                if dropped_on_opening {
+                    pdf.to_bytes().unwrap();
+                }
+                assert_ne!(pdf.save_plan(Some(&saved), true).unwrap(), SavePlan::Unchanged, "a removal always rewrites");
+                let report = pdf.remove_hidden_information_from(items, Some(&saved)).unwrap();
+                assert!(!report.is_empty() && report.in_file() >= 1, "{report:?}");
+                assert!(report.lines().iter().any(|l| l.starts_with(carbide_engine::sanitize::IN_FILE_LABEL)), "{report:?}");
+                reported.push(report.lines());
+
+                let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, true);
+                assert_eq!(plan, CLEAN);
+                for secret in secrets {
+                    assert_gone(&bytes, secret);
+                }
+                // What was written holds nothing more.
+                let (mut again, rewritten) = SavedFile::open(bytes, None).unwrap();
+                assert_eq!(rewritten.appended_updates(), 0);
+                assert!(again.remove_hidden_information_from(items, Some(&rewritten)).unwrap().is_empty());
+            }
+            assert_eq!(reported[0], reported[1]);
+        }
+    }
+}
+
+/// A one-page file written the way web-optimized files are: a linearization dictionary first, the
+/// hint stream it points to by offset, and a content stream whose length is an object of its own.
+/// `orphan`, when given, is written as one more object nothing refers to.
+fn linearized_file(orphan: Option<&str>) -> Vec<u8> {
+    let write = |hint_offset: usize| {
+        let mut objects = vec![
+            (6, format!("<</Linearized 1/L 0/H [{hint_offset:010} 30]/O 3/E 0/N 1/T 0>>")),
+            (1, "<</Type/Catalog/Pages 2 0 R>>".to_string()),
+            (2, "<</Type/Pages/Kids [3 0 R]/Count 1>>".to_string()),
+            (3, "<</Type/Page/Parent 2 0 R/MediaBox [0 0 612 792]/Contents 4 0 R>>".to_string()),
+            (4, "<</Length 5 0 R>>\nstream\n0 0 m 10 10 l S\nendstream".to_string()),
+            (5, "16".to_string()),
+            (7, "<</Length 8/S 4>>\nstream\n\0\0\0\0\0\0\0\0\nendstream".to_string()),
+        ];
+        if let Some(orphan) = orphan {
+            objects.push((8, orphan.to_string()));
+        }
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![0; objects.len() + 1];
+        for (number, body) in &objects {
+            offsets[*number] = bytes.len();
+            bytes.extend(format!("{number} 0 obj\n{body}\nendobj\n").into_bytes());
+        }
+        let xref = bytes.len();
+        bytes.extend(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).into_bytes());
+        for offset in &offsets[1..] {
+            bytes.extend(format!("{offset:010} 00000 n \n").into_bytes());
+        }
+        bytes.extend(format!("trailer\n<</Size {}/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n", offsets.len()).into_bytes());
+        (bytes, offsets[7])
+    };
+    // The offsets do not depend on the one written into the dictionary, which has a fixed width.
+    let (_, hint_offset) = write(0);
+    write(hint_offset).0
+}
+
+#[test]
+fn how_a_file_was_written_is_not_reported_as_hidden_information() {
+    let items = [HiddenItem::UnusedObjects, HiddenItem::Thumbnails];
+    let (mut pdf, saved) = SavedFile::open(linearized_file(None), None).unwrap();
+    assert_eq!(saved.appended_updates(), 0);
+    let report = pdf.remove_hidden_information_from(&items, Some(&saved)).unwrap();
+    assert!(report.is_empty(), "the linearization data and the stream length were reported: {report:?}");
+
+    // An object that holds something is found next to them, by either count.
+    let file = linearized_file(Some("<</Note (SECRET-ORPHAN)>>"));
+    let (mut pdf, saved) = SavedFile::open(file.clone(), None).unwrap();
+    assert_eq!(pdf.remove_hidden_information_from(&items, Some(&saved)).unwrap().in_file(), 1);
+    let (mut pdf, _) = SavedFile::open(file, None).unwrap();
+    assert_eq!(pdf.remove_hidden_information(&items).unwrap().count(HiddenItem::UnusedObjects), 1);
+}
+
 /// One page per label, built the way word processors and form tools write them, so that other
 /// parts of the document point into every page:
 /// - each page draws its label, and a form XObject showing `FORM-<label>` from a resource

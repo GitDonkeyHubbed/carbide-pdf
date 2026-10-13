@@ -848,7 +848,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 false => only.iter().map(|a| a.item()).collect(),
             };
             items.retain(|item| !keep.iter().any(|k| k.item() == *item));
-            let report = pdf.remove_hidden_information(&items)?;
+            let report = pdf.remove_hidden_information_from(&items, Some(&saved))?;
             if report.is_empty() {
                 println!("No hidden information was found.");
             }
