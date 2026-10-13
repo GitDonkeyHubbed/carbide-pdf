@@ -13,8 +13,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use lopdf::xref::XrefEntry;
 use lopdf::{dictionary, Dictionary, Object, ObjectId, Stream, StringFormat};
 use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
+use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
 use sha2::{Digest, Sha256};
 use x509_cert::der::{Decode, Encode};
 use x509_cert::Certificate;
@@ -68,11 +68,29 @@ pub struct Identity {
 }
 
 impl Identity {
-    pub fn new(chain_der: Vec<Vec<u8>>, key: RsaPrivateKey) -> Result<Identity> {
+    pub fn new(mut chain_der: Vec<Vec<u8>>, key: RsaPrivateKey) -> Result<Identity> {
         if chain_der.is_empty() {
             return Err(Error::Other("the identity has no certificate".into()));
         }
-        Certificate::from_der(&chain_der[0]).map_err(|e| Error::Other(format!("invalid certificate: {e}")))?;
+        for der in &chain_der {
+            Certificate::from_der(der).map_err(|e| Error::Other(format!("invalid certificate: {e}")))?;
+        }
+        // The signer certificate is the one whose public key matches the private key. Some files
+        // (a CA-first PEM bundle, say) list it after its issuer; move it to the front, and refuse
+        // an identity whose key matches none of its certificates.
+        let public_key = RsaPublicKey::from(&key);
+        let matches = |der: &[u8]| {
+            Certificate::from_der(der)
+                .ok()
+                .and_then(|c| c.tbs_certificate.subject_public_key_info.to_der().ok())
+                .and_then(|spki| RsaPublicKey::from_public_key_der(&spki).ok())
+                .is_some_and(|candidate| candidate == public_key)
+        };
+        let signer = chain_der
+            .iter()
+            .position(|der| matches(der))
+            .ok_or_else(|| Error::Other("the private key does not match any of the identity's certificates".into()))?;
+        chain_der.swap(0, signer);
         Ok(Identity { chain: chain_der, key })
     }
 
@@ -759,6 +777,27 @@ pub enum Detail {
 pub struct TrustStore {
     /// DER certificates the user trusts.
     pub certificates: Vec<Vec<u8>>,
+}
+
+/// Reads the X.509 certificates from `bytes`, which may be PEM (one or more `CERTIFICATE` blocks)
+/// or a single DER certificate. Returns their DER encodings, and an error when nothing parses as a
+/// certificate, so a mistaken file (a key, a PKCS#12, random bytes) is refused rather than stored.
+pub fn read_certificates(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut ders: Vec<Vec<u8>> = Vec::new();
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        for der in pem_blocks(text, "CERTIFICATE") {
+            if Certificate::from_der(&der).is_ok() {
+                ders.push(der);
+            }
+        }
+    }
+    if ders.is_empty() && Certificate::from_der(bytes).is_ok() {
+        ders.push(bytes.to_vec());
+    }
+    if ders.is_empty() {
+        return Err(Error::Other("this file does not contain an X.509 certificate".into()));
+    }
+    Ok(ders)
 }
 
 #[derive(Debug, Clone)]

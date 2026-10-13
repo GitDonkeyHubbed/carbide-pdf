@@ -2252,6 +2252,42 @@ fn a_time_stamp_authority_refuses_credentials_over_plain_http() {
 }
 
 #[test]
+fn an_identity_whose_key_does_not_match_its_certificate_is_rejected() {
+    use rsa::pkcs8::EncodePrivateKey;
+    // A certificate for one key, paired with a different key.
+    let other = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let other_pair = rcgen::KeyPair::try_from(other.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(rcgen::DnType::CommonName, "Someone Else");
+    let foreign_cert = params.self_signed(&other_pair).unwrap().der().to_vec();
+
+    let mine = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let Err(err) = Identity::new(vec![foreign_cert.clone()], mine.clone()) else { panic!("mismatch accepted") };
+    assert!(err.to_string().contains("does not match"), "{err}");
+
+    // With the chain listed issuer-first, the signer certificate is found and moved to the front.
+    let my_pair = rcgen::KeyPair::try_from(mine.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let mut my_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    my_params.distinguished_name.push(rcgen::DnType::CommonName, "The Signer");
+    let my_cert = my_params.self_signed(&my_pair).unwrap().der().to_vec();
+    let identity = Identity::new(vec![foreign_cert, my_cert.clone()], mine).unwrap();
+    assert_eq!(identity.certificate_der(), my_cert.as_slice());
+    assert_eq!(identity.common_name(), "The Signer");
+}
+
+#[test]
+fn trusted_certificate_import_rejects_files_that_are_not_certificates() {
+    use carbide_engine::signature::read_certificates;
+    let id = test_identity();
+    // A PEM certificate and a bare DER certificate both parse.
+    assert_eq!(read_certificates(id.cert_pem.as_bytes()).unwrap().len(), 1);
+    assert_eq!(read_certificates(&id.certificate).unwrap(), vec![id.certificate.clone()]);
+    // A private key, or anything else, is refused instead of being stored.
+    assert!(read_certificates(id.key_pem.as_bytes()).is_err());
+    assert!(read_certificates(b"not a certificate at all").is_err());
+}
+
+#[test]
 fn identities_load_from_pem_and_pkcs12() {
     let id = test_identity();
     let from_pem = Identity::from_pem(&id.cert_pem, &id.key_pem).unwrap();
