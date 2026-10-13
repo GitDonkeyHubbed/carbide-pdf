@@ -90,7 +90,7 @@ impl Pdf {
 
     pub fn save_encrypted(&mut self, path: impl AsRef<std::path::Path>, options: &ProtectionOptions) -> Result<()> {
         let bytes = self.to_encrypted_bytes(options)?;
-        std::fs::write(path, bytes)?;
+        crate::fs::write_replacing(path.as_ref(), &bytes)?;
         Ok(())
     }
 }
