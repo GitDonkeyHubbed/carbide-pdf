@@ -2297,56 +2297,65 @@ fn flipping_an_unsigned_algorithm_identifier_does_not_hide_tampering() {
 // ---- time stamps (S3, S8) -----------------------------------------------------------------
 
 /// A test RFC 3161 authority: it signs real time-stamp tokens with an RSA key whose certificate
-/// carries the time-stamping extended key usage.
+/// carries the time-stamping extended key usage, critical and alone as RFC 3161 asks.
 struct TestTsa {
     key: rsa::RsaPrivateKey,
     cert: Vec<u8>,
+    /// The genTime its tokens give.
+    gen_time: &'static str,
 }
 
-fn test_tsa() -> &'static TestTsa {
-    static TSA: OnceLock<TestTsa> = OnceLock::new();
-    TSA.get_or_init(|| {
+impl TestTsa {
+    /// An authority whose certificate is valid from 1 January of `from` to 1 January of `until`,
+    /// with its time-stamping purpose marked critical or not.
+    fn new(name: &str, (from, until): (i32, i32), critical: bool, gen_time: &'static str) -> TestTsa {
         use rsa::pkcs8::EncodePrivateKey;
         let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
         let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.distinguished_name.push(rcgen::DnType::CommonName, "Test TSA");
+        params.distinguished_name.push(rcgen::DnType::CommonName, name);
         params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
-        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::TimeStamping];
+        params.not_before = rcgen::date_time_ymd(from, 1, 1);
+        params.not_after = rcgen::date_time_ymd(until, 1, 1);
+        let purposes = algo::seq(&[&algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 8])]); // id-kp-timeStamping
+        let mut eku = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], purposes);
+        eku.set_criticality(critical);
+        params.custom_extensions.push(eku);
         let cert = params.self_signed(&pair).unwrap().der().to_vec();
-        TestTsa { key, cert }
-    })
-}
+        TestTsa { key, cert, gen_time }
+    }
 
-impl TimestampSource for TestTsa {
-    fn token_for_digest(&self, digest: &[u8; 32]) -> carbide_engine::Result<Vec<u8>> {
+    /// A TimeStampToken over `imprint` (hashed with `hash_oid`), echoing `nonce` (the content of
+    /// an INTEGER) when given, whose ESS signing-certificate attribute hashes `ess_cert`.
+    fn token_with(&self, hash_oid: &[u32], imprint: &[u8], nonce: Option<&[u8]>, ess_cert: &[u8]) -> Vec<u8> {
         use algo::*;
         use rsa::Pkcs1v15Sign;
-        let sha256_alg = seq(&[&oid(&[2, 16, 840, 1, 101, 3, 4, 2, 1]), &null()]);
-        // TSTInfo with the message imprint over `digest`.
-        let imprint = seq(&[&sha256_alg, &tlv(0x04, digest)]);
-        let gen_time = tlv(0x18, b"20260101000000Z");
-        let tst_info = seq(&[
-            &tlv(0x02, &[1]),                                 // version
-            &oid(&[1, 2, 3, 4]),                              // policy (arbitrary)
-            &imprint,
-            &tlv(0x02, &[1]),                                 // serialNumber
-            &gen_time,
-        ]);
-        // Signed attributes: contentType = id-ct-TSTInfo, messageDigest = H(TSTInfo).
-        let content_type = seq(&[
-            &oid(&[1, 2, 840, 113549, 1, 9, 3]),
-            &set(&[&oid(&[1, 2, 840, 113549, 1, 9, 16, 1, 4])]),
-        ]);
-        let tst_digest = <sha2::Sha256 as sha2::Digest>::digest(&tst_info);
-        let message_digest = seq(&[
-            &oid(&[1, 2, 840, 113549, 1, 9, 4]),
-            &set(&[&tlv(0x04, &tst_digest)]),
-        ]);
-        let mut attrs = [content_type, message_digest];
+        let sha256 = |data: &[u8]| <sha2::Sha256 as sha2::Digest>::digest(data).to_vec();
+        let sha256_alg = seq(&[&oid(SHA256_OID), &null()]);
+        let mut fields = vec![
+            tlv(0x02, &[1]),                                                // version
+            oid(&[1, 2, 3, 4]),                                             // policy (arbitrary)
+            seq(&[&seq(&[&oid(hash_oid), &null()]), &tlv(0x04, imprint)]), // messageImprint
+            tlv(0x02, &[1]),                                                // serialNumber
+            tlv(0x18, self.gen_time.as_bytes()),                            // genTime
+        ];
+        if let Some(nonce) = nonce {
+            fields.push(tlv(0x02, nonce));
+        }
+        let refs: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+        let tst_info = seq(&refs);
+        // Signed attributes: contentType = id-ct-TSTInfo, messageDigest = H(TSTInfo), and
+        // signingCertificateV2 naming the certificate by its SHA-256 hash.
+        let mut attrs = [
+            seq(&[&oid(&[1, 2, 840, 113549, 1, 9, 3]), &set(&[&oid(&[1, 2, 840, 113549, 1, 9, 16, 1, 4])])]),
+            seq(&[&oid(&[1, 2, 840, 113549, 1, 9, 4]), &set(&[&tlv(0x04, &sha256(&tst_info))])]),
+            seq(&[
+                &oid(&[1, 2, 840, 113549, 1, 9, 16, 2, 47]),
+                &set(&[&seq(&[&seq(&[&seq(&[&tlv(0x04, &sha256(ess_cert))])])])]),
+            ]),
+        ];
         attrs.sort();
-        let signed_attrs_set = set(&[&attrs[0], &attrs[1]]);
-        let to_sign = <sha2::Sha256 as sha2::Digest>::digest(&signed_attrs_set);
+        let to_sign = sha256(&set(&[&attrs[0], &attrs[1], &attrs[2]]));
         let signature = self.key.sign(Pkcs1v15Sign::new::<sha2::Sha256>(), &to_sign).unwrap();
 
         use x509_cert::der::{Decode, Encode};
@@ -2357,22 +2366,37 @@ impl TimestampSource for TestTsa {
             &tlv(0x02, &[1]),
             &seq(&[&issuer, &serial]),
             &sha256_alg,
-            &ctx(0, &[&attrs[0][..], &attrs[1][..]].concat()),
+            &ctx(0, &attrs.concat()),
             &seq(&[&oid(&[1, 2, 840, 113549, 1, 1, 11]), &null()]),
             &tlv(0x04, &signature),
         ]);
-        let encap = seq(&[
-            &oid(&[1, 2, 840, 113549, 1, 9, 16, 1, 4]),
-            &ctx(0, &tlv(0x04, &tst_info)),
-        ]);
-        let signed_data = seq(&[
-            &tlv(0x02, &[1]),
-            &set(&[&sha256_alg]),
-            &encap,
-            &ctx(0, &self.cert),
-            &set(&[&signer_info]),
-        ]);
-        Ok(seq(&[&oid(&[1, 2, 840, 113549, 1, 7, 2]), &ctx(0, &signed_data)]))
+        let encap = seq(&[&oid(&[1, 2, 840, 113549, 1, 9, 16, 1, 4]), &ctx(0, &tlv(0x04, &tst_info))]);
+        let signed_data = seq(&[&tlv(0x02, &[1]), &set(&[&sha256_alg]), &encap, &ctx(0, &self.cert), &set(&[&signer_info])]);
+        seq(&[&oid(&[1, 2, 840, 113549, 1, 7, 2]), &ctx(0, &signed_data)])
+    }
+
+    fn token(&self, hash_oid: &[u32], imprint: &[u8], nonce: Option<&[u8]>) -> Vec<u8> {
+        self.token_with(hash_oid, imprint, nonce, &self.cert)
+    }
+}
+
+fn test_tsa() -> &'static TestTsa {
+    static TSA: OnceLock<TestTsa> = OnceLock::new();
+    TSA.get_or_init(|| TestTsa::new("Test TSA", (2020, 2040), true, "20260101000000Z"))
+}
+
+impl TimestampSource for TestTsa {
+    fn token_for_digest(&self, digest: &[u8; 32]) -> carbide_engine::Result<Vec<u8>> {
+        Ok(self.token(SHA256_OID, digest, None))
+    }
+}
+
+/// A source whose tokens cover some other digest than the one asked for.
+struct WrongImprint<'a>(&'a TestTsa);
+
+impl TimestampSource for WrongImprint<'_> {
+    fn token_for_digest(&self, _digest: &[u8; 32]) -> carbide_engine::Result<Vec<u8>> {
+        Ok(self.0.token(SHA256_OID, &[0xAB; 32], None))
     }
 }
 
@@ -2389,14 +2413,60 @@ fn an_embedded_time_stamp_is_reported_only_when_it_verifies() {
     options.timestamp = Some(tsa);
     let signed = doc.sign(&base, &options).unwrap();
 
-    let reports = verify(&signed, &trust_test_identity());
+    // A verifying time stamp from a trusted authority.
+    let reports = verify(&signed, &tsa_trust());
     assert_eq!(reports[0].validity, Validity::Valid);
-    assert!(reports[0].has_embedded_timestamp, "a verifying signature time stamp is reported");
+    assert!(reports[0].has_embedded_timestamp && reports[0].embedded_timestamp_trusted);
     assert!(reports[0].description_lines().contains(&sig_messages::TIME_STAMPED));
+
+    // The same time stamp when its authority is not trusted: present, but not vouched for.
+    let reports = verify(&signed, &trust_test_identity());
+    assert!(reports[0].has_embedded_timestamp && !reports[0].embedded_timestamp_trusted);
+    let lines = reports[0].description_lines();
+    assert!(lines.contains(&sig_messages::TIME_STAMP_UNCONFIRMED) && !lines.contains(&sig_messages::TIME_STAMPED));
+
+    // A token over something else says nothing about a time stamp.
+    let wrong = WrongImprint(tsa);
+    let mut options = sign_options(SubFilter::Pkcs7Detached);
+    options.timestamp = Some(&wrong);
+    let reports = verify(&doc.sign(&base, &options).unwrap(), &tsa_trust());
+    assert_eq!(reports[0].validity, Validity::Valid);
+    assert!(!reports[0].has_embedded_timestamp);
+    let lines = reports[0].description_lines();
+    assert!(!lines.contains(&sig_messages::TIME_STAMPED) && !lines.contains(&sig_messages::TIME_STAMP_UNCONFIRMED));
 
     // A signature with no time stamp says nothing about one.
     let plain = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
     assert!(!verify(&plain, &trust_test_identity())[0].has_embedded_timestamp);
+}
+
+#[test]
+fn only_a_trusted_time_stamp_moves_the_certificate_validity_check() {
+    // A signer whose certificate expired long ago signs today. Without a time stamp that is an
+    // expired signature.
+    let (pair, key) = rsa_key();
+    let mut params = cert_params("Expired Signer", IsCa::ExplicitNoCa, &[KeyUsagePurpose::DigitalSignature]);
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+    let identity = Identity::new(vec![cert.clone()], key).unwrap();
+    let mut doc = text_pdf(&[&["backdated"]]);
+    let base = file_bytes(&mut doc);
+    let sign = |tsa: &TestTsa| {
+        let options = SignOptions { identity: Some(&identity), timestamp: Some(tsa), ..Default::default() };
+        doc.sign(&base, &options).unwrap()
+    };
+
+    // A time stamp from an authority nobody trusts, claiming a time inside the certificate's
+    // validity: anyone could add it, so the signature is still expired.
+    let anyone = TestTsa::new("Nobody TSA", (2019, 2040), true, "20200601000000Z");
+    let report = verify(&sign(&anyone), &TrustStore { certificates: vec![cert.clone()] }).remove(0);
+    assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::Expired));
+
+    // The same time from a trusted authority shows the signature was made while it was valid.
+    let trusted = TestTsa::new("Trusted TSA", (2019, 2040), true, "20200601000000Z");
+    let report = verify(&sign(&trusted), &TrustStore { certificates: vec![cert, trusted.cert.clone()] }).remove(0);
+    assert_eq!((report.validity, report.detail), (Validity::Valid, Detail::TrustedDirectly));
 }
 
 #[test]
@@ -2411,19 +2481,88 @@ fn a_document_time_stamp_verifies_as_a_time_stamp() {
     let reports = verify(&stamped, &tsa_trust());
     assert!(reports[0].document_time_stamp);
     assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
+    assert_eq!(reports[0].status_line(), sig_messages::TIMESTAMP_VALID);
     assert_eq!(reports[0].signer.as_deref(), Some("Test TSA"));
     assert!(reports[0].signing_time.as_deref().is_some_and(|t| t.contains("20260101")));
-    assert!(reports[0].description_lines().contains(&sig_messages::TIME_STAMPED));
+    assert!(reports[0].description_lines().contains(&sig_messages::DOCUMENT_TIME_STAMPED));
+    assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_ALL_VALID));
 
-    // Without trusting the authority: the token still verifies, identity not confirmed.
+    // Without trusting the authority: the token still verifies, but nothing vouches for its
+    // authority, and the notice must not call the document valid.
     let untrusted = verify(&stamped, &TrustStore::default());
     assert_eq!((untrusted[0].validity, untrusted[0].detail), (Validity::ValidityUnknown, Detail::DigestOkUntrusted));
+    assert_eq!(untrusted[0].status_line(), sig_messages::TIMESTAMP_VALIDITY_UNKNOWN);
+    let lines = untrusted[0].description_lines();
+    assert!(lines.contains(&sig_messages::TIMESTAMP_AUTHORITY_UNKNOWN) && !lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED));
+    assert_eq!(notice_text(&untrusted), Some(sig_messages::NOTICE_TIMESTAMP_NOT_CONFIRMED));
 
     // Any change to the covered bytes breaks the message imprint.
     let mut tampered = stamped.clone();
     let at = tampered.windows(8).position(|w| w == b"stamped ").unwrap();
     tampered[at] = b'S';
-    assert_eq!(verify(&tampered, &tsa_trust())[0].validity, Validity::Invalid);
+    let reports = verify(&tampered, &tsa_trust());
+    assert_eq!(reports[0].validity, Validity::Invalid);
+    assert!(!reports[0].description_lines().contains(&sig_messages::DOCUMENT_TIME_STAMPED));
+}
+
+#[test]
+fn an_untrusted_time_stamp_after_a_trusted_signature_is_not_called_valid() {
+    let mut doc = text_pdf(&[&["signed then stamped"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    let anyone = TestTsa::new("Self-made TSA", (2020, 2040), true, "20260101000000Z");
+    let options = SignOptions { sub_filter: SubFilter::DocumentTimeStamp, timestamp: Some(&anyone), ..Default::default() };
+    let stamped = Pdf::from_bytes(&signed).unwrap().sign(&signed, &options).unwrap();
+    let reports = verify(&stamped, &trust_test_identity());
+    assert_eq!(reports.len(), 2);
+    assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_TIMESTAMP_NOT_CONFIRMED));
+}
+
+#[test]
+fn a_time_stamp_authority_must_be_valid_and_for_time_stamping_at_its_time() {
+    let mut doc = text_pdf(&[&["authority rules"]]);
+    let base = file_bytes(&mut doc);
+    let cases = [
+        ("expired authority", TestTsa::new("Expired TSA", (2000, 2001), true, "20260101000000Z"), Detail::Expired),
+        ("authority not valid yet", TestTsa::new("Early TSA", (2030, 2040), true, "20260101000000Z"), Detail::Expired),
+        ("time in the future", TestTsa::new("Future TSA", (2020, 2200), true, "20990101000000Z"), Detail::SignedInFuture),
+        ("purpose not critical", TestTsa::new("Lax TSA", (2020, 2040), false, "20260101000000Z"), Detail::NotPermitted),
+    ];
+    for (label, tsa, detail) in cases {
+        let options = SignOptions { sub_filter: SubFilter::DocumentTimeStamp, timestamp: Some(&tsa), ..Default::default() };
+        let stamped = doc.sign(&base, &options).unwrap();
+        // Trusted directly, and still not a valid time stamp.
+        let report = verify(&stamped, &TrustStore { certificates: vec![tsa.cert.clone()] }).remove(0);
+        assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, detail), "{label}");
+        assert!(!report.description_lines().contains(&sig_messages::DOCUMENT_TIME_STAMPED), "{label}");
+    }
+}
+
+#[test]
+fn time_stamp_tokens_that_cannot_be_checked_or_name_another_certificate_are_not_valid() {
+    let mut doc = text_pdf(&[&["token checks"]]);
+    let base = file_bytes(&mut doc);
+    let tsa = test_tsa();
+    let options = SignOptions { sub_filter: SubFilter::DocumentTimeStamp, timestamp: Some(tsa), ..Default::default() };
+    let stamped = doc.sign(&base, &options).unwrap();
+    let covered = covered_bytes(&stamped);
+
+    // A message imprint with a hash this build does not compute: unknown, not damaged, and no
+    // claim of a time stamp.
+    let mut sha224 = stamped.clone();
+    let digest = <sha2::Sha224 as sha2::Digest>::digest(&covered);
+    put_signature_value(&mut sha224, &tsa.token(SHA224_OID, &digest, None));
+    let report = verify(&sha224, &tsa_trust()).remove(0);
+    assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm));
+    let lines = report.description_lines();
+    assert!(!lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED) && !lines.contains(&sig_messages::CORRUPTED), "{lines:?}");
+
+    // An ESS signing-certificate attribute naming a different certificate than the one that signed.
+    let mut other = stamped.clone();
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(&covered);
+    put_signature_value(&mut other, &tsa.token_with(SHA256_OID, &digest, None, &test_identity().certificate));
+    let report = verify(&other, &tsa_trust()).remove(0);
+    assert_eq!(report.validity, Validity::Invalid);
 }
 
 #[test]

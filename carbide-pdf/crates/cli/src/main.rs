@@ -802,7 +802,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
             for r in &reports {
                 println!("{}: {}", r.field_name, r.status_line());
                 if let Some(who) = &r.signer {
-                    println!("  signer: {who}");
+                    println!("  {}: {who}", if r.document_time_stamp { "time stamp authority" } else { "signer" });
+                }
+                if let Some(time) = r.signing_time.as_deref().filter(|_| r.document_time_stamp) {
+                    println!("  time stamp: {}", carbide_engine::revisions::pdf_date_to_local(time));
                 }
                 if let Some(claimed) = &r.claimed_name {
                     println!("  name in signature (unverified): {claimed}");

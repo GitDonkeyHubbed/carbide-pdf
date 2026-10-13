@@ -389,7 +389,11 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                             };
                             ui.colored_label(color, format!("{}: {}", report.field_name, report.status_line()));
                             if let Some(who) = &report.signer {
-                                ui.label(format!("Signer: {who}"));
+                                let role = if report.document_time_stamp { "Time stamp authority" } else { "Signer" };
+                                ui.label(format!("{role}: {who}"));
+                            }
+                            if let Some(time) = time_stamp_time(report) {
+                                ui.label(format!("Time stamp: {time}"));
                             }
                             if let Some(claimed) = &report.claimed_name {
                                 ui.weak(format!("Name in signature (unverified): {claimed}"));
@@ -1214,4 +1218,10 @@ fn recovery_panel(app: &mut CarbideApp, ctx: &egui::Context) -> bool {
         }
     }
     keep
+}
+
+/// The time a document time stamp gives, in local time.
+fn time_stamp_time(report: &SignatureReport) -> Option<String> {
+    let time = report.signing_time.as_deref().filter(|_| report.document_time_stamp)?;
+    Some(carbide_engine::revisions::pdf_date_to_local(time)).filter(|t| !t.is_empty())
 }

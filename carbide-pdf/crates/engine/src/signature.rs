@@ -35,6 +35,9 @@ pub mod messages {
     pub const VALID: &str = "The signature is valid";
     pub const VALIDITY_UNKNOWN: &str = "The signature could not be fully validated";
     pub const INVALID: &str = "The signature is not valid";
+    pub const TIMESTAMP_VALID: &str = "The time stamp is valid";
+    pub const TIMESTAMP_VALIDITY_UNKNOWN: &str = "The time stamp could not be fully validated";
+    pub const TIMESTAMP_INVALID: &str = "The time stamp is not valid";
     pub const REVISION_UNALTERED: &str = "The signed version of the document is unchanged";
     pub const SUBSEQUENT_CHANGES: &str = "The document was changed after it was signed";
     pub const NOT_MODIFIED: &str = "The document has not changed since it was signed";
@@ -42,6 +45,11 @@ pub mod messages {
     pub const IDENTITY_EXPIRED: &str = "The signer's certificate has expired or is not valid yet";
     pub const CHAIN_REJECTED: &str = "The signer's certificate leads to your trusted list, but through a certificate that may not issue it or was not valid at the time";
     pub const SIGNER_NOT_PERMITTED: &str = "The signer's certificate is not allowed to sign documents";
+    pub const TIMESTAMP_AUTHORITY_UNKNOWN: &str = "The time stamp authority is not confirmed: neither its certificate nor any certificate above it is in your trusted list";
+    pub const TIMESTAMP_AUTHORITY_EXPIRED: &str = "The time stamp authority's certificate was not valid at the time it gives";
+    pub const TIMESTAMP_CHAIN_REJECTED: &str = "The time stamp authority's certificate leads to your trusted list, but through a certificate that may not issue it or was not valid at the time";
+    pub const TIMESTAMP_AUTHORITY_NOT_PERMITTED: &str = "The time stamp authority's certificate is not for time stamping";
+    pub const DOCUMENT_TIME_STAMPED: &str = "A trusted time stamp authority confirms this version of the document existed at the time given.";
     pub const DOCUMENT_ALTERED: &str = "The document is damaged or was changed after signing.";
     pub const UNSUPPORTED_ALGORITHM: &str = "This signature uses an algorithm this version cannot check.";
     pub const WEAK_ALGORITHM: &str = "This signature uses SHA-1, which is no longer considered secure.";
@@ -49,17 +57,21 @@ pub mod messages {
     pub const CORRUPTED: &str = "Invalid signature: the signature data is damaged.";
     pub const FILTER_NOT_SUPPORTED: &str = "Invalid signature: this signature handler is not supported.";
     pub const SIGNED_IN_FUTURE: &str = "The signing time is in the future.";
+    pub const TIME_STAMP_IN_FUTURE: &str = "The time stamp's time is in the future.";
     pub const NOTICE_NOT_VERIFIED: &str = "Some signatures still need to be validated.";
     pub const NOTICE_PROBLEMS: &str = "This document is signed, but at least one signature has a problem.";
     pub const NOTICE_NOT_CONFIRMED: &str =
         "This document is signed, but at least one signature's identity is not confirmed.";
     pub const NOTICE_NOT_CHECKED: &str = "This document is signed, but at least one signature could not be checked.";
+    pub const NOTICE_TIMESTAMP_NOT_CONFIRMED: &str =
+        "This document is signed, but at least one time stamp's authority is not confirmed.";
     pub const NOTICE_CHANGED_AFTER_LAST: &str =
         "Signed with valid signatures, but the document changed after the last signature.";
     pub const NOTICE_UPDATED: &str = "Signed with valid signatures; the document was updated after signing.";
     pub const NOTICE_ALL_VALID: &str = "This document is signed and every signature is valid.";
     pub const FIELD_ALREADY_SIGNED: &str = "This field has already been signed.";
     pub const TIME_STAMPED: &str = "The signature carries a time stamp.";
+    pub const TIME_STAMP_UNCONFIRMED: &str = "The signature carries a time stamp, but its authority is not confirmed.";
 }
 
 // ---- identity ------------------------------------------------------------------------------
@@ -268,36 +280,52 @@ fn check_timestamp_response(token: &[u8], digest: &[u8; 32], nonce: &[u8]) -> Re
     if !der::children(&info).iter().any(|e| e.tag == der::INTEGER && e.content == nonce_value.as_slice()) {
         return Err(Error::Other("the time stamp authority returned a mismatched nonce".into()));
     }
-    if !timestamp_signature_ok(&cms, &info) {
+    if timestamp_signature(&cms, &info) != Verified::Ok {
         return Err(Error::Other("the time stamp token did not verify".into()));
     }
     Ok(())
 }
 
-/// Verifies a time-stamp token's own SignerInfo: messageDigest = H(eContent) and the signature over
-/// the signed attributes holds (trust is checked separately).
-fn timestamp_signature_ok(cms: &cms::SignedData, econtent: &[u8]) -> bool {
+/// Verifies a time-stamp token's own SignerInfo (trust is checked separately): its signed
+/// contentType is id-ct-TSTInfo, its messageDigest is H(eContent), its ESS signing-certificate
+/// attribute, when present, names the certificate that signed, and the signature over the signed
+/// attributes holds.
+fn timestamp_signature(cms: &cms::SignedData, econtent: &[u8]) -> Verified {
     let signer_info = &cms.signer;
     let certificates: Vec<Certificate> = cms.certificates.iter().filter_map(|c| Certificate::from_der(c).ok()).collect();
-    let Some(signer) = find_signer(&certificates, &signer_info.id) else { return false };
-    if signer_info.signed_attributes.is_none() {
-        return false;
+    let Some(signer) = find_signer(&certificates, &signer_info.id) else { return Verified::Bad };
+    if signer_info.signed_attributes.is_none() || signer_info.content_type.as_deref() != Some(cms::OID_TST_INFO) {
+        return Verified::Bad;
     }
     let digest_oid = &signer_info.digest_algorithm;
     match sigcrypto::digest(digest_oid, &[econtent]) {
-        Some(content_digest) if signer_info.message_digest.as_deref() == Some(&content_digest) => {}
-        _ => return false,
+        Some(content_digest) if signer_info.message_digest.as_deref() == Some(content_digest.as_slice()) => {}
+        Some(_) => return Verified::Bad,
+        None => return Verified::Unsupported,
     }
-    signer_info.signed_attribute_encodings().iter().any(|set| {
-        sigcrypto::verify(
+    if let Some((hash_oid, hash)) = &signer_info.signing_certificate {
+        let Ok(der) = signer.to_der() else { return Verified::Bad };
+        match sigcrypto::digest(hash_oid, &[&der]) {
+            Some(expected) if &expected == hash => {}
+            Some(_) => return Verified::Bad,
+            None => return Verified::Unsupported,
+        }
+    }
+    let mut outcome = Verified::Bad;
+    for set in signer_info.signed_attribute_encodings() {
+        outcome = sigcrypto::verify(
             signer,
             &signer_info.signature_algorithm,
             signer_info.signature_parameters.as_deref(),
             digest_oid,
-            &[set],
+            &[&set],
             &signer_info.signature,
-        ) == Verified::Ok
-    })
+        );
+        if outcome != Verified::Bad {
+            break;
+        }
+    }
+    outcome
 }
 
 impl TimestampSource for HttpTimestampSource {
@@ -848,7 +876,10 @@ pub struct SignatureReport {
     pub modified_after_signing: bool,
     pub certifying: bool,
     pub document_time_stamp: bool,
+    /// The signature carries a time stamp that verifies.
     pub has_embedded_timestamp: bool,
+    /// ...and that time stamp's authority is trusted.
+    pub embedded_timestamp_trusted: bool,
     /// The signature uses SHA-1, reported as a weak-algorithm note.
     pub weak_algorithm: bool,
     /// File offset where this signature's revision ends (for ordering).
@@ -858,12 +889,17 @@ pub struct SignatureReport {
 impl SignatureReport {
     /// The panel's status line.
     pub fn status_line(&self) -> &'static str {
+        let (valid, unknown, invalid) = if self.document_time_stamp {
+            (messages::TIMESTAMP_VALID, messages::TIMESTAMP_VALIDITY_UNKNOWN, messages::TIMESTAMP_INVALID)
+        } else {
+            (messages::VALID, messages::VALIDITY_UNKNOWN, messages::INVALID)
+        };
         match (self.validity, self.detail) {
             (Validity::Blank, _) => messages::UNSIGNED_FIELD,
-            (Validity::Valid, _) => messages::VALID,
-            (Validity::ValidityUnknown, _) | (Validity::Unknown, _) => messages::VALIDITY_UNKNOWN,
-            (Validity::Invalid, Detail::DigestOkUntrusted) => messages::VALIDITY_UNKNOWN,
-            (Validity::Invalid, _) => messages::INVALID,
+            (Validity::Valid, _) => valid,
+            (Validity::ValidityUnknown, _) | (Validity::Unknown, _) => unknown,
+            (Validity::Invalid, Detail::DigestOkUntrusted) => unknown,
+            (Validity::Invalid, _) => invalid,
         }
     }
 
@@ -881,13 +917,7 @@ impl SignatureReport {
             }
             Validity::ValidityUnknown => {
                 self.integrity_lines(&mut lines);
-                lines.push(match self.detail {
-                    Detail::Expired => messages::IDENTITY_EXPIRED,
-                    Detail::ChainRejected => messages::CHAIN_REJECTED,
-                    Detail::NotPermitted => messages::SIGNER_NOT_PERMITTED,
-                    Detail::SignedInFuture => messages::SIGNED_IN_FUTURE,
-                    _ => messages::IDENTITY_UNKNOWN,
-                });
+                lines.push(self.identity_line());
             }
             Validity::Invalid => lines.push(match self.detail {
                 Detail::BadByteRange => messages::BAD_BYTE_RANGE,
@@ -900,10 +930,30 @@ impl SignatureReport {
         if self.weak_algorithm {
             lines.push(messages::WEAK_ALGORITHM);
         }
-        if self.has_embedded_timestamp || self.document_time_stamp {
-            lines.push(messages::TIME_STAMPED);
+        if self.document_time_stamp {
+            if self.validity == Validity::Valid {
+                lines.push(messages::DOCUMENT_TIME_STAMPED);
+            }
+        } else if self.has_embedded_timestamp {
+            lines.push(if self.embedded_timestamp_trusted { messages::TIME_STAMPED } else { messages::TIME_STAMP_UNCONFIRMED });
         }
         lines
+    }
+
+    /// Why a signer (or time stamp authority) whose signature held is not trusted.
+    fn identity_line(&self) -> &'static str {
+        match (self.detail, self.document_time_stamp) {
+            (Detail::Expired, false) => messages::IDENTITY_EXPIRED,
+            (Detail::Expired, true) => messages::TIMESTAMP_AUTHORITY_EXPIRED,
+            (Detail::ChainRejected, false) => messages::CHAIN_REJECTED,
+            (Detail::ChainRejected, true) => messages::TIMESTAMP_CHAIN_REJECTED,
+            (Detail::NotPermitted, false) => messages::SIGNER_NOT_PERMITTED,
+            (Detail::NotPermitted, true) => messages::TIMESTAMP_AUTHORITY_NOT_PERMITTED,
+            (Detail::SignedInFuture, false) => messages::SIGNED_IN_FUTURE,
+            (Detail::SignedInFuture, true) => messages::TIME_STAMP_IN_FUTURE,
+            (_, false) => messages::IDENTITY_UNKNOWN,
+            (_, true) => messages::TIMESTAMP_AUTHORITY_UNKNOWN,
+        }
     }
 
     /// For a signature whose digest held: the signed version is unchanged, and whether the file
@@ -929,16 +979,20 @@ pub fn notice_text(reports: &[SignatureReport]) -> Option<&'static str> {
         return Some(messages::NOTICE_NOT_VERIFIED);
     }
     // Anything that is neither cleanly valid nor merely identity-unknown (a bad digest, a damaged
-    // or unsupported signature) is a problem; a document time stamp counts as valid here.
+    // signature) is a problem.
     if signed.iter().any(|r| !matches!(r.validity, Validity::Valid | Validity::ValidityUnknown)) {
         return Some(messages::NOTICE_PROBLEMS);
     }
     if signed.iter().any(|r| r.detail == Detail::UnsupportedAlgorithm) {
         return Some(messages::NOTICE_NOT_CHECKED);
     }
-    // A signature whose digest holds but whose signer is not confirmed must not be called valid.
+    // A signature whose digest holds but whose signer is not confirmed must not be called valid,
+    // and neither may a time stamp from an authority anyone could have made.
     if signed.iter().any(|r| r.validity == Validity::ValidityUnknown && !r.document_time_stamp) {
         return Some(messages::NOTICE_NOT_CONFIRMED);
+    }
+    if signed.iter().any(|r| r.validity == Validity::ValidityUnknown) {
+        return Some(messages::NOTICE_TIMESTAMP_NOT_CONFIRMED);
     }
     if signed.last().is_some_and(|r| r.modified_after_signing) {
         return Some(messages::NOTICE_CHANGED_AFTER_LAST);
@@ -1356,6 +1410,7 @@ fn verify_one(
         certifying: pdf.is_certifying_signature(id),
         document_time_stamp: v.get(b"Type").ok().and_then(|o| o.as_name().ok()) == Some(b"DocTimeStamp"),
         has_embedded_timestamp: false,
+        embedded_timestamp_trusted: false,
         weak_algorithm: false,
         revision_end: 0,
     };
@@ -1478,15 +1533,17 @@ fn verify_one(
     }
 
     // An embedded signature time stamp counts only when it is present and itself verifies: its
-    // message imprint is over the signature value, and its own token signature holds. Its time,
-    // when it verifies, is a better reference than the signer-chosen /M for the validity checks.
+    // message imprint is over the signature value, and its own token signature holds. Its time is
+    // a better reference than the signer-chosen /M for the validity checks, but only when its
+    // authority is trusted: anyone can add an unsigned attribute, with any time in it.
     let embedded = cms::unsigned_attribute(signer_info, cms::OID_SIGNATURE_TIMESTAMP)
         .map(|token| check_timestamp_token(token, &[&signer_info.signature], trust, now));
-    let timestamp_time = match &embedded {
-        Some(TokenResult::Verified { gen_time, .. }) => gen_time.as_deref().and_then(gentime_to_utc),
-        _ => None,
-    };
-    report.has_embedded_timestamp = matches!(embedded, Some(TokenResult::Verified { .. }));
+    let mut timestamp_time = None;
+    if let Some(TokenResult::Verified { time, standing, .. }) = embedded {
+        report.has_embedded_timestamp = true;
+        report.embedded_timestamp_trusted = is_trusted(standing);
+        timestamp_time = report.embedded_timestamp_trusted.then_some(time);
+    }
 
     // 5. Trust and validity period.
     let reference_time = timestamp_time
@@ -1527,35 +1584,24 @@ fn verify_document_timestamp(
     now: DateTime<Utc>,
 ) -> SignatureReport {
     let covered: [&[u8]; 2] = [&file[..b], &file[c..c + d]];
-    match check_timestamp_token(token, &covered, trust, now) {
-        TokenResult::NotAToken => {
-            report.validity = Validity::Invalid;
-            report.detail = Detail::Corrupt;
-        }
-        TokenResult::ImprintMismatch => {
-            report.validity = Validity::Invalid;
-            report.detail = Detail::DigestMismatch;
-        }
-        TokenResult::BadSignature => {
-            report.validity = Validity::Invalid;
-            report.detail = Detail::Corrupt;
-        }
-        TokenResult::Verified { gen_time, signer, trust: trusted } => {
+    let (validity, detail) = match check_timestamp_token(token, &covered, trust, now) {
+        TokenResult::NotAToken | TokenResult::BadSignature => (Validity::Invalid, Detail::Corrupt),
+        TokenResult::ImprintMismatch => (Validity::Invalid, Detail::DigestMismatch),
+        TokenResult::Unsupported => (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm),
+        TokenResult::Verified { time, signer, standing } => {
             report.signer = signer;
-            report.signing_time = gen_time.map(|g| format!("D:{g}"));
-            match trusted {
-                Some(level) => {
-                    report.validity = Validity::Valid;
-                    report.detail = level;
-                }
-                None => {
-                    report.validity = Validity::ValidityUnknown;
-                    report.detail = Detail::DigestOkUntrusted;
-                }
-            }
+            report.signing_time = Some(time.format("D:%Y%m%d%H%M%SZ").to_string());
+            (if is_trusted(standing) { Validity::Valid } else { Validity::ValidityUnknown }, standing)
         }
-    }
+    };
+    report.validity = validity;
+    report.detail = detail;
     report
+}
+
+/// True for the details that mean a certificate is trusted.
+fn is_trusted(detail: Detail) -> bool {
+    matches!(detail, Detail::TrustedDirectly | Detail::TrustedViaChain)
 }
 
 /// The outcome of checking an RFC 3161 time-stamp token.
@@ -1566,13 +1612,17 @@ enum TokenResult {
     ImprintMismatch,
     /// The token's own signature does not hold.
     BadSignature,
-    /// The token verifies; `trust` is the trust level of the time-stamp authority, if trusted.
-    Verified { gen_time: Option<String>, signer: Option<String>, trust: Option<Detail> },
+    /// The token uses an algorithm this build cannot check.
+    Unsupported,
+    /// The token verifies. `standing` is its authority's: `TrustedDirectly` or `TrustedViaChain`
+    /// when trusted, else why not.
+    Verified { time: DateTime<Utc>, signer: Option<String>, standing: Detail },
 }
 
-/// Verifies an RFC 3161 time-stamp token: its message imprint must cover `imprint`, its own
-/// signature must hold, and (for a trusted result) its authority certificate must carry the
-/// time-stamping extended key usage and chain to a trusted certificate, valid at the token's time.
+/// Verifies an RFC 3161 time-stamp token: its message imprint must cover `imprint` and its own
+/// signature must hold. For a trusted result its authority certificate must also be valid at the
+/// token's time (which may not be in the future), be for time stamping alone, and chain to a
+/// trusted certificate.
 fn check_timestamp_token(token: &[u8], imprint: &[&[u8]], trust: &TrustStore, now: DateTime<Utc>) -> TokenResult {
     let Some(cms) = cms::parse_signed_data(token) else { return TokenResult::NotAToken };
     if cms.content_type != cms::OID_TST_INFO {
@@ -1580,29 +1630,34 @@ fn check_timestamp_token(token: &[u8], imprint: &[&[u8]], trust: &TrustStore, no
     }
     let Some(econtent) = cms.content.as_deref() else { return TokenResult::NotAToken };
     let Some(info) = cms::parse_tst_info(econtent) else { return TokenResult::NotAToken };
+    let Some(time) = gentime_to_utc(&info.gen_time) else { return TokenResult::NotAToken };
 
     // The message imprint must hash exactly the data this token is supposed to cover.
     match sigcrypto::digest(&info.hash_algorithm, imprint) {
         Some(expected) if expected == info.hashed_message => {}
         Some(_) => return TokenResult::ImprintMismatch,
-        None => return TokenResult::NotAToken,
+        None => return TokenResult::Unsupported,
     }
 
     // The token's own signature, over its signed attributes with messageDigest = H(TSTInfo).
-    if !timestamp_signature_ok(&cms, econtent) {
-        return TokenResult::BadSignature;
+    match timestamp_signature(&cms, econtent) {
+        Verified::Ok => {}
+        Verified::Bad => return TokenResult::BadSignature,
+        Verified::Unsupported => return TokenResult::Unsupported,
     }
 
-    // Trust: the authority certificate must be for time stamping and chain to a trusted root at the
-    // time the token claims.
     let certificates: Vec<Certificate> = cms.certificates.iter().filter_map(|c| Certificate::from_der(c).ok()).collect();
-    let signer = find_signer(&certificates, &cms.signer.id);
-    let at = gentime_to_utc(&info.gen_time).unwrap_or(now);
-    let signer_name = signer.map(subject_name);
-    let trust_level = signer
-        .filter(|s| has_timestamping_eku(s) && key_usage_allows(s, |u| u.digital_signature() || u.non_repudiation()))
-        .and_then(|s| trust_level(s, &certificates, trust, at).ok());
-    TokenResult::Verified { gen_time: Some(info.gen_time), signer: signer_name, trust: trust_level }
+    let Some(signer) = find_signer(&certificates, &cms.signer.id) else { return TokenResult::BadSignature };
+    let standing = if time > now + chrono::Duration::minutes(5) {
+        Detail::SignedInFuture
+    } else if !valid_at(signer, time) {
+        Detail::Expired
+    } else if !(has_timestamping_eku(signer) && key_usage_allows(signer, |u| u.digital_signature() || u.non_repudiation())) {
+        Detail::NotPermitted
+    } else {
+        trust_level(signer, &certificates, trust, time).unwrap_or_else(|detail| detail)
+    };
+    TokenResult::Verified { time, signer: Some(subject_name(signer)), standing }
 }
 
 /// Finds the certificate a SignerInfo names, by issuer and serial or by subject key identifier.
@@ -1619,14 +1674,15 @@ fn find_signer<'a>(certificates: &'a [Certificate], id: &cms::SignerId) -> Optio
         .or_else(|| certificates.first())
 }
 
-/// True when `certificate` has the id-kp-timeStamping extended key usage.
+/// True when `certificate` is for time stamping as RFC 3161 asks: a critical extended key usage
+/// whose only purpose is id-kp-timeStamping.
 fn has_timestamping_eku(certificate: &Certificate) -> bool {
     let Some(extensions) = certificate.tbs_certificate.extensions.as_ref() else { return false };
     let Some(extension) = extensions.iter().find(|e| e.extn_id.to_string() == "2.5.29.37") else { return false };
     let Ok(usage) = x509_cert::ext::pkix::ExtendedKeyUsage::from_der(extension.extn_value.as_bytes()) else {
         return false;
     };
-    usage.0.iter().any(|oid| oid.to_string() == "1.3.6.1.5.5.7.3.8")
+    extension.critical && usage.0.len() == 1 && usage.0[0].to_string() == "1.3.6.1.5.5.7.3.8"
 }
 
 /// A GeneralizedTime (`YYYYMMDDHHMMSS[.fff]Z`) as a UTC instant.

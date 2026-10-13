@@ -8,7 +8,12 @@
 use crate::der::{self, Element};
 
 pub(crate) const OID_SIGNED_DATA: &str = "1.2.840.113549.1.7.2";
+const OID_CONTENT_TYPE: &str = "1.2.840.113549.1.9.3";
 const OID_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
+const OID_SIGNING_CERTIFICATE: &str = "1.2.840.113549.1.9.16.2.12";
+const OID_SIGNING_CERTIFICATE_V2: &str = "1.2.840.113549.1.9.16.2.47";
+const OID_SHA1: &str = "1.3.14.3.2.26";
+const OID_SHA256: &str = "2.16.840.1.101.3.4.2.1";
 
 #[derive(Debug)]
 pub(crate) struct SignedData {
@@ -37,6 +42,11 @@ pub(crate) struct SignerInfo {
     /// Each signed attribute in DER, in the order they were sent.
     pub signed_attributes: Option<Vec<Vec<u8>>>,
     pub message_digest: Option<Vec<u8>>,
+    /// The signed contentType attribute.
+    pub content_type: Option<String>,
+    /// The signed ESS signing-certificate attribute (v1 or v2): the hash algorithm and the hash of
+    /// the certificate the signer says it used.
+    pub signing_certificate: Option<(String, Vec<u8>)>,
     pub signature_algorithm: String,
     /// DER of the signature algorithm's parameters, when it has any (RSASSA-PSS carries them).
     pub signature_parameters: Option<Vec<u8>>,
@@ -151,12 +161,18 @@ fn parse_signer_info(signer: &Element<'_>) -> Option<SignerInfo> {
     let mut index = 3;
     let mut signed_attributes = None;
     let mut message_digest = None;
+    let mut content_type = None;
+    let mut signing_certificate = None;
     if parts.get(index)?.tag == 0xA0 {
         let mut attributes = Vec::new();
         for attribute in der::children_ber(parts[index].content) {
             let (kind, values) = attribute_parts(&attribute)?;
-            if kind == OID_MESSAGE_DIGEST {
-                message_digest = Some(der::string_value(values.first()?)?);
+            match kind.as_str() {
+                OID_MESSAGE_DIGEST => message_digest = Some(der::string_value(values.first()?)?),
+                OID_CONTENT_TYPE => content_type = Some(oid_of(values.first()?)?),
+                OID_SIGNING_CERTIFICATE => signing_certificate = Some(ess_cert_id(values.first()?, OID_SHA1)?),
+                OID_SIGNING_CERTIFICATE_V2 => signing_certificate = Some(ess_cert_id(values.first()?, OID_SHA256)?),
+                _ => {}
             }
             attributes.push(der::normalize(&attribute)?);
         }
@@ -178,11 +194,29 @@ fn parse_signer_info(signer: &Element<'_>) -> Option<SignerInfo> {
         digest_algorithm,
         signed_attributes,
         message_digest,
+        content_type,
+        signing_certificate,
         signature_algorithm,
         signature_parameters,
         signature,
         unsigned_attributes,
     })
+}
+
+/// The first ESSCertID(v2) of a SigningCertificate(V2) value: its hash algorithm (`default_hash`
+/// when the field is left out, as v2 allows and v1 always does) and the certificate hash.
+fn ess_cert_id(value: &Element<'_>, default_hash: &str) -> Option<(String, Vec<u8>)> {
+    let certs = der::children_ber(value.content).into_iter().next().filter(|e| e.tag == der::SEQUENCE)?;
+    let first = der::children_ber(certs.content).into_iter().next().filter(|e| e.tag == der::SEQUENCE)?;
+    let fields = der::children_ber(first.content);
+    match fields.first()? {
+        algorithm_id if algorithm_id.tag == der::SEQUENCE => {
+            let hash = fields.get(1).filter(|e| e.tag & !0x20 == der::OCTET_STRING)?;
+            Some((algorithm(algorithm_id)?.0, der::string_value(hash)?))
+        }
+        hash if hash.tag & !0x20 == der::OCTET_STRING => Some((default_hash.to_string(), der::string_value(hash)?)),
+        _ => None,
+    }
 }
 
 /// An attribute's type and values.
