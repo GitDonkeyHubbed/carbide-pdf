@@ -1,0 +1,73 @@
+//! The command line saves edits the way the desktop app does: a protected input stays protected.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use carbide_engine::{Error, Pdf, ProtectionOptions};
+
+fn carbide(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_carbide")).args(args).output().unwrap()
+}
+
+fn scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("carbide-cli-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A one-page file showing "private words", protected with `user` (may be empty) and `owner`.
+fn protected(path: &Path, user: &str, owner: &str) {
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    pdf.add_text_box(0, 72.0, 720.0, "private words", 18.0).unwrap();
+    std::fs::write(path, pdf.to_encrypted_bytes(&ProtectionOptions::new(user, owner)).unwrap()).unwrap();
+}
+
+fn key(bytes: &[u8]) -> Vec<u8> {
+    let pdf = Pdf::from_bytes_with_password(bytes, "owner pw").unwrap();
+    pdf.document().encryption_state.as_ref().expect("still encrypted").file_encryption_key().to_vec()
+}
+
+#[test]
+fn editing_a_protected_file_in_place_keeps_it_encrypted() {
+    let dir = scratch("in-place");
+    for (user, password) in [("", None), ("user pw", Some("user pw"))] {
+        let file = dir.join("f.pdf");
+        protected(&file, user, "owner pw");
+        let before = key(&std::fs::read(&file).unwrap());
+        let path = file.to_str().unwrap();
+        let mut args = vec!["rotate", path, "1", "90", path];
+        args.extend(password.iter().flat_map(|p| ["--password", p]));
+        let output = carbide(&args);
+        assert!(output.status.success(), "{user:?}: {}", String::from_utf8_lossy(&output.stderr));
+
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(!bytes.windows(7).any(|w| w == b"private"), "{user:?}: written in the clear");
+        assert_eq!(key(&bytes), before, "{user:?}: encrypted with another key");
+        assert_eq!(Pdf::from_bytes_with_password(&bytes, "owner pw").unwrap().page_rotation(0).unwrap(), 90);
+        if !user.is_empty() {
+            assert!(matches!(Pdf::from_bytes(&bytes), Err(Error::PasswordRequired)));
+            assert!(Pdf::from_bytes_with_password(&bytes, user).is_ok());
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn new_documents_are_not_written_unencrypted_over_a_protected_input() {
+    let dir = scratch("new-document");
+    let file = dir.join("f.pdf");
+    protected(&file, "", "owner pw");
+    let before = std::fs::read(&file).unwrap();
+    let path = file.to_str().unwrap();
+    let output = carbide(&["extract", path, "1", path]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("password-protected"));
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+
+    // To another file is fine: that is a new, separate document.
+    let copy = dir.join("copy.pdf");
+    assert!(carbide(&["extract", path, "1", copy.to_str().unwrap()]).status.success());
+    let _ = std::fs::remove_dir_all(dir);
+}

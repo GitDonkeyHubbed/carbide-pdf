@@ -15,7 +15,8 @@ use carbide_engine::reduce::{messages as reduce_messages, reduce_files, OutputOp
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PlanOptions, PrintingOrder, Style};
 use carbide_engine::{
     compare_documents, export_images, export_text, open_revision_bytes, pdf_date_now, BatesOptions, Error,
-    ImageFormat, MarkupStyle, PageAnchor, Pdf, ProtectionOptions, Rect, Redaction, Renderer, WatermarkOptions,
+    ImageFormat, MarkupStyle, PageAnchor, Pdf, ProtectionOptions, Rect, Redaction, Renderer, SavePlan, SavedFile,
+    WatermarkOptions,
 };
 use image::RgbaImage;
 use lopdf::{dictionary, Document, Object, Stream};
@@ -316,16 +317,21 @@ fn encryption_requires_the_password() {
 fn saving_a_protected_document_does_not_write_the_plaintext() {
     let mut pdf = text_pdf(&[&["private"]]);
     let encrypted = pdf.to_encrypted_bytes(&ProtectionOptions::new("open-sesame", "owner-pw")).unwrap();
-    assert!(!encrypted.windows(7).any(|w| w == b"private"));
-    let mut opened = Pdf::from_bytes_with_password(&encrypted, "open-sesame").unwrap();
-    let leaked = opened.to_bytes().unwrap();
-    assert!(leaked.windows(7).any(|w| w == b"private"), "the decrypted document serializes as plaintext");
-    let saved = opened.bytes_for_save(Some(&encrypted), Some("open-sesame")).unwrap();
-    assert!(!saved.windows(7).any(|w| w == b"private"));
-    assert!(matches!(Pdf::from_bytes(&saved), Err(Error::PasswordRequired)));
-    let mut again = Pdf::from_bytes_with_password(&saved, "open-sesame").unwrap();
-    assert!(again.to_bytes().unwrap().windows(7).any(|w| w == b"private"));
-    assert!(matches!(Pdf::from_bytes_with_password(&saved, "owner-pw"), Err(Error::WrongPassword) | Err(Error::PasswordRequired)));
+    assert!(!contains(&encrypted, b"private"));
+    let (mut opened, saved) = SavedFile::open(encrypted.clone(), Some("open-sesame".into())).unwrap();
+    assert!(contains(&opened.to_bytes().unwrap(), b"private"), "the decrypted document serializes as plaintext");
+
+    opened.add_note(0, 100.0, 100.0, "checked").unwrap();
+    let plan = opened.save_plan(Some(&saved), false).unwrap();
+    assert_eq!(plan, SavePlan::FullRewrite { breaks_signatures: false, drops_revisions: false });
+    let bytes = opened.save_bytes(plan, Some(&saved)).unwrap();
+    assert!(!contains(&bytes, b"private") && !contains(&bytes, b"checked"));
+    assert!(matches!(Pdf::from_bytes(&bytes), Err(Error::PasswordRequired)));
+    // Both of the original passwords still open it.
+    for password in ["open-sesame", "owner-pw"] {
+        let mut again = Pdf::from_bytes_with_password(&bytes, password).unwrap();
+        assert!(contains(&again.to_bytes().unwrap(), b"private"), "{password}");
+    }
 }
 
 // ---- annotations ---------------------------------------------------------------------------
@@ -402,68 +408,6 @@ fn incremental_update_appends_without_touching_the_original_bytes() {
 }
 
 #[test]
-fn saving_keeps_signatures_and_revision_prefixes() {
-    let mut doc = text_pdf(&[&["contract body"]]);
-    let base = file_bytes(&mut doc);
-    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
-    let trust = trust_test_identity();
-
-    let mut reopened = Pdf::from_bytes(&signed).unwrap();
-    // Opening a document re-serializes it in memory. That must not count as an edit.
-    let _ = reopened.to_bytes().unwrap();
-    let untouched = reopened.bytes_for_save(Some(&signed), None).unwrap();
-    assert_eq!(untouched, signed, "saving with no edits must not rewrite a signed file");
-    let reports = verify(&untouched, &trust);
-    assert_eq!(reports[0].validity, Validity::Valid);
-    assert!(!reports[0].modified_after_signing);
-
-    reopened.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
-    let flat = {
-        let mut copy = Pdf::from_bytes(&signed).unwrap();
-        copy.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
-        copy.to_bytes().unwrap()
-    };
-    let rewritten = Pdf::verify_signatures(&flat, &trust, chrono::Utc::now()).unwrap_or_default();
-    assert!(
-        rewritten.first().is_none_or(|r| r.validity != Validity::Valid),
-        "a full rewrite destroys the signature, which is the bug save must not hit"
-    );
-
-    let saved = reopened.bytes_for_save(Some(&signed), None).unwrap();
-    assert!(saved.starts_with(&signed), "the signed bytes have to stay a prefix");
-    assert!(saved.len() > signed.len());
-    let reports = verify(&saved, &trust);
-    assert_eq!(reports[0].validity, Validity::Valid);
-    assert!(reports[0].modified_after_signing);
-
-    let mut working = Pdf::from_bytes(&signed).unwrap();
-    working.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
-    let v1 = working.save_revision(&signed, "First draft", &pdf_date_now()).unwrap();
-    let mut working = Pdf::from_bytes(&v1).unwrap();
-    working.apply_bates(&BatesOptions::default()).unwrap();
-    let v2 = working.save_revision(&v1, "Second", &pdf_date_now()).unwrap();
-    let revisions = Pdf::from_bytes(&v2).unwrap().revisions();
-    assert!(revisions.len() >= 2);
-
-    let mut current = Pdf::from_bytes(&v2).unwrap();
-    current.apply_watermark(&WatermarkOptions::new("FINAL")).unwrap();
-    let saved = current.bytes_for_save(Some(&v2), None).unwrap();
-    assert!(saved.starts_with(&v2));
-    let after = Pdf::from_bytes(&saved).unwrap();
-    let opened = open_revision_bytes(&saved, &after.revisions()[0]).unwrap();
-    assert_eq!(opened.len(), after.revisions()[0].file_offset as usize);
-
-    let mut flattened = Pdf::from_bytes(&v2).unwrap();
-    flattened.apply_watermark(&WatermarkOptions::new("FINAL")).unwrap();
-    let flat_bytes = flattened.to_bytes().unwrap();
-    let flat_revisions = Pdf::from_bytes(&flat_bytes).unwrap().revisions();
-    assert!(
-        open_revision_bytes(&flat_bytes, &flat_revisions[0]).is_err(),
-        "rewriting the file makes the stored revision offset unusable"
-    );
-}
-
-#[test]
 fn revisions_are_prefixes_of_the_file_and_open_as_they_were() {
     let r = renderer();
     let mut doc = text_pdf(&[&["contract body"]]);
@@ -514,6 +458,679 @@ fn revisions_are_prefixes_of_the_file_and_open_as_they_were() {
     assert!(open_revision_bytes(&v2, &broken).is_err());
     broken.file_offset = v2.len() as u64 + 10;
     assert!(open_revision_bytes(&v2, &broken).is_err());
+}
+
+// ---- saving over the file ----------------------------------------------------------------
+
+fn contains(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Fails if `needle` is anywhere in `file`: in the raw bytes, or in any stream body, decompressed,
+/// whether or not a cross-reference table still points at it.
+fn assert_gone(file: &[u8], needle: &str) {
+    assert!(!contains(file, needle.as_bytes()), "{needle:?} is in the raw file");
+    let mut at = 0;
+    while let Some(found) = file[at..].windows(6).position(|w| w == b"stream") {
+        let start = at + found + 6;
+        at = start;
+        if file[..start - 6].ends_with(b"end") {
+            continue;
+        }
+        let Some(length) = file[start..].windows(9).position(|w| w == b"endstream") else { break };
+        let body = &file[start..start + length];
+        let body = body.strip_prefix(b"\r\n").or_else(|| body.strip_prefix(b"\n")).unwrap_or(body);
+        let mut decoded = Vec::new();
+        if std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(body), &mut decoded).is_ok() {
+            assert!(!contains(&decoded, needle.as_bytes()), "{needle:?} is in a compressed stream");
+        }
+    }
+}
+
+fn plan_and_bytes(pdf: &mut Pdf, saved: &SavedFile, content_removed: bool) -> (SavePlan, Vec<u8>) {
+    let plan = pdf.save_plan(Some(saved), content_removed).unwrap();
+    let bytes = pdf.save_bytes(plan, Some(saved)).unwrap();
+    (plan, bytes)
+}
+
+const CLEAN: SavePlan = SavePlan::FullRewrite { breaks_signatures: false, drops_revisions: false };
+
+#[test]
+fn saving_after_redaction_leaves_no_trace_of_the_secret() {
+    let r = renderer();
+    let base = text_pdf(&[&["TOP SECRET 12345", "public line"], &["page two stays"]]).to_bytes().unwrap();
+    let (mut pdf, saved) = SavedFile::open(base.clone(), None).unwrap();
+    pdf.apply_redactions(r, &[Redaction { page: 0, rect: Rect::new(60.0, 692.0, 300.0, 28.0) }], 150.0).unwrap();
+    assert!(saved.removed_from(&pdf), "the redaction dropped content the file holds");
+
+    let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, true);
+    assert_eq!(plan, CLEAN);
+    assert!(!bytes.starts_with(&base[..base.len() / 2]), "nothing of the old file is kept as a prefix");
+    assert_gone(&bytes, "SECRET");
+    assert_gone(&bytes, "12345");
+    let mut reopened = Pdf::from_bytes(&bytes).unwrap();
+    assert!(page_text(r, &mut reopened, 1).contains("page two stays"));
+}
+
+#[test]
+fn deleted_pages_leave_nothing_behind() {
+    let base = text_pdf(&[&["kept page"], &["DELETEDPAGE 999"]]).to_bytes().unwrap();
+    let (mut pdf, saved) = SavedFile::open(base, None).unwrap();
+    pdf.delete_pages(&[1]).unwrap();
+    assert!(saved.removed_from(&pdf));
+    let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, true);
+    assert_eq!(plan, CLEAN);
+    assert_gone(&bytes, "DELETEDPAGE");
+    assert_eq!(Pdf::from_bytes(&bytes).unwrap().page_count(), 1);
+}
+
+/// One page per label, built the way word processors and form tools write them, so that other
+/// parts of the document point into every page:
+/// - each page draws its label, and a form XObject showing `FORM-<label>` from a resource
+///   dictionary all pages share (only that page draws its form);
+/// - each page has a filled text field whose value and appearance are `FIELD-<label>`;
+/// - a structure tree has an element per page whose ActualText is `TAG-<label>`;
+/// - the first page links to the last.
+fn layered_pdf(labels: &[&str]) -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica", "Encoding" => "WinAnsiEncoding",
+    });
+    let forms: Vec<(String, Object)> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let content = format!("BT /F1 12 Tf 72 400 Td (FORM-{label}) Tj ET");
+            let form = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+                },
+                content.into_bytes(),
+            ));
+            (format!("Fm{i}"), Object::Reference(form))
+        })
+        .collect();
+    let shared = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font },
+        "XObject" => Object::Dictionary(forms.into_iter().collect()),
+    });
+    let tree_root = doc.new_object_id();
+    let document_element = doc.new_object_id();
+    let (mut kids, mut widgets, mut elements, mut parents) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (i, label) in labels.iter().enumerate() {
+        let page_id = doc.new_object_id();
+        let content = format!("/P <</MCID 0>> BDC BT /F1 18 Tf 72 700 Td ({label}) Tj ET EMC /Fm{i} Do");
+        let content_id = doc.add_object(Stream::new(lopdf::Dictionary::new(), content.into_bytes()));
+        let appearance = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 200.into(), 20.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+            },
+            format!("BT /F1 12 Tf 2 5 Td (FIELD-{label}) Tj ET").into_bytes(),
+        ));
+        let widget = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx",
+            "T" => Object::string_literal(format!("field{i}")),
+            "V" => Object::string_literal(format!("FIELD-{label}")),
+            "Rect" => vec![72.into(), 600.into(), 272.into(), 620.into()],
+            "P" => page_id,
+            "AP" => dictionary! { "N" => appearance },
+        });
+        widgets.push(Object::Reference(widget));
+        let mut annots = vec![Object::Reference(widget)];
+        if i == 0 && labels.len() > 1 {
+            annots.push(Object::Reference(doc.add_object(dictionary! {
+                "Type" => "Annot", "Subtype" => "Link", "Rect" => vec![72.into(), 650.into(), 200.into(), 670.into()],
+                // Pointed at the last page below, once that exists.
+                "Dest" => Object::Null,
+            })));
+        }
+        let element = doc.add_object(dictionary! {
+            "Type" => "StructElem", "S" => "P", "P" => document_element, "Pg" => page_id, "K" => 0,
+            "ActualText" => Object::string_literal(format!("TAG-{label}")),
+        });
+        elements.push(Object::Reference(element));
+        parents.push(Object::Integer(i as i64));
+        parents.push(Object::Array(vec![Object::Reference(element)]));
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page", "Parent" => pages_id, "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Contents" => content_id, "Resources" => shared, "Annots" => annots, "StructParents" => i as i64,
+            }),
+        );
+        kids.push(Object::Reference(page_id));
+    }
+    // The link on the first page points at the last page.
+    let last = kids.last().and_then(|k| k.as_reference().ok()).unwrap();
+    for object in doc.objects.values_mut() {
+        if let Object::Dictionary(d) = object {
+            if d.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Link") {
+                d.set("Dest", vec![Object::Reference(last), "Fit".into()]);
+            }
+        }
+    }
+    doc.objects.insert(document_element, Object::Dictionary(dictionary! {
+        "Type" => "StructElem", "S" => "Document", "P" => tree_root, "K" => elements,
+    }));
+    doc.objects.insert(tree_root, Object::Dictionary(dictionary! {
+        "Type" => "StructTreeRoot", "K" => document_element,
+        "ParentTree" => dictionary! { "Nums" => parents }, "ParentTreeNextKey" => labels.len() as i64,
+    }));
+    doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+        "Type" => "Pages", "Kids" => kids.clone(), "Count" => kids.len() as i64,
+    }));
+    let catalog = doc.add_object(dictionary! {
+        "Type" => "Catalog", "Pages" => pages_id, "StructTreeRoot" => tree_root,
+        "MarkInfo" => dictionary! { "Marked" => true },
+        "AcroForm" => dictionary! { "Fields" => widgets, "DA" => Object::string_literal("/F1 12 Tf 0 g") },
+    });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// Number of fields left in the document's form.
+fn form_fields(pdf: &Pdf) -> usize {
+    let doc = pdf.document();
+    let Ok(Object::Dictionary(form)) = doc.catalog().unwrap().get(b"AcroForm").map(|f| match f {
+        Object::Reference(id) => doc.get_object(*id).unwrap().clone(),
+        other => other.clone(),
+    }) else {
+        return 0;
+    };
+    form.get(b"Fields").and_then(Object::as_array).map(Vec::len).unwrap_or(0)
+}
+
+#[test]
+fn deleting_a_page_takes_its_fields_tags_and_drawings_along() {
+    let r = renderer();
+    let base = layered_pdf(&["ALPHA", "BRAVO", "CHARLIE"]);
+    let (mut pdf, saved) = SavedFile::open(base, None).unwrap();
+    pdf.delete_pages(&[1]).unwrap();
+    assert_eq!(form_fields(&pdf), 2, "the other pages keep their fields");
+    let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, true);
+    assert_eq!(plan, CLEAN);
+    assert_gone(&bytes, "BRAVO");
+    for kept in ["ALPHA", "CHARLIE"] {
+        assert!(contains(&bytes, format!("FIELD-{kept}").as_bytes()) && contains(&bytes, format!("TAG-{kept}").as_bytes()));
+    }
+    // The pages that stay still draw their own forms.
+    let mut reopened = Pdf::from_bytes(&bytes).unwrap();
+    let text = page_text(r, &mut reopened, 1);
+    assert!(text.contains("CHARLIE") && text.contains("FORM-CHARLIE"), "{text:?}");
+}
+
+#[test]
+fn redaction_takes_the_page_fields_and_drawings_along() {
+    let r = renderer();
+    let base = layered_pdf(&["ALPHA", "BRAVO", "CHARLIE"]);
+    let (mut pdf, saved) = SavedFile::open(base, None).unwrap();
+    pdf.apply_redactions(r, &[Redaction { page: 1, rect: Rect::new(0.0, 0.0, 612.0, 792.0) }], 72.0).unwrap();
+    assert_eq!(form_fields(&pdf), 2);
+    let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, true);
+    assert_eq!(plan, CLEAN);
+    assert_gone(&bytes, "BRAVO");
+    let mut reopened = Pdf::from_bytes(&bytes).unwrap();
+    assert_eq!(reopened.page_count(), 3);
+    for (page, kept) in [(0, "ALPHA"), (2, "CHARLIE")] {
+        let text = page_text(r, &mut reopened, page);
+        assert!(text.contains(kept) && text.contains(&format!("FORM-{kept}")), "{text:?}");
+    }
+}
+
+#[test]
+fn extracted_pages_carry_nothing_of_the_other_pages() {
+    let r = renderer();
+    let source = Pdf::from_bytes(&layered_pdf(&["ALPHA", "BRAVO", "CHARLIE"])).unwrap();
+    let mut part = source.extract_pages(&[0]).unwrap();
+    assert_eq!(form_fields(&part), 1);
+    let bytes = part.to_bytes().unwrap();
+    assert_gone(&bytes, "BRAVO");
+    assert_gone(&bytes, "CHARLIE");
+    let text = page_text(r, &mut part, 0);
+    assert!(text.contains("ALPHA") && text.contains("FORM-ALPHA"), "{text:?}");
+
+    let mut last = source.extract_pages(&[2]).unwrap();
+    let bytes = last.to_bytes().unwrap();
+    assert_gone(&bytes, "ALPHA");
+    assert_gone(&bytes, "BRAVO");
+    assert!(page_text(r, &mut last, 0).contains("FORM-CHARLIE"));
+}
+
+/// A signed one-page file whose page carries an ink drawing: numbers only, no appearance stream.
+fn signed_with_ink() -> (Vec<u8>, Vec<Object>) {
+    let mut doc = text_pdf(&[&["contract body"]]);
+    let page = doc.page_id(0).unwrap();
+    let ink = doc.document_mut().add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Ink", "Rect" => vec![100.into(), 100.into(), 200.into(), 200.into()],
+        "InkList" => vec![Object::Array(vec![100.into(), 100.into(), 150.into(), 180.into(), 200.into(), 120.into()])],
+    });
+    doc.document_mut().get_dictionary_mut(page).unwrap().set("Annots", vec![Object::Reference(ink)]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    let annots = Pdf::from_bytes(&signed).unwrap().document().get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap().clone();
+    (signed, annots)
+}
+
+#[test]
+fn removing_an_annotation_counts_even_when_it_holds_only_numbers() {
+    let (signed, annots) = signed_with_ink();
+    let (mut pdf, saved) = SavedFile::open(signed, None).unwrap();
+    let page = pdf.page_id(0).unwrap();
+    let ink = annots.iter().find(|a| {
+        pdf.document().get_dictionary(a.as_reference().unwrap()).unwrap().get(b"Subtype").unwrap().as_name().unwrap() == b"Ink"
+    });
+    let kept: Vec<Object> = annots.iter().filter(|a| Some(*a) != ink).cloned().collect();
+    pdf.document_mut().get_dictionary_mut(page).unwrap().set("Annots", kept);
+    assert!(saved.removed_from(&pdf));
+    assert_eq!(pdf.save_plan(Some(&saved), false).unwrap(), SavePlan::FullRewrite { breaks_signatures: true, drops_revisions: false });
+}
+
+#[test]
+fn appended_updates_carry_only_what_the_document_still_uses() {
+    let (signed, annots) = signed_with_ink();
+    let (mut pdf, saved) = SavedFile::open(signed.clone(), None).unwrap();
+    let page = pdf.page_id(0).unwrap();
+    pdf.add_note(0, 300.0, 300.0, "ORPHANSECRET draft").unwrap();
+    pdf.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
+    // The note is taken out again; nothing prunes the document before saving.
+    pdf.document_mut().get_dictionary_mut(page).unwrap().set("Annots", annots);
+    let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, false);
+    assert_eq!(plan, SavePlan::Incremental);
+    assert!(bytes.starts_with(&signed));
+    assert_gone(&bytes, "ORPHANSECRET");
+    assert_eq!(verify(&bytes, &trust_test_identity())[0].validity, Validity::Valid);
+}
+
+#[test]
+fn a_signature_the_file_already_fails_is_not_kept_by_appending() {
+    let r = renderer();
+    let mut doc = text_pdf(&[&["TOP SECRET 12345", "public line"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    let (mut pdf, saved) = SavedFile::open(signed, None).unwrap();
+    pdf.apply_redactions(r, &[Redaction { page: 0, rect: Rect::new(60.0, 692.0, 300.0, 28.0) }], 150.0).unwrap();
+    let (plan, rewritten) = plan_and_bytes(&mut pdf, &saved, true);
+    assert!(plan.needs_confirmation());
+
+    // The rewritten file still carries the signature field, but the signature no longer holds:
+    // later edits are written in full and nothing asks about signatures again.
+    let (mut pdf, saved) = SavedFile::open(rewritten, None).unwrap();
+    pdf.add_note(0, 100.0, 100.0, "after the rewrite").unwrap();
+    assert_eq!(pdf.save_plan(Some(&saved), false).unwrap(), CLEAN);
+}
+
+#[test]
+fn redacting_a_drawn_signature_takes_the_signature_along() {
+    let r = renderer();
+    let mut doc = text_pdf(&[&["contract body"]]);
+    let base = file_bytes(&mut doc);
+    let mut options = sign_options(SubFilter::Pkcs7Detached);
+    options.appearance = Some((0, Rect::new(300.0, 100.0, 200.0, 60.0)));
+    let signed = doc.sign(&base, &options).unwrap();
+    let (mut pdf, saved) = SavedFile::open(signed, None).unwrap();
+    pdf.apply_redactions(r, &[Redaction { page: 0, rect: Rect::new(290.0, 90.0, 220.0, 80.0) }], 72.0).unwrap();
+    let (_, bytes) = plan_and_bytes(&mut pdf, &saved, true);
+    assert!(verify(&bytes, &trust_test_identity()).is_empty(), "the blacked-out signature still names its signer");
+}
+
+#[test]
+fn unchanged_documents_save_byte_identical() {
+    let base = text_pdf(&[&["nothing changes"]]).to_bytes().unwrap();
+    let (mut pdf, saved) = SavedFile::open(base.clone(), None).unwrap();
+    // Opening re-serializes the document in memory, and undo reloads it from such a copy.
+    let before = pdf.to_bytes().unwrap();
+    pdf.add_note(0, 100.0, 100.0, "gone again").unwrap();
+    let mut pdf = Pdf::from_bytes(&before).unwrap();
+    let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, false);
+    assert_eq!(plan, SavePlan::Unchanged);
+    assert_eq!(bytes, base);
+
+    // A document with no file yet is written in full.
+    let mut fresh = text_pdf(&[&["new"]]);
+    let plan = fresh.save_plan(None, false).unwrap();
+    assert_eq!(plan, CLEAN);
+    assert!(Pdf::from_bytes(&fresh.save_bytes(plan, None).unwrap()).is_ok());
+}
+
+#[test]
+fn signed_documents_get_edits_that_remove_nothing_appended() {
+    let mut doc = text_pdf(&[&["contract body"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    let trust = trust_test_identity();
+
+    let (mut reopened, saved) = SavedFile::open(signed.clone(), None).unwrap();
+    let _ = reopened.to_bytes().unwrap();
+    let (plan, untouched) = plan_and_bytes(&mut reopened, &saved, false);
+    assert_eq!(plan, SavePlan::Unchanged);
+    assert_eq!(untouched, signed, "saving with no edits must not rewrite a signed file");
+
+    reopened.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
+    reopened.add_note(0, 100.0, 100.0, "looks fine").unwrap();
+    assert!(!saved.removed_from(&reopened));
+    let (plan, appended) = plan_and_bytes(&mut reopened, &saved, false);
+    assert_eq!(plan, SavePlan::Incremental);
+    assert!(appended.starts_with(&signed) && appended.len() > signed.len(), "the signed bytes have to stay a prefix");
+    let reports = verify(&appended, &trust);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].validity, Validity::Valid);
+    assert!(reports[0].modified_after_signing);
+
+    // Saved revisions are kept the same way.
+    let mut working = Pdf::from_bytes(&base).unwrap();
+    working.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
+    let v1 = working.save_revision(&base, "First draft", &pdf_date_now()).unwrap();
+    let mut working = Pdf::from_bytes(&v1).unwrap();
+    working.apply_bates(&BatesOptions::default()).unwrap();
+    let v2 = working.save_revision(&v1, "Second", &pdf_date_now()).unwrap();
+    let (mut current, saved) = SavedFile::open(v2.clone(), None).unwrap();
+    current.apply_watermark(&WatermarkOptions::new("FINAL")).unwrap();
+    let (plan, bytes) = plan_and_bytes(&mut current, &saved, false);
+    assert_eq!(plan, SavePlan::Incremental);
+    assert!(bytes.starts_with(&v2));
+    let revisions = Pdf::from_bytes(&bytes).unwrap().revisions();
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(open_revision_bytes(&bytes, &revisions[0]).unwrap(), v1);
+}
+
+#[test]
+fn signed_documents_need_a_clean_rewrite_after_a_redaction() {
+    let r = renderer();
+    let mut doc = text_pdf(&[&["TOP SECRET 12345", "public line"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+
+    let (mut pdf, saved) = SavedFile::open(signed.clone(), None).unwrap();
+    pdf.apply_redactions(r, &[Redaction { page: 0, rect: Rect::new(60.0, 692.0, 300.0, 28.0) }], 150.0).unwrap();
+    let rewrite = SavePlan::FullRewrite { breaks_signatures: true, drops_revisions: false };
+    // Found by comparing with the file even when the caller did not flag it.
+    assert_eq!(pdf.save_plan(Some(&saved), false).unwrap(), rewrite);
+    let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, true);
+    assert_eq!(plan, rewrite);
+    assert!(plan.needs_confirmation());
+    assert_gone(&bytes, "SECRET");
+    let reports = verify(&bytes, &trust_test_identity());
+    assert_eq!(reports.len(), 1, "the signature field itself stays");
+    assert_ne!(reports[0].validity, Validity::Valid, "the rewritten file no longer matches the signature");
+
+    // A file with saved revisions loses them instead.
+    let base = text_pdf(&[&["kept page"], &["DELETEDPAGE 999"]]).to_bytes().unwrap();
+    let mut working = Pdf::from_bytes(&base).unwrap();
+    working.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
+    let v1 = working.save_revision(&base, "First draft", &pdf_date_now()).unwrap();
+    let (mut pdf, saved) = SavedFile::open(v1, None).unwrap();
+    pdf.delete_pages(&[1]).unwrap();
+    let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, true);
+    assert_eq!(plan, SavePlan::FullRewrite { breaks_signatures: false, drops_revisions: true });
+    assert_gone(&bytes, "DELETEDPAGE");
+    assert!(Pdf::from_bytes(&bytes).unwrap().revisions().is_empty());
+}
+
+#[test]
+fn protected_documents_keep_both_passwords_and_their_permissions() {
+    let mut options = ProtectionOptions::new("user pw", "owner pw");
+    options.allow_printing = false;
+    options.allow_copying = false;
+    options.allow_annotating = false;
+    let original = text_pdf(&[&["private"]]).to_encrypted_bytes(&options).unwrap();
+    let state = |bytes: &[u8], password: &str| {
+        Pdf::from_bytes_with_password(bytes, password).unwrap().document().encryption_state.clone().expect("encrypted")
+    };
+    let before = state(&original, "user pw");
+
+    for opened_with in ["user pw", "owner pw"] {
+        let (mut pdf, saved) = SavedFile::open(original.clone(), Some(opened_with.into())).unwrap();
+        assert!(saved.is_protected());
+        let (plan, unchanged) = plan_and_bytes(&mut pdf, &saved, false);
+        assert_eq!((plan, unchanged == original), (SavePlan::Unchanged, true));
+
+        pdf.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
+        let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, false);
+        assert_eq!(plan, CLEAN);
+        assert!(!contains(&bytes, b"private") && !contains(&bytes, b"DRAFT"), "nothing is written in the clear");
+        assert!(matches!(Pdf::from_bytes(&bytes), Err(Error::PasswordRequired)));
+        assert!(matches!(Pdf::from_bytes_with_password(&bytes, "wrong"), Err(Error::WrongPassword)));
+        for password in ["user pw", "owner pw"] {
+            let after = state(&bytes, password);
+            assert_eq!(after.permissions(), before.permissions(), "{opened_with} / {password}");
+            assert_eq!((after.version(), after.revision()), (before.version(), before.revision()));
+            assert_eq!(after.file_encryption_key(), before.file_encryption_key());
+            assert_eq!((after.owner_value(), after.user_value()), (before.owner_value(), before.user_value()));
+            assert_eq!((after.owner_encrypted(), after.user_encrypted()), (before.owner_encrypted(), before.user_encrypted()));
+            assert_eq!(after.permission_encrypted(), before.permission_encrypted());
+        }
+        let mut reopened = Pdf::from_bytes_with_password(&bytes, "user pw").unwrap();
+        let text = page_text(renderer(), &mut reopened, 0);
+        assert!(text.contains("private") && text.contains("DRAFT"), "{text:?}");
+    }
+}
+
+#[test]
+fn files_that_only_restrict_permissions_stay_protected() {
+    let mut options = ProtectionOptions::new("", "owner pw");
+    options.allow_copying = false;
+    options.allow_printing = false;
+    let original = text_pdf(&[&["private"]]).to_encrypted_bytes(&options).unwrap();
+    // Opens without asking for a password.
+    let (mut pdf, saved) = SavedFile::open(original, None).unwrap();
+    assert!(saved.is_protected());
+    let before = pdf.document().encryption_state.clone().unwrap();
+
+    pdf.add_note(0, 100.0, 100.0, "reviewed").unwrap();
+    let (_, bytes) = plan_and_bytes(&mut pdf, &saved, false);
+    assert!(!contains(&bytes, b"private"));
+    let reopened = Pdf::from_bytes(&bytes).unwrap();
+    let after = reopened.document().encryption_state.clone().expect("still encrypted");
+    assert_eq!(after.permissions(), before.permissions());
+    assert_eq!(after.file_encryption_key(), before.file_encryption_key());
+    assert_eq!((after.owner_value(), after.owner_encrypted()), (before.owner_value(), before.owner_encrypted()));
+}
+
+#[test]
+fn passwords_are_used_exactly_as_typed() {
+    for password in [" secret ", "   "] {
+        let original = text_pdf(&[&["private"]]).to_encrypted_bytes(&ProtectionOptions::new(password, password)).unwrap();
+        let (mut pdf, saved) = SavedFile::open(original, Some(password.into())).unwrap();
+        pdf.add_note(0, 100.0, 100.0, "reviewed").unwrap();
+        let (_, bytes) = plan_and_bytes(&mut pdf, &saved, false);
+        assert!(!contains(&bytes, b"private"), "{password:?}");
+        assert!(matches!(Pdf::from_bytes(&bytes), Err(Error::PasswordRequired)), "{password:?}");
+        assert!(Pdf::from_bytes_with_password(&bytes, password).is_ok(), "{password:?}");
+        let trimmed = password.trim();
+        if !trimmed.is_empty() {
+            assert!(matches!(Pdf::from_bytes_with_password(&bytes, trimmed), Err(Error::WrongPassword)));
+        }
+    }
+}
+
+/// A file protected the older way other software still writes: RC4 128-bit (revision 3) or AES-128
+/// (revision 4). Their file key is derived from the open password and the file identifier.
+fn legacy_protected(aes: bool, user: &str, owner: &str) -> Vec<u8> {
+    use lopdf::encryption::crypt_filters::{Aes128CryptFilter, CryptFilter};
+    use lopdf::{EncryptionState, EncryptionVersion, Permissions};
+    let mut pdf = text_pdf(&[&["private words"]]);
+    let id = Object::String(b"carbide-test-id1".to_vec(), lopdf::StringFormat::Hexadecimal);
+    pdf.document_mut().trailer.set("ID", vec![id.clone(), id]);
+    let plain = pdf.document().clone();
+    let permissions = Permissions::PRINTABLE | Permissions::COPYABLE;
+    let version = if aes {
+        let mut filters: std::collections::BTreeMap<Vec<u8>, std::sync::Arc<dyn CryptFilter>> = Default::default();
+        filters.insert(b"StdCF".to_vec(), std::sync::Arc::new(Aes128CryptFilter));
+        EncryptionVersion::V4 {
+            document: &plain,
+            encrypt_metadata: true,
+            crypt_filters: filters,
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: owner,
+            user_password: user,
+            permissions,
+        }
+    } else {
+        EncryptionVersion::V2 { document: &plain, owner_password: owner, user_password: user, key_length: 128, permissions }
+    };
+    let state = EncryptionState::try_from(version).unwrap();
+    let mut doc = plain.clone();
+    doc.encrypt(&state).unwrap();
+    let mut out = Vec::new();
+    doc.save_with_options(&mut out, lopdf::SaveOptions::builder().use_object_streams(false).use_xref_streams(false).build())
+        .unwrap();
+    out
+}
+
+#[test]
+fn older_encryption_opens_with_either_password_and_saves_with_the_same_key() {
+    let r = renderer();
+    for aes in [false, true] {
+        for (user, owner, opened_with) in [
+            ("user", "owner", Some("user")),
+            ("user", "owner", Some("owner")),
+            ("pässwörd", "owner", Some("pässwörd")),
+            ("pässwörd", "öwner", Some("öwner")),
+            // An empty owner password opens the file without asking.
+            ("user", "", None),
+        ] {
+            let label = format!("aes {aes}, open {user:?}, owner {owner:?}, opened with {opened_with:?}");
+            let original = legacy_protected(aes, user, owner);
+            assert!(r.page_text_with_password(&original, user, 0).unwrap().contains("private words"), "{label}: fixture");
+            if owner.is_empty() {
+                assert!(Pdf::from_bytes(&original).is_ok(), "{label}");
+            } else {
+                assert!(matches!(Pdf::from_bytes(&original), Err(Error::PasswordRequired)), "{label}");
+                assert!(matches!(Pdf::from_bytes_with_password(&original, "wrong"), Err(Error::WrongPassword)), "{label}");
+            }
+
+            let (mut pdf, saved) = SavedFile::open(original.clone(), opened_with.map(str::to_string)).unwrap();
+            assert!(saved.is_protected(), "{label}");
+            let key = pdf.document().encryption_state.clone().unwrap().file_encryption_key().to_vec();
+            assert!(page_text(r, &mut pdf, 0).contains("private words"), "{label}: decrypted with the wrong key");
+
+            pdf.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
+            let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, false);
+            assert_eq!(plan, CLEAN, "{label}");
+            assert!(!contains(&bytes, b"private words"), "{label}: written in the clear");
+            // PDFium does not take an empty owner password, for the original file either.
+            for password in [user, owner].into_iter().filter(|p| !p.is_empty()) {
+                let text = r.page_text_with_password(&bytes, password, 0).unwrap_or_else(|e| panic!("{label}, read with {password:?}: {e}"));
+                assert!(text.contains("private words") && text.contains("DRAFT"), "{label}, read with {password:?}: {text:?}");
+                let reopened = Pdf::from_bytes_with_password(&bytes, password).unwrap();
+                assert_eq!(reopened.document().encryption_state.as_ref().unwrap().file_encryption_key(), key.as_slice(), "{label}");
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_files_with_revisions_get_encrypted_updates_appended() {
+    let r = renderer();
+    // Protected after a revision was saved, as other software can do; the revision record stays.
+    let base = text_pdf(&[&["private words"]]).to_bytes().unwrap();
+    let mut working = Pdf::from_bytes(&base).unwrap();
+    working.apply_bates(&BatesOptions::default()).unwrap();
+    let v1 = working.save_revision(&base, "First", &pdf_date_now()).unwrap();
+    let modern = Pdf::from_bytes(&v1).unwrap().to_encrypted_bytes(&ProtectionOptions::new("user", "owner")).unwrap();
+    let older = {
+        let mut doc = Pdf::from_bytes(&v1).unwrap();
+        let bytes = doc.to_bytes().unwrap();
+        // The older revisions need a file identifier; give the plain file one before protecting it.
+        let mut plain = Document::load_mem(&bytes).unwrap();
+        let id = Object::String(b"carbide-test-id2".to_vec(), lopdf::StringFormat::Hexadecimal);
+        plain.trailer.set("ID", vec![id.clone(), id]);
+        let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V2 {
+            document: &plain,
+            owner_password: "owner",
+            user_password: "user",
+            key_length: 128,
+            permissions: lopdf::Permissions::PRINTABLE,
+        })
+        .unwrap();
+        let mut encrypted = plain.clone();
+        encrypted.encrypt(&state).unwrap();
+        let mut out = Vec::new();
+        encrypted.save_with_options(&mut out, lopdf::SaveOptions::builder().use_object_streams(false).use_xref_streams(false).build()).unwrap();
+        out
+    };
+    for (label, original) in [("AES-256", modern), ("RC4", older)] {
+        let (mut pdf, saved) = SavedFile::open(original.clone(), Some("owner".into())).unwrap();
+        assert_eq!(pdf.revisions().len(), 1, "{label}");
+        pdf.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
+        let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, false);
+        assert_eq!(plan, SavePlan::Incremental, "{label}");
+        assert!(bytes.starts_with(&original), "{label}: the protected original is not a prefix");
+        assert!(!contains(&bytes[original.len()..], b"DRAFT"), "{label}: the update is in the clear");
+        for password in ["user", "owner"] {
+            let text = r.page_text_with_password(&bytes, password, 0).unwrap_or_else(|e| panic!("{label}, {password}: {e}"));
+            assert!(text.contains("private words") && text.contains("DRAFT"), "{label}, {password}: {text:?}");
+        }
+    }
+}
+
+#[test]
+fn aes256_passwords_are_prepared_the_way_the_standard_says() {
+    // Option+Space types a no-break space; accents can arrive composed or decomposed.
+    for (set, typed) in [("my\u{a0}pass", "my\u{a0}pass"), ("café", "café"), ("café", "cafe\u{301}")] {
+        let original = text_pdf(&[&["private"]]).to_encrypted_bytes(&ProtectionOptions::new(set, "owner pw")).unwrap();
+        let (mut pdf, saved) = SavedFile::open(original, Some(typed.into())).unwrap_or_else(|e| panic!("{typed:?}: {e}"));
+        assert!(page_text(renderer(), &mut pdf, 0).contains("private"), "{typed:?}");
+        pdf.add_note(0, 100.0, 100.0, "reviewed").unwrap();
+        let (_, bytes) = plan_and_bytes(&mut pdf, &saved, false);
+        assert!(Pdf::from_bytes_with_password(&bytes, typed).is_ok(), "{typed:?}");
+        assert!(Pdf::from_bytes_with_password(&bytes, "owner pw").is_ok(), "{typed:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_a_file_keeps_its_mode_and_follows_symbolic_links() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use carbide_engine::fs::write_replacing;
+    let dir = scratch_dir("replace");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    let set_mode = |path: &std::path::Path, mode: u32| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+    // A private file stays private.
+    let private = dir.join("private.pdf");
+    std::fs::write(&private, b"old").unwrap();
+    set_mode(&private, 0o600);
+    write_replacing(&private, b"new").unwrap();
+    assert_eq!(std::fs::read(&private).unwrap(), b"new");
+    assert_eq!(mode(&private), 0o600);
+
+    // Saving through a link replaces the file it points to, and the link stays a link.
+    let target = dir.join("target.pdf");
+    std::fs::write(&target, b"old").unwrap();
+    set_mode(&target, 0o640);
+    let link = dir.join("link.pdf");
+    symlink("target.pdf", &link).unwrap();
+    write_replacing(&link, b"through the link").unwrap();
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read(&target).unwrap(), b"through the link");
+    assert_eq!(mode(&target), 0o640);
+
+    // A read-only file is refused and left alone.
+    let locked = dir.join("locked.pdf");
+    std::fs::write(&locked, b"keep").unwrap();
+    set_mode(&locked, 0o444);
+    assert!(write_replacing(&locked, b"replaced").is_err());
+    assert_eq!(std::fs::read(&locked).unwrap(), b"keep");
+    assert_eq!(mode(&locked), 0o444);
+
+    // A new file is simply created.
+    let fresh = dir.join("fresh.pdf");
+    write_replacing(&fresh, b"first").unwrap();
+    assert_eq!(std::fs::read(&fresh).unwrap(), b"first");
+
+    // No temporary file is left behind.
+    let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    assert_eq!(names, ["fresh.pdf", "link.pdf", "locked.pdf", "private.pdf", "target.pdf"]);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- auto save / auto recovery -------------------------------------------------------------
@@ -611,6 +1228,32 @@ fn autosave_cleans_up_on_save_and_close_but_never_touches_originals() {
 
     assert_eq!(std::fs::read(&user_file).unwrap(), b"the user's own file");
     let _ = std::fs::remove_file(user_file);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_copies_are_private_and_never_of_protected_documents() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir("autosave-private");
+    let mut store = AutoSaveStore::open(&dir).unwrap();
+    let draft = store.begin_document(None, 1);
+    store.autosave(draft, &mut text_pdf(&[&["draft"]]), 2).unwrap();
+    assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0, "{}", path.display());
+    }
+
+    // Opens without a password, so nothing else stops it.
+    let protected = text_pdf(&[&["PROTECTEDTEXT"]]).to_encrypted_bytes(&ProtectionOptions::new("", "owner pw")).unwrap();
+    let mut opened = Pdf::from_bytes(&protected).unwrap();
+    opened.add_note(0, 100.0, 100.0, "edited").unwrap();
+    let record = store.begin_document(None, 3);
+    assert!(store.autosave(record, &mut opened, 4).is_err());
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        assert_gone(&std::fs::read(entry.unwrap().path()).unwrap(), "PROTECTEDTEXT");
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -890,6 +1533,17 @@ fn batch_reduce_never_damages_originals() {
     assert_eq!(std::fs::read(&tiny).unwrap(), tiny_before, "a file that cannot shrink is left alone");
     assert_eq!(outcomes[2].warning.as_deref(), Some(reduce_messages::OPEN_FAILED));
     assert_eq!(std::fs::read(&broken).unwrap(), b"this is not a pdf");
+
+    // A protected original is never replaced by an unencrypted copy, even one that opens
+    // without a password.
+    let protected = dir.join("protected.pdf");
+    let mut options = ProtectionOptions::new("", "owner pw");
+    options.allow_copying = false;
+    std::fs::write(&protected, photo_pdf().to_encrypted_bytes(&options).unwrap()).unwrap();
+    let before = std::fs::read(&protected).unwrap();
+    let outcomes = reduce_files(std::slice::from_ref(&protected), &OutputOptions::default(), &ReduceOptions::default());
+    assert_eq!(outcomes[0].warning.as_deref(), Some(reduce_messages::PROTECTED));
+    assert_eq!(std::fs::read(&protected).unwrap(), before);
 
     // Naming and overwrite rules.
     let named = OutputOptions { prefix: "small-".into(), overwrite: false, ..Default::default() };

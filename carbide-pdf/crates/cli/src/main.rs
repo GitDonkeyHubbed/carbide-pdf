@@ -15,7 +15,7 @@ use carbide_engine::signature::{
 use carbide_engine::{
     compare_documents, export_images, export_text, open_revision_bytes, pdf_date_now, revision_display_name,
     BatesOptions, ImageFormat, MarkupStyle, PageAnchor, Pdf, ProtectionOptions, Rect, Redaction, Renderer,
-    StandardFont, WatermarkOptions,
+    SavePlan, SavedFile, StandardFont, WatermarkOptions,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -433,6 +433,52 @@ fn save(pdf: &mut Pdf, output: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Opens an input that is edited and written out again, together with the file it came from.
+fn open_for_edit(path: &Path, pw: &Password) -> Result<(Pdf, SavedFile), Failure> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(SavedFile::open(bytes, pw.password.clone())?)
+}
+
+/// Writes an edited input to `output` the way the desktop app saves it. A protected input stays
+/// encrypted with its own key, passwords and permissions. A signed input, or one with saved
+/// revisions, gets the edits appended so those stay valid, unless the edit removed content
+/// (`content_removed`): then it is written in full, and a note says what that costs.
+fn save_edit(pdf: &mut Pdf, saved: &SavedFile, content_removed: bool, input: &Path, output: &Path) -> Result<(), Failure> {
+    let plan = pdf.save_plan(Some(saved), content_removed)?;
+    if let SavePlan::FullRewrite { breaks_signatures, drops_revisions } = plan {
+        if breaks_signatures {
+            eprintln!("note: {} is written in full, so its signatures no longer validate", output.display());
+        }
+        if drops_revisions {
+            eprintln!("note: {} is written in full, so its saved revisions are dropped", output.display());
+        }
+    }
+    let bytes = pdf.save_bytes(plan, Some(saved))?;
+    if !(plan == SavePlan::Unchanged && same_file(input, output)) {
+        carbide_engine::fs::write_replacing(output, &bytes)?;
+    }
+    println!("wrote {}", output.display());
+    Ok(())
+}
+
+/// True when `a` and `b` name the same existing file, links followed.
+fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+/// Refuses to write a new, unencrypted document over the password-protected `input` it came from.
+fn refuse_over_protected(input: &Path, pdf: &Pdf, output: &Path) -> Result<(), Failure> {
+    if pdf.document().was_encrypted() && same_file(input, output) {
+        return Err(format!(
+            "{} is password-protected, and this result would not be encrypted: choose another output file \
+             (or remove the protection with `decrypt`)",
+            input.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 // ---- commands ------------------------------------------------------------------------------
 
 fn run(cli: Cli) -> Result<(), Failure> {
@@ -452,11 +498,15 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Command::Merge { output, inputs } => {
             let docs: Result<Vec<Pdf>, Failure> = inputs.iter().map(|p| open(p, &Password { password: None })).collect();
             let docs = docs?;
+            for (input, doc) in inputs.iter().zip(&docs) {
+                refuse_over_protected(input, doc, &output)?;
+            }
             let refs: Vec<&Pdf> = docs.iter().collect();
             save(&mut Pdf::merge(&refs)?, &output)?;
         }
         Command::Extract { input, pages, output, pw } => {
             let pdf = open(&input, &pw)?;
+            refuse_over_protected(&input, &pdf, &output)?;
             let selected = pages_arg(&pages, &pdf)?;
             save(&mut pdf.extract_pages(&selected)?, &output)?;
         }
@@ -466,34 +516,35 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             for range in Pdf::parse_ranges(&ranges, pdf.page_count())? {
                 let name = format!("{stem}-pages-{}-{}.pdf", range.start() + 1, range.end() + 1);
+                refuse_over_protected(&input, &pdf, &folder.join(&name))?;
                 let mut part = pdf.extract_pages(&range.clone().collect::<Vec<_>>())?;
                 save(&mut part, &folder.join(name))?;
             }
         }
         Command::Delete { input, pages, output, pw } => {
-            let mut pdf = open(&input, &pw)?;
+            let (mut pdf, saved) = open_for_edit(&input, &pw)?;
             let selected = pages_arg(&pages, &pdf)?;
             pdf.delete_pages(&selected)?;
-            save(&mut pdf, &output)?;
+            save_edit(&mut pdf, &saved, true, &input, &output)?;
         }
         Command::Rotate { input, pages, degrees, output, pw } => {
-            let mut pdf = open(&input, &pw)?;
+            let (mut pdf, saved) = open_for_edit(&input, &pw)?;
             let selected = pages_arg(&pages, &pdf)?;
             pdf.rotate_pages(&selected, degrees)?;
-            save(&mut pdf, &output)?;
+            save_edit(&mut pdf, &saved, false, &input, &output)?;
         }
         Command::Blank { input, at, output, pw } => {
-            let mut pdf = open(&input, &pw)?;
+            let (mut pdf, saved) = open_for_edit(&input, &pw)?;
             pdf.insert_blank_page(one_based(at, "position")?, None)?;
-            save(&mut pdf, &output)?;
+            save_edit(&mut pdf, &saved, false, &input, &output)?;
         }
         Command::Move { input, from, to, output, pw } => {
-            let mut pdf = open(&input, &pw)?;
+            let (mut pdf, saved) = open_for_edit(&input, &pw)?;
             pdf.move_page(one_based(from, "from")?, one_based(to, "to")?)?;
-            save(&mut pdf, &output)?;
+            save_edit(&mut pdf, &saved, false, &input, &output)?;
         }
         Command::Watermark(a) => {
-            let mut pdf = open(&a.input, &a.pw)?;
+            let (mut pdf, saved) = open_for_edit(&a.input, &a.pw)?;
             let mut options = WatermarkOptions::new(a.text);
             options.font = StandardFont::HelveticaBold;
             options.font_size = a.size;
@@ -504,10 +555,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 options.pages = Some(pages_arg(p, &pdf)?);
             }
             pdf.apply_watermark(&options)?;
-            save(&mut pdf, &a.output)?;
+            save_edit(&mut pdf, &saved, false, &a.input, &a.output)?;
         }
         Command::Bates(a) => {
-            let mut pdf = open(&a.input, &a.pw)?;
+            let (mut pdf, saved) = open_for_edit(&a.input, &a.pw)?;
             let anchor = match a.position {
                 AnchorArg::TopLeft => PageAnchor::TopLeft,
                 AnchorArg::TopCenter => PageAnchor::TopCenter,
@@ -525,19 +576,19 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 font_size: a.size,
                 ..Default::default()
             })?;
-            save(&mut pdf, &a.output)?;
+            save_edit(&mut pdf, &saved, false, &a.input, &a.output)?;
         }
         Command::Redact { input, output, rects, dpi, pw } => {
-            let mut pdf = open(&input, &pw)?;
+            let (mut pdf, saved) = open_for_edit(&input, &pw)?;
             let parsed: Result<Vec<Redaction>, Failure> = rects
                 .iter()
                 .map(|r| parse_rect(r).map(|(page, rect)| Redaction { page, rect }))
                 .collect();
             pdf.apply_redactions(renderer()?, &parsed?, dpi)?;
-            save(&mut pdf, &output)?;
+            save_edit(&mut pdf, &saved, true, &input, &output)?;
         }
         Command::Markup { input, output, rect, style, pw } => {
-            let mut pdf = open(&input, &pw)?;
+            let (mut pdf, saved) = open_for_edit(&input, &pw)?;
             let (page, rect) = parse_rect(&rect)?;
             let style = match style {
                 MarkupArg::Highlight => MarkupStyle::Highlight,
@@ -545,17 +596,17 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 MarkupArg::Strikeout => MarkupStyle::StrikeOut,
             };
             pdf.add_markup(page, &[rect], style, None)?;
-            save(&mut pdf, &output)?;
+            save_edit(&mut pdf, &saved, false, &input, &output)?;
         }
         Command::Note { input, output, at, text, on_page, size, pw } => {
-            let mut pdf = open(&input, &pw)?;
+            let (mut pdf, saved) = open_for_edit(&input, &pw)?;
             let (page, x, y) = parse_point(&at)?;
             if on_page {
                 pdf.add_text_box(page, x, y, &text, size)?;
             } else {
                 pdf.add_note(page, x, y, &text)?;
             }
-            save(&mut pdf, &output)?;
+            save_edit(&mut pdf, &saved, false, &input, &output)?;
         }
         Command::Compare { original, revised } => {
             let mut a = open(&original, &Password { password: None })?;
@@ -626,7 +677,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             }
         }
         Command::Ocr { input, output, dpi, models, pages, pw } => {
-            let mut pdf = open(&input, &pw)?;
+            let (mut pdf, saved) = open_for_edit(&input, &pw)?;
             let options = carbide_engine::ocr::OcrOptions {
                 dpi,
                 models_dir: models,
@@ -643,10 +694,11 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 report.lines,
                 report.skipped_pages.len()
             );
-            save(&mut pdf, &output)?;
+            save_edit(&mut pdf, &saved, false, &input, &output)?;
         }
         Command::Impose(a) => {
             let pdf = open(&a.input, &a.pw)?;
+            refuse_over_protected(&a.input, &pdf, &a.output)?;
             let mut options = match &a.settings {
                 Some(path) => ImpositionOptions::from_ini(&std::fs::read_to_string(path)?)?,
                 None => impose_options(&a)?,
@@ -706,7 +758,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 timestamp: authority.as_ref().map(|t| t as &dyn carbide_engine::signature::TimestampSource),
                 signing_time: None,
             };
-            std::fs::write(&a.output, pdf.sign(&base, &options)?)?;
+            carbide_engine::fs::write_replacing(&a.output, &pdf.sign(&base, &options)?)?;
             println!("signed {} as {}", a.output.display(), identity.common_name());
         }
         Command::Timestamp { input, output, tsa, tsa_user, tsa_password } => {
@@ -718,7 +770,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 timestamp: Some(&authority),
                 ..Default::default()
             };
-            std::fs::write(&output, pdf.sign(&base, &options)?)?;
+            carbide_engine::fs::write_replacing(&output, &pdf.sign(&base, &options)?)?;
             println!("wrote {}", output.display());
         }
         Command::Verify { input, trust } => {
@@ -769,7 +821,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 let base = std::fs::read(&file)?;
                 let pdf = Pdf::from_bytes(&base)?;
                 let updated = pdf.save_revision(&base, &label, &pdf_date_now())?;
-                std::fs::write(&file, updated)?;
+                carbide_engine::fs::write_replacing(&file, &updated)?;
                 println!("saved revision {:?} in {}", label, file.display());
             }
             RevisionAction::List { file } => {
@@ -788,7 +840,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 let revision = revisions
                     .get(one_based(number, "revision")?)
                     .ok_or_else(|| format!("{} has {} revision(s)", file.display(), revisions.len()))?;
-                std::fs::write(&output, open_revision_bytes(&bytes, revision)?)?;
+                carbide_engine::fs::write_replacing(&output, &open_revision_bytes(&bytes, revision)?)?;
                 let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 println!("wrote {} ({})", output.display(), revision_display_name(&name, revision));
             }

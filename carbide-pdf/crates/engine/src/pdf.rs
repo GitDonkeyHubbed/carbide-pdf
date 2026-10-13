@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::RangeInclusive;
 use std::path::Path;
 
@@ -6,7 +6,7 @@ use lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 
 use crate::error::{Error, Result};
 use crate::geometry::{normalize_rotation, PageGeometry};
-use crate::security::ProtectionOptions;
+use crate::scrub::widget_area;
 
 /// A PDF document. All page indexes in this API are zero-based.
 #[derive(Clone)]
@@ -47,21 +47,18 @@ impl Pdf {
         Self::from_bytes_with_password(&std::fs::read(path)?, password)
     }
 
+    /// Opens a file. An encrypted one opens only when it needs no password to be read (its
+    /// restrictions are kept and saving encrypts it again).
     pub fn from_bytes(bytes: &[u8]) -> Result<Pdf> {
-        let doc = Document::load_mem(bytes)?;
-        if doc.is_encrypted() {
-            return Err(Error::PasswordRequired);
-        }
-        Ok(Pdf { doc })
+        Ok(Pdf { doc: crate::crypt::load(bytes, None)? })
     }
 
+    /// Opens a file with its open password or its owner password, used exactly as given.
     pub fn from_bytes_with_password(bytes: &[u8], password: &str) -> Result<Pdf> {
-        // The password has to be given to the loader: without it only the encryption dictionary
-        // is read and the document comes back empty.
-        match Document::load_mem_with_options(bytes, lopdf::LoadOptions::with_password(password)) {
+        match crate::crypt::load(bytes, Some(password)) {
             Ok(doc) => Ok(Pdf { doc }),
-            Err(lopdf::Error::InvalidPassword) | Err(lopdf::Error::Decryption(_)) => Err(Error::WrongPassword),
-            Err(other) => Err(other.into()),
+            Err(Error::Pdf(lopdf::Error::InvalidPassword | lopdf::Error::Decryption(_))) => Err(Error::WrongPassword),
+            Err(other) => Err(other),
         }
     }
 
@@ -73,34 +70,11 @@ impl Pdf {
         Ok(out)
     }
 
+    /// Writes the document to `path`, replacing a file there in one step.
     pub fn save(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let bytes = self.to_bytes()?;
-        std::fs::write(path, bytes)?;
+        crate::fs::write_replacing(path.as_ref(), &bytes)?;
         Ok(())
-    }
-
-    /// Bytes that should replace the file on disk.
-    ///
-    /// `base_bytes` is the file this document was loaded from. The result starts with those exact
-    /// bytes, so signatures and saved-revision prefixes stay valid, and a document with no changes
-    /// is returned unchanged. Pass `None` for a document that has never been saved.
-    ///
-    /// When `password` is set, the result is a new AES-256 file that still requires that password.
-    /// A decrypted document's ordinary serialization is plaintext; writing that over the original
-    /// would remove the protection. The in-memory document stays decrypted.
-    pub fn bytes_for_save(&mut self, base_bytes: Option<&[u8]>, password: Option<&str>) -> Result<Vec<u8>> {
-        if let Some(password) = password.map(str::trim).filter(|p| !p.is_empty()) {
-            let mut options = ProtectionOptions::new(password, password);
-            options.allow_printing = true;
-            options.allow_copying = true;
-            options.allow_modifying = true;
-            options.allow_annotating = true;
-            return self.to_encrypted_bytes(&options);
-        }
-        match base_bytes {
-            Some(base) => self.incremental_update(base),
-            None => self.to_bytes(),
-        }
     }
 
     pub fn is_encrypted(&self) -> bool {
@@ -250,7 +224,8 @@ impl Pdf {
         Ok(())
     }
 
-    /// Deletes pages. A document must keep at least one page.
+    /// Deletes pages. A document must keep at least one page. Nothing of a deleted page stays in
+    /// the document: its form fields, its tags and the resources only it used go with it.
     pub fn delete_pages(&mut self, pages: &[usize]) -> Result<()> {
         let count = self.page_count();
         let mut unique: Vec<usize> = pages.to_vec();
@@ -262,9 +237,15 @@ impl Pdf {
         if unique.len() >= count {
             return Err(Error::Other("a document needs at least one page".into()));
         }
+        let ids = self.page_ids();
+        let doomed: HashSet<ObjectId> = unique.iter().map(|&p| ids[p]).collect();
+        // What refers to the pages is found through them, so this comes first. An invisible
+        // signature only sits on a page because every field has to; it is not the page's content.
+        self.drop_form_fields_on(&doomed, &|_, widget, signature| !signature || widget_area(widget).is_some());
+        self.drop_structure_of(&doomed);
         let numbers: Vec<u32> = unique.iter().map(|&p| p as u32 + 1).collect();
         self.doc.delete_pages(&numbers);
-        Ok(())
+        self.trim_resources()
     }
 
     /// Inserts a blank page so that it ends up at `index`. Size defaults to the neighbouring page.
@@ -311,7 +292,8 @@ impl Pdf {
         Ok(())
     }
 
-    /// A new document holding only the given pages, in the given order.
+    /// A new document holding only the given pages, in the given order. Nothing of the other
+    /// pages is carried along, not through form fields, tags, links or shared resources either.
     pub fn extract_pages(&self, pages: &[usize]) -> Result<Pdf> {
         let count = self.page_count();
         if pages.is_empty() {
@@ -323,20 +305,29 @@ impl Pdf {
         let mut copy = self.clone();
         copy.flatten_page_tree()?;
         let ids = copy.page_ids();
+        let kept: HashSet<ObjectId> = pages.iter().map(|&p| ids[p]).collect();
+        let dropped: HashSet<ObjectId> = ids.iter().copied().filter(|id| !kept.contains(id)).collect();
+        copy.drop_form_fields_on(&dropped, &|_, _, _| true);
         let root_id = copy.pages_root()?;
         let kids: Vec<Object> = pages.iter().map(|&p| Object::Reference(ids[p])).collect();
         let root = copy.doc.get_dictionary_mut(root_id)?;
         root.set("Count", kids.len() as i64);
         root.set("Kids", kids);
-        // Outlines would point at pages that no longer exist.
+        // Outlines and page labels would describe pages that no longer exist, and the structure
+        // tree holds the tagged content of every page.
         if let Ok(catalog_id) = copy.doc.trailer.get(b"Root").and_then(|o| o.as_reference()) {
             if let Ok(catalog) = copy.doc.get_dictionary_mut(catalog_id) {
-                catalog.remove(b"Outlines");
-                catalog.remove(b"Names");
-                catalog.remove(b"Dests");
-                catalog.remove(b"OpenAction");
+                for key in [&b"Outlines"[..], b"Names", b"Dests", b"OpenAction", b"PageLabels", b"StructTreeRoot", b"MarkInfo"] {
+                    catalog.remove(key);
+                }
             }
         }
+        // Links, beads and anything else that still points at a dropped page loses that target.
+        copy.drop_references_to(&dropped);
+        for id in &dropped {
+            copy.doc.objects.remove(id);
+        }
+        copy.trim_resources()?;
         copy.doc.prune_objects();
         Ok(copy)
     }

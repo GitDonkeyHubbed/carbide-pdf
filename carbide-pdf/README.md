@@ -110,7 +110,9 @@ carbide ocr scan.pdf scan-searchable.pdf --dpi 300 --pages 1-4
 - Revisions are stored in the file as a catalog entry plus incremental updates.
 - Signatures: RSA identities only (PKCS#12 or PEM); SHA-256; revocation checking and LTV are not implemented. DocMDP change-detection is not implemented: the certification is recorded, but later changes are not classified.
 - OCR writes Latin text only and does not auto-detect rotated scans.
-- Incremental updates and signing of encrypted files are not supported.
+- Desktop Save writes the whole file again, so removed or replaced content does not stay in it. Only a signed file or one with saved revisions gets an appended update, to keep those valid; after redacting, deleting pages or other removals Save asks before rewriting it, which invalidates its signatures and drops its revisions. An encrypted file keeps its passwords and permissions. The CLI's edit commands save the same way; where a rewrite costs signatures or revisions they say so instead of asking.
+- Redacting or deleting a page also removes its form fields (a field that still has a widget on another page keeps its value), its tags, and resources only it used. Extracted and split files carry nothing of the other pages and have no tags.
+- Signing and saving revisions of encrypted files are not supported. Reduce File Size refuses encrypted files, and Auto Recovery keeps no copy of them.
 
 Interface differences, as found in the code:
 

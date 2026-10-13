@@ -12,7 +12,7 @@ use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, FontId, Frame, Key, Margin, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui,
 };
 
-use crate::dialogs::Dialog;
+use crate::dialogs::{AfterSave, Dialog};
 use crate::icons::{self, Glyph};
 use crate::ribbon::{self, Cmd, RibbonTab};
 use crate::{paths, theme, CarbideApp, Tool};
@@ -69,6 +69,8 @@ pub struct ShellState {
     window_title: String,
     /// Asking what to do with unsaved documents before the window closes.
     quit_prompt: bool,
+    /// Save All was chosen and is waiting for the answer to a save question.
+    save_all_pending: bool,
     quit_confirmed: bool,
     /// The Add Location window, holding the cloud folders found on this computer.
     add_location: Option<Vec<(String, PathBuf)>>,
@@ -92,9 +94,16 @@ impl ShellState {
             comments: None,
             window_title: String::new(),
             quit_prompt: false,
+            save_all_pending: false,
             quit_confirmed: false,
             add_location: None,
         }
+    }
+
+    /// Carries on with Save All and quitting, after a save question was answered.
+    pub fn resume_save_all(&mut self) {
+        self.quit_prompt = true;
+        self.save_all_pending = true;
     }
 
     /// Drops everything derived from the active document.
@@ -284,7 +293,7 @@ impl CarbideApp {
 
             Cmd::PageInsert => self.edit("Insert page", move |p| p.insert_blank_page(page + 1, None)),
             Cmd::PageExtract => self.extract_current(),
-            Cmd::PageDelete => self.edit("Delete page", move |p| p.delete_pages(&[page])),
+            Cmd::PageDelete => self.edit_removing("Delete page", move |p| p.delete_pages(&[page])),
             Cmd::Merge => self.merge_files(),
             Cmd::Split => self.dialog = Some(Dialog::Split { ranges: "1-2".into() }),
             Cmd::Imposition => self.dialog = Some(Dialog::impose()),
@@ -463,11 +472,9 @@ impl CarbideApp {
             Some(Choice::Save) => {
                 self.shell.pending_close = None;
                 self.activate(Some(index));
-                self.save();
-                // A cancelled Save As leaves the document modified: keep it open then.
-                if self.doc.as_ref().is_some_and(|d| !d.dirty) {
-                    self.close_tab(index);
-                }
+                // The tab closes once the document is saved, after the answer when saving asks
+                // first. A cancelled Save As leaves it modified and open.
+                self.save_then(AfterSave::CloseTab);
             }
             Some(Choice::Discard) => {
                 self.shell.pending_close = None;
@@ -523,7 +530,14 @@ impl CarbideApp {
             .collect();
         if dirty.is_empty() {
             self.shell.quit_prompt = false;
+            // The last document was saved after answering its question: carry on quitting.
+            if std::mem::take(&mut self.shell.save_all_pending) {
+                self.finish_quit(ctx);
+            }
             return;
+        }
+        if std::mem::take(&mut self.shell.save_all_pending) {
+            return self.save_all_and_quit(ctx);
         }
         enum Choice {
             SaveAll,
@@ -558,20 +572,38 @@ impl CarbideApp {
             choice = Some(Choice::Cancel);
         }
         match choice {
-            Some(Choice::SaveAll) => {
-                let indices: Vec<usize> = (0..self.tabs.len()).filter(|&i| self.tab_label(i).1).collect();
-                for index in indices {
-                    self.activate(Some(index));
-                    self.save();
-                }
-                // A cancelled Save As leaves a document modified: keep the prompt up then.
-                if !(0..self.tabs.len()).any(|i| self.tab_label(i).1) {
-                    self.finish_quit(ctx);
-                }
-            }
+            Some(Choice::SaveAll) => self.save_all_and_quit(ctx),
             Some(Choice::Discard) => self.finish_quit(ctx),
             Some(Choice::Cancel) => self.shell.quit_prompt = false,
             None => {}
+        }
+    }
+
+    /// Saves every modified document, then quits. Documents that save without a question go
+    /// first; then the first one that has to ask does, and quitting carries on once it is answered.
+    pub(crate) fn save_all_and_quit(&mut self, ctx: &egui::Context) {
+        let indices: Vec<usize> = (0..self.tabs.len()).filter(|&i| self.tab_label(i).1).collect();
+        let mut asks = None;
+        for index in indices {
+            self.activate(Some(index));
+            if self.save_needs_question() {
+                asks.get_or_insert(index);
+            } else {
+                self.save();
+            }
+        }
+        // A save that failed has said why; the quit prompt stays up for another try.
+        if self.dialog.is_some() {
+            return;
+        }
+        if let Some(index) = asks {
+            self.shell.quit_prompt = false;
+            self.activate(Some(index));
+            return self.save_then(AfterSave::Quit);
+        }
+        // A cancelled Save As leaves a document modified: keep the prompt up then.
+        if !(0..self.tabs.len()).any(|i| self.tab_label(i).1) {
+            self.finish_quit(ctx);
         }
     }
 
