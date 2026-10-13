@@ -11,6 +11,7 @@ use carbide_engine::{pdf_date_now, Pdf, ProtectionOptions};
 use eframe::egui;
 
 use crate::dialogs::{AfterSave, Dialog, Export};
+use crate::ribbon::Cmd;
 use crate::{CarbideApp, OcrJob, SignJob};
 
 /// A folder of its own for one test.
@@ -378,4 +379,36 @@ fn merging_in_a_protected_file_asks_and_combining_keeps_a_shared_protection() {
     app.combine(documents, true);
     assert_eq!(app.tabs.len(), tabs + 1);
     assert!(!app.doc.as_ref().unwrap().is_protected());
+}
+
+#[test]
+fn hidden_information_is_removed_as_an_edit_and_offered_after_redacting() {
+    let dir = scratch();
+    let mut noted = document(&["PAGE TEXT"]);
+    noted.add_note(0, 100.0, 100.0, "SECRET NOTE").unwrap();
+    let path = dir.join("noted.pdf");
+    std::fs::write(&path, noted.to_bytes().unwrap()).unwrap();
+    let mut app = app(&dir);
+    app.open_path(&path);
+
+    app.run(Cmd::RemoveHidden);
+    let Some(Dialog::RemoveHidden { doc, chosen }) = app.dialog.take() else { panic!("no dialog") };
+    assert!(chosen.iter().any(|(item, on)| *item == carbide_engine::HiddenItem::Bookmarks && !on), "bookmarks are kept unless chosen");
+    let items = chosen.iter().filter(|(_, on)| *on).map(|(item, _)| *item).collect();
+    app.remove_hidden_information(doc, items);
+    let Some(Dialog::Message(report)) = &app.dialog else { panic!("nothing was reported") };
+    // The note, and the text box `document` draws its label with.
+    assert!(report.contains("Comments and markup: 2"), "{report}");
+    let open = app.doc.as_ref().unwrap();
+    assert!(open.dirty && open.content_removed);
+    app.dialog = None;
+    app.save();
+    assert!(!contains(&std::fs::read(&path).unwrap(), "SECRET NOTE"));
+
+    // Applying redactions offers to look for the same text elsewhere.
+    let Ok(renderer) = carbide_engine::Renderer::global() else { return };
+    app.renderer = Some(renderer);
+    app.pending_redactions = vec![carbide_engine::Redaction { page: 0, rect: carbide_engine::Rect::new(60.0, 690.0, 200.0, 40.0) }];
+    app.run(Cmd::ApplyRedactions);
+    assert!(matches!(app.dialog, Some(Dialog::SuggestRemoveHidden { doc }) if doc == active_id(&app)));
 }

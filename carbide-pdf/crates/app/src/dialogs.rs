@@ -13,7 +13,7 @@ use carbide_engine::signature::{
     CertifyLevel, HttpTimestampSource, Identity, SignOptions, SignatureReport, SubFilter, TimestampSource, Validity,
 };
 use carbide_engine::{
-    validate_label, BatesOptions, PageAnchor, PageDiff, Pdf, ProtectionOptions, Rect, Revision, StandardFont,
+    validate_label, BatesOptions, HiddenItem, PageAnchor, PageDiff, Pdf, ProtectionOptions, Rect, Revision, StandardFont,
     WatermarkOptions,
 };
 use eframe::egui;
@@ -191,6 +191,10 @@ pub enum Dialog {
     ConfirmMerge { doc: u64, others: Vec<Pdf>, names: Vec<String>, protected: Vec<String>, keeps_protection: bool },
     /// The files to combine are protected in different ways, so the result cannot keep them all.
     ConfirmCombine { documents: Vec<Pdf> },
+    /// Remove Hidden Information from document `doc`, with each item and whether it is chosen.
+    RemoveHidden { doc: u64, chosen: Vec<(HiddenItem, bool)> },
+    /// Redactions were just applied to document `doc`: offer to remove its hidden information too.
+    SuggestRemoveHidden { doc: u64 },
     Watermark(WatermarkForm),
     Bates(BatesForm),
     Protect(ProtectForm),
@@ -213,9 +217,16 @@ impl Dialog {
             Dialog::ConfirmRewrite { doc, .. }
             | Dialog::ExistingFiles { doc, .. }
             | Dialog::ConfirmExport { doc, .. }
-            | Dialog::ConfirmMerge { doc, .. } => Some(*doc),
+            | Dialog::ConfirmMerge { doc, .. }
+            | Dialog::RemoveHidden { doc, .. }
+            | Dialog::SuggestRemoveHidden { doc } => Some(*doc),
             _ => None,
         }
+    }
+
+    /// Remove Hidden Information for document `doc`, with the usual items chosen.
+    pub fn remove_hidden(doc: u64) -> Dialog {
+        Dialog::RemoveHidden { doc, chosen: HiddenItem::ALL.into_iter().map(|item| (item, item.chosen_by_default())).collect() }
     }
 
     pub fn watermark() -> Dialog {
@@ -597,6 +608,46 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                 let (ok, cancel) = buttons(ui, "Combine Without Protection", true);
                 if ok {
                     app.combine(std::mem::take(documents), true);
+                    open = false;
+                }
+                open &= !cancel;
+            });
+        }
+
+        Dialog::RemoveHidden { doc, chosen } => {
+            window("Remove Hidden Information").show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label("Remove what the document holds besides what its pages show:");
+                for (item, on) in chosen.iter_mut() {
+                    ui.checkbox(on, item.label());
+                }
+                ui.weak("The document is written in full when it is saved, so nothing removed stays in the file.");
+                let items: Vec<HiddenItem> = chosen.iter().filter(|(_, on)| *on).map(|(item, _)| *item).collect();
+                let (ok, cancel) = buttons(ui, "Remove", !items.is_empty());
+                if ok {
+                    open = false;
+                    app.remove_hidden_information(*doc, items);
+                }
+                open &= !cancel;
+            });
+        }
+
+        Dialog::SuggestRemoveHidden { doc } => {
+            window("Redaction").show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label("The marked content is gone from the pages.");
+                ui.label(
+                    "The same text can still be in the document's information, bookmarks, attachments, comments or \
+                     other content the pages do not show. Remove hidden information now?",
+                );
+                let (ok, cancel) = buttons(ui, "Remove Hidden Information...", true);
+                if ok {
+                    let mut dialog = Dialog::remove_hidden(*doc);
+                    // Bookmark titles often repeat what was redacted.
+                    if let Dialog::RemoveHidden { chosen, .. } = &mut dialog {
+                        chosen.iter_mut().for_each(|(_, on)| *on = true);
+                    }
+                    app.dialog = Some(dialog);
                     open = false;
                 }
                 open &= !cancel;

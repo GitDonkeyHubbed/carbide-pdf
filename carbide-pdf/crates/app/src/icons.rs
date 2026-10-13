@@ -67,6 +67,7 @@ pub enum Glyph {
     Search,
     Revision,
     Recovery,
+    Sanitize,
     Settings,
     Close,
     Plus,
@@ -74,7 +75,7 @@ pub enum Glyph {
 }
 
 impl Glyph {
-    pub const ALL: [Glyph; 56] = [
+    pub const ALL: [Glyph; 57] = [
         Glyph::Open, Glyph::Save, Glyph::Print, Glyph::Undo, Glyph::Redo, Glyph::Hand, Glyph::Cursor,
         Glyph::Sidebar, Glyph::PageInsert, Glyph::PageExtract, Glyph::PageDelete, Glyph::Merge, Glyph::Split,
         Glyph::RotateLeft, Glyph::RotateRight, Glyph::MovePageUp, Glyph::MovePageDown, Glyph::Stamp,
@@ -84,7 +85,7 @@ impl Glyph {
         Glyph::TimeStamp, Glyph::Verify, Glyph::Trust, Glyph::ZoomIn, Glyph::ZoomOut, Glyph::FitWidth,
         Glyph::FitPage, Glyph::ActualSize, Glyph::PrevPage, Glyph::NextPage, Glyph::FirstPage,
         Glyph::LastPage, Glyph::Folder, Glyph::NewDocument, Glyph::Search, Glyph::Revision,
-        Glyph::Recovery, Glyph::Settings, Glyph::Close, Glyph::Plus, Glyph::Document,
+        Glyph::Recovery, Glyph::Sanitize, Glyph::Settings, Glyph::Close, Glyph::Plus, Glyph::Document,
     ];
 }
 
@@ -593,6 +594,16 @@ fn recovery(p: &Pen) {
     }
 }
 
+/// Page with an eraser across its lower corner: information wiped from the document.
+fn sanitize(p: &Pen) {
+    page(p);
+    p.seg((0.24, 0.3), (0.5, 0.3));
+    p.seg((0.24, 0.46), (0.5, 0.46));
+    p.shape(&[(0.56, 0.66), (0.8, 0.42), (0.96, 0.58), (0.72, 0.82)], true);
+    p.seg((0.64, 0.74), (0.88, 0.5));
+    p.seg((0.5, 0.94), (0.92, 0.94));
+}
+
 /// Gear with eight teeth and a centre hole.
 fn gear(p: &Pen) {
     let teeth: [(f32, f32); 4] = [(-0.34, 0.31), (-0.2, 0.4), (0.2, 0.4), (0.34, 0.31)];
@@ -694,6 +705,7 @@ pub fn paint(painter: &Painter, rect: Rect, glyph: Glyph, color: Color32) {
         Glyph::Search => magnifier(&p),
         Glyph::Revision => revision(&p),
         Glyph::Recovery => recovery(&p),
+        Glyph::Sanitize => sanitize(&p),
         Glyph::Settings => gear(&p),
         Glyph::Close => close_x(&p),
         Glyph::Plus => plus_sign(&p),

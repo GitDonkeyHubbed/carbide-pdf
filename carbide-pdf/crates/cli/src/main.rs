@@ -15,7 +15,7 @@ use carbide_engine::signature::{
 use carbide_engine::fs::{write_file, write_replacing, Existing};
 use carbide_engine::{
     compare_documents, export_images, export_text, image_paths, open_revision_bytes, pdf_date_now, revision_display_name,
-    BatesOptions, ImageFormat, MarkupStyle, PageAnchor, Pdf, ProtectionOptions, Rect, Redaction, Renderer,
+    BatesOptions, HiddenItem, ImageFormat, MarkupStyle, PageAnchor, Pdf, ProtectionOptions, Rect, Redaction, Renderer,
     SavePlan, SavedFile, StandardFont, WatermarkOptions,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -195,6 +195,24 @@ enum Command {
         /// Replace each original with its reduced copy.
         #[arg(long, conflicts_with_all = ["out_dir", "prefix", "suffix"])]
         in_place: bool,
+    },
+    /// Remove hidden information: document information, XMP metadata, attachments, scripts, form
+    /// values, comments, thumbnails, unused objects and private application data, and with
+    /// --bookmarks the bookmarks and named destinations. A protected input stays protected.
+    Sanitize {
+        input: PathBuf,
+        output: PathBuf,
+        /// Remove only these.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        only: Vec<HiddenArg>,
+        /// Keep these.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        keep: Vec<HiddenArg>,
+        /// Also remove the bookmarks and named destinations.
+        #[arg(long)]
+        bookmarks: bool,
+        #[command(flatten)]
+        pw: Password,
     },
     /// Recognize text on scanned pages and add an invisible, searchable text layer.
     Ocr {
@@ -387,6 +405,37 @@ struct ImposeArgs {
     out: Unprotected,
     #[command(flatten)]
     pw: Password,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum HiddenArg {
+    Metadata,
+    Xmp,
+    Attachments,
+    Scripts,
+    FormData,
+    Comments,
+    Thumbnails,
+    Unused,
+    Private,
+    Bookmarks,
+}
+
+impl HiddenArg {
+    fn item(self) -> HiddenItem {
+        match self {
+            HiddenArg::Metadata => HiddenItem::Metadata,
+            HiddenArg::Xmp => HiddenItem::Xmp,
+            HiddenArg::Attachments => HiddenItem::Attachments,
+            HiddenArg::Scripts => HiddenItem::Scripts,
+            HiddenArg::FormData => HiddenItem::FormData,
+            HiddenArg::Comments => HiddenItem::Comments,
+            HiddenArg::Thumbnails => HiddenItem::Thumbnails,
+            HiddenArg::Unused => HiddenItem::UnusedObjects,
+            HiddenArg::Private => HiddenItem::PrivateData,
+            HiddenArg::Bookmarks => HiddenItem::Bookmarks,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -791,6 +840,22 @@ fn run(cli: Cli) -> Result<(), Failure> {
             if warnings > 0 {
                 return Err(format!("{warnings} file(s) could not be reduced").into());
             }
+        }
+        Command::Sanitize { input, output, only, keep, bookmarks, pw } => {
+            let (mut pdf, saved) = open_for_edit(&input, &pw)?;
+            let mut items: Vec<HiddenItem> = match only.is_empty() {
+                true => HiddenItem::ALL.into_iter().filter(|i| i.chosen_by_default() || (bookmarks && *i == HiddenItem::Bookmarks)).collect(),
+                false => only.iter().map(|a| a.item()).collect(),
+            };
+            items.retain(|item| !keep.iter().any(|k| k.item() == *item));
+            let report = pdf.remove_hidden_information(&items)?;
+            if report.is_empty() {
+                println!("No hidden information was found.");
+            }
+            for line in report.lines() {
+                println!("removed {line}");
+            }
+            save_edit(&mut pdf, &saved, true, &input, &output)?;
         }
         Command::Ocr { input, output, dpi, models, pages, pw } => {
             let (mut pdf, saved) = open_for_edit(&input, &pw)?;

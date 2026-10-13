@@ -347,6 +347,7 @@ impl CarbideApp {
 
             Cmd::MarkRedaction => self.tool = Tool::Redact,
             Cmd::ApplyRedactions => self.apply_redactions(),
+            Cmd::RemoveHidden => self.dialog = self.doc.as_ref().map(|d| Dialog::remove_hidden(d.id)),
             Cmd::SignVisible => {
                 self.tool = Tool::Sign;
                 self.status = "Drag a rectangle on the page to place the signature.".into();

@@ -94,6 +94,7 @@ pub enum Cmd {
     // security
     MarkRedaction,
     ApplyRedactions,
+    RemoveHidden,
     SignVisible,
     SignInvisible,
     Certify,
@@ -155,6 +156,7 @@ impl Cmd {
             Cmd::OpenRevision => "Open Revision",
             Cmd::MarkRedaction => "Mark Redaction",
             Cmd::ApplyRedactions => "Apply",
+            Cmd::RemoveHidden => "Remove Hidden Info",
             Cmd::SignVisible => "Sign",
             Cmd::SignInvisible => "Sign Invisibly",
             Cmd::Certify => "Certify",
@@ -182,6 +184,7 @@ impl Cmd {
             Cmd::Ocr => "Make scanned pages searchable",
             Cmd::MarkRedaction => "Drag over content to mark it for permanent removal",
             Cmd::ApplyRedactions => "Permanently remove all marked content",
+            Cmd::RemoveHidden => "Remove metadata, attachments, scripts, comments and other information the pages do not show",
             Cmd::SignVisible => "Drag a rectangle on the page to place a signature",
             Cmd::SignInvisible => "Sign without a visible appearance",
             Cmd::Certify => "Certify the document and limit later changes",
@@ -240,6 +243,7 @@ impl Cmd {
             Cmd::SaveRevision | Cmd::OpenRevision => Glyph::Revision,
             Cmd::MarkRedaction => Glyph::Redact,
             Cmd::ApplyRedactions => Glyph::ApplyRedact,
+            Cmd::RemoveHidden => Glyph::Sanitize,
             Cmd::SignVisible | Cmd::SignInvisible => Glyph::Sign,
             Cmd::Certify => Glyph::Certify,
             Cmd::TimeStamp => Glyph::TimeStamp,
@@ -292,7 +296,7 @@ const ADVANCED: &[Group] = &[
 ];
 
 const SECURITY: &[Group] = &[
-    Group { name: "Redaction", commands: &[Cmd::MarkRedaction, Cmd::ApplyRedactions] },
+    Group { name: "Redaction", commands: &[Cmd::MarkRedaction, Cmd::ApplyRedactions, Cmd::RemoveHidden] },
     Group {
         name: "Signature",
         commands: &[Cmd::SignVisible, Cmd::SignInvisible, Cmd::TimeStamp, Cmd::Certify, Cmd::Verify],

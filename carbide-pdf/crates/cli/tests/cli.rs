@@ -242,3 +242,40 @@ fn reduce_keeps_the_originals_and_refuses_names_that_collide() {
     assert!(std::fs::read(&file).unwrap().len() < before.len());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn sanitize_removes_what_is_chosen_and_keeps_protection() {
+    let dir = scratch("sanitize");
+    let file = dir.join("noted.pdf");
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    pdf.add_note(0, 100.0, 100.0, "SECRET NOTE").unwrap();
+    std::fs::write(&file, pdf.to_bytes().unwrap()).unwrap();
+    let path = file.to_str().unwrap();
+    let has_note = |path: &Path| std::fs::read(path).unwrap().windows(11).any(|w| w == b"SECRET NOTE");
+
+    let kept = dir.join("kept.pdf");
+    let output = carbide(&["sanitize", path, kept.to_str().unwrap(), "--keep", "comments,metadata"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(has_note(&kept), "a kept item was removed");
+
+    let clean = dir.join("clean.pdf");
+    let output = carbide(&["sanitize", path, clean.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("removed Comments and markup: 1"));
+    assert!(!has_note(&clean));
+    assert!(has_note(&file), "the input was changed");
+
+    // A protected input comes out protected the same way.
+    let locked = dir.join("locked.pdf");
+    protected(&locked, "user pw", "owner pw");
+    let before = key(&std::fs::read(&locked).unwrap());
+    let out = dir.join("locked-clean.pdf");
+    let output = carbide(&["sanitize", locked.to_str().unwrap(), out.to_str().unwrap(), "--only", "comments", "--password", "user pw"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let bytes = std::fs::read(&out).unwrap();
+    assert!(matches!(Pdf::from_bytes(&bytes), Err(Error::PasswordRequired)));
+    assert_eq!(key(&bytes), before);
+    assert!(Pdf::from_bytes_with_password(&bytes, "user pw").unwrap().annotations(0).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -558,8 +558,9 @@ impl CarbideApp {
         self.run_edit(label, true, f);
     }
 
-    fn run_edit(&mut self, label: &str, removes: bool, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) {
-        let Some(doc) = self.doc.as_mut() else { return };
+    /// Runs an edit, and returns whether it was made.
+    fn run_edit(&mut self, label: &str, removes: bool, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) -> bool {
+        let Some(doc) = self.doc.as_mut() else { return false };
         let snapshot = Snapshot { bytes: doc.bytes.clone(), content_removed: doc.content_removed };
         match f(&mut doc.pdf).and_then(|_| doc.refresh()) {
             Ok(()) => {
@@ -573,12 +574,14 @@ impl CarbideApp {
                 self.status = format!("{label} done.");
                 self.textures.clear();
                 self.thumbs.clear();
+                true
             }
             Err(e) => {
                 // Put the document back exactly as it was.
                 let _ = doc.restore(&snapshot.bytes);
                 let message = format!("{label} failed: {e}");
                 self.alert(message);
+                false
             }
         }
     }
@@ -1453,7 +1456,34 @@ impl CarbideApp {
         if redactions.is_empty() {
             return;
         }
-        self.edit_removing("Apply redactions", move |pdf| pdf.apply_redactions(renderer, &redactions, 200.0));
+        if self.run_edit("Apply redactions", true, move |pdf| pdf.apply_redactions(renderer, &redactions, 200.0)) {
+            // The same text may still be elsewhere in the document, so offer to look.
+            if let Some(doc) = self.doc.as_ref() {
+                self.dialog = Some(Dialog::SuggestRemoveHidden { doc: doc.id });
+            }
+        }
+    }
+
+    /// Takes `items` of hidden information out of document `doc`, as an edit that removes content,
+    /// and says what was found. Nothing happens when `doc` is no longer in front.
+    pub fn remove_hidden_information(&mut self, doc: u64, items: Vec<carbide_engine::HiddenItem>) {
+        if self.doc.as_ref().map(|d| d.id) != Some(doc) {
+            self.status = "Nothing was removed: the document is no longer in front.".into();
+            return;
+        }
+        let mut report = None;
+        self.edit_removing("Remove hidden information", |pdf| {
+            report = Some(pdf.remove_hidden_information(&items)?);
+            Ok(())
+        });
+        match report {
+            Some(report) if report.is_empty() => self.status = "No hidden information was found.".into(),
+            Some(report) => {
+                let lines = report.lines().iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n");
+                self.alert(format!("Removed from the document:\n{lines}\n\nSave the document to write it without them."));
+            }
+            None => {}
+        }
     }
 
     fn compare_with(&mut self) {

@@ -16,7 +16,7 @@ use carbide_engine::reduce::{messages as reduce_messages, reduce_files, OutputOp
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PlanOptions, PrintingOrder, Style};
 use carbide_engine::{
     compare_documents, export_images, export_text, image_paths, open_revision_bytes, pdf_date_now, BatesOptions, Error,
-    ImageFormat, MarkupStyle, PageAnchor, Pdf, ProtectionOptions, Rect, Redaction, Renderer, SavePlan, SavedFile,
+    HiddenItem, ImageFormat, MarkupStyle, PageAnchor, Pdf, ProtectionOptions, Rect, Redaction, Renderer, SavePlan, SavedFile,
     WatermarkOptions,
 };
 use image::RgbaImage;
@@ -714,6 +714,116 @@ fn page_labels_carry_on_where_a_page_was_deleted() {
     assert_eq!((decimal.get(b"S").unwrap().as_name().unwrap(), decimal.get(b"St").unwrap().as_i64().unwrap()), (&b"D"[..], 2));
     // "Closing Chapter" led to the deleted page; the other three items stay.
     assert_eq!(outline(&pdf, catalog.get(b"Outlines").unwrap().as_reference().unwrap()).len(), 3);
+}
+
+/// One page showing "visible text", and hidden information of every kind, each holding
+/// `SECRET-<kind>`: document information, XMP, an attachment and a file attachment comment,
+/// document JavaScript run on opening and on a page event, a filled text field, a note with its
+/// pop-up, a thumbnail, private application data, a bookmark and an object nothing uses. A link
+/// and the form field are not hidden information and stay.
+fn hidden_pdf() -> Vec<u8> {
+    let mut pdf = text_pdf(&[&["visible text"]]);
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let secret = |kind: &str| Object::string_literal(format!("SECRET-{kind}"));
+    let rect = || vec![Object::from(10), 10.into(), 60.into(), 30.into()];
+    let stream = |doc: &mut Document, dict: lopdf::Dictionary, kind: &str| {
+        doc.add_object(Stream::new(dict, format!("SECRET-{kind}").into_bytes()).with_compression(false))
+    };
+
+    let info = doc.add_object(dictionary! { "Title" => secret("TITLE"), "Author" => "someone" });
+    doc.trailer.set("Info", info);
+    let xmp = stream(doc, dictionary! { "Type" => "Metadata", "Subtype" => "XML" }, "XMP");
+    let attached = stream(doc, dictionary! { "Type" => "EmbeddedFile" }, "ATTACHMENT");
+    let spec = doc.add_object(dictionary! { "Type" => "Filespec", "F" => secret("FILENAME"), "EF" => dictionary! { "F" => attached } });
+    let in_comment = stream(doc, dictionary! { "Type" => "EmbeddedFile" }, "COMMENTFILE");
+    let comment_spec = doc.add_object(dictionary! { "Type" => "Filespec", "F" => "a.txt", "EF" => dictionary! { "F" => in_comment } });
+    let script = doc.add_object(dictionary! { "S" => "JavaScript", "JS" => secret("SCRIPT") });
+    let appearance = stream(doc, dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => rect() }, "VALUE");
+    let field = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx", "T" => "name", "V" => secret("VALUE"), "Rect" => rect(), "P" => page,
+        "AP" => dictionary! { "N" => appearance },
+    });
+    let popup = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Popup", "Rect" => rect() });
+    let note = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Text", "Rect" => rect(), "Contents" => secret("COMMENT"), "Popup" => popup });
+    doc.get_dictionary_mut(popup).unwrap().set("Parent", note);
+    let file_comment = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "FileAttachment", "Rect" => rect(), "FS" => comment_spec });
+    let link = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Link", "Rect" => rect(), "A" => dictionary! { "S" => "URI", "URI" => "https://example.com" },
+    });
+    let thumbnail = stream(doc, dictionary! { "Width" => 1, "Height" => 1, "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8 }, "THUMB");
+    let private = dictionary! { "Editor" => dictionary! { "Private" => secret("PRIVATE"), "LastModified" => "D:20260101" } };
+    let page_dict = doc.get_dictionary_mut(page).unwrap();
+    page_dict.set("Annots", vec![field.into(), note.into(), popup.into(), file_comment.into(), link.into()]);
+    page_dict.set("Thumb", thumbnail);
+    page_dict.set("PieceInfo", private);
+    page_dict.set("AA", dictionary! { "O" => script });
+
+    let outlines = doc.catalog().unwrap().get(b"Outlines").unwrap().as_reference().unwrap();
+    let bookmark = doc.add_object(dictionary! { "Title" => secret("BOOKMARK"), "Parent" => outlines, "Dest" => vec![page.into(), "Fit".into()] });
+    let outline_root = doc.get_dictionary_mut(outlines).unwrap();
+    outline_root.set("First", bookmark);
+    outline_root.set("Last", bookmark);
+    outline_root.set("Count", 1);
+    let catalog = doc.catalog_mut().unwrap();
+    catalog.set("Metadata", xmp);
+    catalog.set("Names", dictionary! {
+        "EmbeddedFiles" => dictionary! { "Names" => vec![Object::string_literal("notes.txt"), spec.into()] },
+        "JavaScript" => dictionary! { "Names" => vec![Object::string_literal("init"), script.into()] },
+    });
+    catalog.set("OpenAction", script);
+    catalog.set("AcroForm", dictionary! { "Fields" => vec![Object::Reference(field)] });
+    stream(doc, lopdf::Dictionary::new(), "ORPHAN");
+    // Written as it is, without dropping the object nothing uses.
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+const HIDDEN: [&str; 11] =
+    ["TITLE", "XMP", "ATTACHMENT", "FILENAME", "COMMENTFILE", "SCRIPT", "VALUE", "COMMENT", "THUMB", "PRIVATE", "ORPHAN"];
+
+#[test]
+fn hidden_information_is_removed_as_chosen_and_reported() {
+    let file = hidden_pdf();
+    for kind in HIDDEN.iter().chain(&["BOOKMARK"]) {
+        assert!(contains(&file, format!("SECRET-{kind}").as_bytes()), "the fixture lacks {kind}");
+    }
+
+    // Only what is chosen goes.
+    let mut pdf = Pdf::from_bytes(&file).unwrap();
+    let report = pdf.remove_hidden_information(&[HiddenItem::Metadata]).unwrap();
+    assert_eq!(report.count(HiddenItem::Metadata), 2);
+    assert_eq!(report.lines(), ["Document information (title, author, keywords): 2"]);
+    let bytes = pdf.to_bytes().unwrap();
+    assert_gone(&bytes, "SECRET-TITLE");
+    assert!(contains(&bytes, b"SECRET-XMP") && contains(&bytes, b"SECRET-COMMENT"));
+
+    // Everything but the bookmarks by default.
+    let mut pdf = Pdf::from_bytes(&file).unwrap();
+    let chosen: Vec<HiddenItem> = HiddenItem::ALL.into_iter().filter(|i| i.chosen_by_default()).collect();
+    let report = pdf.remove_hidden_information(&chosen).unwrap();
+    for item in &chosen {
+        assert!(report.count(*item) >= 1, "{item:?} was not found: {report:?}");
+    }
+    assert_eq!(report.count(HiddenItem::Comments), 1, "the pop-up goes with its note, uncounted");
+    assert_eq!(report.count(HiddenItem::Attachments), 2);
+    assert_eq!(report.count(HiddenItem::Scripts), 3, "the named script, the open action and the page event");
+    let bytes = pdf.to_bytes().unwrap();
+    for kind in HIDDEN {
+        assert_gone(&bytes, &format!("SECRET-{kind}"));
+    }
+    assert!(contains(&bytes, b"SECRET-BOOKMARK"), "bookmarks stay unless chosen");
+    let reopened = Pdf::from_bytes(&bytes).unwrap();
+    let kinds: Vec<Vec<u8>> =
+        reopened.annotations(0).unwrap().iter().map(|a| a.get(b"Subtype").unwrap().as_name().unwrap().to_vec()).collect();
+    assert_eq!(kinds, [b"Widget".to_vec(), b"Link".to_vec()]);
+    assert!(page_text(renderer(), &mut pdf, 0).contains("visible text"));
+
+    let report = pdf.remove_hidden_information(&[HiddenItem::Bookmarks]).unwrap();
+    assert_eq!(report.count(HiddenItem::Bookmarks), 1);
+    assert_gone(&pdf.to_bytes().unwrap(), "SECRET-BOOKMARK");
+    assert!(pdf.remove_hidden_information(&HiddenItem::ALL).unwrap().is_empty(), "nothing is left to find");
 }
 
 /// One page per label, built the way word processors and form tools write them, so that other
