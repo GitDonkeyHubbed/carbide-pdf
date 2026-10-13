@@ -133,6 +133,19 @@ impl OpenDoc {
     }
 }
 
+type OcrResult = Result<(Pdf, carbide_engine::ocr::OcrReport), String>;
+
+/// Text recognition running on a copy of one document.
+struct OcrJob {
+    /// The document and the version of it the copy was taken from. The result replaces the
+    /// document, so it is only used while the document is still exactly that version.
+    doc: u64,
+    version: u64,
+    receiver: std::sync::mpsc::Receiver<OcrResult>,
+    /// Received, and waiting for its document to come back to the front.
+    result: Option<OcrResult>,
+}
+
 #[derive(Clone, Copy)]
 struct DragState {
     page: usize,
@@ -165,8 +178,8 @@ pub struct CarbideApp {
     pub autosave: Option<AutoSaveStore>,
     pub settings: AutoSaveSettings,
     last_autosave: Instant,
-    /// Result channel of a running OCR job.
-    ocr_job: Option<std::sync::mpsc::Receiver<Result<(Pdf, carbide_engine::ocr::OcrReport), String>>>,
+    /// A running (or finished, not yet applied) OCR job.
+    ocr_job: Option<OcrJob>,
     /// The document notice bar text (signature summary).
     pub notice: Option<String>,
     /// One slot per open document, in tab order. The active document lives in `doc`, and its slot
@@ -978,6 +991,7 @@ impl CarbideApp {
         if self.ocr_job.is_some() {
             return;
         }
+        let (id, version) = (doc.id, doc.version);
         let mut copy = doc.pdf.clone();
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -987,15 +1001,37 @@ impl CarbideApp {
                 .map_err(|e| e.to_string());
             let _ = sender.send(result);
         });
-        self.ocr_job = Some(receiver);
+        self.ocr_job = Some(OcrJob { doc: id, version, receiver, result: None });
         self.status = "Recognizing text...".into();
     }
 
+    /// Applies a finished OCR job to the document it ran on. The result is a whole new copy of
+    /// that document, so it is dropped when the document changed in the meantime (a redaction
+    /// would come back otherwise), and it waits while another document is in front.
     fn poll_ocr(&mut self) {
-        let Some(receiver) = &self.ocr_job else { return };
-        match receiver.try_recv() {
-            Ok(Ok((pdf, report))) => {
+        let Some(job) = self.ocr_job.as_mut() else { return };
+        if job.result.is_none() {
+            match job.receiver.try_recv() {
+                Ok(result) => job.result = Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.ocr_job = None;
+                    return self.alert("OCR stopped unexpectedly.".into());
+                }
+            }
+        }
+        let (doc, version) = (job.doc, job.version);
+        let active = self.doc.as_ref().map(|d| (d.id, d.version));
+        if active.map(|(id, _)| id) != Some(doc) {
+            let still_open = (0..self.tabs.len()).any(|i| self.doc_at(i).is_some_and(|d| d.id == doc));
+            if !still_open {
                 self.ocr_job = None;
+            }
+            return;
+        }
+        let Some(OcrJob { result: Some(result), .. }) = self.ocr_job.take() else { return };
+        match result {
+            Ok((pdf, report)) if active == Some((doc, version)) => {
                 let message = format!(
                     "OCR: {} page(s) recognized, {} already had text.",
                     report.recognized_pages.len(),
@@ -1007,15 +1043,10 @@ impl CarbideApp {
                 });
                 self.status = message;
             }
-            Ok(Err(message)) => {
-                self.ocr_job = None;
-                self.alert(format!("OCR failed: {message}"));
+            Ok(_) => {
+                self.status = "The recognized text was not added: the document changed while OCR ran. Run OCR again.".into();
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.ocr_job = None;
-                self.alert("OCR stopped unexpectedly.".into());
-            }
+            Err(message) => self.alert(format!("OCR failed: {message}")),
         }
     }
 

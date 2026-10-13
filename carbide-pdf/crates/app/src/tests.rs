@@ -1,16 +1,17 @@
-//! How the window's commands drive saving: the save question, what follows a save, and Auto
-//! Recovery. Driven without a window; dialogs are answered the way their buttons do.
+//! How the window's commands drive saving: the save question, what follows a save, background OCR
+//! and Auto Recovery. Driven without a window; dialogs are answered the way their buttons do.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use carbide_engine::autosave::{AutoSaveSettings, AutoSaveStore};
+use carbide_engine::ocr::OcrReport;
 use carbide_engine::{pdf_date_now, Pdf, ProtectionOptions};
 use eframe::egui;
 
 use crate::dialogs::{AfterSave, Dialog};
-use crate::CarbideApp;
+use crate::{CarbideApp, OcrJob};
 
 /// A folder of its own for one test.
 fn scratch() -> PathBuf {
@@ -181,6 +182,45 @@ fn close_and_quit_finish_after_the_save_question() {
     app.prompts(&ctx);
     assert!(app.tabs.is_empty(), "quitting did not go on");
     assert!(!contains(&std::fs::read(&a).unwrap(), "REMOVED-A"));
+}
+
+#[test]
+fn ocr_results_only_replace_the_unchanged_document_they_came_from() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["PAGE ONE", "SECRET PAGE"]);
+    let b = plain(&dir, "b.pdf", &["B"]);
+    let mut app = app(&dir);
+    let report = || OcrReport { recognized_pages: vec![0], skipped_pages: vec![], lines: 1 };
+    let start = |app: &mut CarbideApp| {
+        let doc = app.doc.as_ref().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.ocr_job = Some(OcrJob { doc: doc.id, version: doc.version, receiver, result: None });
+        (sender, doc.pdf.clone())
+    };
+
+    // The page is deleted while OCR runs: the result must not bring it back.
+    app.open_path(&a);
+    let (sender, copy) = start(&mut app);
+    app.edit_removing("Delete page", |p| p.delete_pages(&[1]));
+    sender.send(Ok((copy, report()))).unwrap();
+    app.poll_ocr();
+    assert!(app.ocr_job.is_none());
+    assert_eq!(app.doc.as_ref().unwrap().pdf.page_count(), 1, "the deleted page came back");
+    assert!(app.doc.as_ref().unwrap().content_removed);
+
+    // Another document is in front when OCR finishes: the result waits for its own.
+    let (sender, mut copy) = start(&mut app);
+    copy.rotate_pages(&[0], 180).unwrap();
+    let a_index = app.active_tab.unwrap();
+    app.open_path(&b);
+    sender.send(Ok((copy, report()))).unwrap();
+    app.poll_ocr();
+    assert_eq!(app.doc.as_ref().unwrap().pdf.page_rotation(0).unwrap(), 0, "b.pdf got a.pdf's result");
+    assert!(app.ocr_job.is_some());
+    app.activate(Some(a_index));
+    app.poll_ocr();
+    assert!(app.ocr_job.is_none());
+    assert_eq!(app.doc.as_ref().unwrap().pdf.page_rotation(0).unwrap(), 180);
 }
 
 #[test]
