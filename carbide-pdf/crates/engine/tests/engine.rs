@@ -295,12 +295,12 @@ fn export_images_and_text() {
     let r = renderer();
     let mut pdf = text_pdf(&[&["page one"], &["page two"]]);
     let dir = scratch_dir("export");
-    let paths = export_images(&r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::Refuse).unwrap();
+    let paths = export_images(r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::Refuse).unwrap();
     let names: Vec<_> = paths.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
     assert_eq!(names, vec!["doc-001.png", "doc-002.png"]);
     assert_eq!(paths, image_paths(&pdf, &dir, "doc", ImageFormat::Png));
     assert_eq!(image::open(&paths[0]).unwrap().width(), 612);
-    let jpegs = export_images(&r, &mut pdf, &dir, "doc", ImageFormat::Jpeg, 72.0, Existing::Refuse).unwrap();
+    let jpegs = export_images(r, &mut pdf, &dir, "doc", ImageFormat::Jpeg, 72.0, Existing::Refuse).unwrap();
     assert_eq!(image::open(&jpegs[1]).unwrap().width(), 612);
     assert!(export_text(&r, &mut pdf).unwrap().contains("page two"));
     let _ = std::fs::remove_dir_all(dir);
@@ -320,15 +320,15 @@ fn exported_images_never_replace_files_unless_asked() {
         names
     };
 
-    let refused = export_images(&r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::Refuse).unwrap_err();
+    let refused = export_images(r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::Refuse).unwrap_err();
     assert!(refused.to_string().contains("doc-002.png"), "{refused}");
     assert_eq!(listing(&dir), ["doc-002.png"], "nothing is written when a name is taken");
 
-    let kept = export_images(&r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::KeepBoth).unwrap();
+    let kept = export_images(r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::KeepBoth).unwrap();
     assert_eq!(kept, [dir.join("doc-001.png"), dir.join("doc-002 (2).png")]);
     assert_eq!(std::fs::read(dir.join("doc-002.png")).unwrap(), b"earlier export");
 
-    let replaced = export_images(&r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::Replace).unwrap();
+    let replaced = export_images(r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::Replace).unwrap();
     assert_eq!(replaced, [dir.join("doc-001.png"), dir.join("doc-002.png")]);
     assert_eq!(image::open(dir.join("doc-002.png")).unwrap().width(), 612);
     assert_eq!(listing(&dir), ["doc-001.png", "doc-002 (2).png", "doc-002.png"], "no temporary files are left");
@@ -1422,7 +1422,7 @@ fn documents_made_from_a_protected_one_keep_its_passwords_and_permissions() {
         let letter = ImpositionOptions { media: Media::Named("Letter".into()), ..Default::default() };
         let derived = [
             ("extract", source.extract_pages(&[0]).unwrap()),
-            ("split", source.split(&[0..=0]).unwrap().remove(0)),
+            ("split", source.split(&Pdf::parse_ranges("1", source.page_count()).unwrap()).unwrap().remove(0)),
             ("impose", source.impose(&letter, None).unwrap()),
             ("merge", Pdf::merge(&[&source, &source.clone()]).unwrap()),
         ];

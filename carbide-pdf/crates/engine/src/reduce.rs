@@ -700,7 +700,7 @@ pub struct FileOutcome {
 /// same file, or a result would replace another input, nothing is reduced at all.
 pub fn reduce_files(inputs: &[PathBuf], output: &OutputOptions, options: &ReduceOptions) -> Vec<FileOutcome> {
     let planned = output.plan(inputs);
-    let stopped = planned.iter().any(|p| *p == Err(messages::OUTPUT_COLLIDES));
+    let stopped = planned.contains(&Err(messages::OUTPUT_COLLIDES));
     inputs
         .iter()
         .zip(planned)
