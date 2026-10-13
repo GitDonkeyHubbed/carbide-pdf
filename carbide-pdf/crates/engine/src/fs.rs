@@ -88,8 +88,10 @@ fn link_new(temp: &Path, path: &Path) -> io::Result<()> {
     }
 }
 
-/// Folders [`private_temp_file`] makes are named this, followed by random characters.
-const PRIVATE_PREFIX: &str = "carbide-";
+/// Folders [`private_temp_file`] makes are named this, followed by [`PRIVATE_DIGITS`] random
+/// hexadecimal digits.
+const PRIVATE_PREFIX: &str = "carbide-copy-";
+const PRIVATE_DIGITS: usize = 16;
 
 /// Writes `bytes` to a new file called `name` inside a new folder of its own in the system's
 /// temporary folder, and returns the file's path. Only the user can read the folder and the file,
@@ -100,7 +102,7 @@ pub fn private_temp_file(name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
     }
     let base = std::env::temp_dir();
     for _ in 0..100 {
-        let mut random = [0u8; 8];
+        let mut random = [0u8; PRIVATE_DIGITS / 2];
         getrandom::fill(&mut random).map_err(|e| io::Error::other(format!("no randomness available: {e}")))?;
         let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
         let dir = base.join(format!("{PRIVATE_PREFIX}{suffix}"));
@@ -134,8 +136,10 @@ pub fn private_temp_file(name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
 /// True for a file [`private_temp_file`] made.
 pub fn is_private_temp_file(path: &Path) -> bool {
     let Some(dir) = path.parent() else { return false };
-    dir.parent() == Some(std::env::temp_dir().as_path())
-        && dir.file_name().is_some_and(|n| n.to_string_lossy().starts_with(PRIVATE_PREFIX))
+    let named_so = dir.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix(PRIVATE_PREFIX)).is_some_and(|digits| {
+        digits.len() == PRIVATE_DIGITS && digits.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    });
+    named_so && dir.parent() == Some(std::env::temp_dir().as_path())
 }
 
 /// Removes a file [`private_temp_file`] made, and its folder. Any other path is refused.
@@ -364,6 +368,7 @@ mod tests {
 
         assert!(private_temp_file("../escape.pdf", b"x").is_err());
         assert!(remove_private_temp_file(&std::env::temp_dir().join("not-ours.pdf")).is_err());
+        assert!(!is_private_temp_file(&std::env::temp_dir().join("carbide-copy-notes").join("a.pdf")));
         remove_private_temp_file(&path).unwrap();
         remove_private_temp_file(&other).unwrap();
         assert!(!dir.exists());
