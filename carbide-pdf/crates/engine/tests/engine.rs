@@ -2255,8 +2255,42 @@ fn an_unsupported_algorithm_is_reported_as_unknown_not_altered() {
     let reports = verify(&signed, &TrustStore { certificates: vec![cert] });
     assert_eq!((reports[0].validity, reports[0].detail), (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm));
     assert_ne!(reports[0].status_line(), sig_messages::INVALID);
-    assert!(reports[0].description_lines().contains(&sig_messages::UNSUPPORTED_ALGORITHM));
-    assert!(!reports[0].description_lines().contains(&sig_messages::DOCUMENT_ALTERED));
+    let lines = reports[0].description_lines();
+    assert!(lines.contains(&sig_messages::UNSUPPORTED_ALGORITHM));
+    assert!(!lines.contains(&sig_messages::DOCUMENT_ALTERED));
+    // Nothing was checked, so nothing claims the document is unchanged or the signer unconfirmed.
+    assert!(!lines.contains(&sig_messages::NOT_MODIFIED) && !lines.contains(&sig_messages::IDENTITY_UNKNOWN), "{lines:?}");
+    assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_NOT_CHECKED));
+}
+
+#[test]
+fn flipping_an_unsigned_algorithm_identifier_does_not_hide_tampering() {
+    // The algorithm identifiers sit in the unsigned gap, so anyone can change them. Changing one to
+    // an algorithm this build does not check, then changing the signed content, must not make the
+    // document read as unchanged.
+    let sha256 = [0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+    let sha256_rsa = [0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B];
+    let mut doc = text_pdf(&[&["pay 100 dollars"]]);
+    let base = file_bytes(&mut doc);
+    for (sub_filter, oid, replacement) in [
+        (SubFilter::CadesDetached, &sha256[..], 0x04),     // digestAlgorithm SHA-256 -> SHA-224
+        (SubFilter::Pkcs7Detached, &sha256_rsa[..], 0x0E), // sha256WithRSA -> sha224WithRSA
+    ] {
+        let mut forged = doc.sign(&base, &sign_options(sub_filter)).unwrap();
+        let mut cms = signature_value(&forged);
+        // The SignerInfo comes after the certificates, so it holds the last occurrence.
+        let at = cms.windows(oid.len()).rposition(|w| w == oid).unwrap();
+        cms[at + oid.len() - 1] = replacement;
+        put_signature_value(&mut forged, &cms);
+        let position = forged.windows(11).position(|w| w == b"pay 100 dol").unwrap();
+        forged[position + 4] = b'9';
+
+        let reports = verify(&forged, &trust_test_identity());
+        assert_ne!(reports[0].validity, Validity::Valid, "{sub_filter:?}");
+        let lines = reports[0].description_lines();
+        assert!(!lines.contains(&sig_messages::NOT_MODIFIED) && !lines.contains(&sig_messages::REVISION_UNALTERED), "{sub_filter:?}: {lines:?}");
+        assert_ne!(notice_text(&reports), Some(sig_messages::NOTICE_ALL_VALID), "{sub_filter:?}");
+    }
 }
 
 
@@ -2543,6 +2577,14 @@ fn a_ca_issued_signer_is_trusted_through_its_chain() {
     assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedViaChain));
 }
 
+/// The chain reaches the trusted root by names and signatures but breaks an issuing rule: the
+/// panel says so, rather than that nothing in the chain is trusted.
+fn assert_rejected(report: &carbide_engine::signature::SignatureReport, label: &str) {
+    assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::ChainRejected), "{label}");
+    let lines = report.description_lines();
+    assert!(lines.contains(&sig_messages::CHAIN_REJECTED) && !lines.contains(&sig_messages::IDENTITY_UNKNOWN), "{label}");
+}
+
 #[test]
 fn chain_rules_reject_bad_issuers() {
     let (root_pair, _) = rsa_key();
@@ -2559,7 +2601,7 @@ fn chain_rules_reject_bad_issuers() {
         let mid_issuer = Issuer::new(mid_params, mid_pair);
         let (identity, _) = chain_identity(&mid_issuer, &[mid]);
         let reports = verify(&sign_with(&identity), &trust);
-        assert_eq!(reports[0].detail, Detail::DigestOkUntrusted, "non-CA issuer");
+        assert_rejected(&reports[0], "non-CA issuer");
     }
 
     // A CA without keyCertSign in its key usage cannot issue.
@@ -2570,7 +2612,7 @@ fn chain_rules_reject_bad_issuers() {
         let mid_issuer = Issuer::new(mid_params, mid_pair);
         let (identity, _) = chain_identity(&mid_issuer, &[mid]);
         let reports = verify(&sign_with(&identity), &trust);
-        assert_eq!(reports[0].detail, Detail::DigestOkUntrusted, "missing keyCertSign");
+        assert_rejected(&reports[0], "missing keyCertSign");
     }
 
     // pathLenConstraint exceeded: root pathLen 0 -> intermediate CA -> leaf.
@@ -2581,7 +2623,7 @@ fn chain_rules_reject_bad_issuers() {
         let int_issuer = Issuer::new(int_params, int_pair);
         let (identity, _) = chain_identity(&int_issuer, &[intermediate]);
         let reports = verify(&sign_with(&identity), &trust);
-        assert_eq!(reports[0].detail, Detail::DigestOkUntrusted, "pathLen exceeded");
+        assert_rejected(&reports[0], "pathLen exceeded");
     }
 
     // An expired intermediate is not accepted as an issuer at the signing time.
@@ -2599,8 +2641,53 @@ fn chain_rules_reject_bad_issuers() {
         let int_issuer = Issuer::new(int_params, int_pair);
         let (identity, _) = chain_identity(&int_issuer, &[intermediate]);
         let reports = verify(&sign_with(&identity), &TrustStore { certificates: vec![wide] });
-        assert_eq!(reports[0].detail, Detail::DigestOkUntrusted, "expired intermediate");
+        assert_rejected(&reports[0], "expired intermediate");
     }
+}
+
+#[test]
+fn a_cross_signed_intermediate_is_found_through_either_issuer() {
+    // One intermediate key, certified by two roots; only the second root is trusted, and the
+    // certificate from the first is listed first.
+    let roots: Vec<(Vec<u8>, Issuer<'static, KeyPair>)> = ["Root One", "Root Two"]
+        .into_iter()
+        .map(|name| {
+            let (pair, _) = rsa_key();
+            let params = cert_params(name, IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+            let der = params.self_signed(&pair).unwrap().der().to_vec();
+            (der, Issuer::new(params, pair))
+        })
+        .collect();
+    let (int_pair, _) = rsa_key();
+    let int_params = cert_params("Intermediate CA", IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+    let by_one = int_params.signed_by(&int_pair, &roots[0].1).unwrap().der().to_vec();
+    let by_two = int_params.signed_by(&int_pair, &roots[1].1).unwrap().der().to_vec();
+    let int_issuer = Issuer::new(int_params, int_pair);
+
+    let (identity, _) = chain_identity(&int_issuer, &[by_one, by_two]);
+    let reports = verify(&sign_with(&identity), &TrustStore { certificates: vec![roots[1].0.clone()] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedViaChain));
+}
+
+#[test]
+fn signer_key_usage_and_future_dates_are_named_as_such() {
+    // A trusted certificate whose key usage does not cover signing.
+    let (pair, key) = rsa_key();
+    let params = cert_params("Encryption Only", IsCa::ExplicitNoCa, &[KeyUsagePurpose::KeyEncipherment]);
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+    let identity = Identity::new(vec![cert.clone()], key).unwrap();
+    let report = verify(&sign_with(&identity), &TrustStore { certificates: vec![cert] }).remove(0);
+    assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::NotPermitted));
+    let lines = report.description_lines();
+    assert!(lines.contains(&sig_messages::SIGNER_NOT_PERMITTED) && !lines.contains(&sig_messages::IDENTITY_UNKNOWN));
+
+    // A signing time in the future.
+    let mut doc = text_pdf(&[&["later"]]);
+    let base = file_bytes(&mut doc);
+    let options = SignOptions { signing_time: Some("D:20991231000000Z".into()), ..sign_options(SubFilter::Pkcs7Detached) };
+    let report = verify(&doc.sign(&base, &options).unwrap(), &trust_test_identity()).remove(0);
+    assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::SignedInFuture));
+    assert!(report.description_lines().contains(&sig_messages::SIGNED_IN_FUTURE));
 }
 
 // ---- OCR -----------------------------------------------------------------------------------

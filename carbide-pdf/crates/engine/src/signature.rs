@@ -7,7 +7,7 @@
 //! `/ByteRange` is patched in, and the CMS signature over the two byte ranges is written into the
 //! placeholder. Digest is SHA-256 and the signature RSA PKCS#1 v1.5 with SHA-256.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, TimeZone, Utc};
 use lopdf::xref::XrefEntry;
@@ -40,6 +40,8 @@ pub mod messages {
     pub const NOT_MODIFIED: &str = "The document has not changed since it was signed";
     pub const IDENTITY_UNKNOWN: &str = "The signer's identity is not confirmed: neither the certificate nor any certificate above it is in your trusted list";
     pub const IDENTITY_EXPIRED: &str = "The signer's certificate has expired or is not valid yet";
+    pub const CHAIN_REJECTED: &str = "The signer's certificate leads to your trusted list, but through a certificate that may not issue it or was not valid at the time";
+    pub const SIGNER_NOT_PERMITTED: &str = "The signer's certificate is not allowed to sign documents";
     pub const DOCUMENT_ALTERED: &str = "The document is damaged or was changed after signing.";
     pub const UNSUPPORTED_ALGORITHM: &str = "This signature uses an algorithm this version cannot check.";
     pub const WEAK_ALGORITHM: &str = "This signature uses SHA-1, which is no longer considered secure.";
@@ -51,6 +53,7 @@ pub mod messages {
     pub const NOTICE_PROBLEMS: &str = "This document is signed, but at least one signature has a problem.";
     pub const NOTICE_NOT_CONFIRMED: &str =
         "This document is signed, but at least one signature's identity is not confirmed.";
+    pub const NOTICE_NOT_CHECKED: &str = "This document is signed, but at least one signature could not be checked.";
     pub const NOTICE_CHANGED_AFTER_LAST: &str =
         "Signed with valid signatures, but the document changed after the last signature.";
     pub const NOTICE_UPDATED: &str = "Signed with valid signatures; the document was updated after signing.";
@@ -794,6 +797,12 @@ pub enum Detail {
     TrustedDirectly = 8,
     DigestOkUntrusted = 9,
     UnsupportedAlgorithm = 10,
+    /// Certificates lead to a trusted one by name and signature, but break the issuing rules.
+    ChainRejected = 11,
+    /// The certificate's key usage does not allow what it was used for.
+    NotPermitted = 12,
+    /// The time the signature claims is in the future.
+    SignedInFuture = 13,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -861,32 +870,24 @@ impl SignatureReport {
     /// The panel's description lines.
     pub fn description_lines(&self) -> Vec<&'static str> {
         let mut lines = Vec::new();
-        let modification = if self.modified_after_signing {
-            messages::SUBSEQUENT_CHANGES
-        } else {
-            messages::NOT_MODIFIED
-        };
         match self.validity {
-            Validity::Valid => {
-                lines.push(if self.modified_after_signing { messages::REVISION_UNALTERED } else { modification });
+            Validity::Valid => self.integrity_lines(&mut lines),
+            // Nothing was checked, so nothing is said about the signed version being unchanged.
+            Validity::ValidityUnknown | Validity::Unknown if self.detail == Detail::UnsupportedAlgorithm => {
                 if self.modified_after_signing {
                     lines.push(messages::SUBSEQUENT_CHANGES);
                 }
+                lines.push(messages::UNSUPPORTED_ALGORITHM);
             }
             Validity::ValidityUnknown => {
-                if self.detail == Detail::Expired {
-                    lines.push(messages::IDENTITY_EXPIRED);
-                } else if self.detail == Detail::UnsupportedAlgorithm {
-                    lines.push(modification);
-                    lines.push(messages::UNSUPPORTED_ALGORITHM);
-                } else {
-                    lines.push(modification);
-                    lines.push(messages::IDENTITY_UNKNOWN);
-                }
-            }
-            Validity::Unknown if self.detail == Detail::UnsupportedAlgorithm => {
-                lines.push(modification);
-                lines.push(messages::UNSUPPORTED_ALGORITHM);
+                self.integrity_lines(&mut lines);
+                lines.push(match self.detail {
+                    Detail::Expired => messages::IDENTITY_EXPIRED,
+                    Detail::ChainRejected => messages::CHAIN_REJECTED,
+                    Detail::NotPermitted => messages::SIGNER_NOT_PERMITTED,
+                    Detail::SignedInFuture => messages::SIGNED_IN_FUTURE,
+                    _ => messages::IDENTITY_UNKNOWN,
+                });
             }
             Validity::Invalid => lines.push(match self.detail {
                 Detail::BadByteRange => messages::BAD_BYTE_RANGE,
@@ -904,6 +905,17 @@ impl SignatureReport {
         }
         lines
     }
+
+    /// For a signature whose digest held: the signed version is unchanged, and whether the file
+    /// goes on past it.
+    fn integrity_lines(&self, lines: &mut Vec<&'static str>) {
+        if self.modified_after_signing {
+            lines.push(messages::REVISION_UNALTERED);
+            lines.push(messages::SUBSEQUENT_CHANGES);
+        } else {
+            lines.push(messages::NOT_MODIFIED);
+        }
+    }
 }
 
 /// The notice bar text for a set of reports: the most serious condition wins.
@@ -920,6 +932,9 @@ pub fn notice_text(reports: &[SignatureReport]) -> Option<&'static str> {
     // or unsupported signature) is a problem; a document time stamp counts as valid here.
     if signed.iter().any(|r| !matches!(r.validity, Validity::Valid | Validity::ValidityUnknown)) {
         return Some(messages::NOTICE_PROBLEMS);
+    }
+    if signed.iter().any(|r| r.detail == Detail::UnsupportedAlgorithm) {
+        return Some(messages::NOTICE_NOT_CHECKED);
     }
     // A signature whose digest holds but whose signer is not confirmed must not be called valid.
     if signed.iter().any(|r| r.validity == Validity::ValidityUnknown && !r.document_time_stamp) {
@@ -952,32 +967,102 @@ fn issued_by(child: &Certificate, issuer: &Certificate) -> bool {
     ) == Verified::Ok
 }
 
-/// Builds and trusts a chain from `signer` up to a certificate in `store`. Each issuer must be a CA
-/// (basicConstraints cA=true, keyUsage keyCertSign when present), satisfy its pathLenConstraint, and
-/// be valid at `at`. A non-CA leaf can never act as an issuer, so one leaf cannot vouch for another.
-fn trust_level(signer: &Certificate, embedded: &[Certificate], store: &TrustStore, at: DateTime<Utc>) -> Option<Detail> {
-    let trusted: Vec<Certificate> = store.certificates.iter().filter_map(|d| Certificate::from_der(d).ok()).collect();
+/// How many certificates a chain may have above the signer.
+const MAX_CHAIN: usize = 8;
+
+/// Builds and trusts a chain from `signer` up to a certificate in `store`, trying every candidate
+/// issuer (a cross-signed intermediate has several). Each issuer must be a CA (basicConstraints
+/// cA=true, keyUsage keyCertSign when present), satisfy its pathLenConstraint, and be valid at
+/// `at`. A non-CA leaf can never act as an issuer, so one leaf cannot vouch for another. When no
+/// chain qualifies, the error says whether one reaches the store by names and signatures alone
+/// (`ChainRejected`) or none does (`DigestOkUntrusted`).
+fn trust_level(
+    signer: &Certificate,
+    embedded: &[Certificate],
+    store: &TrustStore,
+    at: DateTime<Utc>,
+) -> std::result::Result<Detail, Detail> {
     let in_store = |cert: &Certificate| cert.to_der().ok().is_some_and(|der| store.certificates.contains(&der));
     // A certificate the user trusts outright needs nothing further: this is the "trust one
     // person's certificate" flow, where that certificate may be an ordinary end-entity one.
     if in_store(signer) {
-        return Some(Detail::TrustedDirectly);
+        return Ok(Detail::TrustedDirectly);
     }
-    let mut current = signer.clone();
-    // `intermediates` is the number of CA certificates between the leaf and the issuer considered.
-    for intermediates in 0..8 {
-        let der = current.to_der().ok()?;
-        let parent = trusted.iter().chain(embedded.iter()).find(|candidate| {
-            candidate.to_der().ok().as_ref() != Some(&der)
-                && can_issue(candidate, intermediates, at)
-                && issued_by(&current, candidate)
-        })?;
-        if in_store(parent) {
-            return Some(Detail::TrustedViaChain);
+    let trusted: Vec<Certificate> = store.certificates.iter().filter_map(|d| Certificate::from_der(d).ok()).collect();
+    let mut search = ChainSearch::new(signer, trusted.iter().chain(embedded), &in_store);
+    if search.reaches_store(Some(at)) {
+        Ok(Detail::TrustedViaChain)
+    } else if search.reaches_store(None) {
+        Err(Detail::ChainRejected)
+    } else {
+        Err(Detail::DigestOkUntrusted)
+    }
+}
+
+/// A depth-first search for a path of issuers from the signer to a stored certificate.
+struct ChainSearch<'a> {
+    /// The signer first, then every other distinct certificate on offer.
+    certificates: Vec<&'a Certificate>,
+    stored: Vec<bool>,
+    /// `issued_by` by (child, issuer) index, so each certificate signature is checked once.
+    issued: HashMap<(usize, usize), bool>,
+    /// (certificate, intermediates below its issuer) already searched without reaching the store.
+    dead_ends: HashSet<(usize, usize)>,
+}
+
+impl<'a> ChainSearch<'a> {
+    fn new(
+        signer: &'a Certificate,
+        others: impl Iterator<Item = &'a Certificate>,
+        in_store: &dyn Fn(&Certificate) -> bool,
+    ) -> Self {
+        let mut certificates = vec![signer];
+        let mut seen = vec![signer.to_der().unwrap_or_default()];
+        for cert in others {
+            let der = cert.to_der().unwrap_or_default();
+            if !seen.contains(&der) {
+                seen.push(der);
+                certificates.push(cert);
+            }
         }
-        current = parent.clone();
+        let stored = certificates.iter().map(|c| in_store(c)).collect();
+        ChainSearch { certificates, stored, issued: HashMap::new(), dead_ends: HashSet::new() }
     }
-    None
+
+    /// With `rules` (the time to check validity at), every issuer must also be allowed to issue at
+    /// its place in the path; without, names and signatures alone count.
+    fn reaches_store(&mut self, rules: Option<DateTime<Utc>>) -> bool {
+        self.dead_ends.clear();
+        self.search(0, &mut vec![0], rules)
+    }
+
+    fn search(&mut self, child: usize, path: &mut Vec<usize>, rules: Option<DateTime<Utc>>) -> bool {
+        // The number of CA certificates between the leaf and the issuer considered.
+        let intermediates = path.len() - 1;
+        if intermediates >= MAX_CHAIN || self.dead_ends.contains(&(child, intermediates)) {
+            return false;
+        }
+        for issuer in 0..self.certificates.len() {
+            if path.contains(&issuer) || rules.is_some_and(|at| !can_issue(self.certificates[issuer], intermediates, at)) {
+                continue;
+            }
+            let certificates = &self.certificates;
+            if !*self.issued.entry((child, issuer)).or_insert_with(|| issued_by(certificates[child], certificates[issuer])) {
+                continue;
+            }
+            if self.stored[issuer] {
+                return true;
+            }
+            path.push(issuer);
+            let found = self.search(issuer, path, rules);
+            path.pop();
+            if found {
+                return true;
+            }
+        }
+        self.dead_ends.insert((child, intermediates));
+        false
+    }
 }
 
 /// Whether `cert` may issue a certificate that has `intermediates` CA certificates below it, and is
@@ -1206,7 +1291,7 @@ impl Pdf {
         let file_end = file_bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map(|p| p + 1).unwrap_or(0);
 
         // Field name per signature dictionary id.
-        let mut names: std::collections::HashMap<ObjectId, String> = std::collections::HashMap::new();
+        let mut names: HashMap<ObjectId, String> = HashMap::new();
         for object in pdf.doc.objects.values() {
             if let Object::Dictionary(d) = object {
                 if let (Ok(Object::Reference(v)), Some(name)) = (d.get(b"V"), text_of(d, b"T")) {
@@ -1408,37 +1493,24 @@ fn verify_one(
         .or_else(|| report.signing_time.as_deref().and_then(parse_pdf_date))
         .unwrap_or(now);
     if reference_time > now + chrono::Duration::minutes(5) {
-        report.validity = Validity::ValidityUnknown;
-        report.detail = Detail::DigestOkUntrusted;
+        unknown(&mut report, Detail::SignedInFuture);
         return report;
     }
-    let validity = &signer.tbs_certificate.validity;
-    let (not_before, not_after) = (
-        Utc.timestamp_opt(validity.not_before.to_unix_duration().as_secs() as i64, 0).single(),
-        Utc.timestamp_opt(validity.not_after.to_unix_duration().as_secs() as i64, 0).single(),
-    );
-    if let (Some(nb), Some(na)) = (not_before, not_after) {
-        if reference_time < nb || reference_time > na {
-            report.validity = Validity::ValidityUnknown;
-            report.detail = Detail::Expired;
-            return report;
-        }
+    if !valid_at(signer, reference_time) {
+        unknown(&mut report, Detail::Expired);
+        return report;
     }
     // The signer certificate, when it declares a key usage, must allow signing.
     if !key_usage_allows(signer, |usage| usage.digital_signature() || usage.non_repudiation()) {
-        report.validity = Validity::ValidityUnknown;
-        report.detail = Detail::DigestOkUntrusted;
+        unknown(&mut report, Detail::NotPermitted);
         return report;
     }
     match trust_level(signer, &certificates, trust, reference_time) {
-        Some(level) => {
+        Ok(level) => {
             report.validity = Validity::Valid;
             report.detail = level;
         }
-        None => {
-            report.validity = Validity::ValidityUnknown;
-            report.detail = Detail::DigestOkUntrusted;
-        }
+        Err(detail) => unknown(&mut report, detail),
     }
     report
 }
@@ -1529,7 +1601,7 @@ fn check_timestamp_token(token: &[u8], imprint: &[&[u8]], trust: &TrustStore, no
     let signer_name = signer.map(subject_name);
     let trust_level = signer
         .filter(|s| has_timestamping_eku(s) && key_usage_allows(s, |u| u.digital_signature() || u.non_repudiation()))
-        .and_then(|s| trust_level(s, &certificates, trust, at));
+        .and_then(|s| trust_level(s, &certificates, trust, at).ok());
     TokenResult::Verified { gen_time: Some(info.gen_time), signer: signer_name, trust: trust_level }
 }
 
