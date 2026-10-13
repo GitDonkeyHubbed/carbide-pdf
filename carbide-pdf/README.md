@@ -47,6 +47,7 @@ target/release/carbide-gui [file.pdf]
 | Watermark | `stamp.rs` (`apply_watermark`) | `watermark` | Yes: Edit > Content Editing > Watermark |
 | Bates numbering | `stamp.rs` (`apply_bates`) | `bates` | Yes: Edit > Content Editing > Bates Number |
 | Redaction | `redact.rs` (`apply_redactions`) | `redact` | Yes: Security > Redaction > Mark Redaction, then Apply |
+| Remove hidden information | `sanitize.rs` (`remove_hidden_information`) | `sanitize` | Yes: Security > Redaction > Remove Hidden Info (also offered after Apply) |
 | Markup (highlight, underline, strikeout) | `annotate.rs` (`add_markup`) | `markup` | Yes: Comment > Text Markup > Highlight, Highlight Area, Crossout, Underline |
 | Sticky note | `annotate.rs` (`add_note`) | `note` | Yes: Comment > Comment > Note |
 | Text box | `annotate.rs` (`add_text_box`) | `note --on-page` | Yes: Comment > Comment > Typewriter |
@@ -88,12 +89,16 @@ you pin any folder. These are ordinary folders to Carbide PDF: it does not sign 
 
 Page numbers are 1-based. Rectangles are `PAGE:X,Y,W,H` in points, with the origin at the bottom left of the displayed page. The `note --at` anchor is `PAGE:X,Y`, measured from the top left. Most commands accept `--password` for a protected input.
 
+New files made from a protected input (`extract`, `split`, `impose`, `merge`) keep its passwords and permissions; `--unprotected` writes them without. `images` and `text` refuse a protected input unless `--unprotected` is given. `split` and `images` do not replace files already in the folder unless `--force` is given. `reduce` writes `<name>-reduced.pdf` next to each original and replaces nothing; `--overwrite` replaces other existing files and `--in-place` replaces the originals.
+
 ```
 carbide merge combined.pdf part1.pdf part2.pdf
 carbide extract report.pdf "1-3,5" excerpt.pdf
 carbide watermark draft.pdf stamped.pdf --text DRAFT --opacity 0.2 --angle 30 --color CC0000 --pages 1-5
 carbide bates brief.pdf numbered.pdf --prefix ACME- --start 100 --digits 6 --position bottom-right
 carbide redact filing.pdf filing-redacted.pdf --rect 2:72,500,300,24 --rect 4:72,180,200,16
+carbide sanitize filing-redacted.pdf filing-clean.pdf --bookmarks
+carbide reduce *.pdf --out-dir small
 carbide encrypt contract.pdf contract-locked.pdf --owner "owner-secret" --user "open-secret" --no-print
 carbide impose signature.pdf booklet.pdf --layout booklet4 --media A4 --perfect-bound --sheets-per-fold 2 --crop-marks
 carbide sign contract.pdf contract-signed.pdf --p12 signer.p12 --p12-password "$P12_PASS" --certify 2 --reason "Approved" --rect 1:72,72,180,50
@@ -111,8 +116,12 @@ carbide ocr scan.pdf scan-searchable.pdf --dpi 300 --pages 1-4
 - Signatures: signing uses RSA identities (PKCS#12 or PEM) with SHA-256. Verification also accepts ECDSA (P-256 and P-384), RSA-PSS and SHA-1/384/512 digests (SHA-1 is flagged as weak), subjectKeyIdentifier signer references, and RFC 3161 document and signature time stamps; an algorithm it cannot check is reported as validity unknown rather than invalid. Revocation checking and LTV are not implemented. DocMDP change-detection is not implemented: the certification is recorded, but later changes are not classified.
 - OCR writes Latin text only and does not auto-detect rotated scans.
 - Desktop Save writes the whole file again, so removed or replaced content does not stay in it. Only a signed file or one with saved revisions gets an appended update, to keep those valid; after redacting, deleting pages or other removals Save asks before rewriting it, which invalidates its signatures and drops its revisions. An encrypted file keeps its passwords and permissions. The CLI's edit commands save the same way; where a rewrite costs signatures or revisions they say so instead of asking.
-- Redacting or deleting a page also removes its form fields (a field that still has a widget on another page keeps its value), its tags, and resources only it used. Extracted and split files carry nothing of the other pages and have no tags.
+- Redacting or deleting a page also removes its form fields (a field that still has a widget on another page keeps its value), its tags, and resources only it used. Deleting a page also removes the bookmarks, named destinations, open action, link destinations and article beads that lead only to it, and the pages that stay keep their page labels. Extracted and split files carry nothing of the other pages and have no tags.
+- Redaction does not touch document-level text such as the document information, bookmarks or attachments; Remove Hidden Information does, item by item.
+- Extracted pages, split parts, imposed sheets and merged documents made from a protected document keep its passwords and permissions. Documents protected in different ways are only merged without protection, which the GUI asks about and the CLI needs `--unprotected` for. Exporting images or text of a protected document asks first in the GUI.
 - Signing and saving revisions of encrypted files are not supported. Reduce File Size refuses encrypted files, and Auto Recovery keeps no copy of them.
+- Reduce File Size writes its results under new names next to the originals by default; replacing the originals is a separate choice. A batch in which two files would be written to the same file is refused before anything is reduced.
+- Auto Recovery: each window keeps its own recovery records, and only those of windows that are no longer running are offered for recovery. A recovered document opens as an unsaved document; Save asks before replacing the file it was recovered for. Deleting recovered copies asks first.
 
 Interface differences, as found in the code:
 
