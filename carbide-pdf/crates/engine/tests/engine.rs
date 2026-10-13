@@ -3082,6 +3082,102 @@ fn signer_key_usage_and_future_dates_are_named_as_such() {
     assert!(report.description_lines().contains(&sig_messages::SIGNED_IN_FUTURE));
 }
 
+// ---- OpenSSL cross-checks ------------------------------------------------------------------
+
+/// Runs `openssl` with `args`; `None` when OpenSSL 3 is not on the PATH (the cross-checks are then
+/// skipped), else whether it succeeded.
+fn openssl(args: &[std::ffi::OsString]) -> Option<bool> {
+    let version = std::process::Command::new("openssl").arg("version").output().ok()?;
+    if !String::from_utf8_lossy(&version.stdout).starts_with("OpenSSL 3") {
+        return None;
+    }
+    let output = std::process::Command::new("openssl").args(args).output().ok()?;
+    if !output.status.success() {
+        eprintln!("openssl {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    Some(output.status.success())
+}
+
+#[test]
+fn signatures_agree_with_openssl_both_ways() {
+    let Some(true) = openssl(&["version".into()]) else {
+        eprintln!("OpenSSL 3 is not on the PATH; skipping the cross-checks");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name);
+    let arg = |text: &str| std::ffi::OsString::from(text);
+    let mut doc = text_pdf(&[&["cross-checked"]]);
+    let base = file_bytes(&mut doc);
+
+    // Carbide's signatures, checked by OpenSSL against the bytes they cover.
+    let mut stamped = sign_options(SubFilter::CadesDetached);
+    stamped.timestamp = Some(test_tsa());
+    for (label, options) in [
+        ("PKCS#7", sign_options(SubFilter::Pkcs7Detached)),
+        ("CAdES", sign_options(SubFilter::CadesDetached)),
+        ("CAdES with a time stamp", stamped),
+    ] {
+        let signed = doc.sign(&base, &options).unwrap();
+        std::fs::write(path("covered.bin"), covered_bytes(&signed)).unwrap();
+        std::fs::write(path("signature.der"), signature_value(&signed)).unwrap();
+        let verified = openssl(&[
+            arg("cms"), arg("-verify"), arg("-binary"), arg("-noverify"), arg("-inform"), arg("DER"),
+            arg("-in"), path("signature.der").into(), arg("-content"), path("covered.bin").into(),
+            arg("-out"), path("out.bin").into(),
+        ]);
+        assert_eq!(verified, Some(true), "OpenSSL rejects Carbide's {label} signature");
+    }
+
+    // OpenSSL's signatures, checked by Carbide. A time stamp on the placeholder signing reserves
+    // room for any of them; the fixed signing time keeps the covered bytes the same.
+    let roomy = |cms: &[u8]| {
+        let mut options = SignOptions { signing_time: Some("D:20261001000000Z".into()), ..sign_options(SubFilter::CadesDetached) };
+        options.timestamp = Some(test_tsa());
+        let mut signed = doc.sign(&base, &options).unwrap();
+        put_signature_value(&mut signed, cms);
+        signed
+    };
+    std::fs::write(path("covered.bin"), covered_bytes(&roomy(&[0x30, 0x00]))).unwrap();
+    let (rsa_pair, _) = rsa_key();
+    let p384_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+    let cases: [(&str, &KeyPair, &[&str], Validity, Detail); 4] = [
+        ("RSA, SHA-256", &rsa_pair, &["-md", "sha256"], Validity::Valid, Detail::TrustedDirectly),
+        ("P-384, SHA-1", &p384_pair, &["-md", "sha1"], Validity::Valid, Detail::TrustedDirectly),
+        ("RSA-PSS, SHA-256", &rsa_pair, &["-md", "sha256", "-keyopt", "rsa_padding_mode:pss"], Validity::Valid, Detail::TrustedDirectly),
+        (
+            "RSA-PSS, SHA-256 with MGF1 over SHA-1",
+            &rsa_pair,
+            &["-md", "sha256", "-keyopt", "rsa_padding_mode:pss", "-keyopt", "rsa_mgf1_md:sha1"],
+            Validity::ValidityUnknown,
+            Detail::UnsupportedAlgorithm,
+        ),
+    ];
+    for (label, pair, extra, validity, detail) in cases {
+        let cert = self_signed(pair, "OpenSSL Signer");
+        std::fs::write(path("cert.pem"), x509_pem(&cert)).unwrap();
+        std::fs::write(path("key.pem"), pair.serialize_pem()).unwrap();
+        let mut args = vec![
+            arg("cms"), arg("-sign"), arg("-binary"), arg("-nosmimecap"), arg("-outform"), arg("DER"),
+            arg("-in"), path("covered.bin").into(), arg("-signer"), path("cert.pem").into(),
+            arg("-inkey"), path("key.pem").into(), arg("-out"), path("openssl.der").into(),
+        ];
+        args.extend(extra.iter().map(|a| arg(a)));
+        assert_eq!(openssl(&args), Some(true), "{label}: OpenSSL could not sign");
+        let cms = std::fs::read(path("openssl.der")).unwrap();
+        let report = verify(&roomy(&cms), &TrustStore { certificates: vec![cert] }).remove(0);
+        assert_eq!((report.validity, report.detail), (validity, detail), "{label}");
+    }
+}
+
+/// A DER certificate as PEM.
+fn x509_pem(der: &[u8]) -> String {
+    use base64::Engine;
+    let text = base64::engine::general_purpose::STANDARD.encode(der);
+    let lines: Vec<&str> = text.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap()).collect();
+    format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", lines.join("\n"))
+}
+
 // ---- OCR -----------------------------------------------------------------------------------
 
 fn ocr_models() -> PathBuf {
