@@ -1702,6 +1702,64 @@ fn recovery_copies_are_private_and_never_of_protected_documents() {
 }
 
 #[test]
+fn windows_sharing_the_folder_never_take_each_others_live_copies() {
+    let r = renderer();
+    let dir = scratch_dir("autosave-windows");
+    let original = dir.join("..").join("contract.pdf");
+    let names = |dir: &PathBuf| {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    };
+
+    // Window A has an auto-saved document.
+    let mut a = AutoSaveStore::open(&dir).unwrap();
+    let in_a = a.begin_document(Some(&original), 1);
+    a.autosave(in_a, &mut text_pdf(&[&["window A"]]), 2).unwrap();
+    let a_copy = a.record(in_a).unwrap().recovered.clone().unwrap().path;
+
+    // Window B, opened while A runs (Open Revision does that), sees none of it as recovered and
+    // cannot delete it.
+    let mut b = AutoSaveStore::open(&dir).unwrap();
+    assert!(!b.any_needs_save());
+    assert!(b.panel_rows().is_empty());
+    assert_eq!(b.remove_all_loaded().unwrap(), 0);
+    let in_b = b.begin_document(None, 3);
+    b.autosave(in_b, &mut text_pdf(&[&["window B"]]), 4).unwrap();
+    // They write their indexes in any order, and neither drops the other's records.
+    a.autosave(in_a, &mut text_pdf(&[&["window A, later"]]), 5).unwrap();
+    b.document_closed(in_b).unwrap();
+    assert!(a_copy.exists());
+    assert!(!names(&dir).iter().any(|n| n.ends_with(".tmp")), "an index was not replaced in one step");
+
+    // A ends without closing its document (a crash): the next window recovers it, and B, still
+    // running, has not taken it.
+    drop(a);
+    assert!(b.panel_rows().is_empty());
+    let c = AutoSaveStore::open(&dir).unwrap();
+    let rows = c.panel_rows();
+    assert_eq!(rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["contract.pdf (saved)", "contract.pdf (recovered)"]);
+    assert_eq!(rows[1].save_time, 5);
+    let (mut recovered, _) = c.open_recovered(rows[1].record, None).unwrap();
+    assert!(page_text(r, &mut recovered, 0).contains("window A, later"));
+
+    // Now C runs and holds the record: another window does not see it either.
+    let d = AutoSaveStore::open(&dir).unwrap();
+    assert!(d.panel_rows().is_empty());
+    drop(d);
+    drop(c);
+    drop(b);
+    // Once C is gone too, the record is listed exactly once.
+    let mut e = AutoSaveStore::open(&dir).unwrap();
+    assert_eq!(e.panel_rows().len(), 2);
+    assert_eq!(e.remove_all_loaded().unwrap(), 1);
+    assert!(!a_copy.exists());
+    drop(e);
+    assert_eq!(names(&dir), ["AutoRecovery.lock"], "nothing but the folder lock is left");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn a_damaged_index_is_ignored() {
     let dir = scratch_dir("autosave-bad");
     std::fs::create_dir_all(&dir).unwrap();

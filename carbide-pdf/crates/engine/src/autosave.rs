@@ -6,6 +6,11 @@
 //! Passwords are never written to disk, and neither is a password-protected document: its recovery
 //! copy would hold its content unencrypted. The folder and everything in it are private to the user.
 //!
+//! Several windows (processes) can share the folder. Each store writes an index of its own and holds
+//! a lock on a file of its own for as long as it is open, so a running window's documents are never
+//! listed as recovered in another, and no window deletes or drops another's live copies. A store
+//! takes over the records of a window that is gone (its lock is free) when it opens.
+//!
 //! The module is deliberately UI-free: the application owns the timers and calls into
 //! [`AutoSaveStore`] and the policy functions below.
 
@@ -19,7 +24,13 @@ use crate::pdf::Pdf;
 pub const MIN_INTERVAL_MINUTES: u32 = 1;
 pub const MAX_INTERVAL_MINUTES: u32 = 120;
 pub const DEFAULT_INTERVAL_MINUTES: u32 = 10;
+/// The index of earlier versions, which kept one for every window; it is taken over like the index
+/// of a window that is gone.
 pub const INDEX_FILE_NAME: &str = "AutoRecovery.xml";
+/// Each store's own index is `AutoRecovery-<token>.xml`, next to its lock `AutoRecovery-<token>.lock`.
+const OWN_PREFIX: &str = "AutoRecovery-";
+/// Held briefly while a store opens, so two stores never take over the same records.
+const FOLDER_LOCK: &str = "AutoRecovery.lock";
 
 /// User-facing messages.
 pub mod messages {
@@ -180,17 +191,34 @@ pub struct AutoSaveStore {
     dir: PathBuf,
     records: Vec<Record>,
     next_id: RecordId,
+    /// This store's own index, which no other store writes.
+    index: PathBuf,
+    /// This store's lock file, held while the store is open: it tells other stores that the
+    /// records in its index belong to a running window.
+    owner: PathBuf,
+    _owner_lock: Option<fs::File>,
 }
 
 impl AutoSaveStore {
-    /// Opens (creating if needed) the data directory and loads the index. A missing index, or one
-    /// whose root element is not `AutoSave`, yields an empty list.
+    /// Opens (creating if needed) the data directory, and takes over the records of windows that
+    /// are no longer running: those are the loaded records. An index that cannot be read, or whose
+    /// root element is not `AutoSave`, yields no records and is left alone.
     pub fn open(dir: impl Into<PathBuf>) -> Result<AutoSaveStore> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
         private(&dir, 0o700);
-        let mut store = AutoSaveStore { dir, records: Vec::new(), next_id: 1 };
-        store.load_index();
+        let _folder = lock_folder(&dir);
+        let (owner, owner_lock) = create_owner(&dir)?;
+        let token = owner.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+        let mut store = AutoSaveStore {
+            index: dir.join(format!("{token}.xml")),
+            dir,
+            records: Vec::new(),
+            next_id: 1,
+            owner,
+            _owner_lock: owner_lock,
+        };
+        store.take_over_ended_windows();
         Ok(store)
     }
 
@@ -204,10 +232,6 @@ impl AutoSaveStore {
 
     pub fn record(&self, id: RecordId) -> Option<&Record> {
         self.records.iter().find(|r| r.id == id)
-    }
-
-    fn index_path(&self) -> PathBuf {
-        self.dir.join(INDEX_FILE_NAME)
     }
 
     /// True if any loaded record still holds a recovery copy (quit and launch prompts).
@@ -425,7 +449,15 @@ impl AutoSaveStore {
         }
     }
 
+    /// Writes this store's own index in one step (a temporary file renamed over it), or removes it
+    /// when there are no records.
     fn write_index(&self) -> Result<()> {
+        if self.records.is_empty() {
+            match fs::remove_file(&self.index) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => return Ok(()),
+            }
+        }
         let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<AutoSave version=\"1.0\">\n");
         for record in &self.records {
             xml.push_str("  <AutoSaveItem");
@@ -444,49 +476,160 @@ impl AutoSaveStore {
         }
         xml.push_str("</AutoSave>\n");
 
-        let temp = self.index_path().with_extension("xml.tmp");
+        let temp = self.index.with_extension("xml.tmp");
         write_private(&temp, xml.as_bytes())?;
-        fs::rename(&temp, self.index_path())?;
+        fs::rename(&temp, &self.index)?;
         Ok(())
     }
 
-    fn load_index(&mut self) {
-        let Ok(text) = fs::read_to_string(self.index_path()) else { return };
-        let Ok(document) = roxmltree::Document::parse(&text) else { return };
-        let root = document.root_element();
-        if root.tag_name().name() != "AutoSave" {
-            return;
-        }
-        for item in root.children().filter(|n| n.has_tag_name("AutoSaveItem")) {
-            let attr = |name: &str| item.attribute(name).filter(|v| !v.is_empty());
-            let original = attr("OriginalFile").map(|path| OriginalSlot {
-                path: PathBuf::from(path),
-                file_name: attr("OriginalFileName").unwrap_or_default().to_string(),
-                save_time: attr("OriginalSaveTime").and_then(|v| v.parse().ok()).unwrap_or(0),
-            });
-            // A recovery file that no longer exists cannot be opened, so the slot is dropped.
-            let recovered = attr("RecoveredFile")
-                .map(PathBuf::from)
-                .filter(|p| p.exists())
-                .map(|path| RecoveredSlot {
-                    path,
-                    save_time: attr("RecoveredSaveTime").and_then(|v| v.parse().ok()).unwrap_or(0),
-                    flags: attr("RecoveredFlags").and_then(|v| v.parse().ok()).unwrap_or(0),
-                });
-            if original.is_none() && recovered.is_none() {
+    /// Takes over the records in the indexes of windows that are gone: an index whose lock file is
+    /// free or missing, or the one index of earlier versions. Their records become this store's
+    /// loaded records, and their index and lock files are removed once this store's index holds
+    /// them. Indexes of running windows are left alone. The caller holds the folder lock, so no
+    /// other store takes over the same records meanwhile.
+    fn take_over_ended_windows(&mut self) {
+        let Ok(entries) = fs::read_dir(&self.dir) else { return };
+        let mut taken: Vec<PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path == self.index || path == self.owner {
                 continue;
             }
-            let id = self.next_id;
-            self.next_id += 1;
-            self.records.push(Record {
-                id,
-                original,
-                recovered,
-                is_new_doc: attr("IsNewDoc") == Some("1"),
-                loaded: true,
-            });
+            let (index, lock) = match (name.strip_suffix(".xml"), name.strip_suffix(".lock")) {
+                (Some(_), _) if name == INDEX_FILE_NAME => (path, None),
+                (Some(token), _) if token.starts_with(OWN_PREFIX) => (path, Some(self.dir.join(format!("{token}.lock")))),
+                // The lock of a window that ended without records, or before writing any.
+                (_, Some(token)) if token.starts_with(OWN_PREFIX) && !self.dir.join(format!("{token}.xml")).exists() => {
+                    if !is_running(&path) {
+                        let _ = fs::remove_file(&path);
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            if lock.as_deref().is_some_and(is_running) {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&index) else { continue };
+            let Some(items) = parse_index(&text) else { continue };
+            for (original, recovered, is_new_doc) in items {
+                let duplicate = recovered.as_ref().is_some_and(|r| {
+                    self.records.iter().any(|existing| existing.recovered.as_ref().is_some_and(|e| e.path == r.path))
+                });
+                if duplicate {
+                    continue;
+                }
+                let id = self.next_id;
+                self.next_id += 1;
+                self.records.push(Record { id, original, recovered, is_new_doc, loaded: true });
+            }
+            taken.push(index);
+            taken.extend(lock);
+        }
+        if taken.is_empty() {
+            return;
+        }
+        // Their records are only deleted once this index holds them.
+        if self.write_index().is_ok() {
+            for path in taken {
+                let _ = fs::remove_file(path);
+            }
         }
     }
+}
+
+impl Drop for AutoSaveStore {
+    /// A store with no records leaves nothing behind. One with records keeps its index; its lock is
+    /// released, so the next store to open takes them over.
+    fn drop(&mut self) {
+        if self.records.is_empty() {
+            let _folder = lock_folder(&self.dir);
+            let _ = fs::remove_file(&self.index);
+            let _ = fs::remove_file(&self.owner);
+        }
+    }
+}
+
+/// True while the window that holds the lock file `lock` runs. A lock that cannot be checked counts
+/// as running, so that nothing of a window still in use is ever taken over.
+fn is_running(lock: &Path) -> bool {
+    match fs::OpenOptions::new().read(true).write(true).open(lock) {
+        Ok(file) => file.try_lock().is_err(),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Holds the lock on the data folder until dropped. Locking is best effort: without it the
+/// folder is used as it is.
+fn lock_folder(dir: &Path) -> Option<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(dir.join(FOLDER_LOCK)).ok()?;
+    file.lock().ok()?;
+    Some(file)
+}
+
+/// Creates this store's lock file, `AutoRecovery-<token>.lock` with a random token, and locks it.
+/// Its handle has to stay open for the lock to hold.
+fn create_owner(dir: &Path) -> Result<(PathBuf, Option<fs::File>)> {
+    for _ in 0..32 {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).map_err(|e| Error::Other(format!("no randomness available: {e}")))?;
+        let token: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let path = dir.join(format!("{OWN_PREFIX}{token}.lock"));
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&path) {
+            Ok(file) => {
+                let locked = file.try_lock().is_ok().then_some(file);
+                return Ok((path, locked));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(Error::Other("could not create an auto-save lock file".into()))
+}
+
+/// One record of an index: the original, the recovered copy, and whether it is a new document.
+type IndexItem = (Option<OriginalSlot>, Option<RecoveredSlot>, bool);
+
+/// The records an index holds. A recovery file that no longer exists cannot be opened, so its slot
+/// is dropped. `None` for an index that cannot be read.
+fn parse_index(text: &str) -> Option<Vec<IndexItem>> {
+    let document = roxmltree::Document::parse(text).ok()?;
+    let root = document.root_element();
+    if root.tag_name().name() != "AutoSave" {
+        return None;
+    }
+    let mut items = Vec::new();
+    for item in root.children().filter(|n| n.has_tag_name("AutoSaveItem")) {
+        let attr = |name: &str| item.attribute(name).filter(|v| !v.is_empty());
+        let original = attr("OriginalFile").map(|path| OriginalSlot {
+            path: PathBuf::from(path),
+            file_name: attr("OriginalFileName").unwrap_or_default().to_string(),
+            save_time: attr("OriginalSaveTime").and_then(|v| v.parse().ok()).unwrap_or(0),
+        });
+        // A recovery file that no longer exists cannot be opened, so the slot is dropped.
+        let recovered = attr("RecoveredFile")
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .map(|path| RecoveredSlot {
+                path,
+                save_time: attr("RecoveredSaveTime").and_then(|v| v.parse().ok()).unwrap_or(0),
+                flags: attr("RecoveredFlags").and_then(|v| v.parse().ok()).unwrap_or(0),
+            });
+        if original.is_none() && recovered.is_none() {
+            continue;
+        }
+        items.push((original, recovered, attr("IsNewDoc") == Some("1")));
+    }
+    Some(items)
 }
 
 /// Writes `bytes` to a file only the user can read, replacing one that is there.
