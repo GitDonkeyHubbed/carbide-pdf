@@ -220,39 +220,32 @@ impl Pdf {
         count
     }
 
-    /// Document JavaScript, the open action, additional actions (/AA) everywhere, and JavaScript
-    /// or Launch actions that annotations and bookmarks run.
+    /// Document JavaScript, the open action, additional actions (/AA) everywhere, the JavaScript and
+    /// Launch actions that links, form fields and bookmarks run, wherever they sit in a chain of
+    /// actions (/Next), and the scripts of rendition actions. A chain closes up around an action
+    /// that goes: the actions after it take its place.
     fn remove_scripts(&mut self) -> usize {
         let mut count = self.remove_name_tree(b"JavaScript");
         if let Ok(catalog) = self.doc.catalog_mut() {
             count += usize::from(catalog.remove(b"OpenAction").is_some());
         }
         count += remove_key_everywhere(&mut self.doc, b"AA");
-        let runs_code = |doc: &Document, action: &Object| {
-            let action = match action {
-                Object::Reference(id) => doc.get_object(*id).ok(),
-                other => Some(other),
-            };
-            action
-                .and_then(|a| a.as_dict().ok())
-                .and_then(|a| a.get(b"S").and_then(Object::as_name).ok())
-                .is_some_and(|s| matches!(s, b"JavaScript" | b"Launch"))
-        };
-        let with_code: Vec<ObjectId> = self
-            .doc
-            .objects
-            .iter()
-            .filter(|(_, object)| object.as_dict().ok().and_then(|d| d.get(b"A").ok()).is_some_and(|a| runs_code(&self.doc, a)))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in &with_code {
-            self.remove_from(*id, b"A");
+        let code: HashSet<ObjectId> =
+            self.doc.objects.iter().filter(|(_, object)| object.as_dict().is_ok_and(runs_code)).map(|(id, _)| *id).collect();
+        let mut removed = HashSet::new();
+        let ids: Vec<ObjectId> = self.doc.objects.keys().copied().collect();
+        for id in ids {
+            // Taken out while it is changed, so the rest of the document can still be read.
+            let Some(mut object) = self.doc.objects.remove(&id) else { continue };
+            count += strip_code(&self.doc, &mut object, &code, &mut removed, 0);
+            self.doc.objects.insert(id, object);
         }
-        count + with_code.len()
+        count + removed.len()
     }
 
-    /// The values of form fields (signatures excepted) and the appearances that draw them, and
-    /// any XFA form data. Viewers draw the emptied fields afresh.
+    /// The values of form fields (signatures excepted), the options picked in lists and the
+    /// default values, the appearances that draw them, and any XFA form data. Viewers draw the
+    /// emptied fields afresh.
     fn remove_form_data(&mut self) -> usize {
         let Ok(catalog_id) = self.doc.trailer.get(b"Root").and_then(Object::as_reference) else { return 0 };
         let Ok(form) = self.doc.get_dictionary(catalog_id).and_then(|c| c.get(b"AcroForm")).cloned() else { return 0 };
@@ -284,7 +277,7 @@ impl Pdf {
     }
 
     /// Clears the value of the field `field` and of the fields below it, and the appearances of
-    /// their widgets. `field_type` is the type (/FT) it inherits. Returns how many values it cleared.
+    /// their widgets. `field_type` is the type (/FT) it inherits. Returns how many fields it cleared.
     fn clear_field(&mut self, field: &Object, field_type: Option<&[u8]>, visited: &mut HashSet<ObjectId>, depth: usize) -> usize {
         let Ok(id) = field.as_reference() else { return 0 };
         if depth > MAX_DEPTH || !visited.insert(id) {
@@ -297,8 +290,10 @@ impl Pdf {
         }
         let mut count = 0;
         if let Ok(dict) = self.doc.get_dictionary_mut(id) {
-            count += usize::from(dict.remove(b"V").is_some());
-            dict.remove(b"RV");
+            // The value, its rich text, the options picked in a list (/I) and the value a reset
+            // restores (/DV).
+            let cleared = [&b"V"[..], b"RV", b"I", b"DV"].into_iter().filter(|key| dict.remove(key).is_some()).count();
+            count += usize::from(cleared > 0);
             let is_widget = dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Widget");
             if is_widget {
                 match field_type.as_deref() {
@@ -426,6 +421,117 @@ fn count_outline(doc: &Document, node: ObjectId) -> usize {
         }
     }
     count
+}
+
+/// True for an action that runs code: JavaScript, or launching an application or file.
+fn runs_code(action: &Dictionary) -> bool {
+    action.get(b"S").and_then(Object::as_name).is_ok_and(|s| matches!(s, b"JavaScript" | b"Launch"))
+}
+
+/// Takes the actions that run code out of the action chains in `object` and in everything it holds
+/// directly. `code` are the actions stored as objects of their own that run code; those taken out
+/// are added to `removed`. Returns how many actions held directly were taken out, and how many
+/// rendition scripts.
+fn strip_code(doc: &Document, object: &mut Object, code: &HashSet<ObjectId>, removed: &mut HashSet<ObjectId>, depth: usize) -> usize {
+    if depth > MAX_DEPTH {
+        return 0;
+    }
+    let dict = match object {
+        Object::Dictionary(dict) => dict,
+        Object::Stream(stream) => &mut stream.dict,
+        Object::Array(items) => return items.iter_mut().map(|item| strip_code(doc, item, code, removed, depth + 1)).sum(),
+        _ => return 0,
+    };
+    let mut count = 0;
+    if dict.get(b"S").and_then(Object::as_name).is_ok_and(|s| s == b"Rendition") && dict.remove(b"JS").is_some() {
+        count += 1;
+    }
+    for key in [&b"A"[..], b"Next"] {
+        let Ok(value) = dict.get(key) else { continue };
+        let mut kept = Vec::new();
+        if !splice(doc, value, code, removed, &mut kept, &mut count, &mut HashSet::new(), 0) {
+            continue;
+        }
+        match kept.len() {
+            0 => {
+                dict.remove(key);
+            }
+            1 => dict.set(key.to_vec(), kept.remove(0)),
+            _ if key == b"Next" => dict.set(key.to_vec(), kept),
+            // /A holds one action: the first, as a copy that the others follow.
+            _ => {
+                let first = kept.remove(0);
+                let Ok(mut first) = (match &first {
+                    Object::Reference(id) => doc.get_dictionary(*id).cloned(),
+                    other => other.as_dict().cloned(),
+                }) else {
+                    dict.remove(key);
+                    continue;
+                };
+                let mut next = match first.get(b"Next") {
+                    Ok(Object::Array(items)) => items.clone(),
+                    Ok(other) => vec![other.clone()],
+                    Err(_) => Vec::new(),
+                };
+                next.extend(kept);
+                first.set("Next", next);
+                dict.set(key.to_vec(), first);
+            }
+        }
+    }
+    for (_, value) in dict.iter_mut() {
+        count += strip_code(doc, value, code, removed, depth + 1);
+    }
+    count
+}
+
+/// Puts the actions `value` (an action, or an array of them) runs into `kept`, each that runs code
+/// replaced by the actions that follow it (its /Next). Returns true when one was taken out. Those
+/// held directly are counted in `count`, the others added to `removed`; `chain` guards against
+/// chains that loop.
+#[allow(clippy::too_many_arguments)]
+fn splice(
+    doc: &Document,
+    value: &Object,
+    code: &HashSet<ObjectId>,
+    removed: &mut HashSet<ObjectId>,
+    kept: &mut Vec<Object>,
+    count: &mut usize,
+    chain: &mut HashSet<ObjectId>,
+    depth: usize,
+) -> bool {
+    // A chain this deep is damaged; what is left of it goes.
+    if depth > MAX_DEPTH {
+        return true;
+    }
+    let next = match value {
+        Object::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= splice(doc, item, code, removed, kept, count, chain, depth + 1);
+            }
+            return changed;
+        }
+        Object::Reference(id) if code.contains(id) => {
+            removed.insert(*id);
+            if !chain.insert(*id) {
+                return true;
+            }
+            doc.get_dictionary(*id).ok().and_then(|action| action.get(b"Next").ok())
+        }
+        Object::Dictionary(action) if runs_code(action) => {
+            *count += 1;
+            action.get(b"Next").ok()
+        }
+        other => {
+            kept.push(other.clone());
+            return false;
+        }
+    };
+    if let Some(next) = next {
+        splice(doc, next, code, removed, kept, count, chain, depth + 1);
+    }
+    true
 }
 
 /// Removes `key` from every dictionary and stream dictionary in the document, and returns how many

@@ -940,6 +940,102 @@ fn how_a_file_was_written_is_not_reported_as_hidden_information() {
     assert_eq!(pdf.remove_hidden_information(&items).unwrap().count(HiddenItem::UnusedObjects), 1);
 }
 
+#[test]
+fn scripts_are_taken_out_wherever_actions_chain_them() {
+    let mut pdf = text_pdf(&[&["first"], &["second"]]);
+    let pages = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let script = |text: &str| Object::Dictionary(dictionary! { "S" => "JavaScript", "JS" => Object::string_literal(text) });
+    let go_to = |page| dictionary! { "S" => "GoTo", "D" => vec![Object::Reference(page), "Fit".into()] };
+    let rect = || vec![Object::from(10), 10.into(), 60.into(), 30.into()];
+
+    // A link, held directly in the page's list, that opens a web page and then runs a script.
+    let link = dictionary! {
+        "Type" => "Annot", "Subtype" => "Link", "Rect" => rect(),
+        "A" => dictionary! { "S" => "URI", "URI" => "https://example.com", "Next" => script("app.alert('SECRET-NEXT-JS')") },
+    };
+    // A button whose action, an object of its own, runs a script and then goes to the second page.
+    let then = doc.add_object(go_to(pages[1]));
+    let button_script = doc.add_object(dictionary! { "S" => "JavaScript", "JS" => Object::string_literal("SECRET-BUTTON-JS"), "Next" => then });
+    let button = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Btn", "Ff" => 65536, "T" => "go", "Rect" => rect(), "A" => button_script,
+    });
+    // A media action with a script of its own.
+    let rendition = doc.add_object(dictionary! { "S" => "Rendition", "OP" => 0, "JS" => Object::string_literal("SECRET-RENDITION-JS") });
+    let screen = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Screen", "Rect" => rect(), "A" => rendition });
+    doc.get_dictionary_mut(pages[0]).unwrap().set("Annots", vec![Object::Dictionary(link), button.into(), screen.into()]);
+    // A bookmark that goes to the first page, then runs a script, launches an application and
+    // goes to the second page.
+    let outlines = doc.catalog().unwrap().get(b"Outlines").unwrap().as_reference().unwrap();
+    let launch = dictionary! { "S" => "Launch", "F" => Object::string_literal("SECRET-LAUNCH.app") };
+    let mut first_page = go_to(pages[0]);
+    first_page.set("Next", vec![script("SECRET-OUTLINE-JS"), Object::Dictionary(launch), Object::Dictionary(go_to(pages[1]))]);
+    let bookmark = doc.add_object(dictionary! { "Title" => "Chapter", "Parent" => outlines, "A" => first_page });
+    let root = doc.get_dictionary_mut(outlines).unwrap();
+    root.set("First", bookmark);
+    root.set("Last", bookmark);
+    root.set("Count", 1);
+
+    let report = pdf.remove_hidden_information(&[HiddenItem::Scripts]).unwrap();
+    assert_eq!(report.count(HiddenItem::Scripts), 5, "four scripts and the launch: {report:?}");
+    let bytes = file_bytes(&mut pdf);
+    for secret in ["SECRET-NEXT-JS", "SECRET-BUTTON-JS", "SECRET-RENDITION-JS", "SECRET-OUTLINE-JS", "SECRET-LAUNCH"] {
+        assert_gone(&bytes, secret);
+    }
+
+    // What runs no code stays, and each chain closes up around what went.
+    let pdf = Pdf::from_bytes(&bytes).unwrap();
+    let doc = pdf.document();
+    let resolve = |object: &Object| match object {
+        Object::Reference(id) => doc.get_dictionary(*id).unwrap().clone(),
+        other => other.as_dict().unwrap().clone(),
+    };
+    let kind = |action: &lopdf::Dictionary| action.get(b"S").unwrap().as_name().unwrap().to_vec();
+    let target = |action: &lopdf::Dictionary| action.get(b"D").unwrap().as_array().unwrap()[0].as_reference().unwrap();
+    let annotations = pdf.annotations(0).unwrap();
+    let link = resolve(annotations[0].get(b"A").unwrap());
+    assert_eq!((kind(&link), link.has(b"Next")), (b"URI".to_vec(), false));
+    let button = resolve(annotations[1].get(b"A").unwrap());
+    assert_eq!((kind(&button), target(&button)), (b"GoTo".to_vec(), pages[1]));
+    let rendition = resolve(annotations[2].get(b"A").unwrap());
+    assert_eq!((kind(&rendition), rendition.has(b"JS")), (b"Rendition".to_vec(), false));
+    let bookmark = resolve(doc.get_dictionary(bookmark).unwrap().get(b"A").unwrap());
+    assert_eq!((kind(&bookmark), target(&bookmark)), (b"GoTo".to_vec(), pages[0]));
+    let next = resolve(bookmark.get(b"Next").unwrap());
+    assert_eq!((kind(&next), target(&next)), (b"GoTo".to_vec(), pages[1]));
+}
+
+#[test]
+fn clearing_form_data_also_clears_what_a_list_shows_as_picked_and_its_default() {
+    let mut pdf = text_pdf(&[&["form"]]);
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let widget = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "Rect" => vec![Object::from(10), 10.into(), 160.into(), 60.into()], "P" => page,
+    });
+    // A list box that allows several choices: the value, the options picked (by index) and the
+    // value a reset gives it.
+    let field = doc.add_object(dictionary! {
+        "FT" => "Ch", "T" => "condition", "Ff" => 2_097_152,
+        "Opt" => vec![Object::string_literal("Healthy"), Object::string_literal("Other")],
+        "V" => vec![Object::string_literal("SECRET-CHOICE")], "I" => vec![Object::Integer(1)], "DV" => Object::string_literal("SECRET-DEFAULT"),
+        "Kids" => vec![widget.into()],
+    });
+    doc.get_dictionary_mut(widget).unwrap().set("Parent", field);
+    doc.get_dictionary_mut(page).unwrap().set("Annots", vec![Object::Reference(widget)]);
+    doc.catalog_mut().unwrap().set("AcroForm", dictionary! { "Fields" => vec![Object::Reference(field)] });
+
+    let report = pdf.remove_hidden_information(&[HiddenItem::FormData]).unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    let bytes = file_bytes(&mut pdf);
+    assert_gone(&bytes, "SECRET-CHOICE");
+    assert_gone(&bytes, "SECRET-DEFAULT");
+    let pdf = Pdf::from_bytes(&bytes).unwrap();
+    let field = pdf.document().get_dictionary(field).unwrap();
+    assert!(!field.has(b"V") && !field.has(b"I") && !field.has(b"DV"), "{field:?}");
+    assert!(field.has(b"Opt"), "the options offered are part of the form");
+}
+
 /// One page per label, built the way word processors and form tools write them, so that other
 /// parts of the document point into every page:
 /// - each page draws its label, and a form XObject showing `FORM-<label>` from a resource
