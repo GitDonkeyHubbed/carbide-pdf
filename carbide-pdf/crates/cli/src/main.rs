@@ -36,14 +36,38 @@ struct Password {
     password: Option<String>,
 }
 
+#[derive(Args, Clone, Copy)]
+struct Unprotected {
+    /// Write the output without the password protection of a protected input. By default it keeps
+    /// the same passwords and permissions.
+    #[arg(long)]
+    unprotected: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Show page count, page sizes and revisions.
     Info { input: PathBuf, #[command(flatten)] pw: Password },
-    /// Join several PDFs into one.
-    Merge { output: PathBuf, inputs: Vec<PathBuf> },
+    /// Join several PDFs into one. Protected inputs need to share their protection, which the
+    /// result keeps; --password opens every protected input.
+    Merge {
+        output: PathBuf,
+        inputs: Vec<PathBuf>,
+        #[command(flatten)]
+        out: Unprotected,
+        #[command(flatten)]
+        pw: Password,
+    },
     /// Copy selected pages (e.g. "1-3,5") into a new file.
-    Extract { input: PathBuf, pages: String, output: PathBuf, #[command(flatten)] pw: Password },
+    Extract {
+        input: PathBuf,
+        pages: String,
+        output: PathBuf,
+        #[command(flatten)]
+        out: Unprotected,
+        #[command(flatten)]
+        pw: Password,
+    },
     /// Split into one file per range (e.g. "1-3,4-6") inside a folder.
     Split {
         input: PathBuf,
@@ -52,6 +76,8 @@ enum Command {
         /// Replace files of the same names already in the folder.
         #[arg(long)]
         force: bool,
+        #[command(flatten)]
+        out: Unprotected,
         #[command(flatten)]
         pw: Password,
     },
@@ -118,11 +144,21 @@ enum Command {
         /// Replace images of the same names already in the folder.
         #[arg(long)]
         force: bool,
+        /// Export a password-protected document anyway: the images are not protected.
+        #[arg(long)]
+        unprotected: bool,
         #[command(flatten)]
         pw: Password,
     },
     /// Print the document's text.
-    Text { input: PathBuf, #[command(flatten)] pw: Password },
+    Text {
+        input: PathBuf,
+        /// Print the text of a password-protected document anyway.
+        #[arg(long)]
+        unprotected: bool,
+        #[command(flatten)]
+        pw: Password,
+    },
     /// Save a password-protected copy (AES-256).
     Encrypt {
         input: PathBuf,
@@ -344,6 +380,8 @@ struct ImposeArgs {
     #[arg(long)]
     flip_backs: bool,
     #[command(flatten)]
+    out: Unprotected,
+    #[command(flatten)]
     pw: Password,
 }
 
@@ -449,15 +487,31 @@ fn parse_color(hex: &str) -> Result<[f32; 3], Failure> {
     Ok([channel(0)?, channel(2)?, channel(4)?])
 }
 
-fn save(pdf: &mut Pdf, output: &Path) -> Result<(), Failure> {
-    write_output(pdf, output, Existing::Replace)
+/// Writes a new document made from protected or unprotected inputs to `output`: protected like
+/// them unless `out` asks for it without. `password` opened the protected input; `existing` says
+/// what happens to a file already at `output`.
+fn write_output(pdf: &mut Pdf, output: &Path, out: Unprotected, password: Option<&str>, existing: Existing) -> Result<(), Failure> {
+    if out.unprotected {
+        pdf.set_protection(None);
+    }
+    let bytes = pdf.to_file_bytes(password)?;
+    write_file(output, &bytes, existing).map_err(|e| format!("{}: {e}", output.display()))?;
+    match pdf.is_protected() {
+        true => println!("wrote {} (password-protected like its input)", output.display()),
+        false => println!("wrote {}", output.display()),
+    }
+    Ok(())
 }
 
-/// Writes a new document to `output`; `existing` says what happens to a file already there.
-fn write_output(pdf: &mut Pdf, output: &Path, existing: Existing) -> Result<(), Failure> {
-    let bytes = pdf.to_bytes()?;
-    write_file(output, &bytes, existing).map_err(|e| format!("{}: {e}", output.display()))?;
-    println!("wrote {}", output.display());
+/// Refuses to give out the content of a protected document unprotected unless that was asked for.
+fn refuse_unprotected_export(input: &Path, pdf: &Pdf, unprotected: bool, what: &str) -> Result<(), Failure> {
+    if pdf.is_protected() && !unprotected {
+        return Err(format!(
+            "{} is password-protected, and its {what} would not be: use --unprotected to export it anyway",
+            input.display()
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -506,9 +560,10 @@ fn same_file(a: &Path, b: &Path) -> bool {
     matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
-/// Refuses to write a new, unencrypted document over the password-protected `input` it came from.
-fn refuse_over_protected(input: &Path, pdf: &Pdf, output: &Path) -> Result<(), Failure> {
-    if pdf.document().was_encrypted() && same_file(input, output) {
+/// Refuses to write a new document without protection (`--unprotected`) over the
+/// password-protected `input` it came from.
+fn refuse_over_protected(input: &Path, pdf: &Pdf, output: &Path, out: Unprotected) -> Result<(), Failure> {
+    if out.unprotected && pdf.is_protected() && same_file(input, output) {
         return Err(format!(
             "{} is password-protected, and this result would not be encrypted: choose another output file \
              (or remove the protection with `decrypt`)",
@@ -535,22 +590,29 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 println!("  revision {}: {:?} saved {}", n + 1, revision.label, revision.display_time());
             }
         }
-        Command::Merge { output, inputs } => {
-            let docs: Result<Vec<Pdf>, Failure> = inputs.iter().map(|p| open(p, &Password { password: None })).collect();
-            let docs = docs?;
-            for (input, doc) in inputs.iter().zip(&docs) {
-                refuse_over_protected(input, doc, &output)?;
+        Command::Merge { output, inputs, out, pw } => {
+            let docs: Result<Vec<Pdf>, Failure> = inputs.iter().map(|p| open(p, &pw)).collect();
+            let mut docs = docs?;
+            for (input, doc) in inputs.iter().zip(docs.iter_mut()) {
+                refuse_over_protected(input, doc, &output, out)?;
+                if out.unprotected {
+                    doc.set_protection(None);
+                }
             }
             let refs: Vec<&Pdf> = docs.iter().collect();
-            save(&mut Pdf::merge(&refs)?, &output)?;
+            let mut merged = Pdf::merge(&refs).map_err(|e| match Pdf::shared_protection(&refs) {
+                Err(_) => format!("{e} Use --unprotected to merge them without protection."),
+                Ok(_) => e.to_string(),
+            })?;
+            write_output(&mut merged, &output, out, pw.password.as_deref(), Existing::Replace)?;
         }
-        Command::Extract { input, pages, output, pw } => {
+        Command::Extract { input, pages, output, out, pw } => {
             let pdf = open(&input, &pw)?;
-            refuse_over_protected(&input, &pdf, &output)?;
+            refuse_over_protected(&input, &pdf, &output, out)?;
             let selected = pages_arg(&pages, &pdf)?;
-            save(&mut pdf.extract_pages(&selected)?, &output)?;
+            write_output(&mut pdf.extract_pages(&selected)?, &output, out, pw.password.as_deref(), Existing::Replace)?;
         }
-        Command::Split { input, ranges, folder, force, pw } => {
+        Command::Split { input, ranges, folder, force, out, pw } => {
             let pdf = open(&input, &pw)?;
             std::fs::create_dir_all(&folder)?;
             let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -559,9 +621,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 ranges.iter().map(|r| folder.join(format!("{stem}-pages-{}-{}.pdf", r.start() + 1, r.end() + 1))).collect();
             let existing = refuse_existing(&outputs, force)?;
             for (range, output) in ranges.iter().zip(&outputs) {
-                refuse_over_protected(&input, &pdf, output)?;
+                refuse_over_protected(&input, &pdf, output, out)?;
                 let mut part = pdf.extract_pages(&range.clone().collect::<Vec<_>>())?;
-                write_output(&mut part, output, existing)?;
+                write_output(&mut part, output, out, pw.password.as_deref(), existing)?;
             }
         }
         Command::Delete { input, pages, output, pw } => {
@@ -665,8 +727,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 diff.added.iter().for_each(|l| println!("  + {l}"));
             }
         }
-        Command::Images { input, folder, dpi, jpeg, force, pw } => {
+        Command::Images { input, folder, dpi, jpeg, force, unprotected, pw } => {
             let mut pdf = open(&input, &pw)?;
+            refuse_unprotected_export(&input, &pdf, unprotected, "images")?;
             let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let format = if jpeg { ImageFormat::Jpeg } else { ImageFormat::Png };
             let existing = refuse_existing(&image_paths(&pdf, &folder, &stem, format), force)?;
@@ -674,8 +737,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 println!("wrote {}", path.display());
             }
         }
-        Command::Text { input, pw } => {
+        Command::Text { input, unprotected, pw } => {
             let mut pdf = open(&input, &pw)?;
+            refuse_unprotected_export(&input, &pdf, unprotected, "text")?;
             println!("{}", export_text(renderer()?, &mut pdf)?);
         }
         Command::Encrypt { input, output, user, owner, no_print, no_copy, pw } => {
@@ -688,7 +752,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Command::Decrypt { input, output, password } => {
             let mut pdf = open(&input, &Password { password: Some(password) })?;
-            save(&mut pdf, &output)?;
+            write_output(&mut pdf, &output, Unprotected { unprotected: true }, None, Existing::Replace)?;
         }
         Command::Reduce { inputs, slider, out_dir, prefix, suffix, no_overwrite } => {
             let output = OutputOptions {
@@ -742,7 +806,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Command::Impose(a) => {
             let pdf = open(&a.input, &a.pw)?;
-            refuse_over_protected(&a.input, &pdf, &a.output)?;
+            refuse_over_protected(&a.input, &pdf, &a.output, a.out)?;
             let mut options = match &a.settings {
                 Some(path) => ImpositionOptions::from_ini(&std::fs::read_to_string(path)?)?,
                 None => impose_options(&a)?,
@@ -763,7 +827,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             };
             let mut imposed = pdf.impose(&options, Some(&mut progress))?;
             eprintln!("\r100%");
-            save(&mut imposed, &a.output)?;
+            write_output(&mut imposed, &a.output, a.out, a.pw.password.as_deref(), Existing::Replace)?;
         }
         Command::Sign(a) => {
             let identity = match (&a.p12, &a.cert, &a.key) {

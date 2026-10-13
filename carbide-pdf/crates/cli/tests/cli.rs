@@ -61,19 +61,95 @@ fn new_documents_are_not_written_unencrypted_over_a_protected_input() {
     protected(&file, "", "owner pw");
     let before = std::fs::read(&file).unwrap();
     let path = file.to_str().unwrap();
-    let output = carbide(&["extract", path, "1", path]);
+    let output = carbide(&["extract", path, "1", path, "--unprotected"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("password-protected"));
     assert_eq!(std::fs::read(&file).unwrap(), before);
 
     // To another file is fine: that is a new, separate document.
     let copy = dir.join("copy.pdf");
-    assert!(carbide(&["extract", path, "1", copy.to_str().unwrap()]).status.success());
+    assert!(carbide(&["extract", path, "1", copy.to_str().unwrap(), "--unprotected"]).status.success());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn new_documents_from_a_protected_input_keep_its_protection_unless_asked() {
+    let dir = scratch("derived");
+    let file = dir.join("f.pdf");
+    protected(&file, "user pw", "owner pw");
+    let before = key(&std::fs::read(&file).unwrap());
+    let path = file.to_str().unwrap();
+    let plain = dir.join("plain.pdf");
+    plain_file(&plain, &["plain page"]);
+    let out = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    for (what, args) in [
+        ("extract", vec!["extract", path, "1", &out("extract.pdf")]),
+        ("split", vec!["split", path, "1", &out("parts")]),
+        ("impose", vec!["impose", path, &out("impose.pdf")]),
+        ("merge", vec!["merge", &out("merge.pdf"), path, plain.to_str().unwrap()]),
+    ] {
+        let mut args: Vec<&str> = args;
+        args.extend(["--password", "user pw"]);
+        let output = carbide(&args);
+        assert!(output.status.success(), "{what}: {}", stderr(&output));
+        let written = match what {
+            "split" => dir.join("parts/f-pages-1-1.pdf"),
+            name => dir.join(format!("{name}.pdf")),
+        };
+        let bytes = std::fs::read(&written).unwrap();
+        assert!(!bytes.windows(7).any(|w| w == b"private"), "{what}: written in the clear");
+        assert!(matches!(Pdf::from_bytes(&bytes), Err(Error::PasswordRequired)), "{what}");
+        assert!(Pdf::from_bytes_with_password(&bytes, "user pw").is_ok(), "{what}");
+        assert_eq!(key(&bytes), before, "{what}: protected with another key");
+    }
+
+    // Without protection only when asked for.
+    let unprotected = out("unprotected.pdf");
+    let output = carbide(&["extract", path, "1", &unprotected, "--password", "user pw", "--unprotected"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(Pdf::open(&unprotected).unwrap().document().encryption_state.is_none());
+
+    // Two inputs protected in different ways cannot share one protection.
+    let other = dir.join("other.pdf");
+    protected(&other, "user pw", "owner pw");
+    let output = carbide(&["merge", &out("both.pdf"), path, other.to_str().unwrap(), "--password", "user pw"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("--unprotected"), "{}", stderr(&output));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn protected_documents_are_exported_only_when_asked() {
+    let dir = scratch("export-protected");
+    let file = dir.join("f.pdf");
+    // Page text, not a text box, so that it is part of the exported text.
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    pdf.apply_watermark(&carbide_engine::WatermarkOptions::new("private words")).unwrap();
+    std::fs::write(&file, pdf.to_encrypted_bytes(&ProtectionOptions::new("", "owner pw")).unwrap()).unwrap();
+    let path = file.to_str().unwrap();
+    let images = dir.join("images");
+
+    let output = carbide(&["text", path]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("--unprotected"), "{}", stderr(&output));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("private"));
+    let output = carbide(&["images", path, images.to_str().unwrap(), "--dpi", "20"]);
+    assert!(!output.status.success());
+    assert!(!images.join("f-001.png").exists());
+
+    let output = carbide(&["text", path, "--unprotected"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("private words"));
+    let output = carbide(&["images", path, images.to_str().unwrap(), "--dpi", "20", "--unprotected"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(images.join("f-001.png").exists());
     let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A plain file with one page per label.
-fn plain(path: &Path, labels: &[&str]) {
+fn plain_file(path: &Path, labels: &[&str]) {
     let mut pdf = Pdf::new();
     for (i, label) in labels.iter().enumerate() {
         pdf.insert_blank_page(i, Some((612.0, 792.0))).unwrap();
@@ -90,7 +166,7 @@ fn stderr(output: &Output) -> String {
 fn split_and_image_export_replace_files_only_with_force() {
     let dir = scratch("existing");
     let input = dir.join("doc.pdf");
-    plain(&input, &["one", "two"]);
+    plain_file(&input, &["one", "two"]);
     let input = input.to_str().unwrap();
 
     let parts = dir.join("parts");

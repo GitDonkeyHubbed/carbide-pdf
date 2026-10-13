@@ -4,7 +4,9 @@
 //! survives anywhere in the file. Appending an update instead is the exception: it is only used to
 //! keep existing signatures or saved revisions valid, and only when no edit since the last save took
 //! content out of the document. An encrypted file is written back with the encryption it was opened
-//! with, so its open password, its owner password and its permissions all keep working.
+//! with, so its open password, its owner password and its permissions all keep working. So is a new
+//! document made from it (extracted pages, split parts, imposed sheets, a merge): it carries the
+//! protection along, and writing it without needs `set_protection(None)` first.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -46,13 +48,35 @@ pub struct SavedFile {
     content: HashMap<ObjectId, Fingerprint>,
 }
 
-/// How the file was encrypted.
+/// How a protected file is encrypted: the values of its encryption dictionary and the file key its
+/// passwords give. A document written with it opens with the same passwords and grants the same
+/// permissions as the file.
 #[derive(Clone)]
-struct Protection {
+pub struct Protection {
     state: EncryptionState,
     /// The trailer's file identifier; older encryption revisions derive the file key from it.
     id: Option<Object>,
 }
+
+impl Protection {
+    /// True when `other` is the same encryption: the same file key, encryption dictionary values
+    /// and permissions, so the same passwords open both and allow the same.
+    pub fn same_as(&self, other: &Protection) -> bool {
+        let (a, b) = (&self.state, &other.state);
+        let first_id = |p: &Protection| p.id.as_ref().and_then(|id| id.as_array().ok()?.first().cloned());
+        a.file_encryption_key() == b.file_encryption_key()
+            && (a.version(), a.revision()) == (b.version(), b.revision())
+            && a.permissions() == b.permissions()
+            && (a.owner_value(), a.user_value()) == (b.owner_value(), b.user_value())
+            && (a.owner_encrypted(), a.user_encrypted()) == (b.owner_encrypted(), b.user_encrypted())
+            && a.permission_encrypted() == b.permission_encrypted()
+            && (a.revision() >= 5 || first_id(self) == first_id(other))
+    }
+}
+
+/// Refusal to merge documents that are protected in different ways.
+pub const DIFFERENT_PROTECTION: &str = "The documents are protected with different passwords or permissions, \
+so one file cannot keep the protection of all of them.";
 
 impl SavedFile {
     /// Records `bytes`, the file `pdf` was just loaded from, opened with `password` if it needed one.
@@ -92,6 +116,11 @@ impl SavedFile {
         self.protection.is_some()
     }
 
+    /// How the file is encrypted, `None` for an unprotected one.
+    pub fn protection(&self) -> Option<&Protection> {
+        self.protection.as_ref()
+    }
+
     /// True when `pdf` has lost text or data this file holds: an object that is no longer part of
     /// the document, or one that no longer carries all of the strings or stream data it had. An
     /// annotation counts even when it holds neither, since what it draws is content. Other objects
@@ -114,6 +143,65 @@ impl SavedFile {
 }
 
 impl Pdf {
+    /// How the file this document was opened from is encrypted, `None` when it was not. Documents
+    /// made from it (extracted pages, split parts, imposed sheets, a merge) carry it along, and
+    /// [`Pdf::to_file_bytes`] writes them protected the same way.
+    pub fn protection(&self) -> Option<Protection> {
+        Some(Protection { state: self.doc.encryption_state.clone()?, id: self.doc.trailer.get(b"ID").ok().cloned() })
+    }
+
+    /// Gives the document the protection it is written with. `None` takes it away: writing a
+    /// document made from a protected one without protection is a choice made this way.
+    pub fn set_protection(&mut self, protection: Option<Protection>) {
+        match protection {
+            Some(Protection { state, id }) => {
+                self.doc.encryption_state = Some(state);
+                if let Some(id) = id {
+                    self.doc.trailer.set("ID", id);
+                }
+            }
+            None => self.doc.encryption_state = None,
+        }
+    }
+
+    /// True when the document carries a protection (see [`Pdf::protection`]).
+    pub fn is_protected(&self) -> bool {
+        self.doc.encryption_state.is_some()
+    }
+
+    /// The protection a merge of `documents` carries: the one its protected documents share.
+    /// Documents protected in different ways are refused with [`DIFFERENT_PROTECTION`], since the
+    /// passwords of one would then open the pages of the others; take the protection off them with
+    /// `set_protection(None)` first to merge them without.
+    pub fn shared_protection(documents: &[&Pdf]) -> Result<Option<Protection>> {
+        let mut shared: Option<Protection> = None;
+        for protection in documents.iter().filter_map(|d| d.protection()) {
+            match &shared {
+                None => shared = Some(protection),
+                Some(first) if first.same_as(&protection) => {}
+                Some(_) => return Err(Error::Unsupported(DIFFERENT_PROTECTION.into())),
+            }
+        }
+        Ok(shared)
+    }
+
+    /// The document as a file of its own, pruned: encrypted with its protection when it carries
+    /// one, so the file opens with the same passwords and grants the same permissions as the file
+    /// it came from; otherwise unencrypted, as [`Pdf::to_bytes`] gives it. Saved revisions are left
+    /// out, as they are positions in another file.
+    ///
+    /// `password` is the one the protected file was opened with, `None` when it opened without one.
+    /// The result is read back with it and has to give the same file key and encryption values;
+    /// otherwise this fails rather than give out a file that is unencrypted or opens differently.
+    pub fn to_file_bytes(&mut self, password: Option<&str>) -> Result<Vec<u8>> {
+        let protection = self.protection();
+        let bytes = self.rewrite(protection.as_ref())?;
+        if let Some(protection) = &protection {
+            check_encryption(&bytes, password, protection)?;
+        }
+        Ok(bytes)
+    }
+
     /// Decides how saving this document over `saved` writes it. `content_removed` is the caller's
     /// record that an edit since the last save took content out (applying redactions, deleting
     /// pages); edits that dropped content of the file are also found by comparing with it.
@@ -146,20 +234,26 @@ impl Pdf {
     ///
     /// A protected file comes out encrypted with the same file key and the same encryption
     /// dictionary values, so every password and permission of the original still applies. When
-    /// that cannot be done the save fails instead of producing plaintext.
+    /// that cannot be done the save fails instead of producing plaintext. A new document, without
+    /// a file, is written as [`Pdf::to_file_bytes`] writes it: with the protection it carries.
     pub fn save_bytes(&mut self, plan: SavePlan, saved: Option<&SavedFile>) -> Result<Vec<u8>> {
-        if saved.is_some_and(|s| s.password.is_some() && s.protection.is_none()) {
+        let Some(saved) = saved else {
+            return match plan {
+                SavePlan::FullRewrite { .. } => self.to_file_bytes(None),
+                _ => Err(Error::Other("there is no file to update".into())),
+            };
+        };
+        if saved.password.is_some() && saved.protection.is_none() {
             return Err(Error::Other(NOT_ENCRYPTED.into()));
         }
-        let protection = saved.and_then(|s| s.protection.as_ref());
-        let bytes = match (plan, saved) {
-            (SavePlan::Unchanged, Some(saved)) => return Ok(saved.bytes.clone()),
-            (SavePlan::Incremental, Some(saved)) => self.append_update(&saved.bytes, saved.load()?)?,
-            (SavePlan::FullRewrite { .. }, _) => self.rewrite(protection)?,
-            (_, None) => return Err(Error::Other("there is no file to update".into())),
+        let protection = saved.protection.as_ref();
+        let bytes = match plan {
+            SavePlan::Unchanged => return Ok(saved.bytes.clone()),
+            SavePlan::Incremental => self.append_update(&saved.bytes, saved.load()?)?,
+            SavePlan::FullRewrite { .. } => self.rewrite(protection)?,
         };
-        if let (Some(saved), Some(protection)) = (saved, protection) {
-            check_encryption(&bytes, saved, protection)?;
+        if let Some(protection) = protection {
+            check_encryption(&bytes, saved.password(), protection)?;
         }
         Ok(bytes)
     }
@@ -197,15 +291,23 @@ impl Pdf {
 
 const NOT_ENCRYPTED: &str = "the document could not be encrypted again, so it was not saved";
 
-/// Fails unless `bytes` open with the password `saved` was opened with, and that password, checked
-/// against the new file's encryption dictionary, gives the file key and the dictionary values of
-/// the original. The key is derived afresh here, so a wrong one in memory cannot slip through.
-fn check_encryption(bytes: &[u8], saved: &SavedFile, protection: &Protection) -> Result<()> {
-    let written = match &saved.password {
+/// Fails unless `bytes` open with `password`, the one the protected file was opened with, and that
+/// password, checked against the new file's encryption dictionary, gives the file key and the
+/// dictionary values of the original. The key is derived afresh here, so a wrong one in memory
+/// cannot slip through.
+fn check_encryption(bytes: &[u8], password: Option<&str>, protection: &Protection) -> Result<()> {
+    let written = match password {
         Some(password) => Pdf::from_bytes_with_password(bytes, password),
         None => Pdf::from_bytes(bytes),
     };
-    let Some(state) = written.ok().and_then(|pdf| pdf.doc.encryption_state) else {
+    let state = match written {
+        Ok(pdf) => pdf.doc.encryption_state,
+        Err(Error::PasswordRequired) => {
+            return Err(Error::Other(format!("{NOT_ENCRYPTED} (the password it was opened with is needed)")));
+        }
+        Err(_) => None,
+    };
+    let Some(state) = state else {
         return Err(Error::Other(NOT_ENCRYPTED.into()));
     };
     let original = &protection.state;

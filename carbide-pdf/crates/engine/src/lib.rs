@@ -41,6 +41,6 @@ pub use pdf::Pdf;
 pub use redact::Redaction;
 pub use render::Renderer;
 pub use revisions::{open_revision_bytes, pdf_date_now, revision_display_name, validate_label, Revision};
-pub use save::{SavePlan, SavedFile};
+pub use save::{Protection, SavePlan, SavedFile};
 pub use security::ProtectionOptions;
 pub use stamp::{BatesOptions, PageAnchor, WatermarkOptions};

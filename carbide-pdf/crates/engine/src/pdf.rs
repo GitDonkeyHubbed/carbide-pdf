@@ -70,9 +70,11 @@ impl Pdf {
         Ok(out)
     }
 
-    /// Writes the document to `path`, replacing a file there in one step.
+    /// Writes the document to `path` as [`Pdf::to_file_bytes`] does, replacing a file there in one
+    /// step: a document that carries a protection is written encrypted with it. One protected with
+    /// an open password needs that password, given to `to_file_bytes`.
     pub fn save(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let bytes = self.to_bytes()?;
+        let bytes = self.to_file_bytes(None)?;
         crate::fs::write_replacing(path.as_ref(), &bytes)?;
         Ok(())
     }
@@ -302,6 +304,7 @@ impl Pdf {
 
     /// A new document holding only the given pages, in the given order. Nothing of the other
     /// pages is carried along, not through form fields, tags, links or shared resources either.
+    /// It carries this document's protection (see [`Pdf::protection`]).
     pub fn extract_pages(&self, pages: &[usize]) -> Result<Pdf> {
         let count = self.page_count();
         if pages.is_empty() {
@@ -352,10 +355,13 @@ impl Pdf {
     }
 
     /// Concatenates documents. Outlines and named destinations of the inputs are not carried over.
+    /// The result carries the protection its protected inputs share; inputs protected in different
+    /// ways are refused (see [`Pdf::shared_protection`]).
     pub fn merge(documents: &[&Pdf]) -> Result<Pdf> {
         if documents.is_empty() {
             return Ok(Pdf::new());
         }
+        let protection = Pdf::shared_protection(documents)?;
         // The new document already owns a few low object ids (catalog, page tree); the inputs
         // are renumbered to start after them so nothing collides.
         let mut result = Pdf::new();
@@ -395,6 +401,7 @@ impl Pdf {
         let root = result.doc.get_dictionary_mut(root_id)?;
         root.set("Kids", page_ids.iter().map(|id| Object::Reference(*id)).collect::<Vec<_>>());
         root.set("Count", page_ids.len() as i64);
+        result.set_protection(protection);
         Ok(result)
     }
 

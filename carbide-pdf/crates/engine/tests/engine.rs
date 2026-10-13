@@ -1141,6 +1141,110 @@ fn aes256_passwords_are_prepared_the_way_the_standard_says() {
     }
 }
 
+/// The encryption values a password gives for `bytes`, which must open with it.
+fn encryption(bytes: &[u8], password: Option<&str>) -> lopdf::EncryptionState {
+    let pdf = match password {
+        Some(password) => Pdf::from_bytes_with_password(bytes, password),
+        None => Pdf::from_bytes(bytes),
+    };
+    pdf.unwrap().document().encryption_state.clone().expect("encrypted")
+}
+
+fn same_encryption(a: &lopdf::EncryptionState, b: &lopdf::EncryptionState) -> bool {
+    a.file_encryption_key() == b.file_encryption_key()
+        && a.permissions() == b.permissions()
+        && (a.version(), a.revision()) == (b.version(), b.revision())
+        && (a.owner_value(), a.user_value()) == (b.owner_value(), b.user_value())
+        && (a.owner_encrypted(), a.user_encrypted()) == (b.owner_encrypted(), b.user_encrypted())
+}
+
+#[test]
+fn documents_made_from_a_protected_one_keep_its_passwords_and_permissions() {
+    let r = renderer();
+    let mut options = ProtectionOptions::new("user pw", "owner pw");
+    options.allow_printing = false;
+    options.allow_copying = false;
+    let sources = [
+        ("AES-256", text_pdf(&[&["private words"], &["second page"]]).to_encrypted_bytes(&options).unwrap()),
+        // The older revisions derive the key from the file identifier, which has to come along.
+        ("RC4", legacy_protected(false, "user pw", "owner pw")),
+        ("AES-128", legacy_protected(true, "user pw", "owner pw")),
+    ];
+    for (label, original) in sources {
+        let before = encryption(&original, Some("user pw"));
+        let source = Pdf::from_bytes_with_password(&original, "user pw").unwrap();
+        assert!(source.is_protected());
+        let letter = ImpositionOptions { media: Media::Named("Letter".into()), ..Default::default() };
+        let derived = [
+            ("extract", source.extract_pages(&[0]).unwrap()),
+            ("split", source.split(&[0..=0]).unwrap().remove(0)),
+            ("impose", source.impose(&letter, None).unwrap()),
+            ("merge", Pdf::merge(&[&source, &source.clone()]).unwrap()),
+        ];
+        for (what, mut pdf) in derived {
+            let bytes = pdf.to_file_bytes(Some("user pw")).unwrap();
+            assert!(!contains(&bytes, b"private words"), "{label} {what}: written in the clear");
+            assert!(matches!(Pdf::from_bytes(&bytes), Err(Error::PasswordRequired)), "{label} {what}");
+            assert!(matches!(Pdf::from_bytes_with_password(&bytes, "wrong"), Err(Error::WrongPassword)), "{label} {what}");
+            for password in ["user pw", "owner pw"] {
+                assert!(same_encryption(&encryption(&bytes, Some(password)), &before), "{label} {what}, opened with {password}");
+                let text = r.page_text_with_password(&bytes, password, 0).unwrap();
+                assert!(text.contains("private words"), "{label} {what}, read with {password}: {text:?}");
+            }
+            assert!(pdf.to_file_bytes(Some("wrong")).is_err(), "{label} {what}: not checked with the password");
+        }
+    }
+
+    // A file that only restricts permissions: the parts open without a password and keep the
+    // restrictions, and `save` needs none.
+    let mut restricted = ProtectionOptions::new("", "owner pw");
+    restricted.allow_copying = false;
+    let original = text_pdf(&[&["private words"], &["second page"]]).to_encrypted_bytes(&restricted).unwrap();
+    let before = encryption(&original, None);
+    let source = Pdf::from_bytes(&original).unwrap();
+    let dir = scratch_dir("derived-protection");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("part.pdf");
+    source.extract_pages(&[1]).unwrap().save(&path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(!contains(&bytes, b"second page"));
+    assert!(same_encryption(&encryption(&bytes, None), &before));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn merging_keeps_a_shared_protection_and_refuses_different_ones() {
+    let protect = |text: &str, user: &str| {
+        let bytes = text_pdf(&[&[text]]).to_encrypted_bytes(&ProtectionOptions::new(user, "owner pw")).unwrap();
+        Pdf::from_bytes_with_password(&bytes, "owner pw").unwrap()
+    };
+    let (first, second) = (protect("first secret", "one"), protect("second secret", "two"));
+    let plain = text_pdf(&[&["plain page"]]);
+
+    // A protected and an unprotected input: the result is protected like the protected one.
+    let mut merged = Pdf::merge(&[&plain, &first]).unwrap();
+    let bytes = merged.to_file_bytes(Some("one")).unwrap();
+    assert!(!contains(&bytes, b"first secret") && !contains(&bytes, b"plain page"));
+    assert!(same_encryption(&encryption(&bytes, Some("one")), first.document().encryption_state.as_ref().unwrap()));
+    assert_eq!(Pdf::from_bytes_with_password(&bytes, "one").unwrap().page_count(), 2);
+
+    // Protected in two ways: either password would open the other's pages, so it is refused.
+    let refused = Pdf::merge(&[&first, &second]).unwrap_err();
+    assert_eq!(refused.to_string(), carbide_engine::save::DIFFERENT_PROTECTION);
+    assert!(Pdf::shared_protection(&[&first, &second]).is_err());
+
+    // Without protection only when that is asked for.
+    let (mut a, mut b) = (first.clone(), second.clone());
+    a.set_protection(None);
+    b.set_protection(None);
+    let mut merged = Pdf::merge(&[&a, &b]).unwrap();
+    assert!(!merged.is_protected());
+    let bytes = merged.to_file_bytes(None).unwrap();
+    let reopened = Pdf::from_bytes(&bytes).unwrap();
+    assert!(reopened.document().encryption_state.is_none());
+    assert_eq!(reopened.page_count(), 2);
+}
+
 #[cfg(unix)]
 #[test]
 fn replacing_a_file_keeps_its_mode_and_follows_symbolic_links() {
