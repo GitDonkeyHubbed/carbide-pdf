@@ -89,7 +89,7 @@ you pin any folder. These are ordinary folders to Carbide PDF: it does not sign 
 
 Page numbers are 1-based. Rectangles are `PAGE:X,Y,W,H` in points, with the origin at the bottom left of the displayed page. The `note --at` anchor is `PAGE:X,Y`, measured from the top left. Most commands accept `--password` for a protected input.
 
-New files made from a protected input (`extract`, `split`, `impose`, `merge`) keep its passwords and permissions; `--unprotected` writes them without. `images` and `text` refuse a protected input unless `--unprotected` is given. `split` and `images` do not replace files already in the folder unless `--force` is given. `reduce` writes `<name>-reduced.pdf` next to each original and replaces nothing; `--overwrite` replaces other existing files and `--in-place` replaces the originals.
+New files made from a protected input (`extract`, `split`, `impose`, `merge`) keep its passwords and permissions; `--unprotected` writes them without. `images`, `text` and `compare` refuse a protected input unless `--unprotected` is given. `split` and `images` do not replace files already in the folder unless `--force` is given. `reduce` writes `<name>-reduced.pdf` next to each original and replaces nothing; `--overwrite` replaces other existing files and `--in-place` replaces the originals.
 
 ```
 carbide merge combined.pdf part1.pdf part2.pdf

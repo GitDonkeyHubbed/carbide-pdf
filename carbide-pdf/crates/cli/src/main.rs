@@ -131,8 +131,16 @@ enum Command {
         #[command(flatten)]
         pw: Password,
     },
-    /// Compare the text of two documents.
-    Compare { original: PathBuf, revised: PathBuf },
+    /// Compare the text of two documents. --password opens every protected input.
+    Compare {
+        original: PathBuf,
+        revised: PathBuf,
+        /// Print the text of password-protected documents anyway.
+        #[arg(long)]
+        unprotected: bool,
+        #[command(flatten)]
+        pw: Password,
+    },
     /// Export every page as an image.
     Images {
         input: PathBuf,
@@ -766,9 +774,12 @@ fn run(cli: Cli) -> Result<(), Failure> {
             }
             save_edit(&mut pdf, &saved, false, &input, &output)?;
         }
-        Command::Compare { original, revised } => {
-            let mut a = open(&original, &Password { password: None })?;
-            let mut b = open(&revised, &Password { password: None })?;
+        Command::Compare { original, revised, unprotected, pw } => {
+            let mut a = open(&original, &pw)?;
+            let mut b = open(&revised, &pw)?;
+            // The differences print the text of both.
+            refuse_unprotected_export(&original, &a, unprotected, "text")?;
+            refuse_unprotected_export(&revised, &b, unprotected, "text")?;
             let diffs = compare_documents(renderer()?, &mut a, &mut b)?;
             let changed: Vec<_> = diffs.iter().filter(|d| !d.is_identical()).collect();
             if changed.is_empty() {

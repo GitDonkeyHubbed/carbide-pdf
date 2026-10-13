@@ -148,12 +148,41 @@ fn protected_documents_are_exported_only_when_asked() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn compare_prints_the_text_of_a_protected_document_only_when_asked() {
+    let dir = scratch("compare-protected");
+    let restricted = dir.join("restricted.pdf");
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    pdf.apply_watermark(&carbide_engine::WatermarkOptions::new("private words")).unwrap();
+    std::fs::write(&restricted, pdf.to_encrypted_bytes(&ProtectionOptions::new("", "owner pw")).unwrap()).unwrap();
+    let blank = dir.join("blank.pdf");
+    plain_file(&blank, &[]);
+    let (restricted, blank) = (restricted.to_str().unwrap(), blank.to_str().unwrap());
+
+    // It opens without a password, but its text is not printed without --unprotected, whichever
+    // side it is on.
+    for args in [["compare", restricted, blank], ["compare", blank, restricted]] {
+        let output = carbide(&args);
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("--unprotected"), "{}", stderr(&output));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("private"));
+    }
+    let output = carbide(&["compare", restricted, blank, "--unprotected"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("private words"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A plain file with one page per label.
 fn plain_file(path: &Path, labels: &[&str]) {
     let mut pdf = Pdf::new();
     for (i, label) in labels.iter().enumerate() {
         pdf.insert_blank_page(i, Some((612.0, 792.0))).unwrap();
         pdf.add_text_box(i, 72.0, 720.0, label, 18.0).unwrap();
+    }
+    if labels.is_empty() {
+        pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
     }
     std::fs::write(path, pdf.to_bytes().unwrap()).unwrap();
 }
