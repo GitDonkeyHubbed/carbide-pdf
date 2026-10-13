@@ -319,6 +319,10 @@ impl Pdf {
             .into_iter()
             .filter_map(|(start, style)| Some((start.as_i64().ok()?, self.resolve(&style).as_dict().ok()?.clone())))
             .collect();
+        if ranges.is_empty() {
+            // Nothing readable to carry over: the tree is left as it is.
+            return None;
+        }
         ranges.sort_by_key(|(start, _)| *start);
         let label = |index: usize| -> Label {
             let index = index as i64;

@@ -262,7 +262,7 @@ fn sanitize_removes_what_is_chosen_and_keeps_protection() {
     let clean = dir.join("clean.pdf");
     let output = carbide(&["sanitize", path, clean.to_str().unwrap()]);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("removed Comments and markup: 1"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("removed Comments, text boxes and markup: 1"));
     assert!(!has_note(&clean));
     assert!(has_note(&file), "the input was changed");
 

@@ -398,7 +398,7 @@ fn hidden_information_is_removed_as_an_edit_and_offered_after_redacting() {
     app.remove_hidden_information(doc, items);
     let Some(Dialog::Message(report)) = &app.dialog else { panic!("nothing was reported") };
     // The note, and the text box `document` draws its label with.
-    assert!(report.contains("Comments and markup: 2"), "{report}");
+    assert!(report.contains("Comments, text boxes and markup: 2"), "{report}");
     let open = app.doc.as_ref().unwrap();
     assert!(open.dirty && open.content_removed);
     app.dialog = None;

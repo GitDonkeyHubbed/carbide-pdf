@@ -807,6 +807,7 @@ fn hidden_information_is_removed_as_chosen_and_reported() {
         assert!(report.count(*item) >= 1, "{item:?} was not found: {report:?}");
     }
     assert_eq!(report.count(HiddenItem::Comments), 1, "the pop-up goes with its note, uncounted");
+    assert!(report.lines().contains(&"Comments, text boxes and markup: 1".to_string()), "{:?}", report.lines());
     assert_eq!(report.count(HiddenItem::Attachments), 2);
     assert_eq!(report.count(HiddenItem::Scripts), 3, "the named script, the open action and the page event");
     let bytes = pdf.to_bytes().unwrap();

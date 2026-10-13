@@ -29,7 +29,7 @@ pub enum HiddenItem {
     Scripts,
     /// Values filled into form fields, with their drawn appearances and any XFA form data.
     FormData,
-    /// Comments and markup: notes, text boxes, highlights, drawings, stamps.
+    /// Comments and markup: notes, text boxes (typewriter text), highlights, drawings, stamps.
     Comments,
     /// Page thumbnails.
     Thumbnails,
@@ -68,7 +68,7 @@ impl HiddenItem {
             HiddenItem::Attachments => "Attachments and embedded files",
             HiddenItem::Scripts => "JavaScript and actions",
             HiddenItem::FormData => "Form field values",
-            HiddenItem::Comments => "Comments and markup",
+            HiddenItem::Comments => "Comments, text boxes and markup",
             HiddenItem::Thumbnails => "Page thumbnails",
             HiddenItem::UnusedObjects => "Unused objects and resources",
             HiddenItem::PrivateData => "Private application data",
