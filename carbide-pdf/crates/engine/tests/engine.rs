@@ -1934,7 +1934,7 @@ fn a_signature_object_moved_after_the_gap_is_rejected() {
 fn trailer_numbers(file: &[u8], key: &str) -> (u32, u32) {
     let needle = format!("/{key}");
     let at = file.windows(needle.len()).rposition(|w| w == needle.as_bytes()).unwrap() + needle.len();
-    let text = String::from_utf8_lossy(&file[at..at + 40]).into_owned();
+    let text = String::from_utf8_lossy(&file[at..(at + 40).min(file.len())]).into_owned();
     let numbers: Vec<u32> = text.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).take(2).map(|s| s.parse().unwrap()).collect();
     (numbers[0], numbers.get(1).copied().unwrap_or(0))
 }
@@ -2023,19 +2023,16 @@ fn bytes_written_into_the_gap_never_make_a_signature_disappear() {
     }
 }
 
-#[test]
-fn signatures_on_owner_password_protected_files_verify() {
-    // Protected with an owner password only, so it opens without one. Its strings and streams are
-    // encrypted, but a signature value never is.
-    let plain = text_pdf(&[&["protected and signed"]]).to_bytes().unwrap();
-    let protected = Pdf::from_bytes(&plain).unwrap().to_encrypted_bytes(&ProtectionOptions::new("", "owner")).unwrap();
-    let (encrypt, generation) = trailer_numbers(&protected, "Encrypt");
-    let id = trailer_numbers(&protected, "Size").0;
+/// `protected` (an encrypted file) with a signature over all of it appended by hand, as another
+/// signer would: a signature dictionary holds no encrypted strings, and its value never is.
+fn sign_protected(protected: &[u8]) -> Vec<u8> {
+    let (encrypt, generation) = trailer_numbers(protected, "Encrypt");
+    let id = trailer_numbers(protected, "Size").0;
     let placeholder = "0".repeat(2 * 4096);
     let dictionary = format!(
         "{id} 0 obj\n<</Type/Sig/Filter/Adobe.PPKLite/SubFilter/adbe.pkcs7.detached/ByteRange[0000000000 0000000000 0000000000 0000000000]/Contents<{placeholder}>>>\nendobj"
     );
-    let mut signed = append_revision(&protected, &[(id, dictionary)], &format!("/Encrypt {encrypt} {generation} R"));
+    let mut signed = append_revision(protected, &[(id, dictionary)], &format!("/Encrypt {encrypt} {generation} R"));
     let b = signed.windows(placeholder.len() + 1).rposition(|w| w[0] == b'<' && w[1..].iter().all(|x| *x == b'0')).unwrap();
     let c = b + placeholder.len() + 2;
     let d = signed.len() - c;
@@ -2044,21 +2041,44 @@ fn signatures_on_owner_password_protected_files_verify() {
     // Sign the covered bytes directly (no signed attributes).
     use rsa::pkcs8::DecodePrivateKey;
     let key = rsa::RsaPrivateKey::from_pkcs8_der(&test_identity().pkcs8).unwrap();
-    let covered = covered_bytes(&signed);
-    let digest = <sha2::Sha256 as sha2::Digest>::digest(&covered);
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(covered_bytes(&signed));
     let signature = key.sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &digest).unwrap();
     let cms = detached_cms(&test_identity().certificate, SHA256_OID, &[1, 2, 840, 113549, 1, 1, 11], None, &signature);
     put_signature_value(&mut signed, &cms);
+    signed
+}
 
+#[test]
+fn signatures_on_owner_password_protected_files_verify() {
+    // Protected with an owner password only, so it opens without one. Its strings and streams are
+    // encrypted, but the signature value is not.
+    let plain = text_pdf(&[&["protected and signed"]]).to_bytes().unwrap();
+    let protected = Pdf::from_bytes(&plain).unwrap().to_encrypted_bytes(&ProtectionOptions::new("", "owner")).unwrap();
+    let signed = sign_protected(&protected);
     let reports = verify(&signed, &trust_test_identity());
     assert_eq!(reports.len(), 1);
     assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
 
     // And the covered (encrypted) bytes are still bound to it.
     let mut tampered = signed.clone();
-    let middle = b / 2;
-    tampered[middle] ^= 0x01;
+    let [_, b, _, _] = byte_range(&signed);
+    tampered[b / 2] ^= 0x01;
     assert_ne!(verify(&tampered, &trust_test_identity()).first().map(|r| r.validity), Some(Validity::Valid));
+}
+
+#[test]
+fn a_signed_file_with_an_open_password_and_a_later_update_takes_appended_edits() {
+    let plain = text_pdf(&[&["locked and signed"]]).to_bytes().unwrap();
+    let protected = Pdf::from_bytes(&plain).unwrap().to_encrypted_bytes(&ProtectionOptions::new("user", "owner")).unwrap();
+    let signed = sign_protected(&protected);
+    // An update after the signature, so its revision has to be read on its own, with the password.
+    let (encrypt, generation) = trailer_numbers(&signed, "Encrypt");
+    let n = trailer_numbers(&signed, "Size").0;
+    let note = format!("{n} 0 obj\n<</Type/Annot/Subtype/Square/Rect[0 0 1 1]>>\nendobj");
+    let updated = append_revision(&signed, &[(n, note)], &format!("/Encrypt {encrypt} {generation} R"));
+    let (mut pdf, saved) = SavedFile::open(updated, Some("user".into())).unwrap();
+    pdf.rotate_pages(&[0], 90).unwrap();
+    assert_eq!(pdf.save_plan(Some(&saved), false).unwrap(), SavePlan::Incremental, "the intact signature was treated as broken");
 }
 
 // ---- algorithm coverage (S7, S6) ----------------------------------------------------------

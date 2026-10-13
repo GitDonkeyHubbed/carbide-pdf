@@ -1415,7 +1415,7 @@ impl Pdf {
             if !is_signature_dictionary(v) {
                 continue;
             }
-            reports.push(verify_one(&pdf, *id, v, names.get(id).cloned(), file_bytes, file_end, trust, now));
+            reports.push(verify_one(&pdf, *id, v, names.get(id).cloned(), file_bytes, None, file_end, trust, now));
         }
         // A signature field whose value is gone or no longer reads as a signature (bytes written
         // into the gap broke its dictionary, say) is still a signature, and a damaged one.
@@ -1425,7 +1425,7 @@ impl Pdf {
             match pdf.doc.objects.get(&value) {
                 Some(Object::Dictionary(v)) if is_signature_dictionary(v) => {}
                 Some(Object::Dictionary(v)) if v.has(b"ByteRange") => {
-                    reports.push(verify_one(&pdf, value, v, names.get(&value).cloned(), file_bytes, file_end, trust, now));
+                    reports.push(verify_one(&pdf, value, v, names.get(&value).cloned(), file_bytes, None, file_end, trust, now));
                 }
                 _ => {
                     let mut report = SignatureReport::new(text_of(field, b"T").unwrap_or_else(|| format!("object {}", value.0)));
@@ -1440,11 +1440,12 @@ impl Pdf {
         Ok(reports)
     }
 
-    /// True when this document, loaded from `file_bytes`, holds a signature that an update appended
-    /// to the file would keep valid. A signature whose byte range no longer fits the file, or whose
-    /// digest no longer matches it (the file was rewritten since), is already broken. One that
-    /// cannot be checked here (an unsupported algorithm, say) counts as intact.
-    pub(crate) fn has_intact_signatures(&self, file_bytes: &[u8]) -> bool {
+    /// True when this document, loaded from `file_bytes` (with `password`, for a protected file),
+    /// holds a signature that an update appended to the file would keep valid. A signature whose
+    /// byte range no longer fits the file, or whose digest no longer matches it (the file was
+    /// rewritten since), is already broken. One that cannot be checked here (an unsupported
+    /// algorithm, say) counts as intact.
+    pub(crate) fn has_intact_signatures(&self, file_bytes: &[u8], password: Option<&str>) -> bool {
         let file_end = file_bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map(|p| p + 1).unwrap_or(0);
         let trust = TrustStore::default();
         self.doc.objects.iter().any(|(id, object)| {
@@ -1452,12 +1453,13 @@ impl Pdf {
             if !is_signature_dictionary(v) {
                 return false;
             }
-            let report = verify_one(self, *id, v, None, file_bytes, file_end, &trust, Utc::now());
+            let report = verify_one(self, *id, v, None, file_bytes, password, file_end, &trust, Utc::now());
             !(report.validity == Validity::Invalid && matches!(report.detail, Detail::BadByteRange | Detail::DigestMismatch))
         })
     }
 }
 
+/// Checks the signature dictionary `v` (object `id` of `pdf`, loaded from `file` with `password`).
 #[allow(clippy::too_many_arguments)]
 fn verify_one(
     pdf: &Pdf,
@@ -1465,6 +1467,7 @@ fn verify_one(
     v: &Dictionary,
     name: Option<String>,
     file: &[u8],
+    password: Option<&str>,
     file_end: usize,
     trust: &TrustStore,
     now: DateTime<Utc>,
@@ -1503,7 +1506,8 @@ fn verify_one(
     // copy, outside the signed bytes, must not supply the date, reason or names.
     let reloaded;
     let revision = if report.modified_after_signing {
-        match Pdf::from_bytes(&file[..c + d]) {
+        let signed_part = &file[..c + d];
+        match password.map_or_else(|| Pdf::from_bytes(signed_part), |p| Pdf::from_bytes_with_password(signed_part, p)) {
             Ok(pdf) => {
                 reloaded = pdf;
                 &reloaded
