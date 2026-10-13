@@ -7,6 +7,10 @@ use carbide_engine::autosave::{AutoSaveSettings, DEFAULT_INTERVAL_MINUTES};
 /// `~/Library/Application Support/Carbide PDF` (macOS), `%APPDATA%\Carbide PDF` (Windows) or
 /// `~/.local/share/carbide-pdf` (elsewhere).
 pub fn data_dir() -> PathBuf {
+    // Tests never touch the user's own settings, recent files or recovery copies.
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("carbide-app-tests-{}", std::process::id()));
+    }
     let home = || std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     if cfg!(target_os = "macos") {
         home().join("Library/Application Support/Carbide PDF")

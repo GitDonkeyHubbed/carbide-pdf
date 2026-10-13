@@ -1,0 +1,215 @@
+//! How the window's commands drive saving: the save question, what follows a save, and Auto
+//! Recovery. Driven without a window; dialogs are answered the way their buttons do.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use carbide_engine::autosave::{AutoSaveSettings, AutoSaveStore};
+use carbide_engine::{pdf_date_now, Pdf, ProtectionOptions};
+use eframe::egui;
+
+use crate::dialogs::{AfterSave, Dialog};
+use crate::CarbideApp;
+
+/// A folder of its own for one test.
+fn scratch() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!("carbide-app-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// The application with no window and no renderer, keeping recovery copies in `dir`.
+fn app(dir: &Path) -> CarbideApp {
+    let store = AutoSaveStore::open(dir.join("AutoSave")).ok();
+    CarbideApp::with_parts(None, None, store, AutoSaveSettings::default())
+}
+
+/// A document with one page per label, each showing its label.
+fn document(labels: &[&str]) -> Pdf {
+    let mut pdf = Pdf::new();
+    for (i, label) in labels.iter().enumerate() {
+        pdf.insert_blank_page(i, Some((612.0, 792.0))).unwrap();
+        pdf.add_text_box(i, 72.0, 720.0, label, 18.0).unwrap();
+    }
+    pdf
+}
+
+/// `labels` written to `name` with one saved revision, so a save that removes content has to ask.
+fn with_revision(dir: &Path, name: &str, labels: &[&str]) -> PathBuf {
+    let base = document(labels).to_bytes().unwrap();
+    let mut working = Pdf::from_bytes(&base).unwrap();
+    working.rotate_pages(&[0], 90).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, working.save_revision(&base, "First", &pdf_date_now()).unwrap()).unwrap();
+    path
+}
+
+fn plain(dir: &Path, name: &str, labels: &[&str]) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, document(labels).to_bytes().unwrap()).unwrap();
+    path
+}
+
+fn contains(bytes: &[u8], needle: &str) -> bool {
+    bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+}
+
+fn active_id(app: &CarbideApp) -> u64 {
+    app.doc.as_ref().expect("a document is open").id
+}
+
+/// The document and file a pending save question is about.
+fn question(app: &CarbideApp) -> Option<(u64, PathBuf)> {
+    match &app.dialog {
+        Some(Dialog::ConfirmRewrite { doc, path, .. }) => Some((*doc, path.clone())),
+        _ => None,
+    }
+}
+
+fn recovery_copies(dir: &Path) -> usize {
+    std::fs::read_dir(dir.join("AutoSave"))
+        .map(|entries| entries.filter(|e| e.as_ref().is_ok_and(|e| e.path().extension().is_some_and(|x| x == "asd"))).count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_save_question_is_dropped_when_another_document_comes_forward() {
+    let dir = scratch();
+    let a = with_revision(&dir, "a.pdf", &["KEEP", "REMOVED-A"]);
+    let b = plain(&dir, "b.pdf", &["OTHER DOCUMENT B"]);
+    let before = std::fs::read(&a).unwrap();
+    let mut app = app(&dir);
+
+    // Every way another document can come forward drops the question about this one.
+    type BringForward = fn(&mut CarbideApp, &Path);
+    let ways: [(&str, BringForward); 3] = [
+        ("new", |app, _| app.new_blank()),
+        ("open", |app, other| app.open_path(other)),
+        ("close", |app, _| app.close_tab(app.active_tab.unwrap())),
+    ];
+    for (how, bring_forward) in ways {
+        app.open_path(&a);
+        app.edit_removing("Delete page", |p| p.delete_pages(&[1]));
+        app.save();
+        let (doc, path) = question(&app).unwrap_or_else(|| panic!("{how}: saving has to ask"));
+        assert_eq!((doc, path.as_path()), (active_id(&app), a.as_path()));
+        bring_forward(&mut app, &b);
+        assert!(question(&app).is_none(), "{how}: the question stayed up");
+
+        // An answer that still arrives for it writes nothing.
+        app.confirm_rewrite(doc, &a, AfterSave::Nothing);
+        assert_eq!(std::fs::read(&a).unwrap(), before, "{how}: another document was written over a.pdf");
+        assert!(!contains(&std::fs::read(&b).unwrap(), "KEEP"), "{how}");
+        while let Some(index) = app.active_tab {
+            app.close_tab(index);
+        }
+    }
+}
+
+#[test]
+fn answering_the_save_question_writes_a_clean_file_and_cancelling_writes_nothing() {
+    let dir = scratch();
+    let a = with_revision(&dir, "a.pdf", &["KEEP", "REMOVED-A"]);
+    let before = std::fs::read(&a).unwrap();
+    let mut app = app(&dir);
+    app.open_path(&a);
+    app.edit_removing("Delete page", |p| p.delete_pages(&[1]));
+
+    app.save();
+    assert!(question(&app).is_some());
+    app.dialog = None; // Cancel
+    assert_eq!(std::fs::read(&a).unwrap(), before);
+    assert!(app.doc.as_ref().unwrap().dirty);
+
+    app.save();
+    let (doc, path) = question(&app).unwrap();
+    app.dialog = None;
+    app.confirm_rewrite(doc, &path, AfterSave::Nothing);
+    let written = std::fs::read(&a).unwrap();
+    assert!(!contains(&written, "REMOVED-A"), "the deleted page is still in the file");
+    let reopened = Pdf::from_bytes(&written).unwrap();
+    assert_eq!((reopened.page_count(), reopened.revisions().len()), (1, 0));
+
+    // What is shown is what is on disk now.
+    let open = app.doc.as_ref().unwrap();
+    assert!(!open.dirty && !open.content_removed);
+    assert_eq!(open.saved.as_ref().unwrap().bytes(), written.as_slice());
+    assert_eq!((open.pdf.page_count(), open.geometries.len()), (1, 1));
+    assert!(app.notice.is_none());
+    // Nothing more to ask about: the revisions are gone.
+    app.save();
+    assert!(question(&app).is_none());
+}
+
+#[test]
+fn close_and_quit_finish_after_the_save_question() {
+    let dir = scratch();
+    let a = with_revision(&dir, "a.pdf", &["KEEP", "REMOVED-A"]);
+    let mut app = app(&dir);
+
+    // Close prompt, Save: the tab closes once the question is answered.
+    app.open_path(&a);
+    app.edit_removing("Delete page", |p| p.delete_pages(&[1]));
+    app.save_then(AfterSave::CloseTab);
+    let (doc, path) = question(&app).unwrap();
+    app.dialog = None;
+    app.confirm_rewrite(doc, &path, AfterSave::CloseTab);
+    assert!(app.tabs.is_empty(), "the tab stayed open");
+    assert!(!contains(&std::fs::read(&a).unwrap(), "REMOVED-A"));
+
+    // Quit prompt, Save All: the document that does not ask is saved first, then the one that
+    // does asks, and quitting goes on after the answer.
+    let a = with_revision(&dir, "a2.pdf", &["KEEP", "REMOVED-A"]);
+    let b = plain(&dir, "b.pdf", &["B"]);
+    app.open_path(&a);
+    app.edit_removing("Delete page", |p| p.delete_pages(&[1]));
+    app.open_path(&b);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    let ctx = egui::Context::default();
+    app.save_all_and_quit(&ctx);
+    assert_eq!(Pdf::open(&b).unwrap().page_rotation(0).unwrap(), 90, "b.pdf was left unsaved");
+    let (doc, path) = question(&app).expect("a2.pdf asks");
+    assert_eq!(path, a);
+    let then = match app.dialog.take() {
+        Some(Dialog::ConfirmRewrite { then, .. }) => then,
+        _ => unreachable!(),
+    };
+    app.confirm_rewrite(doc, &path, then);
+    app.prompts(&ctx);
+    assert!(app.tabs.is_empty(), "quitting did not go on");
+    assert!(!contains(&std::fs::read(&a).unwrap(), "REMOVED-A"));
+}
+
+#[test]
+fn protected_documents_get_no_recovery_copy_and_saving_retires_one() {
+    let dir = scratch();
+    let mut options = ProtectionOptions::new("", "owner pw");
+    options.allow_copying = false;
+    let protected = dir.join("protected.pdf");
+    std::fs::write(&protected, document(&["PROTECTED"]).to_encrypted_bytes(&options).unwrap()).unwrap();
+    let a = plain(&dir, "a.pdf", &["A"]);
+    let mut app = app(&dir);
+    let tick = |app: &mut CarbideApp| {
+        app.last_autosave = Instant::now() - Duration::from_secs(24 * 3600);
+        app.autosave_tick();
+    };
+
+    app.open_path(&protected);
+    assert!(app.doc.as_ref().unwrap().saved.as_ref().unwrap().is_protected());
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    tick(&mut app);
+    assert_eq!(recovery_copies(&dir), 0, "a protected document was copied unencrypted");
+    assert!(app.save_revision("v1").is_err(), "revisions of protected documents are refused");
+
+    app.open_path(&a);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    tick(&mut app);
+    assert_eq!(recovery_copies(&dir), 1);
+    // Saving a revision saves the document, so its recovery copy is no longer needed.
+    app.save_revision("v1").unwrap();
+    assert!(!app.doc.as_ref().unwrap().dirty);
+    assert_eq!(recovery_copies(&dir), 0);
+}

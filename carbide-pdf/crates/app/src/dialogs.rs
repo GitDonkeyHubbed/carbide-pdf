@@ -136,19 +136,32 @@ impl SignRequest {
     }
 }
 
+/// What is carried out once a save has written the file.
+pub enum AfterSave {
+    Nothing,
+    /// Sign the saved file.
+    Sign(Box<SignRequest>),
+    /// Close the saved document's tab (the close prompt's Save).
+    CloseTab,
+    /// Save the other modified documents and quit (the quit prompt's Save All).
+    Quit,
+}
+
 pub enum Dialog {
     Sign(Box<SignRequest>),
     Signatures { reports: Vec<SignatureReport>, notice: String },
     Message(String),
     Password { path: PathBuf, bytes: Vec<u8>, input: String, failed: bool },
-    /// Saving to `path` has to write the whole file again, which costs its signatures or its saved
-    /// revisions. `then_sign` is a signing request waiting for the save.
+    /// Saving document `doc` to `path` has to write the whole file again, which costs its
+    /// signatures or its saved revisions. `then` waits for the save. The question is dropped as
+    /// soon as another document comes to the front.
     ConfirmRewrite {
+        doc: u64,
         path: PathBuf,
         content_removed: bool,
         breaks_signatures: bool,
         drops_revisions: bool,
-        then_sign: Option<Box<SignRequest>>,
+        then: AfterSave,
     },
     Watermark(WatermarkForm),
     Bates(BatesForm),
@@ -421,7 +434,7 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::ConfirmRewrite { path, content_removed, breaks_signatures, drops_revisions, then_sign } => {
+        Dialog::ConfirmRewrite { doc, path, content_removed, breaks_signatures, drops_revisions, then } => {
             window("Save").show(ctx, |ui| {
                 ui.set_max_width(420.0);
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -438,8 +451,8 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                 }
                 let (ok, cancel) = buttons(ui, "Save", true);
                 if ok {
-                    let (path, then_sign) = (path.clone(), then_sign.take());
-                    app.write_to(&path, true, then_sign);
+                    let then = std::mem::replace(then, AfterSave::Nothing);
+                    app.confirm_rewrite(*doc, &path.clone(), then);
                     open = false;
                 }
                 open &= !cancel;
@@ -1083,7 +1096,7 @@ fn reduce_current(app: &mut CarbideApp, slider: u8) -> bool {
     let before = doc.saved.as_ref().map(|s| s.bytes().len());
     let mut copy = doc.pdf.clone();
     match copy.reduce(&ReduceOptions { image_factor: slider }, before) {
-        Ok((bytes, report)) => match std::fs::write(&path, bytes) {
+        Ok((bytes, report)) => match carbide_engine::fs::write_replacing(&path, &bytes) {
             Ok(()) => {
                 app.status = format!(
                     "Reduced {} -> {} bytes ({} images re-encoded, {} streams merged).",
