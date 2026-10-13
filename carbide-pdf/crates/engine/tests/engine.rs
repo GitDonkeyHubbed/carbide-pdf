@@ -581,6 +581,141 @@ fn deleted_pages_leave_nothing_behind() {
     assert_eq!(Pdf::from_bytes(&bytes).unwrap().page_count(), 1);
 }
 
+/// Four pages (`PAGE1X` to `PAGE4X`) and everything that leads to a page from outside the page
+/// tree: outline items (one by explicit destination, one by named destination, one by go-to
+/// action, and "Part Two" with an item below it), named destinations in the catalog and in the
+/// name tree, an open action, links, an article thread, and page labels i, ii, 1, 2. Everything
+/// whose name starts with "Secret" leads to the second page.
+fn navigable_pdf() -> Pdf {
+    let mut pdf = numbered_pages(4);
+    let ids = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let dest = |page: lopdf::ObjectId| Object::Array(vec![Object::Reference(page), "Fit".into()]);
+    let title = |text: &str| Object::string_literal(text);
+
+    let root = doc.new_object_id();
+    let intro = doc.add_object(dictionary! { "Title" => title("Intro Chapter"), "Parent" => root, "Dest" => dest(ids[0]) });
+    let secret = doc.add_object(dictionary! { "Title" => title("SECRET CHAPTER"), "Parent" => root, "Dest" => title("SecretPlace") });
+    let closing = doc.add_object(dictionary! {
+        "Title" => title("Closing Chapter"), "Parent" => root, "A" => dictionary! { "S" => "GoTo", "D" => dest(ids[2]) },
+    });
+    let part = doc.add_object(dictionary! { "Title" => title("Part Two"), "Parent" => root, "Dest" => "SecretName", "Count" => 1 });
+    let appendix = doc.add_object(dictionary! { "Title" => title("Appendix"), "Parent" => part, "Dest" => dest(ids[3]) });
+    let link = |doc: &mut Document, id, key: &str, value| doc.get_dictionary_mut(id).unwrap().set(key, Object::Reference(value));
+    for (a, b) in [(intro, secret), (secret, closing), (closing, part)] {
+        link(doc, a, "Next", b);
+        link(doc, b, "Prev", a);
+    }
+    link(doc, part, "First", appendix);
+    link(doc, part, "Last", appendix);
+    doc.objects.insert(root, Object::Dictionary(dictionary! { "Type" => "Outlines", "First" => intro, "Last" => part, "Count" => 5 }));
+
+    let bead = |doc: &mut Document, page: lopdf::ObjectId| {
+        doc.add_object(dictionary! { "Type" => "Bead", "P" => page, "R" => vec![0.into(), 0.into(), 100.into(), 100.into()] })
+    };
+    let (first_bead, second_bead) = (bead(doc, ids[1]), bead(doc, ids[2]));
+    let thread = doc.add_object(dictionary! { "Type" => "Thread", "F" => first_bead, "I" => dictionary! { "Title" => title("Secret Article") } });
+    for (bead, other) in [(first_bead, second_bead), (second_bead, first_bead)] {
+        let dict = doc.get_dictionary_mut(bead).unwrap();
+        dict.set("T", thread);
+        dict.set("N", other);
+        dict.set("V", other);
+    }
+    for (page, target, bead) in [(ids[0], ids[1], None), (ids[2], ids[3], Some(second_bead)), (ids[1], ids[0], Some(first_bead))] {
+        let annotation = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Link", "Rect" => vec![0.into(), 0.into(), 50.into(), 50.into()], "Dest" => dest(target),
+        });
+        let page = doc.get_dictionary_mut(page).unwrap();
+        page.set("Annots", vec![Object::Reference(annotation)]);
+        if let Some(bead) = bead {
+            page.set("B", vec![Object::Reference(bead)]);
+        }
+    }
+
+    let catalog = doc.catalog_mut().unwrap();
+    catalog.set("Outlines", root);
+    catalog.set("Dests", dictionary! { "SecretName" => dest(ids[1]), "Kept" => dest(ids[0]) });
+    catalog.set("Names", dictionary! { "Dests" => dictionary! { "Names" => vec![title("Intro"), dest(ids[0]), title("SecretPlace"), dest(ids[1])] } });
+    catalog.set("OpenAction", dest(ids[1]));
+    catalog.set("Threads", vec![Object::Reference(thread)]);
+    catalog.set("PageLabels", dictionary! { "Nums" => vec![0.into(), dictionary! { "S" => "r" }.into(), 2.into(), dictionary! { "S" => "D" }.into()] });
+    let bytes = pdf.to_bytes().unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
+/// The titles of the outline items below `parent`, in order, each with the titles below it.
+fn outline(pdf: &Pdf, parent: lopdf::ObjectId) -> Vec<(String, Vec<String>)> {
+    let doc = pdf.document();
+    let mut items = Vec::new();
+    let mut next = doc.get_dictionary(parent).unwrap().get(b"First").and_then(Object::as_reference).ok();
+    while let Some(id) = next {
+        let item = doc.get_dictionary(id).unwrap();
+        let title = String::from_utf8_lossy(item.get(b"Title").unwrap().as_str().unwrap()).into_owned();
+        items.push((title, outline(pdf, id).into_iter().map(|(t, _)| t).collect()));
+        next = item.get(b"Next").and_then(Object::as_reference).ok();
+    }
+    items
+}
+
+#[test]
+fn deleting_a_page_takes_out_what_leads_only_to_it() {
+    let mut pdf = navigable_pdf();
+    let old = pdf.page_ids();
+    pdf.delete_pages(&[1]).unwrap();
+    let bytes = file_bytes(&mut pdf);
+    for needle in ["SECRET CHAPTER", "SecretPlace", "SecretName", "PAGE2X"] {
+        assert_gone(&bytes, needle);
+    }
+    let pdf = Pdf::from_bytes(&bytes).unwrap();
+    let doc = pdf.document();
+    let catalog = doc.catalog().unwrap();
+    assert_eq!(pdf.page_count(), 3);
+
+    // "Part Two" led to the deleted page, but stays (without a destination) for the item below it.
+    let root = catalog.get(b"Outlines").unwrap().as_reference().unwrap();
+    let titles = outline(&pdf, root);
+    let expected = [("Intro Chapter", vec![]), ("Closing Chapter", vec![]), ("Part Two", vec!["Appendix".to_string()])];
+    assert_eq!(titles, expected.map(|(t, below)| (t.to_string(), below)));
+    assert_eq!(doc.get_dictionary(root).unwrap().get(b"Count").unwrap().as_i64().unwrap(), 4);
+    let part = doc.get_dictionary(root).unwrap().get(b"Last").unwrap().as_reference().unwrap();
+    assert!(!doc.get_dictionary(part).unwrap().has(b"Dest"));
+
+    assert!(!catalog.has(b"OpenAction"));
+    let dests = catalog.get(b"Dests").unwrap().as_dict().unwrap();
+    assert_eq!(dests.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), [b"Kept".to_vec()]);
+    let labels = catalog.get(b"PageLabels").unwrap().as_dict().unwrap().get(b"Nums").unwrap().as_array().unwrap();
+    assert_eq!(labels.len(), 4, "{labels:?}");
+    assert_eq!((labels[0].as_i64().unwrap(), labels[2].as_i64().unwrap()), (0, 1), "i, 1, 2: {labels:?}");
+    assert_eq!(labels[3].as_dict().unwrap().get(b"S").unwrap().as_name().unwrap(), b"D");
+
+    // The link to the deleted page is gone; the one to a page that stays is not.
+    let link = |page: usize| pdf.annotations(page).unwrap()[0].clone();
+    assert!(!link(0).has(b"Dest"));
+    assert_eq!(link(1).get(b"Dest").unwrap().as_array().unwrap()[0].as_reference().unwrap(), old[3]);
+
+    // The article keeps its bead on the page that stays.
+    let thread = catalog.get(b"Threads").unwrap().as_array().unwrap()[0].as_reference().unwrap();
+    let bead = doc.get_dictionary(thread).unwrap().get(b"F").unwrap().as_reference().unwrap();
+    let bead_dict = doc.get_dictionary(bead).unwrap();
+    assert_eq!(bead_dict.get(b"P").unwrap().as_reference().unwrap(), old[2]);
+    assert_eq!(bead_dict.get(b"N").unwrap().as_reference().unwrap(), bead);
+}
+
+#[test]
+fn page_labels_carry_on_where_a_page_was_deleted() {
+    let mut pdf = navigable_pdf();
+    // i, ii, 1, 2 without the "1": i, ii, 2.
+    pdf.delete_pages(&[2]).unwrap();
+    let catalog = pdf.document().catalog().unwrap();
+    let labels = catalog.get(b"PageLabels").unwrap().as_dict().unwrap().get(b"Nums").unwrap().as_array().unwrap().clone();
+    assert_eq!(labels.len(), 4, "{labels:?}");
+    assert_eq!((labels[0].as_i64().unwrap(), labels[2].as_i64().unwrap()), (0, 2));
+    let decimal = labels[3].as_dict().unwrap();
+    assert_eq!((decimal.get(b"S").unwrap().as_name().unwrap(), decimal.get(b"St").unwrap().as_i64().unwrap()), (&b"D"[..], 2));
+    // "Closing Chapter" led to the deleted page; the other three items stay.
+    assert_eq!(outline(&pdf, catalog.get(b"Outlines").unwrap().as_reference().unwrap()).len(), 3);
+}
+
 /// One page per label, built the way word processors and form tools write them, so that other
 /// parts of the document point into every page:
 /// - each page draws its label, and a form XObject showing `FORM-<label>` from a resource

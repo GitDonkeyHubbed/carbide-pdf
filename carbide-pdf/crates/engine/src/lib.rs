@@ -18,6 +18,7 @@ pub mod geometry;
 pub mod imposition;
 pub mod imposition_plan;
 pub mod incremental;
+mod navigation;
 pub mod ocr;
 pub mod pdf;
 pub mod redact;

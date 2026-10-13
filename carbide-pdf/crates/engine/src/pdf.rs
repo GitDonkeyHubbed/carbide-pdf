@@ -232,7 +232,9 @@ impl Pdf {
     }
 
     /// Deletes pages. A document must keep at least one page. Nothing of a deleted page stays in
-    /// the document: its form fields, its tags and the resources only it used go with it.
+    /// the document: its form fields, its tags and the resources only it used go with it, and so do
+    /// the outline items, named destinations and other entries that lead only to it. The pages that
+    /// stay keep their page labels.
     pub fn delete_pages(&mut self, pages: &[usize]) -> Result<()> {
         let count = self.page_count();
         let mut unique: Vec<usize> = pages.to_vec();
@@ -250,8 +252,13 @@ impl Pdf {
         // signature only sits on a page because every field has to; it is not the page's content.
         self.drop_form_fields_on(&doomed, &|_, widget, signature| !signature || widget_area(widget).is_some());
         self.drop_structure_of(&doomed);
+        self.drop_navigation_to(&doomed);
+        let labels = self.page_labels_without(&unique);
         let numbers: Vec<u32> = unique.iter().map(|&p| p as u32 + 1).collect();
         self.doc.delete_pages(&numbers);
+        if let Some(labels) = labels {
+            self.doc.catalog_mut()?.set("PageLabels", labels);
+        }
         self.trim_resources()
     }
 
