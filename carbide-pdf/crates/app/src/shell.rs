@@ -584,12 +584,15 @@ impl CarbideApp {
     /// Saves every modified document, then quits. Documents that save without a question go
     /// first; then the first one that has to ask does, and quitting carries on once it is answered.
     pub(crate) fn save_all_and_quit(&mut self, ctx: &egui::Context) {
-        let indices: Vec<usize> = (0..self.tabs.len()).filter(|&i| self.tab_label(i).1).collect();
+        // Followed by document, not by tab: a save can close another tab on the same file.
+        let modified: Vec<u64> =
+            (0..self.tabs.len()).filter(|&i| self.tab_label(i).1).filter_map(|i| self.doc_at(i).map(|d| d.id)).collect();
         let mut asks = None;
-        for index in indices {
+        for id in modified {
+            let Some(index) = self.tab_of(id) else { continue };
             self.activate(Some(index));
             if self.save_needs_question() {
-                asks.get_or_insert(index);
+                asks.get_or_insert(id);
             } else {
                 self.save();
             }
@@ -598,7 +601,7 @@ impl CarbideApp {
         if self.dialog.is_some() {
             return;
         }
-        if let Some(index) = asks {
+        if let Some(index) = asks.and_then(|id| self.tab_of(id)) {
             self.shell.quit_prompt = false;
             self.activate(Some(index));
             return self.save_then(AfterSave::Quit);

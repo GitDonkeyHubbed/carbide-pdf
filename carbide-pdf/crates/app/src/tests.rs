@@ -492,6 +492,7 @@ fn a_recovered_document_is_unsaved_and_replaces_its_original_only_when_agreed() 
     let doc = app.doc.as_ref().expect("the recovered copy is open");
     assert_eq!(doc.title(), "contract.pdf (recovered)");
     assert!(doc.path.is_none() && doc.dirty, "it is shown as unsaved and has no file of its own");
+    assert_eq!(doc.file_name(), "contract.pdf", "Save As suggests the original's name");
     assert_eq!(doc.pdf.page_rotation(0).unwrap(), 90);
     assert!(!std::env::temp_dir().join("contract.pdf (recovered).pdf").exists());
 
@@ -519,6 +520,54 @@ fn a_recovered_document_is_unsaved_and_replaces_its_original_only_when_agreed() 
     assert!(open.recovered.is_none());
     assert!(app.autosave.as_ref().unwrap().panel_rows().is_empty());
     assert_eq!(recovery_copies(&dir), 0);
+}
+
+#[test]
+fn replacing_the_original_leaves_no_other_tab_showing_the_old_file() {
+    let dir = scratch();
+    let original = plain(&dir, "contract.pdf", &["ORIGINAL"]);
+    crashed_session(&dir, &[Some(&original)]);
+    let mut app = app(&dir);
+    let rows = app.autosave.as_ref().unwrap().panel_rows();
+    let record = rows[0].record;
+    let mut question = None;
+    let rotation_on_disk = || Pdf::open(&original).unwrap().page_rotation(0).unwrap();
+
+    // Both rows open: the file as saved, with an unsaved edit, and the recovered copy.
+    recovery_action(&mut app, &mut question, RecoveryAction::Open(record, RowKind::Original));
+    let saved_tab = app.active_tab.unwrap();
+    app.edit("Note", |p| p.add_note(0, 100.0, 100.0, "EDITED IN THE OTHER TAB"));
+    recovery_action(&mut app, &mut question, RecoveryAction::Open(record, RowKind::Recovered));
+    let recovered = active_id(&app);
+
+    // Replacing the file would lose that edit, or have it saved back over the recovered work later.
+    app.save();
+    let Some(Dialog::ReplaceOriginal { doc, path, .. }) = app.dialog.take() else { panic!("saving did not ask") };
+    app.replace_original(doc, &path, AfterSave::Nothing);
+    let Some(Dialog::Message(message)) = app.dialog.take() else { panic!("replacing went ahead") };
+    assert!(message.contains("also open in another tab"), "{message}");
+    assert_eq!(rotation_on_disk(), 0);
+    assert!(app.doc.as_ref().unwrap().saved.is_none(), "the recovered document was tied to the file anyway");
+
+    // Once that tab is saved, replacing goes ahead, and the tab showing the old file goes.
+    app.activate(Some(saved_tab));
+    app.save();
+    let recovered_tab = (0..app.tabs.len()).find(|&i| app.doc_at(i).is_some_and(|d| d.id == recovered)).unwrap();
+    app.activate(Some(recovered_tab));
+    app.save();
+    let Some(Dialog::ReplaceOriginal { doc, path, .. }) = app.dialog.take() else { panic!("saving did not ask") };
+    app.replace_original(doc, &path, AfterSave::Nothing);
+    assert!(app.dialog.is_none(), "{}", app.status);
+    assert_eq!(rotation_on_disk(), 90);
+    assert_eq!(app.tabs.len(), 1);
+    assert_eq!(app.doc.as_ref().unwrap().path.as_deref(), Some(original.as_path()));
+
+    // Nothing else can write the old state back over it.
+    app.open_path(&original);
+    assert_eq!(app.tabs.len(), 1);
+    app.edit("Note", |p| p.add_note(0, 100.0, 100.0, "LATER"));
+    app.save();
+    assert_eq!(rotation_on_disk(), 90);
 }
 
 #[test]

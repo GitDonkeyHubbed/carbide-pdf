@@ -185,6 +185,21 @@ impl OpenDoc {
             .or_else(|| self.name.clone())
             .unwrap_or_else(|| "Untitled".into())
     }
+
+    /// The name Save As suggests: that of the file a recovered document was recovered for, or else
+    /// the title, as a PDF file name.
+    pub fn file_name(&self) -> String {
+        let recovered_for = self.recovered.as_ref().and_then(|r| r.original.as_ref()).and_then(|p| p.file_name());
+        let name = match recovered_for {
+            Some(name) => name.to_string_lossy().into_owned(),
+            None => self.title().trim_end_matches(" (recovered)").to_string(),
+        };
+        if name.to_ascii_lowercase().ends_with(".pdf") {
+            name
+        } else {
+            format!("{name}.pdf")
+        }
+    }
 }
 
 type OcrResult = Result<(Pdf, carbide_engine::ocr::OcrReport), String>;
@@ -448,6 +463,11 @@ impl CarbideApp {
         }
     }
 
+    /// The tab that shows document `id`.
+    fn tab_of(&self, id: u64) -> Option<usize> {
+        (0..self.tabs.len()).find(|&i| self.doc_at(i).is_some_and(|d| d.id == id))
+    }
+
     /// Moves the active document back into its tab slot, together with its view state.
     fn park_active(&mut self) {
         let Some(index) = self.active_tab else { return };
@@ -682,11 +702,15 @@ impl CarbideApp {
                 path.display()
             ));
         }
-        let Some(doc) = self.doc.as_mut() else { return };
-        if confirmed.is_some_and(|id| id != doc.id) {
+        if self.doc.as_ref().is_some_and(|doc| confirmed.is_some_and(|id| id != doc.id)) {
             self.status = "Nothing was saved: the question was about a document that is no longer in front.".into();
             return;
         }
+        if self.refuse_over_unsaved_tab(path) {
+            return;
+        }
+        let others = self.other_tabs_on(path);
+        let Some(doc) = self.doc.as_mut() else { return };
         let plan = match doc.pdf.save_plan(doc.saved.as_ref(), doc.content_removed) {
             Ok(plan) => plan,
             Err(e) => return self.alert(format!("Could not save {}: {e}", path.display())),
@@ -724,6 +748,11 @@ impl CarbideApp {
             doc.adopt_saved(bytes)
         };
         self.after_writing(path);
+        // The other tabs on the file have nothing unsaved (checked above) and show the old file:
+        // this document is that file now.
+        for index in others.into_iter().rev() {
+            self.close_tab(index);
+        }
         self.status = format!("Saved {}", path.display());
         if let Err(e) = reloaded {
             return self.alert(format!("Saved {}, but could not read it back: {e}", path.display()));
@@ -787,10 +816,14 @@ impl CarbideApp {
     /// Answers yes to replacing `path`, the file the recovered document `doc` was recovered for:
     /// it is saved over it the way Save saves, against the file as it is on disk now.
     pub fn replace_original(&mut self, doc: u64, path: &Path, then: AfterSave) {
-        let Some(open) = self.doc.as_mut().filter(|d| d.id == doc) else {
+        if self.doc.as_ref().is_none_or(|d| d.id != doc) {
             self.status = "Nothing was saved: the question was about a document that is no longer in front.".into();
             return;
-        };
+        }
+        if self.refuse_over_unsaved_tab(path) {
+            return;
+        }
+        let Some(open) = self.doc.as_mut() else { return };
         let read = std::fs::read(path).map_err(EngineError::from).and_then(|bytes| SavedFile::open(bytes, None));
         match read {
             Ok((_, saved)) => {
@@ -802,6 +835,31 @@ impl CarbideApp {
                 path.display()
             )),
         }
+    }
+
+    /// Says so and returns true when `path` is open in another tab with unsaved changes. Writing
+    /// over it would leave that tab showing what is no longer on disk, and its next save would put
+    /// that back over what was written.
+    fn refuse_over_unsaved_tab(&mut self, path: &Path) -> bool {
+        let unsaved = self.other_tabs_on(path).into_iter().any(|i| self.doc_at(i).is_some_and(|d| d.dirty));
+        if unsaved {
+            self.alert(format!(
+                "{} is also open in another tab, with changes that are not saved. Save or close that tab first, \
+                 or use Save As to keep both.",
+                path.display()
+            ));
+        }
+        unsaved
+    }
+
+    /// The tabs other than the active one whose document is the file `path`, in tab order.
+    fn other_tabs_on(&self, path: &Path) -> Vec<usize> {
+        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let wanted = canonical(path);
+        (0..self.tabs.len())
+            .filter(|&i| Some(i) != self.active_tab)
+            .filter(|&i| self.doc_at(i).and_then(|d| d.path.as_deref()).is_some_and(|p| canonical(p) == wanted))
+            .collect()
     }
 
     /// True for a place Save never writes to: the Auto Recovery folder, or a private temporary
@@ -818,7 +876,7 @@ impl CarbideApp {
     }
 
     pub fn save_as_then(&mut self, then: AfterSave) {
-        let name = self.doc.as_ref().map(|d| d.title()).unwrap_or_else(|| "Untitled.pdf".into());
+        let name = self.doc.as_ref().map(OpenDoc::file_name).unwrap_or_else(|| "Untitled.pdf".into());
         if let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name(name).save_file() {
             self.write_to(&path, None, then);
         }
