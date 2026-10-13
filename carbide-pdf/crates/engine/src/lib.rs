@@ -5,6 +5,7 @@
 
 pub mod annotate;
 pub mod autosave;
+mod cms;
 pub mod compare;
 mod content;
 mod crypt;

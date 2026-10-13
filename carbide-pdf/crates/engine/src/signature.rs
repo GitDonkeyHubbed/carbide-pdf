@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256, Sha384, Sha512};
 use x509_cert::der::{Decode, Encode};
 use x509_cert::Certificate;
 
+use crate::cms;
 use crate::der;
 use crate::error::{Error, Result};
 use crate::fonts::{literal_string, win_ansi};
@@ -765,66 +766,6 @@ pub fn notice_text(reports: &[SignatureReport]) -> Option<&'static str> {
     Some(messages::NOTICE_ALL_VALID)
 }
 
-#[derive(Debug)]
-struct ParsedCms {
-    certificates: Vec<Vec<u8>>,
-    digest_oid: String,
-    signed_attributes: Option<Vec<u8>>,
-    message_digest: Option<Vec<u8>>,
-    signature: Vec<u8>,
-    sid_issuer: Vec<u8>,
-    sid_serial: Vec<u8>,
-    has_timestamp: bool,
-}
-
-fn parse_cms(data: &[u8]) -> Option<ParsedCms> {
-    let (content_info, _) = der::read(data)?;
-    if content_info.tag != der::SEQUENCE {
-        return None;
-    }
-    let parts = der::children(content_info.content);
-    let explicit = parts.get(1)?;
-    let (signed_data, _) = der::read(explicit.content)?;
-    let fields = der::children(signed_data.content);
-    let mut certificates = Vec::new();
-    let mut signer_infos = None;
-    for field in fields.iter().skip(3) {
-        match field.tag {
-            0xA0 => certificates = der::children(field.content).iter().map(|c| c.raw.to_vec()).collect(),
-            0x31 => signer_infos = Some(field),
-            _ => {}
-        }
-    }
-    let signer = der::children(signer_infos?.content).into_iter().next()?;
-    let parts = der::children(signer.content);
-    let sid = parts.get(1)?;
-    let sid_parts = der::children(sid.content);
-    let (sid_issuer, sid_serial) = (sid_parts.first()?.raw.to_vec(), sid_parts.get(1)?.raw.to_vec());
-    let digest_alg = der::children(parts.get(2)?.content);
-    let digest_oid = der::oid_to_string(digest_alg.first()?.content);
-
-    let mut index = 3;
-    let mut signed_attributes = None;
-    let mut message_digest = None;
-    if parts.get(index)?.tag == 0xA0 {
-        let attrs = parts[index];
-        for attr in der::children(attrs.content) {
-            let kids = der::children(attr.content);
-            if kids.first().map(|o| der::oid_to_string(o.content)).as_deref() == Some("1.2.840.113549.1.9.4") {
-                if let Some(values) = kids.get(1) {
-                    message_digest = der::children(values.content).first().map(|v| v.content.to_vec());
-                }
-            }
-        }
-        signed_attributes = Some(attrs.content.to_vec());
-        index += 1;
-    }
-    index += 1; // signatureAlgorithm
-    let signature = parts.get(index)?.content.to_vec();
-    let has_timestamp = parts.iter().skip(index + 1).any(|p| p.tag == 0xA1);
-    Some(ParsedCms { certificates, digest_oid, signed_attributes, message_digest, signature, sid_issuer, sid_serial, has_timestamp })
-}
-
 fn digest_by_oid(oid: &str, parts: &[&[u8]]) -> Option<Vec<u8>> {
     fn run<D: Digest>(parts: &[&[u8]]) -> Vec<u8> {
         let mut h = D::new();
@@ -1029,18 +970,19 @@ fn verify_one(
         invalid(&mut report, Detail::Corrupt);
         return report;
     };
-    let Some(cms) = parse_cms(&contents) else {
-        if report.document_time_stamp && der::read(&contents).is_some() {
+    let Some(cms) = cms::parse_signed_data(&contents) else {
+        if report.document_time_stamp && der::read_ber(&contents).is_some() {
             // A time-stamp token: the digest check is done below; the TSA signature is not.
             return verify_document_timestamp(report, &contents, file, b as usize, c as usize);
         }
         invalid(&mut report, Detail::Corrupt);
         return report;
     };
-    report.has_embedded_timestamp = cms.has_timestamp;
+    let signer_info = &cms.signer;
+    report.has_embedded_timestamp = !signer_info.unsigned_attributes.is_empty();
 
     let covered: [&[u8]; 2] = [&file[..b as usize], &file[c as usize..(c + d) as usize]];
-    let Some(content_digest) = digest_by_oid(&cms.digest_oid, &covered) else {
+    let Some(content_digest) = digest_by_oid(&signer_info.digest_algorithm, &covered) else {
         invalid(&mut report, Detail::UnsupportedFilter);
         return report;
     };
@@ -1049,9 +991,12 @@ fn verify_one(
     let certificates: Vec<Certificate> = cms.certificates.iter().filter_map(|d| Certificate::from_der(d).ok()).collect();
     let signer = certificates
         .iter()
-        .find(|c| {
-            c.tbs_certificate.issuer.to_der().ok().as_deref() == Some(cms.sid_issuer.as_slice())
-                && c.tbs_certificate.serial_number.to_der().ok().as_deref() == Some(cms.sid_serial.as_slice())
+        .find(|c| match &signer_info.id {
+            cms::SignerId::IssuerAndSerial { issuer, serial } => {
+                c.tbs_certificate.issuer.to_der().ok().as_ref() == Some(issuer)
+                    && c.tbs_certificate.serial_number.to_der().ok().as_ref() == Some(serial)
+            }
+            cms::SignerId::KeyIdentifier => false,
         })
         .or_else(|| certificates.first());
     let Some(signer) = signer else {
@@ -1067,20 +1012,19 @@ fn verify_one(
     }
 
     // 4. Integrity: message digest and signature value.
-    let signature_ok = match &cms.signed_attributes {
-        Some(attrs) => {
-            if cms.message_digest.as_deref() != Some(content_digest.as_slice()) {
+    let digest_oid = &signer_info.digest_algorithm;
+    let signature_ok = match &signer_info.signed_attributes {
+        Some(_) => {
+            if signer_info.message_digest.as_deref() != Some(content_digest.as_slice()) {
                 invalid(&mut report, Detail::DigestMismatch);
                 return report;
             }
-            let as_set = der::tlv(der::SET, attrs);
-            match digest_by_oid(&cms.digest_oid, &[&as_set]) {
-                Some(d) => rsa_verify(&public_key, &cms.digest_oid, &d, &cms.signature),
-                None => false,
-            }
+            signer_info.signed_attribute_encodings().iter().any(|set| {
+                digest_by_oid(digest_oid, &[set]).is_some_and(|d| rsa_verify(&public_key, digest_oid, &d, &signer_info.signature))
+            })
         }
         None => {
-            if !rsa_verify(&public_key, &cms.digest_oid, &content_digest, &cms.signature) {
+            if !rsa_verify(&public_key, digest_oid, &content_digest, &signer_info.signature) {
                 // No message digest to compare: a failing signature means altered content.
                 invalid(&mut report, Detail::DigestMismatch);
                 return report;

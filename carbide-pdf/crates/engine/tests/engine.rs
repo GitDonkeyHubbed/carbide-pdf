@@ -1820,6 +1820,88 @@ fn time_stamps_are_embedded_and_document_time_stamps_check_the_imprint() {
     assert_eq!(verify(&tampered, &TrustStore::default())[0].validity, Validity::Invalid);
 }
 
+/// The `/ByteRange` of the last signature in `file`.
+fn byte_range(file: &[u8]) -> [usize; 4] {
+    let at = file.windows(10).rposition(|w| w == b"/ByteRange").unwrap();
+    let open = at + file[at..].iter().position(|b| *b == b'[').unwrap();
+    let close = open + file[open..].iter().position(|b| *b == b']').unwrap();
+    let numbers: Vec<usize> =
+        std::str::from_utf8(&file[open + 1..close]).unwrap().split_whitespace().map(|n| n.parse().unwrap()).collect();
+    numbers.try_into().unwrap()
+}
+
+/// Tag, header length and total length of the DER element at the front of `data`.
+fn der_header(data: &[u8]) -> (u8, usize, usize) {
+    let first = data[1] as usize;
+    if first < 0x80 {
+        return (data[0], 2, 2 + first);
+    }
+    let n = first & 0x7F;
+    let len = data[2..2 + n].iter().fold(0usize, |len, b| (len << 8) | *b as usize);
+    (data[0], 2 + n, 2 + n + len)
+}
+
+/// The CMS in the last signature's `/Contents`, without the zero padding after it.
+fn signature_value(file: &[u8]) -> Vec<u8> {
+    let [_, b, c, _] = byte_range(file);
+    let hex = std::str::from_utf8(&file[b + 1..c - 1]).unwrap();
+    let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+    let (_, _, total) = der_header(&bytes);
+    bytes[..total].to_vec()
+}
+
+/// Writes `cms` into the last signature's `/Contents`, zero-padded to the reserved size.
+fn put_signature_value(file: &mut [u8], cms: &[u8]) {
+    let [_, b, c, _] = byte_range(file);
+    let hex: String = cms.iter().map(|b| format!("{b:02X}")).collect();
+    assert!(hex.len() <= c - b - 2, "the signature does not fit");
+    let slot = &mut file[b + 1..c - 1];
+    slot.fill(b'0');
+    slot[..hex.len()].copy_from_slice(hex.as_bytes());
+}
+
+/// `der` written again with indefinite lengths on every constructed element, as BER signers do,
+/// except the elements `keep` selects by their path of child positions (and what is inside them).
+fn to_ber(der: &[u8], path: &mut Vec<usize>, keep: &dyn Fn(&[usize]) -> bool) -> Vec<u8> {
+    let (tag, header, total) = der_header(der);
+    if tag & 0x20 == 0 || keep(path) {
+        return der[..total].to_vec();
+    }
+    let mut out = vec![tag, 0x80];
+    let mut rest = &der[header..total];
+    for index in 0.. {
+        if rest.is_empty() {
+            break;
+        }
+        let (_, _, len) = der_header(rest);
+        path.push(index);
+        let child = to_ber(&rest[..len], path, keep);
+        path.pop();
+        out.extend(child);
+        rest = &rest[len..];
+    }
+    out.extend([0, 0]);
+    out
+}
+
+#[test]
+fn signatures_in_ber_with_indefinite_lengths_verify() {
+    let mut doc = text_pdf(&[&["ber"]]);
+    let base = file_bytes(&mut doc);
+    for sub_filter in [SubFilter::Pkcs7Detached, SubFilter::CadesDetached] {
+        let mut signed = doc.sign(&base, &sign_options(sub_filter)).unwrap();
+        let der = signature_value(&signed);
+        // Every wrapper, the signer info and the signed attributes become indefinite-length; the
+        // certificates themselves stay DER, as they must for their own signatures to hold.
+        let ber = to_ber(&der, &mut Vec::new(), &|path: &[usize]| path.len() == 4 && path[..3] == [1, 0, 3]);
+        assert_ne!(ber, der);
+        assert_eq!(&ber[..2], &[0x30, 0x80]);
+        put_signature_value(&mut signed, &ber);
+        let reports = verify(&signed, &trust_test_identity());
+        assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly), "{sub_filter:?}");
+    }
+}
+
 #[test]
 fn identities_load_from_pem_and_pkcs12() {
     let id = test_identity();
