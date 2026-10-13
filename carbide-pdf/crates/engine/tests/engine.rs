@@ -2059,11 +2059,13 @@ fn signatures_on_owner_password_protected_files_verify() {
     assert_eq!(reports.len(), 1);
     assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
 
-    // And the covered (encrypted) bytes are still bound to it.
+    // And the covered (encrypted) bytes are still bound to it: one bit of the page content's
+    // ciphertext changes, which leaves the file's structure as it was.
     let mut tampered = signed.clone();
-    let [_, b, _, _] = byte_range(&signed);
-    tampered[b / 2] ^= 0x01;
-    assert_ne!(verify(&tampered, &trust_test_identity()).first().map(|r| r.validity), Some(Validity::Valid));
+    let data = signed.windows(7).position(|w| w == b"stream\n").unwrap() + 7;
+    tampered[data + 4] ^= 0x01;
+    let reports = verify(&tampered, &trust_test_identity());
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Invalid, Detail::DigestMismatch));
 }
 
 #[test]
