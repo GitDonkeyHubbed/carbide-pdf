@@ -70,9 +70,10 @@ impl Pdf {
         Ok(out)
     }
 
+    /// Writes the document to `path`, replacing a file there in one step.
     pub fn save(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let bytes = self.to_bytes()?;
-        std::fs::write(path, bytes)?;
+        crate::fs::write_replacing(path.as_ref(), &bytes)?;
         Ok(())
     }
 
