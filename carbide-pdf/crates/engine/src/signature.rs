@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, TimeZone, Utc};
+use lopdf::xref::XrefEntry;
 use lopdf::{dictionary, Dictionary, Object, ObjectId, Stream, StringFormat};
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
@@ -845,6 +846,174 @@ fn trust_level(signer: &Certificate, embedded: &[Certificate], store: &TrustStor
     None
 }
 
+/// `/ByteRange [0 b c d]` as offsets into `file`: the first range starts the file, the gap between
+/// the ranges is a hex string, and the second range ends inside the file.
+fn signed_range(v: &Dictionary, file: &[u8]) -> Option<(usize, usize, usize)> {
+    let range = integer_array(v.get(b"ByteRange").ok()).filter(|r| r.len() == 4)?;
+    let [a, b, c, d] = [range[0], range[1], range[2], range[3]].map(|n| usize::try_from(n).ok());
+    let (b, c, d) = (b?, c?, d?);
+    let end = c.checked_add(d)?;
+    let fits = a == Some(0) && b > 0 && c >= b + 2 && end <= file.len();
+    (fits && file[b] == b'<' && file[c - 1] == b'>').then_some((b, c, d))
+}
+
+/// Where the value of `/Contents` lies in the dictionary object `id` as stored in `file`, read
+/// from the bytes at the offset the cross-reference table gives for it.
+fn signature_value_span(pdf: &Pdf, id: ObjectId, file: &[u8]) -> Option<(usize, usize)> {
+    let XrefEntry::Normal { offset, generation } = pdf.doc.reference_table.get(id.0)? else { return None };
+    if u32::from(*generation) != u32::from(id.1) {
+        return None;
+    }
+    let mut lexer = RawLexer { file, at: *offset as usize };
+    for expected in [id.0.to_string().as_bytes(), id.1.to_string().as_bytes(), b"obj"] {
+        lexer.skip_space();
+        if lexer.token()? != expected {
+            return None;
+        }
+    }
+    lexer.skip_space();
+    if !file.get(lexer.at..)?.starts_with(b"<<") {
+        return None;
+    }
+    lexer.at += 2;
+    let mut span = None;
+    loop {
+        lexer.skip_space();
+        if file.get(lexer.at..)?.starts_with(b">>") {
+            return span;
+        }
+        let key = lexer.token()?;
+        lexer.skip_space();
+        let start = lexer.at;
+        lexer.value()?;
+        if key == b"/Contents" {
+            let hex = file.get(start) == Some(&b'<') && file.get(start + 1) != Some(&b'<');
+            span = hex.then_some((start, lexer.at));
+        }
+    }
+}
+
+/// The length of the `/Contents` string as the document was parsed.
+fn parsed_contents_length(v: &Dictionary) -> Option<usize> {
+    v.get(b"Contents").ok()?.as_str().ok().map(<[u8]>::len)
+}
+
+/// Hex digits only, an even number of them.
+fn hex_value(text: &[u8]) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    let digit = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    text.chunks(2).map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?)).collect()
+}
+
+/// True when the revision ending at `end` names cross-reference data of its own in the signed
+/// part: its last `startxref` lies after the gap and points outside it.
+fn revision_is_self_contained(file: &[u8], b: usize, c: usize, end: usize) -> bool {
+    let tail = &file[c..end];
+    let Some(at) = tail.windows(9).rposition(|w| w == b"startxref") else { return false };
+    let mut lexer = RawLexer { file: tail, at: at + 9 };
+    lexer.skip_space();
+    let offset = lexer.token().and_then(|t| std::str::from_utf8(t).ok()?.parse::<usize>().ok());
+    offset.is_some_and(|x| x < b || (c..end).contains(&x))
+}
+
+/// Just enough of the PDF syntax to step over the values in a dictionary as written in the file.
+struct RawLexer<'a> {
+    file: &'a [u8],
+    at: usize,
+}
+
+impl<'a> RawLexer<'a> {
+    fn peek(&self) -> Option<u8> {
+        self.file.get(self.at).copied()
+    }
+
+    fn skip_space(&mut self) {
+        while let Some(byte) = self.peek() {
+            match byte {
+                b'%' => {
+                    while self.peek().is_some_and(|b| b != b'\r' && b != b'\n') {
+                        self.at += 1;
+                    }
+                }
+                b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ' => self.at += 1,
+                _ => return,
+            }
+        }
+    }
+
+    /// A name (with its slash), number or keyword.
+    fn token(&mut self) -> Option<&'a [u8]> {
+        let start = self.at;
+        if self.peek() == Some(b'/') {
+            self.at += 1;
+        }
+        while self.peek().is_some_and(|b| !b"\0\t\n\x0c\r ()<>[]{}/%".contains(&b)) {
+            self.at += 1;
+        }
+        (self.at > start).then(|| &self.file[start..self.at])
+    }
+
+    /// Steps over one value: a string, array, dictionary, or a token (a number followed by
+    /// `G R` is a reference).
+    fn value(&mut self) -> Option<()> {
+        match self.peek()? {
+            b'(' => {
+                let mut depth = 0usize;
+                loop {
+                    match self.peek()? {
+                        b'\\' => self.at += 1,
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                self.at += 1;
+                                return Some(());
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.at += 1;
+                }
+            }
+            b'<' if self.file.get(self.at + 1) == Some(&b'<') => self.container(b">>", 2),
+            b'<' => {
+                self.at += self.file.get(self.at..)?.iter().position(|b| *b == b'>')? + 1;
+                Some(())
+            }
+            b'[' => self.container(b"]", 1),
+            _ => {
+                let token = self.token()?;
+                if token.iter().all(u8::is_ascii_digit) {
+                    let back = self.at;
+                    self.skip_space();
+                    let generation = self.token();
+                    self.skip_space();
+                    let keyword = self.token();
+                    if !(generation.is_some_and(|g| g.iter().all(u8::is_ascii_digit)) && keyword == Some(b"R".as_slice())) {
+                        self.at = back;
+                    }
+                }
+                Some(())
+            }
+        }
+    }
+
+    /// Steps over everything up to and including `close`, starting at an opening of `open_len` bytes.
+    fn container(&mut self, close: &[u8], open_len: usize) -> Option<()> {
+        self.at += open_len;
+        loop {
+            self.skip_space();
+            if self.file.get(self.at..)?.starts_with(close) {
+                self.at += close.len();
+                return Some(());
+            }
+            self.value()?;
+        }
+    }
+}
+
 fn text_of(dict: &Dictionary, key: &[u8]) -> Option<String> {
     dict.get(key).ok()?.as_str().ok().map(decode_text)
 }
@@ -943,37 +1112,32 @@ fn verify_one(
         return report;
     }
 
-    // 2. Byte range sanity.
-    let Some(range) = integer_array(v.get(b"ByteRange").ok()).filter(|r| r.len() == 4) else {
-        invalid(&mut report, Detail::Corrupt);
-        return report;
-    };
-    let (a, b, c, d) = (range[0], range[1], range[2], range[3]);
-    let consistent = a == 0
-        && b >= 0
-        && b <= c
-        && c >= 0
-        && d >= 0
-        && (c + d) as usize <= file.len()
-        && file.get(b as usize) == Some(&b'<')
-        && c >= 1
-        && file.get(c as usize - 1) == Some(&b'>');
-    if !consistent {
+    // 2. The byte range, bound to the signature value: the gap holds exactly this dictionary's
+    //    /Contents, the dictionary lies in the signed part, and so does the revision's own
+    //    cross-reference data.
+    let Some((b, c, d)) = signed_range(v, file) else {
         invalid(&mut report, Detail::BadByteRange);
         return report;
-    }
-    report.revision_end = (c + d) as usize;
+    };
+    report.revision_end = c + d;
     report.modified_after_signing = report.revision_end < file_end;
-
-    // 3. Parse the CMS (or time-stamp token).
-    let Some(contents) = v.get(b"Contents").ok().and_then(|o| o.as_str().ok()).map(|s| s.to_vec()) else {
-        invalid(&mut report, Detail::Corrupt);
+    let bound = signature_value_span(pdf, id, file) == Some((b, c))
+        && (pdf.doc.encryption_state.is_some() || parsed_contents_length(v).is_some_and(|len| 2 * len + 2 == c - b))
+        && revision_is_self_contained(file, b, c, c + d);
+    let Some(contents) = bound.then(|| hex_value(&file[b + 1..c - 1])).flatten() else {
+        invalid(&mut report, Detail::BadByteRange);
         return report;
     };
+
+    // 3. Parse the CMS (or time-stamp token). Only zero padding may follow it.
+    if der::read_ber(&contents).is_none_or(|(_, rest)| rest.iter().any(|byte| *byte != 0)) {
+        invalid(&mut report, Detail::Corrupt);
+        return report;
+    }
     let Some(cms) = cms::parse_signed_data(&contents) else {
         if report.document_time_stamp && der::read_ber(&contents).is_some() {
             // A time-stamp token: the digest check is done below; the TSA signature is not.
-            return verify_document_timestamp(report, &contents, file, b as usize, c as usize);
+            return verify_document_timestamp(report, &contents, file, b, c);
         }
         invalid(&mut report, Detail::Corrupt);
         return report;
@@ -981,7 +1145,7 @@ fn verify_one(
     let signer_info = &cms.signer;
     report.has_embedded_timestamp = !signer_info.unsigned_attributes.is_empty();
 
-    let covered: [&[u8]; 2] = [&file[..b as usize], &file[c as usize..(c + d) as usize]];
+    let covered: [&[u8]; 2] = [&file[..b], &file[c..c + d]];
     let Some(content_digest) = digest_by_oid(&signer_info.digest_algorithm, &covered) else {
         invalid(&mut report, Detail::UnsupportedFilter);
         return report;

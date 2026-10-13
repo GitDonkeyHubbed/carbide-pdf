@@ -1902,6 +1902,78 @@ fn signatures_in_ber_with_indefinite_lengths_verify() {
     }
 }
 
+/// Rewrites the four `/ByteRange` numbers in place (same widths), leaving every other byte and
+/// every cross-reference offset intact so the file still parses.
+fn set_byte_range(file: &mut [u8], range: [usize; 4]) {
+    let text = format!("{:010} {:010} {:010} {:010}", range[0], range[1], range[2], range[3]);
+    let at = file.windows(10).rposition(|w| w == b"/ByteRange").unwrap();
+    let open = at + file[at..].iter().position(|x| *x == b'[').unwrap() + 1;
+    file[open..open + text.len()].copy_from_slice(text.as_bytes());
+}
+
+#[test]
+fn tampering_with_a_signed_file_comes_out_invalid() {
+    let mut doc = text_pdf(&[&["pay 100 dollars"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    assert_eq!(verify(&signed, &trust_test_identity())[0].validity, Validity::Valid);
+    let [a, b, c, d] = byte_range(&signed);
+
+    // The gap is widened past the hex /Contents it must enclose: the claimed gap now runs two
+    // bytes beyond the closing '>'.
+    let mut widened = signed.clone();
+    set_byte_range(&mut widened, [a, b, c + 2, d - 2]);
+    let reports = verify(&widened, &trust_test_identity());
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Invalid, Detail::BadByteRange), "widened gap");
+
+    // The /Contents value is changed in place (a hex digit flipped), offsets untouched.
+    let mut swapped = signed.clone();
+    swapped[b + 1] = if swapped[b + 1] == b'0' { b'1' } else { b'0' };
+    assert_ne!(verify(&swapped, &trust_test_identity())[0].validity, Validity::Valid, "altered /Contents");
+}
+
+/// The signature dictionary's object number, read from its `N 0 obj` header before `/ByteRange`.
+fn signature_object_number(file: &[u8]) -> u32 {
+    let at = file.windows(10).rposition(|w| w == b"/ByteRange").unwrap();
+    let obj = file[..at].windows(4).rposition(|w| w == b" obj").unwrap();
+    let line = file[..obj].iter().rposition(|b| matches!(b, b'\n' | b'\r' | b'>')).map(|p| p + 1).unwrap_or(0);
+    std::str::from_utf8(&file[line..obj]).unwrap().split_whitespace().next().unwrap().parse().unwrap()
+}
+
+/// The offset the file's last `startxref` names.
+fn startxref(file: &[u8]) -> usize {
+    let at = file.windows(9).rposition(|w| w == b"startxref").unwrap();
+    std::str::from_utf8(&file[at + 9..]).unwrap().split_whitespace().next().unwrap().parse().unwrap()
+}
+
+#[test]
+fn a_signature_object_moved_after_the_gap_is_rejected() {
+    // A signature-wrapping layout: an appended revision redefines the signature dictionary so its
+    // bytes now sit after the gap its own ByteRange covers. The verifier must not accept it.
+    let mut doc = text_pdf(&[&["original"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    assert_eq!(verify(&signed, &trust_test_identity())[0].validity, Validity::Valid);
+
+    let id = signature_object_number(&signed);
+    let hex: String = signature_value(&signed).iter().map(|b| format!("{b:02X}")).collect();
+    let [_, b, c, _] = byte_range(&signed);
+    let prev = startxref(&signed);
+
+    let mut forged = signed.clone();
+    forged.push(b'\n');
+    let obj_at = forged.len();
+    forged.extend_from_slice(
+        format!("{id} 0 obj\n<</Type/Sig/Filter/Adobe.PPKLite/SubFilter/adbe.pkcs7.detached/ByteRange[0 {b} {c} 0]/Contents<{hex}>>>\nendobj\n").as_bytes(),
+    );
+    let xref_at = forged.len();
+    forged.extend_from_slice(
+        format!("xref\n{id} 1\n{obj_at:010} 00000 n \ntrailer\n<</Size {}/Root 1 0 R/Prev {prev}>>\nstartxref\n{xref_at}\n%%EOF", id + 1).as_bytes(),
+    );
+    let reports = verify(&forged, &trust_test_identity());
+    assert_eq!(reports[0].detail, Detail::BadByteRange, "relocated signature object was {:?}", reports[0].validity);
+}
+
 #[test]
 fn identities_load_from_pem_and_pkcs12() {
     let id = test_identity();
