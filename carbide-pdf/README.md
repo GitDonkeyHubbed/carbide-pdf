@@ -14,7 +14,14 @@ Carbide PDF is a free, open-source PDF editor written in Rust. Its window layout
 
 **Rust toolchain.** Cargo workspace, edition 2021. The repository does not pin a minimum Rust version.
 
-**PDFium (runtime, for rendering and text).** Needed by `images`, `text`, `compare`, `redact`, `ocr`, and the GUI page view. Other commands do not need it. Download a prebuilt library from https://github.com/bblanchon/pdfium-binaries and set `CARBIDE_PDFIUM_LIB` to the path of the library file (or to the folder containing it). If the variable is not set, the engine also looks in the current directory and then in the executable's directory.
+**PDFium (runtime, for rendering and text).** Needed by `images`, `text`, `compare`, `redact`, `ocr`, and the GUI page view. Other commands do not need it. Download a prebuilt library from https://github.com/bblanchon/pdfium-binaries and set `CARBIDE_PDFIUM_LIB` to the path of the library file (or to the folder containing it). The engine looks for `libpdfium.dylib` (`libpdfium.so`, `pdfium.dll`) in this order and loads the first it finds:
+
+1. `CARBIDE_PDFIUM_LIB`, the file or the folder it names;
+2. the folder of the executable (links followed, then the folder it was started from);
+3. inside an app bundle, its `Contents/Frameworks` and then `Contents/Resources` folders;
+4. the system library folders, by absolute path (`/opt/homebrew/lib`, `/usr/local/lib`, `/usr/lib` on macOS).
+
+The current directory is never searched, not even through the system loader's own search: loading a library runs its code, and a file with that name in the folder a command is run from (an unpacked download, say) could be anyone's.
 
 ```
 export CARBIDE_PDFIUM_LIB=/path/to/lib/libpdfium.dylib

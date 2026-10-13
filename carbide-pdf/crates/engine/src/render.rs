@@ -18,38 +18,70 @@ fn render_error(error: PdfiumError) -> Error {
     Error::Render(format!("{error:?}"))
 }
 
-impl Renderer {
-    /// Looks for PDFium in, in order: `$CARBIDE_PDFIUM_LIB` (file or directory), the current
-    /// directory, the executable's directory, and finally the system library path.
-    pub fn new() -> Result<Renderer> {
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Some(value) = std::env::var_os("CARBIDE_PDFIUM_LIB") {
-            candidates.push(PathBuf::from(value));
-        }
-        candidates.push(PathBuf::from("."));
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                candidates.push(dir.to_path_buf());
-            }
-        }
-        for candidate in candidates {
-            let file = if candidate.is_dir() {
-                Pdfium::pdfium_platform_library_name_at_path(&candidate)
-            } else {
-                candidate.clone()
-            };
-            if file.exists() {
-                if let Ok(renderer) = Self::with_library(&file) {
-                    return Ok(renderer);
+/// Folders searched for PDFium after the executable's own, by absolute path.
+#[cfg(target_os = "macos")]
+const SYSTEM_LIBRARY_DIRS: &[&str] = &["/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"];
+#[cfg(all(unix, not(target_os = "macos")))]
+const SYSTEM_LIBRARY_DIRS: &[&str] =
+    &["/usr/local/lib", "/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu"];
+#[cfg(not(unix))]
+const SYSTEM_LIBRARY_DIRS: &[&str] = &[r"C:\Windows\System32"];
+
+/// The files PDFium is looked for at, in order: `configured` (`$CARBIDE_PDFIUM_LIB`, a library
+/// file or the folder holding it), the folder of `executable` (links followed, then as started),
+/// the `Frameworks` and `Resources` folders of the app bundle it runs from, and the system library
+/// folders. Every place but the configured one is an absolute path, and none is the current
+/// directory: loading a library runs its code, and a file named like PDFium in whatever folder the
+/// program was started from (an unpacked download, say) could be anyone's.
+pub fn library_candidates(configured: Option<&Path>, executable: Option<&Path>) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Some(path) = configured {
+        files.push(if path.is_dir() { Pdfium::pdfium_platform_library_name_at_path(path) } else { path.to_path_buf() });
+    }
+    let mut folders: Vec<PathBuf> = Vec::new();
+    if let Some(executable) = executable {
+        let real = executable.canonicalize().ok();
+        for dir in real.as_deref().into_iter().chain([executable]).filter_map(Path::parent) {
+            folders.push(dir.to_path_buf());
+            // Contents/MacOS of an app bundle: libraries ship in Contents/Frameworks or Resources.
+            if dir.file_name().is_some_and(|name| name == "MacOS") {
+                if let Some(contents) = dir.parent().filter(|c| c.file_name().is_some_and(|name| name == "Contents")) {
+                    folders.push(contents.join("Frameworks"));
+                    folders.push(contents.join("Resources"));
                 }
             }
         }
-        let bindings = Pdfium::bind_to_system_library().map_err(|_| {
-            Error::Render(
-                "PDFium library not found; set CARBIDE_PDFIUM_LIB to the path of libpdfium".into(),
-            )
-        })?;
-        Ok(Renderer { pdfium: Pdfium::new(bindings) })
+    }
+    folders.extend(SYSTEM_LIBRARY_DIRS.iter().map(PathBuf::from));
+    for folder in folders.into_iter().filter(|f| f.is_absolute()) {
+        let file = Pdfium::pdfium_platform_library_name_at_path(&folder);
+        if !files.contains(&file) {
+            files.push(file);
+        }
+    }
+    files
+}
+
+impl Renderer {
+    /// Loads PDFium from the first of [`library_candidates`] that holds it, for this process's
+    /// `$CARBIDE_PDFIUM_LIB` and executable.
+    pub fn new() -> Result<Renderer> {
+        let configured = std::env::var_os("CARBIDE_PDFIUM_LIB").map(PathBuf::from);
+        let executable = std::env::current_exe().ok();
+        let candidates = library_candidates(configured.as_deref(), executable.as_deref());
+        let mut failure = None;
+        for file in &candidates {
+            if file.is_file() {
+                match Self::with_library(file) {
+                    Ok(renderer) => return Ok(renderer),
+                    Err(e) => failure = Some(format!("{}: {e}", file.display())),
+                }
+            }
+        }
+        Err(Error::Render(match failure {
+            Some(failure) => format!("PDFium could not be loaded ({failure}); set CARBIDE_PDFIUM_LIB to the path of libpdfium"),
+            None => "PDFium library not found; set CARBIDE_PDFIUM_LIB to the path of libpdfium".into(),
+        }))
     }
 
     /// The process-wide renderer, created on first use. PDFium keeps global state, so an
@@ -180,5 +212,40 @@ impl Renderer {
             })
             .collect::<Vec<_>>();
         Ok(lines)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_current_directory_is_never_searched_for_pdfium() {
+        let name = Pdfium::pdfium_platform_library_name();
+        let bundle = Path::new("/Applications/Carbide PDF.app/Contents/MacOS/carbide-gui");
+        let candidates = library_candidates(None, Some(bundle));
+        assert!(candidates.iter().all(|c| c.is_absolute()), "{candidates:?}");
+        assert!(!candidates.contains(&PathBuf::from(&name)) && !candidates.contains(&Path::new(".").join(&name)));
+        let contents = Path::new("/Applications/Carbide PDF.app/Contents");
+        assert_eq!(
+            candidates[..3],
+            [contents.join("MacOS").join(&name), contents.join("Frameworks").join(&name), contents.join("Resources").join(&name)]
+        );
+        // A plain executable has no bundle folders; the system folders come after its own.
+        let plain = library_candidates(None, Some(Path::new("/opt/carbide/bin/carbide")));
+        assert_eq!(plain[0], Path::new("/opt/carbide/bin").join(&name));
+        assert_eq!(plain.len(), 1 + SYSTEM_LIBRARY_DIRS.len());
+        assert!(library_candidates(None, None).iter().all(|c| c.is_absolute()));
+    }
+
+    #[test]
+    fn the_configured_library_comes_first() {
+        let file = Path::new("/somewhere/lib/libpdfium-custom.dylib");
+        let candidates = library_candidates(Some(file), Some(Path::new("/opt/carbide/bin/carbide")));
+        assert_eq!(candidates[0], file);
+        // A configured folder names the library inside it.
+        let folder = std::env::temp_dir();
+        let candidates = library_candidates(Some(&folder), None);
+        assert_eq!(candidates[0], Pdfium::pdfium_platform_library_name_at_path(&folder));
     }
 }
