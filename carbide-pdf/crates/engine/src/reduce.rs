@@ -32,6 +32,7 @@ pub mod messages {
     pub const OPEN_FAILED: &str = "This document's security settings do not allow that change.";
     pub const SAVE_ERROR: &str = "The document could not be saved.";
     pub const PORTFOLIO: &str = "Skipped";
+    pub const PROTECTED: &str = "Password-protected documents cannot be reduced: the result would not be encrypted.";
     pub const NEED_SAVE: &str = "Save this document before reducing it. Save now and continue?";
     pub const CHOOSE_FOLDER: &str = "Choose a folder for the output files.";
     pub const INVALID_PATH: &str = "That folder does not exist.";
@@ -45,6 +46,8 @@ pub enum Refusal {
     Xfa,
     NoPermission,
     Portfolio,
+    /// The reduced file is written without encryption, so it would expose the content.
+    Protected,
 }
 
 impl Refusal {
@@ -53,6 +56,7 @@ impl Refusal {
             Refusal::Xfa => messages::XFA,
             Refusal::NoPermission => messages::NO_PERMISSION,
             Refusal::Portfolio => messages::PORTFOLIO,
+            Refusal::Protected => messages::PROTECTED,
         }
     }
 }
@@ -101,6 +105,9 @@ const MIN_SIDE: u32 = 24;
 
 impl Pdf {
     pub fn reduce_refusal(&self) -> Option<Refusal> {
+        if self.doc.was_encrypted() || self.doc.is_encrypted() {
+            return Some(Refusal::Protected);
+        }
         let catalog = self.doc.catalog().ok()?;
         if catalog.has(b"Collection") {
             return Some(Refusal::Portfolio);
@@ -648,11 +655,9 @@ pub fn reduce_files(inputs: &[PathBuf], output: &OutputOptions, options: &Reduce
             };
             match pdf.reduce(options, Some(bytes.len())) {
                 Ok((reduced, report)) => {
-                    // Write next to the target and move into place, so a crash never leaves a
-                    // half-written file where the original was.
-                    let temp = target.with_extension("pdf.carbide-tmp");
-                    if std::fs::write(&temp, &reduced).and_then(|_| std::fs::rename(&temp, &target)).is_err() {
-                        let _ = std::fs::remove_file(&temp);
+                    // Replaced in one step, so a crash never leaves a half-written file where the
+                    // original was.
+                    if crate::fs::write_replacing(&target, &reduced).is_err() {
                         return fail(messages::SAVE_ERROR);
                     }
                     FileOutcome { input: input.clone(), output: Some(target), warning: None, report: Some(report) }

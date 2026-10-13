@@ -3,7 +3,8 @@
 //! Behaviour: a global enable flag and interval (1 to 120 minutes,
 //! default on / 10), one repeating timer per modified document, a full recovery copy written to an
 //! application folder, an XML index that survives restarts, and a recovery list shown at launch.
-//! Passwords are never written to disk.
+//! Passwords are never written to disk, and neither is a password-protected document: its recovery
+//! copy would hold its content unencrypted. The folder and everything in it are private to the user.
 //!
 //! The module is deliberately UI-free: the application owns the timers and calls into
 //! [`AutoSaveStore`] and the policy functions below.
@@ -99,6 +100,9 @@ pub fn can_do_autosave(is_modified: bool, host_busy: bool) -> bool {
     is_modified && !host_busy
 }
 
+/// Refusal for a password-protected document, whose recovery copy would be unencrypted.
+pub const PROTECTED: &str = "password-protected documents are not kept for recovery";
+
 /// The per-document timer starts only if every condition holds.
 pub fn should_start_timer(
     settings: &AutoSaveSettings,
@@ -184,6 +188,7 @@ impl AutoSaveStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<AutoSaveStore> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
+        private(&dir, 0o700);
         let mut store = AutoSaveStore { dir, records: Vec::new(), next_id: 1 };
         store.load_index();
         Ok(store)
@@ -259,8 +264,12 @@ impl AutoSaveStore {
         id
     }
 
-    /// Writes a full recovery copy of `pdf` and updates the index.
+    /// Writes a full recovery copy of `pdf` and updates the index. A document that was opened
+    /// from an encrypted file is refused: the caller has to skip protected documents.
     pub fn autosave(&mut self, id: RecordId, pdf: &mut Pdf, now: i64) -> Result<()> {
+        if pdf.doc.was_encrypted() || pdf.doc.is_encrypted() {
+            return Err(Error::Other(PROTECTED.into()));
+        }
         let bytes = pdf.to_bytes()?;
         let existing = self.record(id).ok_or_else(|| Error::Other("unknown auto-save record".into()))?;
         let path = match &existing.recovered {
@@ -268,7 +277,7 @@ impl AutoSaveStore {
             None => self.reserve_file()?,
         };
         let temp = path.with_extension("asd.tmp");
-        fs::write(&temp, &bytes)?;
+        write_private(&temp, &bytes)?;
         fs::rename(&temp, &path)?;
 
         let record = self.records.iter_mut().find(|r| r.id == id).expect("record exists");
@@ -392,7 +401,11 @@ impl AutoSaveStore {
             getrandom::fill(&mut random).map_err(|e| Error::Other(format!("no randomness available: {e}")))?;
             let suffix: String = random.iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect();
             let path = self.dir.join(format!("ZAS{suffix}.asd"));
-            if fs::OpenOptions::new().write(true).create_new(true).open(&path).is_ok() {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            if options.open(&path).is_ok() {
                 return Ok(path);
             }
         }
@@ -432,7 +445,7 @@ impl AutoSaveStore {
         xml.push_str("</AutoSave>\n");
 
         let temp = self.index_path().with_extension("xml.tmp");
-        fs::write(&temp, xml)?;
+        write_private(&temp, xml.as_bytes())?;
         fs::rename(&temp, self.index_path())?;
         Ok(())
     }
@@ -474,6 +487,29 @@ impl AutoSaveStore {
             });
         }
     }
+}
+
+/// Writes `bytes` to a file only the user can read, replacing one that is there.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let _ = fs::remove_file(path);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)?.write_all(bytes)?;
+    Ok(())
+}
+
+/// Restricts `path` to the user. Best effort: a folder that cannot be changed is used as it is.
+fn private(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
 }
 
 fn attribute(xml: &mut String, name: &str, value: &str) {

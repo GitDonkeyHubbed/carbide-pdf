@@ -1186,6 +1186,32 @@ fn autosave_cleans_up_on_save_and_close_but_never_touches_originals() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn recovery_copies_are_private_and_never_of_protected_documents() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir("autosave-private");
+    let mut store = AutoSaveStore::open(&dir).unwrap();
+    let draft = store.begin_document(None, 1);
+    store.autosave(draft, &mut text_pdf(&[&["draft"]]), 2).unwrap();
+    assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0, "{}", path.display());
+    }
+
+    // Opens without a password, so nothing else stops it.
+    let protected = text_pdf(&[&["PROTECTEDTEXT"]]).to_encrypted_bytes(&ProtectionOptions::new("", "owner pw")).unwrap();
+    let mut opened = Pdf::from_bytes(&protected).unwrap();
+    opened.add_note(0, 100.0, 100.0, "edited").unwrap();
+    let record = store.begin_document(None, 3);
+    assert!(store.autosave(record, &mut opened, 4).is_err());
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        assert_gone(&std::fs::read(entry.unwrap().path()).unwrap(), "PROTECTEDTEXT");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn a_damaged_index_is_ignored() {
     let dir = scratch_dir("autosave-bad");
@@ -1462,6 +1488,17 @@ fn batch_reduce_never_damages_originals() {
     assert_eq!(std::fs::read(&tiny).unwrap(), tiny_before, "a file that cannot shrink is left alone");
     assert_eq!(outcomes[2].warning.as_deref(), Some(reduce_messages::OPEN_FAILED));
     assert_eq!(std::fs::read(&broken).unwrap(), b"this is not a pdf");
+
+    // A protected original is never replaced by an unencrypted copy, even one that opens
+    // without a password.
+    let protected = dir.join("protected.pdf");
+    let mut options = ProtectionOptions::new("", "owner pw");
+    options.allow_copying = false;
+    std::fs::write(&protected, photo_pdf().to_encrypted_bytes(&options).unwrap()).unwrap();
+    let before = std::fs::read(&protected).unwrap();
+    let outcomes = reduce_files(std::slice::from_ref(&protected), &OutputOptions::default(), &ReduceOptions::default());
+    assert_eq!(outcomes[0].warning.as_deref(), Some(reduce_messages::PROTECTED));
+    assert_eq!(std::fs::read(&protected).unwrap(), before);
 
     // Naming and overwrite rules.
     let named = OutputOptions { prefix: "small-".into(), overwrite: false, ..Default::default() };
