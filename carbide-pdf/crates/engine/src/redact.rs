@@ -101,15 +101,18 @@ impl Pdf {
             let page_id = self.page_id(page)?;
             let dict = self.doc.get_dictionary_mut(page_id)?;
             for key in [
-                &b"CropBox"[..], b"Rotate", b"Annots", b"TrimBox", b"BleedBox", b"ArtBox", b"Thumb", b"B",
-                b"AA", b"StructParents", b"Group", b"Metadata", b"PieceInfo",
+                &b"Annots"[..], b"TrimBox", b"BleedBox", b"ArtBox", b"Thumb", b"B", b"AA", b"StructParents", b"Group",
+                b"Metadata", b"PieceInfo",
             ] {
                 dict.remove(key);
             }
-            dict.set(
-                "MediaBox",
-                vec![0.into(), 0.into(), Object::Real(display_w), Object::Real(display_h)],
-            );
+            // The image already shows the page as displayed, so the page gets an explicit box and no
+            // rotation: without them a /Rotate or /CropBox of a page-tree node above it would apply
+            // a second time.
+            let page_box = vec![0.into(), 0.into(), Object::Real(display_w), Object::Real(display_h)];
+            dict.set("MediaBox", page_box.clone());
+            dict.set("CropBox", page_box);
+            dict.set("Rotate", 0);
             dict.set("Contents", content_id);
             dict.set(
                 "Resources",

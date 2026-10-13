@@ -15,11 +15,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use carbide_engine::autosave::{now_unix, AutoSaveSettings, AutoSaveStore, RecordId};
+use carbide_engine::fs::Existing;
 use carbide_engine::{
     open_revision_bytes, pdf_date_now, revision_display_name, Error as EngineError, MarkupStyle, Pdf, PageGeometry,
-    Rect, Redaction, Renderer, Revision, SavePlan, SavedFile,
+    Protection, Rect, Redaction, Renderer, Revision, SavePlan, SavedFile,
 };
-use dialogs::{AfterSave, Dialog};
+use dialogs::{AfterSave, Dialog, Export, Writing};
 use eframe::egui;
 
 const MAX_UNDO: usize = 10;
@@ -55,6 +56,10 @@ pub struct OpenDoc {
     pub version: u64,
     pub record: Option<RecordId>,
     pub dirty: bool,
+    /// What a document without a file is called (an earlier revision, say); `None` for Untitled.
+    pub name: Option<String>,
+    /// Set for a document opened from an Auto Recovery copy, until it is saved.
+    pub recovered: Option<Recovered>,
     pub geometries: Vec<PageGeometry>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
@@ -62,6 +67,15 @@ pub struct OpenDoc {
     view_page: usize,
     view_redactions: Vec<Redaction>,
     view_notice: Option<String>,
+}
+
+/// Where a document opened from an Auto Recovery copy came from. It has no file of its own: Save
+/// writes over the original, once the user agrees, or asks where to put it.
+pub struct Recovered {
+    /// The file it was being edited from; `None` for a document that was never saved.
+    pub original: Option<PathBuf>,
+    /// The record it was recovered from, which goes once the document is saved.
+    pub record: RecordId,
 }
 
 /// A point in the edit history.
@@ -85,6 +99,8 @@ impl OpenDoc {
             version: 0,
             record: None,
             dirty: false,
+            name: None,
+            recovered: None,
             geometries,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -100,6 +116,43 @@ impl OpenDoc {
         self.geometries = (0..self.pdf.page_count()).filter_map(|i| self.pdf.page_geometry(i).ok()).collect();
         self.version += 1;
         Ok(())
+    }
+
+    /// Forgets the edit history. After a signature or a revision is written into the file, going
+    /// back past it would take it out of the document again, and the next save would drop it.
+    fn forget_history(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    /// Replaces the document with `bytes`, a serialized state of it from its edit history. That
+    /// serialization is unencrypted, so the protection it is written with is carried over.
+    fn restore(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
+        let mut pdf = Pdf::from_bytes(bytes)?;
+        pdf.set_protection(self.pdf.protection());
+        self.pdf = pdf;
+        self.refresh()
+    }
+
+    /// The protection a new file made from this document gets (that of its file, or the one it
+    /// carries when it has none yet), and the password that opened it.
+    pub fn protection(&self) -> (Option<Protection>, Option<String>) {
+        let protection = match &self.saved {
+            Some(saved) => saved.protection().cloned(),
+            None => self.pdf.protection(),
+        };
+        (protection, self.saved.as_ref().and_then(|s| s.password()).map(str::to_owned))
+    }
+
+    pub fn is_protected(&self) -> bool {
+        self.protection().0.is_some()
+    }
+
+    /// The bytes of `part`, a new document made from this one, protected like this document.
+    pub fn derived_bytes(&self, part: &mut Pdf) -> Result<Vec<u8>, EngineError> {
+        let (protection, password) = self.protection();
+        part.set_protection(protection);
+        part.to_file_bytes(password.as_deref())
     }
 
     /// Whether the document lost content the file on disk holds: `explicit` for edits known to
@@ -129,7 +182,23 @@ impl OpenDoc {
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
+            .or_else(|| self.name.clone())
             .unwrap_or_else(|| "Untitled".into())
+    }
+
+    /// The name Save As suggests: that of the file a recovered document was recovered for, or else
+    /// the title, as a PDF file name.
+    pub fn file_name(&self) -> String {
+        let recovered_for = self.recovered.as_ref().and_then(|r| r.original.as_ref()).and_then(|p| p.file_name());
+        let name = match recovered_for {
+            Some(name) => name.to_string_lossy().into_owned(),
+            None => self.title().trim_end_matches(" (recovered)").to_string(),
+        };
+        if name.to_ascii_lowercase().ends_with(".pdf") {
+            name
+        } else {
+            format!("{name}.pdf")
+        }
     }
 }
 
@@ -208,7 +277,7 @@ pub struct CarbideApp {
 }
 
 impl CarbideApp {
-    fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, launch: Option<Launch>) -> Self {
         theme::apply(&cc.egui_ctx);
         route_quit_through_window_close();
         let (renderer, renderer_error) = match Renderer::global() {
@@ -217,12 +286,14 @@ impl CarbideApp {
         };
         let autosave = AutoSaveStore::open(paths::autosave_dir()).ok();
         let mut app = Self::with_parts(renderer, renderer_error, autosave, paths::load_autosave_settings());
-        if let Some(path) = initial {
-            app.open_path(&path);
+        match launch {
+            Some(Launch::File(path)) => app.open_path(&path),
+            Some(Launch::Copy(path)) => app.open_copy(&path),
+            None => {}
         }
         // Launch: show recovered documents waiting from an earlier session.
         if app.autosave.as_ref().is_some_and(|s| s.any_needs_save()) {
-            app.dialog = Some(Dialog::AutoRecovery);
+            app.dialog = Some(Dialog::auto_recovery());
         }
         app
     }
@@ -290,6 +361,55 @@ impl CarbideApp {
         }
     }
 
+    /// Opens `path`, a private temporary copy another window wrote (an earlier revision), as a new
+    /// document that has no file yet: Save asks where to put it, so nothing is ever saved into the
+    /// temporary folder. The copy is removed once it has been read.
+    pub fn open_copy(&mut self, path: &Path) {
+        let bytes = std::fs::read(path);
+        if carbide_engine::fs::is_private_temp_file(path) {
+            let _ = carbide_engine::fs::remove_private_temp_file(path);
+        }
+        let opened = bytes.map_err(EngineError::from).and_then(|bytes| Pdf::from_bytes(&bytes));
+        match opened {
+            Ok(pdf) => {
+                self.install(pdf, None, None);
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                    self.status = format!("{} - {} page(s)", doc.title(), doc.pdf.page_count());
+                }
+            }
+            Err(e) => self.alert(format!("Could not open the copy: {e}")),
+        }
+    }
+
+    /// Opens the Auto Recovery copy of `record` as a document with unsaved changes, tied to the file
+    /// it was recovered for. It has no file of its own, so nothing is ever saved into the recovery
+    /// or temporary folder: Save asks to replace the original, or where to put a document that never
+    /// had one. A copy that is already open is brought forward instead.
+    pub fn open_recovered(&mut self, record: RecordId) {
+        let open_at = (0..self.tabs.len()).find(|&i| self.doc_at(i).and_then(|d| d.recovered.as_ref()).is_some_and(|r| r.record == record));
+        if let Some(index) = open_at {
+            return self.activate(Some(index));
+        }
+        let Some(store) = self.autosave.as_ref() else { return };
+        let original = store.record(record).and_then(|r| r.original.as_ref()).map(|o| o.path.clone());
+        let (pdf, title) = match store.open_recovered(record, None) {
+            Ok(opened) => opened,
+            Err(e) => return self.alert(e.to_string()),
+        };
+        self.install(pdf, None, None);
+        let Some(doc) = self.doc.as_mut() else { return };
+        doc.name = Some(title);
+        doc.dirty = true;
+        // Kept for recovery under the original's name, should this session end unexpectedly too.
+        if let (Some(store), Some(id)) = (self.autosave.as_mut(), doc.record) {
+            let _ = store.document_closed(id);
+            doc.record = Some(store.begin_document(original.as_deref(), now_unix()));
+        }
+        doc.recovered = Some(Recovered { original, record });
+        self.status = format!("{} - not saved yet", doc.title());
+    }
+
     /// Opens a protected file. The password is used exactly as typed, spaces included.
     pub fn open_with_password(&mut self, path: PathBuf, bytes: Vec<u8>, password: String) -> bool {
         match SavedFile::open(bytes, Some(password)) {
@@ -343,11 +463,16 @@ impl CarbideApp {
         }
     }
 
+    /// The tab that shows document `id`.
+    fn tab_of(&self, id: u64) -> Option<usize> {
+        (0..self.tabs.len()).find(|&i| self.doc_at(i).is_some_and(|d| d.id == id))
+    }
+
     /// Moves the active document back into its tab slot, together with its view state.
     fn park_active(&mut self) {
         let Some(index) = self.active_tab else { return };
         let Some(mut doc) = self.doc.take() else { return };
-        self.drop_save_question();
+        self.drop_document_question();
         doc.view_page = self.current_page;
         doc.view_redactions = std::mem::take(&mut self.pending_redactions);
         doc.view_notice = self.notice.take();
@@ -355,11 +480,11 @@ impl CarbideApp {
         self.active_tab = None;
     }
 
-    /// A pending save question belongs to the active document. Whenever that document is put
-    /// away (another one opened, created or brought forward, or this one closed) the question goes,
-    /// so answering it can never write a different document.
-    fn drop_save_question(&mut self) {
-        if matches!(self.dialog, Some(Dialog::ConfirmRewrite { .. })) {
+    /// A pending question about the active document (whether to save, replace files, ...) belongs
+    /// to it. Whenever that document is put away (another one opened, created or brought forward,
+    /// or this one closed) the question goes, so answering it can never act on a different document.
+    fn drop_document_question(&mut self) {
+        if self.dialog.as_ref().is_some_and(|d| d.document().is_some()) {
             self.dialog = None;
         }
     }
@@ -391,7 +516,7 @@ impl CarbideApp {
         }
         let was_active = self.active_tab == Some(index);
         let doc = if was_active {
-            self.drop_save_question();
+            self.drop_document_question();
             self.active_tab = None;
             self.pending_redactions.clear();
             self.notice = None;
@@ -451,15 +576,33 @@ impl CarbideApp {
                 Err(e) => return self.alert(format!("{}: {e}", file.display())),
             }
         }
+        self.combine(documents, false);
+    }
+
+    /// Joins `documents` into a new untitled document. It keeps the protection the protected ones
+    /// share; when they are protected in different ways the user is asked whether to combine them
+    /// without protection, which `unprotected` says was agreed to.
+    pub fn combine(&mut self, mut documents: Vec<Pdf>, unprotected: bool) {
         if documents.is_empty() {
             return;
         }
+        if unprotected {
+            documents.iter_mut().for_each(|d| d.set_protection(None));
+        }
         let refs: Vec<&Pdf> = documents.iter().collect();
+        if Pdf::shared_protection(&refs).is_err() {
+            self.dialog = Some(Dialog::ConfirmCombine { documents });
+            return;
+        }
         match Pdf::merge(&refs) {
             Ok(pdf) => {
+                let protected = pdf.is_protected();
                 self.install(pdf, None, None);
                 if let Some(doc) = self.doc.as_mut() {
                     doc.dirty = true;
+                }
+                if protected {
+                    self.status = "Combined. The new document keeps the password protection of the files.".into();
                 }
             }
             Err(e) => self.alert(format!("Could not combine the files: {e}")),
@@ -482,8 +625,9 @@ impl CarbideApp {
         self.run_edit(label, true, f);
     }
 
-    fn run_edit(&mut self, label: &str, removes: bool, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) {
-        let Some(doc) = self.doc.as_mut() else { return };
+    /// Runs an edit, and returns whether it was made.
+    fn run_edit(&mut self, label: &str, removes: bool, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) -> bool {
+        let Some(doc) = self.doc.as_mut() else { return false };
         let snapshot = Snapshot { bytes: doc.bytes.clone(), content_removed: doc.content_removed };
         match f(&mut doc.pdf).and_then(|_| doc.refresh()) {
             Ok(()) => {
@@ -497,15 +641,14 @@ impl CarbideApp {
                 self.status = format!("{label} done.");
                 self.textures.clear();
                 self.thumbs.clear();
+                true
             }
             Err(e) => {
                 // Put the document back exactly as it was.
-                if let Ok(pdf) = Pdf::from_bytes(&snapshot.bytes) {
-                    doc.pdf = pdf;
-                    let _ = doc.refresh();
-                }
+                let _ = doc.restore(&snapshot.bytes);
                 let message = format!("{label} failed: {e}");
                 self.alert(message);
+                false
             }
         }
     }
@@ -524,10 +667,8 @@ impl CarbideApp {
         let target = if undo { doc.undo.pop() } else { doc.redo.pop() };
         let Some(snapshot) = target else { return };
         let current = Snapshot { bytes: doc.bytes.clone(), content_removed: doc.content_removed };
-        match Pdf::from_bytes(&snapshot.bytes) {
-            Ok(pdf) => {
-                doc.pdf = pdf;
-                let _ = doc.refresh();
+        match doc.restore(&snapshot.bytes) {
+            Ok(()) => {
                 doc.content_removed = doc.removes_content(snapshot.content_removed);
                 if undo {
                     doc.redo.push(current);
@@ -555,11 +696,21 @@ impl CarbideApp {
     /// or drops saved revisions); an answer about any other document saves nothing. `then` is
     /// carried out once the file is written.
     pub fn write_to(&mut self, path: &Path, confirmed: Option<u64>, then: AfterSave) {
-        let Some(doc) = self.doc.as_mut() else { return };
-        if confirmed.is_some_and(|id| id != doc.id) {
+        if self.is_private_location(path) {
+            return self.alert(format!(
+                "{} is in a folder Carbide PDF keeps for itself (recovery or temporary copies), so nothing was saved there. Choose another location.",
+                path.display()
+            ));
+        }
+        if self.doc.as_ref().is_some_and(|doc| confirmed.is_some_and(|id| id != doc.id)) {
             self.status = "Nothing was saved: the question was about a document that is no longer in front.".into();
             return;
         }
+        if self.refuse_over_unsaved_tab(path) {
+            return;
+        }
+        let others = self.other_tabs_on(path);
+        let Some(doc) = self.doc.as_mut() else { return };
         let plan = match doc.pdf.save_plan(doc.saved.as_ref(), doc.content_removed) {
             Ok(plan) => plan,
             Err(e) => return self.alert(format!("Could not save {}: {e}", path.display())),
@@ -597,6 +748,11 @@ impl CarbideApp {
             doc.adopt_saved(bytes)
         };
         self.after_writing(path);
+        // The other tabs on the file have nothing unsaved (checked above) and show the old file:
+        // this document is that file now.
+        for index in others.into_iter().rev() {
+            self.close_tab(index);
+        }
         self.status = format!("Saved {}", path.display());
         if let Err(e) = reloaded {
             return self.alert(format!("Saved {}, but could not read it back: {e}", path.display()));
@@ -619,12 +775,19 @@ impl CarbideApp {
     }
 
     /// Everything that follows writing the active document to `path`: what is shown and checked
-    /// is the file on disk now, and its Auto Recovery copy is no longer needed.
+    /// is the file on disk now, and its Auto Recovery copies are no longer needed, including the one
+    /// a recovered document was opened from.
     fn after_writing(&mut self, path: &Path) {
         let Some(doc) = self.doc.as_mut() else { return };
         if let (Some(store), Some(id)) = (self.autosave.as_mut(), doc.record) {
             let _ = store.document_saved(id);
             doc.record = Some(store.begin_document(Some(path), now_unix()));
+        }
+        if let Some(recovered) = doc.recovered.take() {
+            doc.name = None;
+            if let Some(store) = self.autosave.as_mut() {
+                let _ = store.remove_record(recovered.record);
+            }
         }
         self.textures.clear();
         self.thumbs.clear();
@@ -637,20 +800,83 @@ impl CarbideApp {
     }
 
     /// Saves the active document over its file (or asks where to, for a new one), then does
-    /// `then`. Nothing follows when the user cancels.
+    /// `then`. A recovered document asks first whether to replace the file it was recovered for.
+    /// Nothing follows when the user cancels.
     pub fn save_then(&mut self, then: AfterSave) {
-        match self.doc.as_ref().and_then(|d| d.path.clone()) {
-            Some(path) => self.write_to(&path, None, then),
+        let Some(doc) = self.doc.as_ref() else { return };
+        if let Some(path) = doc.path.clone() {
+            return self.write_to(&path, None, then);
+        }
+        match doc.recovered.as_ref().and_then(|r| r.original.clone()).filter(|p| p.exists()) {
+            Some(original) => self.dialog = Some(Dialog::ReplaceOriginal { doc: doc.id, path: original, then }),
             None => self.save_as_then(then),
         }
+    }
+
+    /// Answers yes to replacing `path`, the file the recovered document `doc` was recovered for:
+    /// it is saved over it the way Save saves, against the file as it is on disk now.
+    pub fn replace_original(&mut self, doc: u64, path: &Path, then: AfterSave) {
+        if self.doc.as_ref().is_none_or(|d| d.id != doc) {
+            self.status = "Nothing was saved: the question was about a document that is no longer in front.".into();
+            return;
+        }
+        if self.refuse_over_unsaved_tab(path) {
+            return;
+        }
+        let Some(open) = self.doc.as_mut() else { return };
+        let read = std::fs::read(path).map_err(EngineError::from).and_then(|bytes| SavedFile::open(bytes, None));
+        match read {
+            Ok((_, saved)) => {
+                open.saved = Some(saved);
+                self.write_to(path, None, then);
+            }
+            Err(e) => self.alert(format!(
+                "{} could not be read ({e}), so the recovered document was not saved over it. Use Save As instead.",
+                path.display()
+            )),
+        }
+    }
+
+    /// Says so and returns true when `path` is open in another tab with unsaved changes. Writing
+    /// over it would leave that tab showing what is no longer on disk, and its next save would put
+    /// that back over what was written.
+    fn refuse_over_unsaved_tab(&mut self, path: &Path) -> bool {
+        let unsaved = self.other_tabs_on(path).into_iter().any(|i| self.doc_at(i).is_some_and(|d| d.dirty));
+        if unsaved {
+            self.alert(format!(
+                "{} is also open in another tab, with changes that are not saved. Save or close that tab first, \
+                 or use Save As to keep both.",
+                path.display()
+            ));
+        }
+        unsaved
+    }
+
+    /// The tabs other than the active one whose document is the file `path`, in tab order.
+    fn other_tabs_on(&self, path: &Path) -> Vec<usize> {
+        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let wanted = canonical(path);
+        (0..self.tabs.len())
+            .filter(|&i| Some(i) != self.active_tab)
+            .filter(|&i| self.doc_at(i).and_then(|d| d.path.as_deref()).is_some_and(|p| canonical(p) == wanted))
+            .collect()
+    }
+
+    /// True for a place Save never writes to: the Auto Recovery folder, or a private temporary
+    /// folder the app made.
+    fn is_private_location(&self, path: &Path) -> bool {
+        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let folder = path.parent().filter(|p| !p.as_os_str().is_empty()).map(canonical);
+        let recovery = self.autosave.as_ref().map(|s| canonical(s.directory()));
+        carbide_engine::fs::is_private_temp_file(path) || matches!((folder, recovery), (Some(f), Some(r)) if f.starts_with(&r))
     }
 
     fn save_as(&mut self) {
         self.save_as_then(AfterSave::Nothing);
     }
 
-    fn save_as_then(&mut self, then: AfterSave) {
-        let name = self.doc.as_ref().map(|d| d.title()).unwrap_or_else(|| "Untitled.pdf".into());
+    pub fn save_as_then(&mut self, then: AfterSave) {
+        let name = self.doc.as_ref().map(OpenDoc::file_name).unwrap_or_else(|| "Untitled.pdf".into());
         if let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name(name).save_file() {
             self.write_to(&path, None, then);
         }
@@ -658,8 +884,9 @@ impl CarbideApp {
 
     /// True when saving the active document has to ask first.
     pub fn save_needs_question(&self) -> bool {
-        self.doc.as_ref().is_some_and(|d| {
-            d.path.is_some() && d.pdf.save_plan(d.saved.as_ref(), d.content_removed).is_ok_and(|plan| plan.needs_confirmation())
+        self.doc.as_ref().is_some_and(|d| match &d.path {
+            Some(_) => d.pdf.save_plan(d.saved.as_ref(), d.content_removed).is_ok_and(|plan| plan.needs_confirmation()),
+            None => d.recovered.as_ref().is_some_and(|r| r.original.as_ref().is_some_and(|p| p.exists())),
         })
     }
 
@@ -688,6 +915,7 @@ impl CarbideApp {
         let updated = doc.pdf.save_revision(&base, label, &pdf_date_now()).map_err(|e| e.to_string())?;
         carbide_engine::fs::write_replacing(&path, &updated).map_err(|e| e.to_string())?;
         let reloaded = doc.adopt_saved(updated);
+        doc.forget_history();
         self.after_writing(&path);
         reloaded.map_err(|e| format!("The revision was saved, but the file could not be read back: {e}"))?;
         self.status = format!("Saved revision {label:?}.");
@@ -704,10 +932,12 @@ impl CarbideApp {
         };
         match open_revision_bytes(&bytes, revision) {
             Ok(prefix) => {
-                let name = revision_display_name(&doc.title(), revision).replace(['/', ':'], "-");
-                let target = std::env::temp_dir().join(format!("{name}.pdf"));
-                if std::fs::write(&target, prefix).is_ok() {
-                    self.spawn_window(&target);
+                // Handed to the new window as a private copy that it removes once read; the window
+                // shows it as a new document, so its Save never writes into the temporary folder.
+                let name = format!("{}.pdf", revision_display_name(&doc.title(), revision).replace(['/', ':'], "-"));
+                match carbide_engine::fs::private_temp_file(&name, &prefix) {
+                    Ok(copy) => self.spawn_copy_window(&copy),
+                    Err(e) => self.alert(format!("Could not open the revision: {e}")),
                 }
             }
             Err(e) => self.alert(e.to_string()),
@@ -718,6 +948,19 @@ impl CarbideApp {
         match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg(path).spawn()) {
             Ok(_) => self.status = format!("Opened {} in a new window.", path.display()),
             Err(e) => self.alert(format!("Could not open a new window: {e}")),
+        }
+    }
+
+    /// Opens `copy`, a private temporary file, in a new window as a new document (see `open_copy`).
+    fn spawn_copy_window(&mut self, copy: &Path) {
+        let spawned = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg(COPY_FLAG).arg(copy).spawn());
+        let name = copy.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match spawned {
+            Ok(_) => self.status = format!("Opened {name} in a new window."),
+            Err(e) => {
+                let _ = carbide_engine::fs::remove_private_temp_file(copy);
+                self.alert(format!("Could not open a new window: {e}"));
+            }
         }
     }
 
@@ -738,7 +981,7 @@ impl CarbideApp {
         for doc in self.doc.iter_mut().chain(self.tabs.iter_mut().flatten()) {
             let Some(id) = doc.record else { continue };
             // Its recovery copy would hold the content unencrypted.
-            if doc.saved.as_ref().is_some_and(SavedFile::is_protected) {
+            if doc.is_protected() {
                 continue;
             }
             if carbide_engine::autosave::can_do_autosave(doc.dirty, false) {
@@ -1117,6 +1360,7 @@ impl CarbideApp {
         let Some(doc) = self.doc.as_mut() else { return };
         let result = signed.and_then(|bytes| {
             carbide_engine::fs::write_replacing(path, &bytes).map_err(|e| e.to_string())?;
+            doc.forget_history();
             Ok(doc.adopt_saved(bytes).map_err(|e| format!("Signed {}, but could not read it back: {e}", path.display())))
         });
         let result = match result {
@@ -1181,20 +1425,121 @@ impl CarbideApp {
 
     // ---- file helpers ------------------------------------------------------------------
 
-    fn export_images(&mut self) {
+    /// Exports the active document as images or text. The exported files are not protected, so
+    /// for a protected document the user is asked first.
+    pub fn export(&mut self, export: Export) {
+        let Some(doc) = self.doc.as_ref() else { return };
+        if doc.is_protected() {
+            self.dialog = Some(Dialog::ConfirmExport { doc: doc.id, export });
+            return;
+        }
+        self.export_confirmed(doc.id, export);
+    }
+
+    /// Carries on exporting the document `doc`, once exporting it unprotected was agreed to.
+    pub fn export_confirmed(&mut self, doc: u64, export: Export) {
+        if self.doc.as_ref().map(|d| d.id) != Some(doc) {
+            self.status = "Nothing was exported: the question was about a document that is no longer in front.".into();
+            return;
+        }
+        if self.renderer.is_none() {
+            return;
+        }
+        match export {
+            Export::Images => {
+                let Some(folder) = rfd::FileDialog::new().set_title("Export Here").pick_folder() else { return };
+                self.export_images_to(folder, None);
+            }
+            Export::Text => self.export_text(),
+        }
+    }
+
+    /// Exports every page of the active document as an image into `folder`. When files of those
+    /// names are already there and `existing` does not say what to do with them, the user is asked.
+    pub fn export_images_to(&mut self, folder: PathBuf, existing: Option<Existing>) {
         let (Some(renderer), Some(doc)) = (self.renderer, self.doc.as_mut()) else { return };
-        let Some(folder) = rfd::FileDialog::new().set_title("Export Here").pick_folder() else { return };
         let base = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "page".into());
-        match carbide_engine::export_images(renderer, &mut doc.pdf, &folder, &base, carbide_engine::ImageFormat::Png, 150.0) {
+        let format = carbide_engine::ImageFormat::Png;
+        let existing = match existing {
+            Some(existing) => existing,
+            None => {
+                let taken = taken(carbide_engine::image_paths(&doc.pdf, &folder, &base, format));
+                if !taken.is_empty() {
+                    self.dialog = Some(Dialog::ExistingFiles { doc: doc.id, writing: Writing::Images { folder }, taken });
+                    return;
+                }
+                Existing::Refuse
+            }
+        };
+        match carbide_engine::export_images(renderer, &mut doc.pdf, &folder, &base, format, 150.0, existing) {
             Ok(paths) => self.status = format!("Exported {} image(s).", paths.len()),
             Err(e) => self.alert(format!("Export failed: {e}")),
+        }
+    }
+
+    /// Writes each of `ranges` of the active document as a file of its own into `folder`, asking
+    /// first when files of those names are already there and `existing` does not say what to do.
+    pub fn split_into(&mut self, folder: PathBuf, ranges: &str, existing: Option<Existing>) {
+        let Some(doc) = self.doc.as_ref() else { return };
+        let parsed = match Pdf::parse_ranges(ranges, doc.pdf.page_count()) {
+            Ok(r) => r,
+            Err(e) => return self.alert(e.to_string()),
+        };
+        let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
+        let targets: Vec<PathBuf> =
+            parsed.iter().map(|r| folder.join(format!("{stem}-pages-{}-{}.pdf", r.start() + 1, r.end() + 1))).collect();
+        let mut seen = std::collections::HashSet::new();
+        if let Some(repeated) = targets.iter().find(|t| !seen.insert(*t)) {
+            let name = repeated.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            return self.alert(format!("The ranges would write {name} twice. Give each range once."));
+        }
+        let existing = match existing {
+            Some(existing) => existing,
+            None => {
+                let taken = taken(targets.clone());
+                if !taken.is_empty() {
+                    let writing = Writing::Split { folder, ranges: ranges.to_string() };
+                    self.dialog = Some(Dialog::ExistingFiles { doc: doc.id, writing, taken });
+                    return;
+                }
+                Existing::Refuse
+            }
+        };
+        let mut written = 0;
+        for (range, target) in parsed.iter().zip(&targets) {
+            let result = doc
+                .pdf
+                .extract_pages(&range.clone().collect::<Vec<_>>())
+                .and_then(|mut part| doc.derived_bytes(&mut part))
+                .and_then(|bytes| Ok(carbide_engine::fs::write_file(target, &bytes, existing)?));
+            if let Err(e) = result {
+                let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                return self.alert(format!("Could not write {name}: {e}"));
+            }
+            written += 1;
+        }
+        self.status = format!("Wrote {written} file(s) to {}", folder.display());
+    }
+
+    /// Carries on writing files into a folder, once the user said what happens to files already
+    /// there. Nothing is written when the question was about a document no longer in front.
+    pub fn continue_writing(&mut self, doc: u64, writing: Writing, existing: Existing) {
+        if self.doc.as_ref().map(|d| d.id) != Some(doc) {
+            self.status = "Nothing was written: the question was about a document that is no longer in front.".into();
+            return;
+        }
+        match writing {
+            Writing::Images { folder } => self.export_images_to(folder, Some(existing)),
+            Writing::Split { folder, ranges } => self.split_into(folder, &ranges, Some(existing)),
         }
     }
 
     fn export_text(&mut self) {
         let (Some(renderer), Some(doc)) = (self.renderer, self.doc.as_mut()) else { return };
         let Some(path) = rfd::FileDialog::new().add_filter("Text", &["txt"]).set_file_name("document.txt").save_file() else { return };
-        match carbide_engine::export_text(renderer, &mut doc.pdf).and_then(|t| std::fs::write(&path, t).map_err(Into::into)) {
+        let written = carbide_engine::export_text(renderer, &mut doc.pdf)
+            .and_then(|text| Ok(carbide_engine::fs::write_replacing(&path, text.as_bytes())?));
+        match written {
             Ok(()) => self.status = format!("Exported text to {}", path.display()),
             Err(e) => self.alert(format!("Export failed: {e}")),
         }
@@ -1203,13 +1548,34 @@ impl CarbideApp {
     fn merge_files(&mut self) {
         let Some(files) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).pick_files() else { return };
         let mut others = Vec::new();
-        for file in files {
-            match Pdf::open(&file) {
+        for file in &files {
+            match Pdf::open(file) {
                 Ok(p) => others.push(p),
                 Err(e) => return self.alert(format!("{}: {e}", file.display())),
             }
         }
+        let names = files.iter().map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+        self.merge_into_current(others, names, false);
+    }
+
+    /// Appends `others` (named `names`) to the active document, which keeps its own protection.
+    /// The pages of a protected file that does not share it would be saved with this document's
+    /// protection or none, so the user is asked first; `confirmed` says that was agreed to.
+    pub fn merge_into_current(&mut self, mut others: Vec<Pdf>, names: Vec<String>, confirmed: bool) {
+        let Some(doc) = self.doc.as_ref() else { return };
+        let (protection, _) = doc.protection();
+        let differs = |other: &Pdf| other.protection().is_some_and(|p| !protection.as_ref().is_some_and(|own| own.same_as(&p)));
+        if !confirmed && others.iter().any(differs) {
+            let protected =
+                others.iter().zip(&names).filter(|(other, _)| differs(other)).map(|(_, name)| name.clone()).collect();
+            self.dialog = Some(Dialog::ConfirmMerge { doc: doc.id, others, names, protected, keeps_protection: protection.is_some() });
+            return;
+        }
+        for other in others.iter_mut().filter(|other| differs(other)) {
+            other.set_protection(None);
+        }
         self.edit("Merge", move |pdf| {
+            pdf.set_protection(protection);
             let mut all = vec![pdf.clone()];
             all.extend(others);
             let refs: Vec<&Pdf> = all.iter().collect();
@@ -1220,10 +1586,27 @@ impl CarbideApp {
 
     fn extract_current(&mut self) {
         let page = self.current_page;
-        let Some(doc) = self.doc.as_ref() else { return };
+        if self.doc.is_none() {
+            return;
+        }
         let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name(format!("Page {}.pdf", page + 1)).save_file() else { return };
-        match doc.pdf.extract_pages(&[page]).and_then(|mut p| p.save(&path)) {
-            Ok(()) => self.status = format!("Extracted page {} to {}", page + 1, path.display()),
+        self.extract_page_to(page, &path);
+    }
+
+    /// Writes page `page` of the active document to `path` as a new file, protected like the
+    /// document.
+    pub fn extract_page_to(&mut self, page: usize, path: &Path) {
+        let Some(doc) = self.doc.as_ref() else { return };
+        let written = doc
+            .pdf
+            .extract_pages(&[page])
+            .and_then(|mut part| doc.derived_bytes(&mut part))
+            .and_then(|bytes| Ok(carbide_engine::fs::write_replacing(path, &bytes)?));
+        match written {
+            Ok(()) => {
+                let protected = if doc.is_protected() { ", password-protected like this document" } else { "" };
+                self.status = format!("Extracted page {} to {}{protected}", page + 1, path.display());
+            }
             Err(e) => self.alert(format!("Could not extract: {e}")),
         }
     }
@@ -1233,7 +1616,48 @@ impl CarbideApp {
         if redactions.is_empty() {
             return;
         }
-        self.edit_removing("Apply redactions", move |pdf| pdf.apply_redactions(renderer, &redactions, 200.0));
+        if self.run_edit("Apply redactions", true, move |pdf| pdf.apply_redactions(renderer, &redactions, 200.0)) {
+            // The same text may still be elsewhere in the document, so offer to look.
+            if let Some(doc) = self.doc.as_ref() {
+                self.dialog = Some(Dialog::SuggestRemoveHidden { doc: doc.id });
+            }
+        }
+    }
+
+    /// Takes `items` of hidden information out of document `doc`, as an edit that removes content,
+    /// and says what was found. Nothing happens when `doc` is no longer in front.
+    pub fn remove_hidden_information(&mut self, doc: u64, items: Vec<carbide_engine::HiddenItem>) {
+        if self.doc.as_ref().map(|d| d.id) != Some(doc) {
+            self.status = "Nothing was removed: the document is no longer in front.".into();
+            return;
+        }
+        // What only the file on disk holds is reported too; the save that has to follow leaves it out.
+        let file = self.doc.as_ref().and_then(|d| d.saved.clone());
+        let was_dirty = self.doc.as_ref().is_some_and(|d| d.dirty);
+        let mut report = None;
+        self.edit_removing("Remove hidden information", |pdf| {
+            report = Some(pdf.remove_hidden_information_from(&items, file.as_ref())?);
+            Ok(())
+        });
+        match report {
+            Some(report) if report.is_empty() => {
+                // Nothing was found, so this was no edit: the document is put back exactly as it was,
+                // and a save has nothing to rewrite (which could cost a signature).
+                if let Some(doc) = self.doc.as_mut() {
+                    if let Some(snapshot) = doc.undo.pop() {
+                        let _ = doc.restore(&snapshot.bytes);
+                        doc.content_removed = snapshot.content_removed;
+                    }
+                    doc.dirty = was_dirty;
+                }
+                self.status = "No hidden information was found.".into();
+            }
+            Some(report) => {
+                let lines = report.lines().iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n");
+                self.alert(format!("Removed from the document:\n{lines}\n\nSave the document to write it without them."));
+            }
+            None => {}
+        }
     }
 
     fn compare_with(&mut self) {
@@ -1252,6 +1676,11 @@ impl CarbideApp {
             Err(e) => self.alert(format!("Compare failed: {e}")),
         }
     }
+}
+
+/// Those of `paths` that are already taken.
+fn taken(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.into_iter().filter(|path| path.symlink_metadata().is_ok()).collect()
 }
 
 /// Notice bar text for a document that carries signatures.
@@ -1291,6 +1720,17 @@ impl eframe::App for CarbideApp {
         dialogs::show(self, ui.ctx());
         self.prompts(ui.ctx());
     }
+}
+
+/// `carbide-gui --copy FILE` opens FILE, a private temporary copy, as a new document and removes it.
+const COPY_FLAG: &str = "--copy";
+
+/// What a window opens when it starts.
+enum Launch {
+    /// A file on disk, which Save writes back to.
+    File(PathBuf),
+    /// A private temporary copy, opened as a new document (see `CarbideApp::open_copy`).
+    Copy(PathBuf),
 }
 
 /// `carbide-gui --icons` shows every icon with its name, for checking the drawings.
@@ -1362,7 +1802,12 @@ fn main() -> eframe::Result {
             }),
         );
     }
-    let initial = std::env::args_os().nth(1).map(PathBuf::from);
+    let mut args = std::env::args_os().skip(1);
+    let launch = match args.next() {
+        Some(flag) if flag == COPY_FLAG => args.next().map(|path| Launch::Copy(PathBuf::from(path))),
+        Some(path) => Some(Launch::File(PathBuf::from(path))),
+        None => None,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
@@ -1370,5 +1815,5 @@ fn main() -> eframe::Result {
             .with_title("Carbide PDF"),
         ..Default::default()
     };
-    eframe::run_native("Carbide PDF", options, Box::new(move |cc| Ok(Box::new(CarbideApp::new(cc, initial)))))
+    eframe::run_native("Carbide PDF", options, Box::new(move |cc| Ok(Box::new(CarbideApp::new(cc, launch)))))
 }

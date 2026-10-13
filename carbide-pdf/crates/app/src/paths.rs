@@ -1,8 +1,12 @@
 //! Per-user data locations and the small settings file.
+//!
+//! Every file here is replaced in one step, so a crash or a full disk never leaves a settings file
+//! or list half written.
 
 use std::path::PathBuf;
 
 use carbide_engine::autosave::{AutoSaveSettings, DEFAULT_INTERVAL_MINUTES};
+use carbide_engine::fs::write_replacing;
 
 /// `~/Library/Application Support/Carbide PDF` (macOS), `%APPDATA%\Carbide PDF` (Windows) or
 /// `~/.local/share/carbide-pdf` (elsewhere).
@@ -60,7 +64,7 @@ pub fn save_autosave_settings(settings: &AutoSaveSettings) {
         if settings.enabled { 1 } else { 0 },
         settings.interval_minutes
     );
-    let _ = std::fs::write(settings_file(), text);
+    let _ = write_replacing(&settings_file(), text.as_bytes());
 }
 
 /// Certificates the user has chosen to trust (DER files).
@@ -91,7 +95,7 @@ pub fn trust_certificate_file(path: &std::path::Path) -> std::io::Result<usize> 
     let count = ders.len();
     for der in ders {
         let name = format!("{:016x}.der", der.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)));
-        std::fs::write(trusted_dir().join(name), der)?;
+        write_replacing(&trusted_dir().join(name), &der)?;
     }
     Ok(count)
 }
@@ -138,7 +142,7 @@ pub fn load_recent() -> Vec<RecentFile> {
 pub fn save_recent(list: &[RecentFile]) {
     let _ = std::fs::create_dir_all(data_dir());
     let text: String = list.iter().map(|r| format!("{}\t{}\n", r.opened, r.path.display())).collect();
-    let _ = std::fs::write(recent_file(), text);
+    let _ = write_replacing(&recent_file(), text.as_bytes());
 }
 
 /// Folders pinned in the start screen's sidebar.
@@ -151,7 +155,7 @@ pub fn load_locations() -> Vec<PathBuf> {
 pub fn save_locations(list: &[PathBuf]) {
     let _ = std::fs::create_dir_all(data_dir());
     let text: String = list.iter().map(|p| format!("{}\n", p.display())).collect();
-    let _ = std::fs::write(locations_file(), text);
+    let _ = write_replacing(&locations_file(), text.as_bytes());
 }
 
 // ---- cloud-synced folders -------------------------------------------------------------------

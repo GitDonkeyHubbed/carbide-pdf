@@ -402,16 +402,18 @@ impl Pdf {
             if !fonts.is_empty() {
                 resources.set("Font", Object::Dictionary(fonts));
             }
-            let mut page = dictionary! {
+            // A sheet sets its own boxes and rotation, so nothing meant for the source pages applies.
+            let sheet_box = real_array(&[0.0, 0.0, grid.width, grid.height]);
+            let flipped = options.flip_backs && plan.double_sided && !plate.front && output_index % 2 == 1;
+            let page = dictionary! {
                 "Type" => "Page",
                 "Parent" => root_id,
-                "MediaBox" => real_array(&[0.0, 0.0, grid.width, grid.height]),
+                "MediaBox" => sheet_box.clone(),
+                "CropBox" => sheet_box,
+                "Rotate" => if flipped { 180 } else { 0 },
                 "Resources" => resources,
                 "Contents" => content_id,
             };
-            if options.flip_backs && plan.double_sided && !plate.front && output_index % 2 == 1 {
-                page.set("Rotate", 180);
-            }
             new_pages.push(Object::Reference(out.doc.add_object(page)));
         }
 

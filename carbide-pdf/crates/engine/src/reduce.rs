@@ -20,9 +20,12 @@ use lopdf::content::Content;
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::error::{Error, Result};
+use crate::fs::Existing;
 use crate::pdf::Pdf;
 
 pub const DEFAULT_IMAGE_FACTOR: u8 = 50;
+/// Added to the file names by default, so the originals are kept.
+pub const DEFAULT_SUFFIX: &str = "-reduced";
 
 /// User-facing messages.
 pub mod messages {
@@ -37,6 +40,10 @@ pub mod messages {
     pub const CHOOSE_FOLDER: &str = "Choose a folder for the output files.";
     pub const INVALID_PATH: &str = "That folder does not exist.";
     pub const FILE_EXISTS: &str = "These settings would overwrite existing files…";
+    pub const REPLACES_ORIGINAL: &str =
+        "These settings would replace the original file. Add text to the file names, choose another folder, or choose to replace the original files.";
+    pub const OUTPUT_COLLIDES: &str = "Another file in the list would be written to the same file, or be replaced by this one's result.";
+    pub const BATCH_STOPPED: &str = "Not reduced: other files in the list would be written over each other.";
     pub const SLIDER_NOTE: &str = "The slider only changes how images are compressed.";
 }
 
@@ -585,16 +592,32 @@ pub struct OutputOptions {
     /// "Add to original file names": `prefix + stem + suffix + ".pdf"`. Both empty keeps the name.
     pub prefix: String,
     pub suffix: String,
+    /// Replace other files already where the results go.
     pub overwrite: bool,
+    /// Replace each original with its reduced copy. Results that would land on their original
+    /// are refused without it, whatever `overwrite` says.
+    pub replace_originals: bool,
 }
 
 impl Default for OutputOptions {
+    /// Next to the originals, with [`DEFAULT_SUFFIX`] added to the names, replacing nothing.
     fn default() -> Self {
-        Self { folder: TargetFolder::SameAsOriginal, prefix: String::new(), suffix: String::new(), overwrite: true }
+        Self {
+            folder: TargetFolder::SameAsOriginal,
+            prefix: String::new(),
+            suffix: DEFAULT_SUFFIX.to_string(),
+            overwrite: false,
+            replace_originals: false,
+        }
     }
 }
 
 impl OutputOptions {
+    /// Replace every original with its reduced copy, as an explicit choice.
+    pub fn in_place() -> Self {
+        Self { suffix: String::new(), overwrite: true, replace_originals: true, ..Self::default() }
+    }
+
     /// Output path for `input`, validated the way the Reduce dialog does.
     pub fn output_path(&self, input: &Path) -> std::result::Result<PathBuf, &'static str> {
         let directory = match &self.folder {
@@ -613,10 +636,63 @@ impl OutputOptions {
             format!("{}{}{}.pdf", self.prefix, stem, self.suffix)
         };
         let path = directory.join(name);
-        if !self.overwrite && path.exists() {
+        if file_identity(&path) == file_identity(input) {
+            return if self.replace_originals { Ok(path) } else { Err(messages::REPLACES_ORIGINAL) };
+        }
+        // A link counts as taken even when it leads nowhere: writing would create its target.
+        if !self.overwrite && path.symlink_metadata().is_ok() {
             return Err(messages::FILE_EXISTS);
         }
         Ok(path)
+    }
+
+    /// What writing a result to `target`, planned for `input`, does with a file already there:
+    /// replace it only when that was chosen (`overwrite`, or replacing the original itself).
+    fn existing(&self, input: &Path, target: &Path) -> Existing {
+        let replaces_original = self.replace_originals && file_identity(target) == file_identity(input);
+        if self.overwrite || replaces_original {
+            Existing::Replace
+        } else {
+            Existing::Refuse
+        }
+    }
+
+    /// Where each of `inputs` goes. When two of them would be written to the same file, or one's
+    /// result would replace another input before that one is read, every entry involved gets
+    /// [`messages::OUTPUT_COLLIDES`]: such a batch would lose a file.
+    pub fn plan(&self, inputs: &[PathBuf]) -> Vec<std::result::Result<PathBuf, &'static str>> {
+        let mut planned: Vec<_> = inputs.iter().map(|input| self.output_path(input)).collect();
+        let sources: Vec<PathBuf> = inputs.iter().map(|input| file_identity(input)).collect();
+        let targets: Vec<Option<PathBuf>> = planned.iter().map(|p| p.as_ref().ok().map(|p| file_identity(p))).collect();
+        for i in 0..planned.len() {
+            let Some(target) = &targets[i] else { continue };
+            let collides = (0..inputs.len())
+                .filter(|&j| j != i)
+                .any(|j| sources[j] == *target || targets[j].as_ref() == Some(target) || sources[j] == sources[i]);
+            if collides {
+                planned[i] = Err(messages::OUTPUT_COLLIDES);
+            }
+        }
+        planned
+    }
+}
+
+/// What `path` names, for telling whether two paths are the same file: links followed, and folded
+/// to lower case where file systems usually ignore case. Folding can only find more paths equal,
+/// which refuses a batch rather than lose a file.
+fn file_identity(path: &Path) -> PathBuf {
+    let absolute = match (path.canonicalize(), path.parent(), path.file_name()) {
+        (Ok(resolved), _, _) => resolved,
+        (Err(_), Some(dir), Some(name)) => {
+            let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+            dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()).join(name)
+        }
+        _ => path.to_path_buf(),
+    };
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        PathBuf::from(absolute.to_string_lossy().to_lowercase())
+    } else {
+        absolute
     }
 }
 
@@ -630,18 +706,26 @@ pub struct FileOutcome {
 }
 
 /// Reduces several files. A failed file leaves its original untouched, even when the output path
-/// is the input path (in-place reduction). Returns one outcome per input, in order.
+/// is the input path (in-place reduction, which needs `replace_originals`). Returns one outcome per
+/// input, in order.
+///
+/// The output paths are planned before any file is read: when two inputs would be written to the
+/// same file, or a result would replace another input, nothing is reduced at all.
 pub fn reduce_files(inputs: &[PathBuf], output: &OutputOptions, options: &ReduceOptions) -> Vec<FileOutcome> {
+    let planned = output.plan(inputs);
+    let stopped = planned.contains(&Err(messages::OUTPUT_COLLIDES));
     inputs
         .iter()
-        .map(|input| {
+        .zip(planned)
+        .map(|(input, planned)| {
             let fail = |message: &str| FileOutcome {
                 input: input.clone(),
                 output: None,
                 warning: Some(message.to_string()),
                 report: None,
             };
-            let target = match output.output_path(input) {
+            let target = match planned {
+                Ok(_) if stopped => return fail(messages::BATCH_STOPPED),
                 Ok(path) => path,
                 Err(message) => return fail(message),
             };
@@ -656,9 +740,12 @@ pub fn reduce_files(inputs: &[PathBuf], output: &OutputOptions, options: &Reduce
             match pdf.reduce(options, Some(bytes.len())) {
                 Ok((reduced, report)) => {
                     // Replaced in one step, so a crash never leaves a half-written file where the
-                    // original was.
-                    if crate::fs::write_replacing(&target, &reduced).is_err() {
-                        return fail(messages::SAVE_ERROR);
+                    // original was. Without the choice to replace files, one that appeared since
+                    // the batch was planned is left alone.
+                    match crate::fs::write_file(&target, &reduced, output.existing(input, &target)) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return fail(messages::FILE_EXISTS),
+                        Err(_) => return fail(messages::SAVE_ERROR),
                     }
                     FileOutcome { input: input.clone(), output: Some(target), warning: None, report: Some(report) }
                 }
@@ -689,7 +776,11 @@ mod tests {
         let dir = std::env::temp_dir();
         let input = dir.join("report.pdf");
         let mut options = OutputOptions::default();
-        assert_eq!(options.output_path(&input).unwrap(), input);
+        assert_eq!(options.output_path(&input).unwrap(), dir.join("report-reduced.pdf"), "the original is kept");
+        assert_eq!(OutputOptions::in_place().output_path(&input).unwrap(), input);
+        options.suffix.clear();
+        options.overwrite = true;
+        assert_eq!(options.output_path(&input), Err(messages::REPLACES_ORIGINAL), "replacing it is a choice of its own");
 
         options.prefix = "small-".into();
         options.suffix = "-v2".into();

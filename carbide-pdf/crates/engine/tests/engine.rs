@@ -5,17 +5,18 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use carbide_engine::autosave::{AutoSaveStore, RowKind};
+use carbide_engine::fs::Existing;
 use carbide_engine::imposition::{ImpositionOptions, Margins, Media};
 use carbide_engine::ocr::OcrOptions;
 use carbide_engine::signature::{
     messages as sig_messages, notice_text, CertifyLevel, Detail, HttpTimestampSource, Identity, SignOptions, SubFilter,
     TimestampSource, TrustStore, Validity,
 };
-use carbide_engine::reduce::{messages as reduce_messages, reduce_files, OutputOptions, ReduceOptions};
+use carbide_engine::reduce::{messages as reduce_messages, reduce_files, OutputOptions, ReduceOptions, TargetFolder};
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PlanOptions, PrintingOrder, Style};
 use carbide_engine::{
-    compare_documents, export_images, export_text, open_revision_bytes, pdf_date_now, BatesOptions, Error,
-    ImageFormat, MarkupStyle, PageAnchor, Pdf, ProtectionOptions, Rect, Redaction, Renderer, SavePlan, SavedFile,
+    compare_documents, export_images, export_text, image_paths, open_revision_bytes, pdf_date_now, BatesOptions, Error,
+    HiddenItem, ImageFormat, MarkupStyle, PageAnchor, Pdf, ProtectionOptions, Rect, Redaction, Renderer, SavePlan, SavedFile,
     WatermarkOptions,
 };
 use image::RgbaImage;
@@ -293,12 +294,44 @@ fn compare_reports_line_changes() {
 fn export_images_and_text() {
     let r = renderer();
     let mut pdf = text_pdf(&[&["page one"], &["page two"]]);
-    let dir = std::env::temp_dir().join(format!("carbide-export-{}", std::process::id()));
-    let paths = export_images(&r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0).unwrap();
+    let dir = scratch_dir("export");
+    let paths = export_images(r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::Refuse).unwrap();
     let names: Vec<_> = paths.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
     assert_eq!(names, vec!["doc-001.png", "doc-002.png"]);
+    assert_eq!(paths, image_paths(&pdf, &dir, "doc", ImageFormat::Png));
     assert_eq!(image::open(&paths[0]).unwrap().width(), 612);
+    let jpegs = export_images(r, &mut pdf, &dir, "doc", ImageFormat::Jpeg, 72.0, Existing::Refuse).unwrap();
+    assert_eq!(image::open(&jpegs[1]).unwrap().width(), 612);
     assert!(export_text(&r, &mut pdf).unwrap().contains("page two"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn exported_images_never_replace_files_unless_asked() {
+    let r = renderer();
+    let mut pdf = text_pdf(&[&["page one"], &["page two"]]);
+    let dir = scratch_dir("export-existing");
+    std::fs::create_dir_all(&dir).unwrap();
+    // An earlier export of another document with the same name.
+    std::fs::write(dir.join("doc-002.png"), b"earlier export").unwrap();
+    let listing = |dir: &PathBuf| {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    };
+
+    let refused = export_images(r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::Refuse).unwrap_err();
+    assert!(refused.to_string().contains("doc-002.png"), "{refused}");
+    assert_eq!(listing(&dir), ["doc-002.png"], "nothing is written when a name is taken");
+
+    let kept = export_images(r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::KeepBoth).unwrap();
+    assert_eq!(kept, [dir.join("doc-001.png"), dir.join("doc-002 (2).png")]);
+    assert_eq!(std::fs::read(dir.join("doc-002.png")).unwrap(), b"earlier export");
+
+    let replaced = export_images(r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::Replace).unwrap();
+    assert_eq!(replaced, [dir.join("doc-001.png"), dir.join("doc-002.png")]);
+    assert_eq!(image::open(dir.join("doc-002.png")).unwrap().width(), 612);
+    assert_eq!(listing(&dir), ["doc-001.png", "doc-002 (2).png", "doc-002.png"], "no temporary files are left");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -460,6 +493,30 @@ fn revisions_are_prefixes_of_the_file_and_open_as_they_were() {
     assert!(open_revision_bytes(&v2, &broken).is_err());
 }
 
+#[test]
+fn page_text_that_looks_like_the_length_placeholder_is_left_alone() {
+    let r = renderer();
+    let base = text_pdf(&[&["numbered page"]]).to_bytes().unwrap();
+    let mut working = Pdf::from_bytes(&base).unwrap();
+    // Ten-digit Bates numbers from zero: the page content holds "(0000000000)", written after the
+    // catalog in the update.
+    working.apply_bates(&BatesOptions { start_number: 0, digits: 10, ..Default::default() }).unwrap();
+    let file = working.save_revision(&base, "Numbered", &pdf_date_now()).unwrap();
+    let appended = &file[base.len()..];
+    let catalog_at = appended.windows(16).position(|w| w == b"CarbideRevisions").expect("the record is in the update");
+    assert!(
+        appended.windows(12).rposition(|w| w == b"(0000000000)").is_some_and(|at| at > catalog_at),
+        "the fixture puts the page text after the record"
+    );
+
+    let mut saved = Pdf::from_bytes(&file).unwrap();
+    let revisions = saved.revisions();
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0].file_offset as usize, file.len());
+    assert_eq!(open_revision_bytes(&file, &revisions[0]).unwrap(), file);
+    assert!(page_text(r, &mut saved, 0).contains("0000000000"), "the page text was patched");
+}
+
 // ---- saving over the file ----------------------------------------------------------------
 
 fn contains(bytes: &[u8], needle: &[u8]) -> bool {
@@ -522,6 +579,516 @@ fn deleted_pages_leave_nothing_behind() {
     assert_eq!(plan, CLEAN);
     assert_gone(&bytes, "DELETEDPAGE");
     assert_eq!(Pdf::from_bytes(&bytes).unwrap().page_count(), 1);
+}
+
+/// Four pages (`PAGE1X` to `PAGE4X`) and everything that leads to a page from outside the page
+/// tree: outline items (one by explicit destination, one by named destination, one by go-to
+/// action, and "Part Two" with an item below it), named destinations in the catalog and in the
+/// name tree, an open action, links, an article thread, and page labels i, ii, 1, 2. Everything
+/// whose name starts with "Secret" leads to the second page.
+fn navigable_pdf() -> Pdf {
+    let mut pdf = numbered_pages(4);
+    let ids = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let dest = |page: lopdf::ObjectId| Object::Array(vec![Object::Reference(page), "Fit".into()]);
+    let title = |text: &str| Object::string_literal(text);
+
+    let root = doc.new_object_id();
+    let intro = doc.add_object(dictionary! { "Title" => title("Intro Chapter"), "Parent" => root, "Dest" => dest(ids[0]) });
+    let secret = doc.add_object(dictionary! { "Title" => title("SECRET CHAPTER"), "Parent" => root, "Dest" => title("SecretPlace") });
+    let closing = doc.add_object(dictionary! {
+        "Title" => title("Closing Chapter"), "Parent" => root, "A" => dictionary! { "S" => "GoTo", "D" => dest(ids[2]) },
+    });
+    let part = doc.add_object(dictionary! { "Title" => title("Part Two"), "Parent" => root, "Dest" => "SecretName", "Count" => 1 });
+    let appendix = doc.add_object(dictionary! { "Title" => title("Appendix"), "Parent" => part, "Dest" => dest(ids[3]) });
+    let link = |doc: &mut Document, id, key: &str, value| doc.get_dictionary_mut(id).unwrap().set(key, Object::Reference(value));
+    for (a, b) in [(intro, secret), (secret, closing), (closing, part)] {
+        link(doc, a, "Next", b);
+        link(doc, b, "Prev", a);
+    }
+    link(doc, part, "First", appendix);
+    link(doc, part, "Last", appendix);
+    doc.objects.insert(root, Object::Dictionary(dictionary! { "Type" => "Outlines", "First" => intro, "Last" => part, "Count" => 5 }));
+
+    let bead = |doc: &mut Document, page: lopdf::ObjectId| {
+        doc.add_object(dictionary! { "Type" => "Bead", "P" => page, "R" => vec![0.into(), 0.into(), 100.into(), 100.into()] })
+    };
+    let (first_bead, second_bead) = (bead(doc, ids[1]), bead(doc, ids[2]));
+    let thread = doc.add_object(dictionary! { "Type" => "Thread", "F" => first_bead, "I" => dictionary! { "Title" => title("Secret Article") } });
+    for (bead, other) in [(first_bead, second_bead), (second_bead, first_bead)] {
+        let dict = doc.get_dictionary_mut(bead).unwrap();
+        dict.set("T", thread);
+        dict.set("N", other);
+        dict.set("V", other);
+    }
+    for (page, target, bead) in [(ids[0], ids[1], None), (ids[2], ids[3], Some(second_bead)), (ids[1], ids[0], Some(first_bead))] {
+        let annotation = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Link", "Rect" => vec![0.into(), 0.into(), 50.into(), 50.into()], "Dest" => dest(target),
+        });
+        let page = doc.get_dictionary_mut(page).unwrap();
+        page.set("Annots", vec![Object::Reference(annotation)]);
+        if let Some(bead) = bead {
+            page.set("B", vec![Object::Reference(bead)]);
+        }
+    }
+
+    let catalog = doc.catalog_mut().unwrap();
+    catalog.set("Outlines", root);
+    catalog.set("Dests", dictionary! { "SecretName" => dest(ids[1]), "Kept" => dest(ids[0]) });
+    catalog.set("Names", dictionary! { "Dests" => dictionary! { "Names" => vec![title("Intro"), dest(ids[0]), title("SecretPlace"), dest(ids[1])] } });
+    catalog.set("OpenAction", dest(ids[1]));
+    catalog.set("Threads", vec![Object::Reference(thread)]);
+    catalog.set("PageLabels", dictionary! { "Nums" => vec![0.into(), dictionary! { "S" => "r" }.into(), 2.into(), dictionary! { "S" => "D" }.into()] });
+    let bytes = pdf.to_bytes().unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
+/// The titles of the outline items below `parent`, in order, each with the titles below it.
+fn outline(pdf: &Pdf, parent: lopdf::ObjectId) -> Vec<(String, Vec<String>)> {
+    let doc = pdf.document();
+    let mut items = Vec::new();
+    let mut next = doc.get_dictionary(parent).unwrap().get(b"First").and_then(Object::as_reference).ok();
+    while let Some(id) = next {
+        let item = doc.get_dictionary(id).unwrap();
+        let title = String::from_utf8_lossy(item.get(b"Title").unwrap().as_str().unwrap()).into_owned();
+        items.push((title, outline(pdf, id).into_iter().map(|(t, _)| t).collect()));
+        next = item.get(b"Next").and_then(Object::as_reference).ok();
+    }
+    items
+}
+
+#[test]
+fn deleting_a_page_takes_out_what_leads_only_to_it() {
+    let mut pdf = navigable_pdf();
+    let old = pdf.page_ids();
+    pdf.delete_pages(&[1]).unwrap();
+    let bytes = file_bytes(&mut pdf);
+    for needle in ["SECRET CHAPTER", "SecretPlace", "SecretName", "PAGE2X"] {
+        assert_gone(&bytes, needle);
+    }
+    let pdf = Pdf::from_bytes(&bytes).unwrap();
+    let doc = pdf.document();
+    let catalog = doc.catalog().unwrap();
+    assert_eq!(pdf.page_count(), 3);
+
+    // "Part Two" led to the deleted page, but stays (without a destination) for the item below it.
+    let root = catalog.get(b"Outlines").unwrap().as_reference().unwrap();
+    let titles = outline(&pdf, root);
+    let expected = [("Intro Chapter", vec![]), ("Closing Chapter", vec![]), ("Part Two", vec!["Appendix".to_string()])];
+    assert_eq!(titles, expected.map(|(t, below)| (t.to_string(), below)));
+    assert_eq!(doc.get_dictionary(root).unwrap().get(b"Count").unwrap().as_i64().unwrap(), 4);
+    let part = doc.get_dictionary(root).unwrap().get(b"Last").unwrap().as_reference().unwrap();
+    assert!(!doc.get_dictionary(part).unwrap().has(b"Dest"));
+
+    assert!(!catalog.has(b"OpenAction"));
+    let dests = catalog.get(b"Dests").unwrap().as_dict().unwrap();
+    assert_eq!(dests.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), [b"Kept".to_vec()]);
+    let labels = catalog.get(b"PageLabels").unwrap().as_dict().unwrap().get(b"Nums").unwrap().as_array().unwrap();
+    assert_eq!(labels.len(), 4, "{labels:?}");
+    assert_eq!((labels[0].as_i64().unwrap(), labels[2].as_i64().unwrap()), (0, 1), "i, 1, 2: {labels:?}");
+    assert_eq!(labels[3].as_dict().unwrap().get(b"S").unwrap().as_name().unwrap(), b"D");
+
+    // The link to the deleted page is gone; the one to a page that stays is not.
+    let link = |page: usize| pdf.annotations(page).unwrap()[0].clone();
+    assert!(!link(0).has(b"Dest"));
+    assert_eq!(link(1).get(b"Dest").unwrap().as_array().unwrap()[0].as_reference().unwrap(), old[3]);
+
+    // The article keeps its bead on the page that stays.
+    let thread = catalog.get(b"Threads").unwrap().as_array().unwrap()[0].as_reference().unwrap();
+    let bead = doc.get_dictionary(thread).unwrap().get(b"F").unwrap().as_reference().unwrap();
+    let bead_dict = doc.get_dictionary(bead).unwrap();
+    assert_eq!(bead_dict.get(b"P").unwrap().as_reference().unwrap(), old[2]);
+    assert_eq!(bead_dict.get(b"N").unwrap().as_reference().unwrap(), bead);
+}
+
+#[test]
+fn page_labels_carry_on_where_a_page_was_deleted() {
+    let mut pdf = navigable_pdf();
+    // i, ii, 1, 2 without the "1": i, ii, 2.
+    pdf.delete_pages(&[2]).unwrap();
+    let catalog = pdf.document().catalog().unwrap();
+    let labels = catalog.get(b"PageLabels").unwrap().as_dict().unwrap().get(b"Nums").unwrap().as_array().unwrap().clone();
+    assert_eq!(labels.len(), 4, "{labels:?}");
+    assert_eq!((labels[0].as_i64().unwrap(), labels[2].as_i64().unwrap()), (0, 2));
+    let decimal = labels[3].as_dict().unwrap();
+    assert_eq!((decimal.get(b"S").unwrap().as_name().unwrap(), decimal.get(b"St").unwrap().as_i64().unwrap()), (&b"D"[..], 2));
+    // "Closing Chapter" led to the deleted page; the other three items stay.
+    assert_eq!(outline(&pdf, catalog.get(b"Outlines").unwrap().as_reference().unwrap()).len(), 3);
+}
+
+/// The node `id` of a name tree: its /Limits as text, and how many kids it has.
+fn tree_node(pdf: &Pdf, id: lopdf::ObjectId) -> (Vec<String>, usize) {
+    let dict = pdf.document().get_dictionary(id).unwrap();
+    let text = |o: &Object| String::from_utf8_lossy(o.as_str().unwrap()).into_owned();
+    let limits = dict.get(b"Limits").map(|l| l.as_array().unwrap().iter().map(text).collect()).unwrap_or_default();
+    (limits, dict.get(b"Kids").map(|k| k.as_array().unwrap().len()).unwrap_or(0))
+}
+
+#[test]
+fn deleted_destinations_leave_no_name_in_the_limits_of_their_name_tree() {
+    // Named destinations in a tree of several levels, as long documents have them, each node
+    // naming the first and last name below it.
+    let mut pdf = text_pdf(&[&["first"], &["second"], &["third"]]);
+    let pages = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let name = |n: &str| Object::string_literal(n);
+    let to = |page| Object::Array(vec![Object::Reference(page), "Fit".into()]);
+    let leaf = |doc: &mut Document, names: &[(&str, lopdf::ObjectId)]| {
+        let limits = vec![name(names[0].0), name(names[names.len() - 1].0)];
+        let pairs: Vec<Object> = names.iter().flat_map(|(n, page)| [name(n), to(*page)]).collect();
+        doc.add_object(dictionary! { "Limits" => limits, "Names" => pairs })
+    };
+    let first = leaf(doc, &[("Alpha", pages[0]), ("SecretMergerTarget", pages[1])]);
+    let second = leaf(doc, &[("SecretZeta", pages[1]), ("Zulu", pages[2])]);
+    let third = leaf(doc, &[("ZzSecretLast", pages[1])]);
+    let middle = doc.add_object(dictionary! {
+        "Limits" => vec![name("Alpha"), name("ZzSecretLast")],
+        "Kids" => vec![first.into(), second.into(), third.into()],
+    });
+    let root = doc.add_object(dictionary! { "Kids" => vec![middle.into()] });
+    doc.catalog_mut().unwrap().set("Names", dictionary! { "Dests" => root });
+
+    pdf.delete_pages(&[1]).unwrap();
+    let bytes = file_bytes(&mut pdf);
+    assert_gone(&bytes, "Secret");
+    let pdf = Pdf::from_bytes(&bytes).unwrap();
+    assert_eq!(tree_node(&pdf, first), (vec!["Alpha".into(), "Alpha".into()], 0));
+    assert_eq!(tree_node(&pdf, second), (vec!["Zulu".into(), "Zulu".into()], 0));
+    assert_eq!(tree_node(&pdf, middle), (vec!["Alpha".into(), "Zulu".into()], 2), "the emptied leaf is taken out");
+    assert_eq!(tree_node(&pdf, root), (vec![], 1), "the root has no limits");
+
+    // A tree left without a name goes altogether.
+    let mut pdf = text_pdf(&[&["first"], &["second"]]);
+    let gone_to = pdf.page_ids()[1];
+    let doc = pdf.document_mut();
+    let only = doc.add_object(dictionary! { "Limits" => vec![name("OnlySecret"), name("OnlySecret")], "Names" => vec![name("OnlySecret"), to(gone_to)] });
+    let root = doc.add_object(dictionary! { "Kids" => vec![only.into()] });
+    doc.catalog_mut().unwrap().set("Names", dictionary! { "Dests" => root });
+    pdf.delete_pages(&[1]).unwrap();
+    let bytes = file_bytes(&mut pdf);
+    assert_gone(&bytes, "OnlySecret");
+    let catalog = Pdf::from_bytes(&bytes).unwrap().document().catalog().unwrap().clone();
+    assert!(!catalog.get(b"Names").unwrap().as_dict().unwrap().has(b"Dests"));
+}
+
+/// One page showing "visible text", and hidden information of every kind, each holding
+/// `SECRET-<kind>`: document information, XMP, an attachment and a file attachment comment,
+/// document JavaScript run on opening and on a page event, a filled text field, a note with its
+/// pop-up, a thumbnail, private application data, a bookmark and an object nothing uses. A link
+/// and the form field are not hidden information and stay.
+fn hidden_pdf() -> Vec<u8> {
+    let mut pdf = text_pdf(&[&["visible text"]]);
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let secret = |kind: &str| Object::string_literal(format!("SECRET-{kind}"));
+    let rect = || vec![Object::from(10), 10.into(), 60.into(), 30.into()];
+    let stream = |doc: &mut Document, dict: lopdf::Dictionary, kind: &str| {
+        doc.add_object(Stream::new(dict, format!("SECRET-{kind}").into_bytes()).with_compression(false))
+    };
+
+    let info = doc.add_object(dictionary! { "Title" => secret("TITLE"), "Author" => "someone" });
+    doc.trailer.set("Info", info);
+    let xmp = stream(doc, dictionary! { "Type" => "Metadata", "Subtype" => "XML" }, "XMP");
+    let attached = stream(doc, dictionary! { "Type" => "EmbeddedFile" }, "ATTACHMENT");
+    let spec = doc.add_object(dictionary! { "Type" => "Filespec", "F" => secret("FILENAME"), "EF" => dictionary! { "F" => attached } });
+    let in_comment = stream(doc, dictionary! { "Type" => "EmbeddedFile" }, "COMMENTFILE");
+    let comment_spec = doc.add_object(dictionary! { "Type" => "Filespec", "F" => "a.txt", "EF" => dictionary! { "F" => in_comment } });
+    let script = doc.add_object(dictionary! { "S" => "JavaScript", "JS" => secret("SCRIPT") });
+    let appearance = stream(doc, dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => rect() }, "VALUE");
+    let field = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx", "T" => "name", "V" => secret("VALUE"), "Rect" => rect(), "P" => page,
+        "AP" => dictionary! { "N" => appearance },
+    });
+    let popup = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Popup", "Rect" => rect() });
+    let note = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Text", "Rect" => rect(), "Contents" => secret("COMMENT"), "Popup" => popup });
+    doc.get_dictionary_mut(popup).unwrap().set("Parent", note);
+    let file_comment = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "FileAttachment", "Rect" => rect(), "FS" => comment_spec });
+    let link = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Link", "Rect" => rect(), "A" => dictionary! { "S" => "URI", "URI" => "https://example.com" },
+    });
+    let thumbnail = stream(doc, dictionary! { "Width" => 1, "Height" => 1, "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8 }, "THUMB");
+    let private = dictionary! { "Editor" => dictionary! { "Private" => secret("PRIVATE"), "LastModified" => "D:20260101" } };
+    let page_dict = doc.get_dictionary_mut(page).unwrap();
+    page_dict.set("Annots", vec![field.into(), note.into(), popup.into(), file_comment.into(), link.into()]);
+    page_dict.set("Thumb", thumbnail);
+    page_dict.set("PieceInfo", private);
+    page_dict.set("AA", dictionary! { "O" => script });
+
+    let outlines = doc.catalog().unwrap().get(b"Outlines").unwrap().as_reference().unwrap();
+    let bookmark = doc.add_object(dictionary! { "Title" => secret("BOOKMARK"), "Parent" => outlines, "Dest" => vec![page.into(), "Fit".into()] });
+    let outline_root = doc.get_dictionary_mut(outlines).unwrap();
+    outline_root.set("First", bookmark);
+    outline_root.set("Last", bookmark);
+    outline_root.set("Count", 1);
+    let catalog = doc.catalog_mut().unwrap();
+    catalog.set("Metadata", xmp);
+    catalog.set("Names", dictionary! {
+        "EmbeddedFiles" => dictionary! { "Names" => vec![Object::string_literal("notes.txt"), spec.into()] },
+        "JavaScript" => dictionary! { "Names" => vec![Object::string_literal("init"), script.into()] },
+    });
+    catalog.set("OpenAction", script);
+    catalog.set("AcroForm", dictionary! { "Fields" => vec![Object::Reference(field)] });
+    stream(doc, lopdf::Dictionary::new(), "ORPHAN");
+    // Written as it is, without dropping the object nothing uses.
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+const HIDDEN: [&str; 11] =
+    ["TITLE", "XMP", "ATTACHMENT", "FILENAME", "COMMENTFILE", "SCRIPT", "VALUE", "COMMENT", "THUMB", "PRIVATE", "ORPHAN"];
+
+#[test]
+fn hidden_information_is_removed_as_chosen_and_reported() {
+    let file = hidden_pdf();
+    for kind in HIDDEN.iter().chain(&["BOOKMARK"]) {
+        assert!(contains(&file, format!("SECRET-{kind}").as_bytes()), "the fixture lacks {kind}");
+    }
+
+    // Only what is chosen goes.
+    let mut pdf = Pdf::from_bytes(&file).unwrap();
+    let report = pdf.remove_hidden_information(&[HiddenItem::Metadata]).unwrap();
+    assert_eq!(report.count(HiddenItem::Metadata), 2);
+    assert_eq!(report.lines(), ["Document information (title, author, keywords): 2"]);
+    let bytes = pdf.to_bytes().unwrap();
+    assert_gone(&bytes, "SECRET-TITLE");
+    assert!(contains(&bytes, b"SECRET-XMP") && contains(&bytes, b"SECRET-COMMENT"));
+
+    // Everything but the bookmarks by default.
+    let mut pdf = Pdf::from_bytes(&file).unwrap();
+    let chosen: Vec<HiddenItem> = HiddenItem::ALL.into_iter().filter(|i| i.chosen_by_default()).collect();
+    let report = pdf.remove_hidden_information(&chosen).unwrap();
+    for item in &chosen {
+        assert!(report.count(*item) >= 1, "{item:?} was not found: {report:?}");
+    }
+    assert_eq!(report.count(HiddenItem::Comments), 1, "the pop-up goes with its note, uncounted");
+    assert!(report.lines().contains(&"Comments, text boxes and markup: 1".to_string()), "{:?}", report.lines());
+    assert_eq!(report.count(HiddenItem::Attachments), 2);
+    assert_eq!(report.count(HiddenItem::Scripts), 3, "the named script, the open action and the page event");
+    let bytes = pdf.to_bytes().unwrap();
+    for kind in HIDDEN {
+        assert_gone(&bytes, &format!("SECRET-{kind}"));
+    }
+    assert!(contains(&bytes, b"SECRET-BOOKMARK"), "bookmarks stay unless chosen");
+    let reopened = Pdf::from_bytes(&bytes).unwrap();
+    let kinds: Vec<Vec<u8>> =
+        reopened.annotations(0).unwrap().iter().map(|a| a.get(b"Subtype").unwrap().as_name().unwrap().to_vec()).collect();
+    assert_eq!(kinds, [b"Widget".to_vec(), b"Link".to_vec()]);
+    assert!(page_text(renderer(), &mut pdf, 0).contains("visible text"));
+
+    let report = pdf.remove_hidden_information(&[HiddenItem::Bookmarks]).unwrap();
+    assert_eq!(report.count(HiddenItem::Bookmarks), 1);
+    assert_gone(&pdf.to_bytes().unwrap(), "SECRET-BOOKMARK");
+    assert!(pdf.remove_hidden_information(&HiddenItem::ALL).unwrap().is_empty(), "nothing is left to find");
+}
+
+/// A page with a note holding "SECRET-OLD-COMMENT" and the title "SECRET-OLD-TITLE", then an
+/// update appended that takes the note off the page and changes the title: both stay in the file,
+/// in its earlier version.
+fn file_with_history() -> Vec<u8> {
+    let mut pdf = text_pdf(&[&["page"]]);
+    pdf.add_note(0, 100.0, 100.0, "SECRET-OLD-COMMENT").unwrap();
+    let info = pdf.document_mut().add_object(dictionary! { "Title" => Object::string_literal("SECRET-OLD-TITLE") });
+    pdf.document_mut().trailer.set("Info", info);
+    let base = pdf.to_bytes().unwrap();
+    let mut later = Pdf::from_bytes(&base).unwrap();
+    let page = later.page_ids()[0];
+    later.document_mut().get_dictionary_mut(page).unwrap().remove(b"Annots");
+    later.document_mut().get_dictionary_mut(info).unwrap().set("Title", Object::string_literal("Final"));
+    later.incremental_update(&base).unwrap()
+}
+
+#[test]
+fn removing_hidden_information_leaves_nothing_behind_in_the_file_it_saves_over() {
+    // An object nothing refers to, written out as it is.
+    let mut orphaned = text_pdf(&[&["page"]]);
+    orphaned.document_mut().add_object(Stream::new(lopdf::Dictionary::new(), b"SECRET-ORPHAN".to_vec()).with_compression(false));
+    let mut orphan_file = Vec::new();
+    orphaned.document_mut().save_to(&mut orphan_file).unwrap();
+    let history_file = file_with_history();
+    for secret in ["SECRET-OLD-COMMENT", "SECRET-OLD-TITLE"] {
+        assert!(contains(&history_file, secret.as_bytes()), "the fixture lacks {secret}");
+    }
+    assert_eq!(SavedFile::open(history_file.clone(), None).unwrap().1.appended_updates(), 1);
+
+    let defaults: Vec<HiddenItem> = HiddenItem::ALL.into_iter().filter(|i| i.chosen_by_default()).collect();
+    for (file, secrets) in [(&orphan_file, &["SECRET-ORPHAN"][..]), (&history_file, &["SECRET-OLD-COMMENT", "SECRET-OLD-TITLE"])] {
+        for items in [&defaults[..], &[HiddenItem::Thumbnails]] {
+            let mut reported = Vec::new();
+            // As the command line opens a file, and as the app does, which drops what nothing
+            // refers to as it opens it: the same is reported either way.
+            for dropped_on_opening in [false, true] {
+                let (mut pdf, saved) = SavedFile::open(file.clone(), None).unwrap();
+                if dropped_on_opening {
+                    pdf.to_bytes().unwrap();
+                }
+                assert_ne!(pdf.save_plan(Some(&saved), true).unwrap(), SavePlan::Unchanged, "a removal always rewrites");
+                let report = pdf.remove_hidden_information_from(items, Some(&saved)).unwrap();
+                assert!(!report.is_empty() && report.in_file() >= 1, "{report:?}");
+                assert!(report.lines().iter().any(|l| l.starts_with(carbide_engine::sanitize::IN_FILE_LABEL)), "{report:?}");
+                reported.push(report.lines());
+
+                let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, true);
+                assert_eq!(plan, CLEAN);
+                for secret in secrets {
+                    assert_gone(&bytes, secret);
+                }
+                // What was written holds nothing more.
+                let (mut again, rewritten) = SavedFile::open(bytes, None).unwrap();
+                assert_eq!(rewritten.appended_updates(), 0);
+                assert!(again.remove_hidden_information_from(items, Some(&rewritten)).unwrap().is_empty());
+            }
+            assert_eq!(reported[0], reported[1]);
+        }
+    }
+}
+
+/// A one-page file written the way web-optimized files are: a linearization dictionary first, the
+/// hint stream it points to by offset, and a content stream whose length is an object of its own.
+/// `orphan`, when given, is written as one more object nothing refers to.
+fn linearized_file(orphan: Option<&str>) -> Vec<u8> {
+    let write = |hint_offset: usize| {
+        let mut objects = vec![
+            (6, format!("<</Linearized 1/L 0/H [{hint_offset:010} 30]/O 3/E 0/N 1/T 0>>")),
+            (1, "<</Type/Catalog/Pages 2 0 R>>".to_string()),
+            (2, "<</Type/Pages/Kids [3 0 R]/Count 1>>".to_string()),
+            (3, "<</Type/Page/Parent 2 0 R/MediaBox [0 0 612 792]/Contents 4 0 R>>".to_string()),
+            (4, "<</Length 5 0 R>>\nstream\n0 0 m 10 10 l S\nendstream".to_string()),
+            (5, "16".to_string()),
+            (7, "<</Length 8/S 4>>\nstream\n\0\0\0\0\0\0\0\0\nendstream".to_string()),
+        ];
+        if let Some(orphan) = orphan {
+            objects.push((8, orphan.to_string()));
+        }
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![0; objects.len() + 1];
+        for (number, body) in &objects {
+            offsets[*number] = bytes.len();
+            bytes.extend(format!("{number} 0 obj\n{body}\nendobj\n").into_bytes());
+        }
+        let xref = bytes.len();
+        bytes.extend(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).into_bytes());
+        for offset in &offsets[1..] {
+            bytes.extend(format!("{offset:010} 00000 n \n").into_bytes());
+        }
+        bytes.extend(format!("trailer\n<</Size {}/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n", offsets.len()).into_bytes());
+        (bytes, offsets[7])
+    };
+    // The offsets do not depend on the one written into the dictionary, which has a fixed width.
+    let (_, hint_offset) = write(0);
+    write(hint_offset).0
+}
+
+#[test]
+fn how_a_file_was_written_is_not_reported_as_hidden_information() {
+    let items = [HiddenItem::UnusedObjects, HiddenItem::Thumbnails];
+    let (mut pdf, saved) = SavedFile::open(linearized_file(None), None).unwrap();
+    assert_eq!(saved.appended_updates(), 0);
+    let report = pdf.remove_hidden_information_from(&items, Some(&saved)).unwrap();
+    assert!(report.is_empty(), "the linearization data and the stream length were reported: {report:?}");
+
+    // An object that holds something is found next to them, by either count.
+    let file = linearized_file(Some("<</Note (SECRET-ORPHAN)>>"));
+    let (mut pdf, saved) = SavedFile::open(file.clone(), None).unwrap();
+    assert_eq!(pdf.remove_hidden_information_from(&items, Some(&saved)).unwrap().in_file(), 1);
+    let (mut pdf, _) = SavedFile::open(file, None).unwrap();
+    assert_eq!(pdf.remove_hidden_information(&items).unwrap().count(HiddenItem::UnusedObjects), 1);
+}
+
+#[test]
+fn scripts_are_taken_out_wherever_actions_chain_them() {
+    let mut pdf = text_pdf(&[&["first"], &["second"]]);
+    let pages = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let script = |text: &str| Object::Dictionary(dictionary! { "S" => "JavaScript", "JS" => Object::string_literal(text) });
+    let go_to = |page| dictionary! { "S" => "GoTo", "D" => vec![Object::Reference(page), "Fit".into()] };
+    let rect = || vec![Object::from(10), 10.into(), 60.into(), 30.into()];
+
+    // A link, held directly in the page's list, that opens a web page and then runs a script.
+    let link = dictionary! {
+        "Type" => "Annot", "Subtype" => "Link", "Rect" => rect(),
+        "A" => dictionary! { "S" => "URI", "URI" => "https://example.com", "Next" => script("app.alert('SECRET-NEXT-JS')") },
+    };
+    // A button whose action, an object of its own, runs a script and then goes to the second page.
+    let then = doc.add_object(go_to(pages[1]));
+    let button_script = doc.add_object(dictionary! { "S" => "JavaScript", "JS" => Object::string_literal("SECRET-BUTTON-JS"), "Next" => then });
+    let button = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Btn", "Ff" => 65536, "T" => "go", "Rect" => rect(), "A" => button_script,
+    });
+    // A media action with a script of its own.
+    let rendition = doc.add_object(dictionary! { "S" => "Rendition", "OP" => 0, "JS" => Object::string_literal("SECRET-RENDITION-JS") });
+    let screen = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Screen", "Rect" => rect(), "A" => rendition });
+    doc.get_dictionary_mut(pages[0]).unwrap().set("Annots", vec![Object::Dictionary(link), button.into(), screen.into()]);
+    // A bookmark that goes to the first page, then runs a script, launches an application and
+    // goes to the second page.
+    let outlines = doc.catalog().unwrap().get(b"Outlines").unwrap().as_reference().unwrap();
+    let launch = dictionary! { "S" => "Launch", "F" => Object::string_literal("SECRET-LAUNCH.app") };
+    let mut first_page = go_to(pages[0]);
+    first_page.set("Next", vec![script("SECRET-OUTLINE-JS"), Object::Dictionary(launch), Object::Dictionary(go_to(pages[1]))]);
+    let bookmark = doc.add_object(dictionary! { "Title" => "Chapter", "Parent" => outlines, "A" => first_page });
+    let root = doc.get_dictionary_mut(outlines).unwrap();
+    root.set("First", bookmark);
+    root.set("Last", bookmark);
+    root.set("Count", 1);
+
+    let report = pdf.remove_hidden_information(&[HiddenItem::Scripts]).unwrap();
+    assert_eq!(report.count(HiddenItem::Scripts), 5, "four scripts and the launch: {report:?}");
+    let bytes = file_bytes(&mut pdf);
+    for secret in ["SECRET-NEXT-JS", "SECRET-BUTTON-JS", "SECRET-RENDITION-JS", "SECRET-OUTLINE-JS", "SECRET-LAUNCH"] {
+        assert_gone(&bytes, secret);
+    }
+
+    // What runs no code stays, and each chain closes up around what went.
+    let pdf = Pdf::from_bytes(&bytes).unwrap();
+    let doc = pdf.document();
+    let resolve = |object: &Object| match object {
+        Object::Reference(id) => doc.get_dictionary(*id).unwrap().clone(),
+        other => other.as_dict().unwrap().clone(),
+    };
+    let kind = |action: &lopdf::Dictionary| action.get(b"S").unwrap().as_name().unwrap().to_vec();
+    let target = |action: &lopdf::Dictionary| action.get(b"D").unwrap().as_array().unwrap()[0].as_reference().unwrap();
+    let annotations = pdf.annotations(0).unwrap();
+    let link = resolve(annotations[0].get(b"A").unwrap());
+    assert_eq!((kind(&link), link.has(b"Next")), (b"URI".to_vec(), false));
+    let button = resolve(annotations[1].get(b"A").unwrap());
+    assert_eq!((kind(&button), target(&button)), (b"GoTo".to_vec(), pages[1]));
+    let rendition = resolve(annotations[2].get(b"A").unwrap());
+    assert_eq!((kind(&rendition), rendition.has(b"JS")), (b"Rendition".to_vec(), false));
+    let bookmark = resolve(doc.get_dictionary(bookmark).unwrap().get(b"A").unwrap());
+    assert_eq!((kind(&bookmark), target(&bookmark)), (b"GoTo".to_vec(), pages[0]));
+    let next = resolve(bookmark.get(b"Next").unwrap());
+    assert_eq!((kind(&next), target(&next)), (b"GoTo".to_vec(), pages[1]));
+}
+
+#[test]
+fn clearing_form_data_also_clears_what_a_list_shows_as_picked_and_its_default() {
+    let mut pdf = text_pdf(&[&["form"]]);
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let widget = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "Rect" => vec![Object::from(10), 10.into(), 160.into(), 60.into()], "P" => page,
+    });
+    // A list box that allows several choices: the value, the options picked (by index) and the
+    // value a reset gives it.
+    let field = doc.add_object(dictionary! {
+        "FT" => "Ch", "T" => "condition", "Ff" => 2_097_152,
+        "Opt" => vec![Object::string_literal("Healthy"), Object::string_literal("Other")],
+        "V" => vec![Object::string_literal("SECRET-CHOICE")], "I" => vec![Object::Integer(1)], "DV" => Object::string_literal("SECRET-DEFAULT"),
+        "Kids" => vec![widget.into()],
+    });
+    doc.get_dictionary_mut(widget).unwrap().set("Parent", field);
+    doc.get_dictionary_mut(page).unwrap().set("Annots", vec![Object::Reference(widget)]);
+    doc.catalog_mut().unwrap().set("AcroForm", dictionary! { "Fields" => vec![Object::Reference(field)] });
+
+    let report = pdf.remove_hidden_information(&[HiddenItem::FormData]).unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    let bytes = file_bytes(&mut pdf);
+    assert_gone(&bytes, "SECRET-CHOICE");
+    assert_gone(&bytes, "SECRET-DEFAULT");
+    let pdf = Pdf::from_bytes(&bytes).unwrap();
+    let field = pdf.document().get_dictionary(field).unwrap();
+    assert!(!field.has(b"V") && !field.has(b"I") && !field.has(b"DV"), "{field:?}");
+    assert!(field.has(b"Opt"), "the options offered are part of the form");
 }
 
 /// One page per label, built the way word processors and form tools write them, so that other
@@ -1084,6 +1651,110 @@ fn aes256_passwords_are_prepared_the_way_the_standard_says() {
     }
 }
 
+/// The encryption values a password gives for `bytes`, which must open with it.
+fn encryption(bytes: &[u8], password: Option<&str>) -> lopdf::EncryptionState {
+    let pdf = match password {
+        Some(password) => Pdf::from_bytes_with_password(bytes, password),
+        None => Pdf::from_bytes(bytes),
+    };
+    pdf.unwrap().document().encryption_state.clone().expect("encrypted")
+}
+
+fn same_encryption(a: &lopdf::EncryptionState, b: &lopdf::EncryptionState) -> bool {
+    a.file_encryption_key() == b.file_encryption_key()
+        && a.permissions() == b.permissions()
+        && (a.version(), a.revision()) == (b.version(), b.revision())
+        && (a.owner_value(), a.user_value()) == (b.owner_value(), b.user_value())
+        && (a.owner_encrypted(), a.user_encrypted()) == (b.owner_encrypted(), b.user_encrypted())
+}
+
+#[test]
+fn documents_made_from_a_protected_one_keep_its_passwords_and_permissions() {
+    let r = renderer();
+    let mut options = ProtectionOptions::new("user pw", "owner pw");
+    options.allow_printing = false;
+    options.allow_copying = false;
+    let sources = [
+        ("AES-256", text_pdf(&[&["private words"], &["second page"]]).to_encrypted_bytes(&options).unwrap()),
+        // The older revisions derive the key from the file identifier, which has to come along.
+        ("RC4", legacy_protected(false, "user pw", "owner pw")),
+        ("AES-128", legacy_protected(true, "user pw", "owner pw")),
+    ];
+    for (label, original) in sources {
+        let before = encryption(&original, Some("user pw"));
+        let source = Pdf::from_bytes_with_password(&original, "user pw").unwrap();
+        assert!(source.is_protected());
+        let letter = ImpositionOptions { media: Media::Named("Letter".into()), ..Default::default() };
+        let derived = [
+            ("extract", source.extract_pages(&[0]).unwrap()),
+            ("split", source.split(&Pdf::parse_ranges("1", source.page_count()).unwrap()).unwrap().remove(0)),
+            ("impose", source.impose(&letter, None).unwrap()),
+            ("merge", Pdf::merge(&[&source, &source.clone()]).unwrap()),
+        ];
+        for (what, mut pdf) in derived {
+            let bytes = pdf.to_file_bytes(Some("user pw")).unwrap();
+            assert!(!contains(&bytes, b"private words"), "{label} {what}: written in the clear");
+            assert!(matches!(Pdf::from_bytes(&bytes), Err(Error::PasswordRequired)), "{label} {what}");
+            assert!(matches!(Pdf::from_bytes_with_password(&bytes, "wrong"), Err(Error::WrongPassword)), "{label} {what}");
+            for password in ["user pw", "owner pw"] {
+                assert!(same_encryption(&encryption(&bytes, Some(password)), &before), "{label} {what}, opened with {password}");
+                let text = r.page_text_with_password(&bytes, password, 0).unwrap();
+                assert!(text.contains("private words"), "{label} {what}, read with {password}: {text:?}");
+            }
+            assert!(pdf.to_file_bytes(Some("wrong")).is_err(), "{label} {what}: not checked with the password");
+        }
+    }
+
+    // A file that only restricts permissions: the parts open without a password and keep the
+    // restrictions, and `save` needs none.
+    let mut restricted = ProtectionOptions::new("", "owner pw");
+    restricted.allow_copying = false;
+    let original = text_pdf(&[&["private words"], &["second page"]]).to_encrypted_bytes(&restricted).unwrap();
+    let before = encryption(&original, None);
+    let source = Pdf::from_bytes(&original).unwrap();
+    let dir = scratch_dir("derived-protection");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("part.pdf");
+    source.extract_pages(&[1]).unwrap().save(&path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(!contains(&bytes, b"second page"));
+    assert!(same_encryption(&encryption(&bytes, None), &before));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn merging_keeps_a_shared_protection_and_refuses_different_ones() {
+    let protect = |text: &str, user: &str| {
+        let bytes = text_pdf(&[&[text]]).to_encrypted_bytes(&ProtectionOptions::new(user, "owner pw")).unwrap();
+        Pdf::from_bytes_with_password(&bytes, "owner pw").unwrap()
+    };
+    let (first, second) = (protect("first secret", "one"), protect("second secret", "two"));
+    let plain = text_pdf(&[&["plain page"]]);
+
+    // A protected and an unprotected input: the result is protected like the protected one.
+    let mut merged = Pdf::merge(&[&plain, &first]).unwrap();
+    let bytes = merged.to_file_bytes(Some("one")).unwrap();
+    assert!(!contains(&bytes, b"first secret") && !contains(&bytes, b"plain page"));
+    assert!(same_encryption(&encryption(&bytes, Some("one")), first.document().encryption_state.as_ref().unwrap()));
+    assert_eq!(Pdf::from_bytes_with_password(&bytes, "one").unwrap().page_count(), 2);
+
+    // Protected in two ways: either password would open the other's pages, so it is refused.
+    let refused = Pdf::merge(&[&first, &second]).unwrap_err();
+    assert_eq!(refused.to_string(), carbide_engine::save::DIFFERENT_PROTECTION);
+    assert!(Pdf::shared_protection(&[&first, &second]).is_err());
+
+    // Without protection only when that is asked for.
+    let (mut a, mut b) = (first.clone(), second.clone());
+    a.set_protection(None);
+    b.set_protection(None);
+    let mut merged = Pdf::merge(&[&a, &b]).unwrap();
+    assert!(!merged.is_protected());
+    let bytes = merged.to_file_bytes(None).unwrap();
+    let reopened = Pdf::from_bytes(&bytes).unwrap();
+    assert!(reopened.document().encryption_state.is_none());
+    assert_eq!(reopened.page_count(), 2);
+}
+
 #[cfg(unix)]
 #[test]
 fn replacing_a_file_keeps_its_mode_and_follows_symbolic_links() {
@@ -1130,6 +1801,44 @@ fn replacing_a_file_keeps_its_mode_and_follows_symbolic_links() {
     let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
     names.sort();
     assert_eq!(names, ["fresh.pdf", "link.pdf", "locked.pdf", "private.pdf", "target.pdf"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_and_protected_copies_replace_files_in_one_step() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let dir = scratch_dir("safe-save");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+    // Saving over a private file keeps it private.
+    let private = dir.join("private.pdf");
+    std::fs::write(&private, b"old").unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+    text_pdf(&[&["saved"]]).save(&private).unwrap();
+    assert_eq!(mode(&private), 0o600);
+    assert_eq!(Pdf::open(&private).unwrap().page_count(), 1);
+
+    // A protected copy written through a link replaces the file it points to.
+    let link = dir.join("link.pdf");
+    symlink("private.pdf", &link).unwrap();
+    text_pdf(&[&["protected"]]).save_encrypted(&link, &ProtectionOptions::new("open", "owner")).unwrap();
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(matches!(Pdf::open(&private), Err(Error::PasswordRequired)));
+    assert_eq!(mode(&private), 0o600);
+
+    // A file that cannot be written is refused and left as it was, by both.
+    let locked = dir.join("locked.pdf");
+    std::fs::write(&locked, b"keep").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444)).unwrap();
+    assert!(text_pdf(&[&["x"]]).save(&locked).is_err());
+    assert!(text_pdf(&[&["x"]]).save_encrypted(&locked, &ProtectionOptions::new("", "owner")).is_err());
+    assert_eq!(std::fs::read(&locked).unwrap(), b"keep");
+
+    let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    assert_eq!(names, ["link.pdf", "locked.pdf", "private.pdf"], "no temporary files are left");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1258,6 +1967,64 @@ fn recovery_copies_are_private_and_never_of_protected_documents() {
 }
 
 #[test]
+fn windows_sharing_the_folder_never_take_each_others_live_copies() {
+    let r = renderer();
+    let dir = scratch_dir("autosave-windows");
+    let original = dir.join("..").join("contract.pdf");
+    let names = |dir: &PathBuf| {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    };
+
+    // Window A has an auto-saved document.
+    let mut a = AutoSaveStore::open(&dir).unwrap();
+    let in_a = a.begin_document(Some(&original), 1);
+    a.autosave(in_a, &mut text_pdf(&[&["window A"]]), 2).unwrap();
+    let a_copy = a.record(in_a).unwrap().recovered.clone().unwrap().path;
+
+    // Window B, opened while A runs (Open Revision does that), sees none of it as recovered and
+    // cannot delete it.
+    let mut b = AutoSaveStore::open(&dir).unwrap();
+    assert!(!b.any_needs_save());
+    assert!(b.panel_rows().is_empty());
+    assert_eq!(b.remove_all_loaded().unwrap(), 0);
+    let in_b = b.begin_document(None, 3);
+    b.autosave(in_b, &mut text_pdf(&[&["window B"]]), 4).unwrap();
+    // They write their indexes in any order, and neither drops the other's records.
+    a.autosave(in_a, &mut text_pdf(&[&["window A, later"]]), 5).unwrap();
+    b.document_closed(in_b).unwrap();
+    assert!(a_copy.exists());
+    assert!(!names(&dir).iter().any(|n| n.ends_with(".tmp")), "an index was not replaced in one step");
+
+    // A ends without closing its document (a crash): the next window recovers it, and B, still
+    // running, has not taken it.
+    drop(a);
+    assert!(b.panel_rows().is_empty());
+    let c = AutoSaveStore::open(&dir).unwrap();
+    let rows = c.panel_rows();
+    assert_eq!(rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["contract.pdf (saved)", "contract.pdf (recovered)"]);
+    assert_eq!(rows[1].save_time, 5);
+    let (mut recovered, _) = c.open_recovered(rows[1].record, None).unwrap();
+    assert!(page_text(r, &mut recovered, 0).contains("window A, later"));
+
+    // Now C runs and holds the record: another window does not see it either.
+    let d = AutoSaveStore::open(&dir).unwrap();
+    assert!(d.panel_rows().is_empty());
+    drop(d);
+    drop(c);
+    drop(b);
+    // Once C is gone too, the record is listed exactly once.
+    let mut e = AutoSaveStore::open(&dir).unwrap();
+    assert_eq!(e.panel_rows().len(), 2);
+    assert_eq!(e.remove_all_loaded().unwrap(), 1);
+    assert!(!a_copy.exists());
+    drop(e);
+    assert_eq!(names(&dir), ["AutoRecovery.lock"], "nothing but the folder lock is left");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn a_damaged_index_is_ignored() {
     let dir = scratch_dir("autosave-bad");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1265,6 +2032,37 @@ fn a_damaged_index_is_ignored() {
     assert!(AutoSaveStore::open(&dir).unwrap().records().is_empty());
     std::fs::write(dir.join(carbide_engine::autosave::INDEX_FILE_NAME), "not xml at all").unwrap();
     assert!(AutoSaveStore::open(&dir).unwrap().records().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_index_of_earlier_versions_is_taken_over_only_once_it_stops_changing() {
+    let dir = scratch_dir("autosave-earlier");
+    std::fs::create_dir_all(&dir).unwrap();
+    let copy = dir.join("ZASolder1.asd");
+    std::fs::write(&copy, text_pdf(&[&["older window"]]).to_bytes().unwrap()).unwrap();
+    let index = dir.join(carbide_engine::autosave::INDEX_FILE_NAME);
+    let item = format!("<AutoSaveItem RecoveredFile=\"{}\" RecoveredSaveTime=\"5\" IsNewDoc=\"1\"/>", copy.display());
+    std::fs::write(&index, format!("<?xml version=\"1.0\"?>\n<AutoSave version=\"1.0\">{item}</AutoSave>\n")).unwrap();
+
+    // Just written: a window of an earlier version may still be running and using them.
+    let mut store = AutoSaveStore::open(&dir).unwrap();
+    assert!(store.panel_rows().is_empty());
+    assert_eq!(store.remove_all_loaded().unwrap(), 0);
+    drop(store);
+    assert!(index.exists() && copy.exists());
+
+    // Unchanged for longer than any window waits between two auto-saves: that window is gone.
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 3600);
+    for path in [&index, &copy] {
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(long_ago).unwrap();
+    }
+    let mut store = AutoSaveStore::open(&dir).unwrap();
+    assert_eq!(store.panel_rows().len(), 1);
+    assert!(!index.exists());
+    assert_eq!(store.remove_all_loaded().unwrap(), 1);
+    assert!(!copy.exists());
+    drop(store);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1385,6 +2183,92 @@ fn imposition_reports_progress_and_can_be_cancelled() {
     let broken = ImpositionOptions { media: Media::None, ..Default::default() };
     assert!(source.impose(&broken, None).unwrap_err().to_string().starts_with("Choose a media size"));
     let _ = (Binding::Saddle, Style::Sheetwise);
+}
+
+// ---- inherited page attributes -------------------------------------------------------------
+
+/// `numbered_pages(4)` with /Rotate 90 and /CropBox [0 300 500 792] (which still shows the text)
+/// set only on a page-tree node: the root, or a node between the root and the pages.
+fn inherited_geometry(on_root: bool) -> Pdf {
+    let mut pdf = numbered_pages(4);
+    let doc = pdf.document_mut();
+    let root_id = doc.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+    let crop: Vec<Object> = vec![0.into(), 300.into(), 500.into(), 792.into()];
+    if on_root {
+        let root = doc.get_dictionary_mut(root_id).unwrap();
+        root.set("Rotate", 90);
+        root.set("CropBox", crop);
+    } else {
+        let kids = doc.get_dictionary(root_id).unwrap().get(b"Kids").unwrap().clone();
+        let middle = doc.add_object(dictionary! {
+            "Type" => "Pages", "Parent" => root_id, "Kids" => kids.clone(), "Count" => 4, "Rotate" => 90, "CropBox" => crop,
+        });
+        for kid in kids.as_array().unwrap() {
+            doc.get_dictionary_mut(kid.as_reference().unwrap()).unwrap().set("Parent", middle);
+        }
+        doc.get_dictionary_mut(root_id).unwrap().set("Kids", vec![Object::Reference(middle)]);
+    }
+    let bytes = pdf.to_bytes().unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
+/// Width and height of a page as PDFium draws it at 72 dpi.
+fn rendered_size(pdf: &mut Pdf, page: usize) -> (u32, u32) {
+    render(renderer(), pdf, page).dimensions()
+}
+
+#[test]
+fn new_and_rebuilt_pages_do_not_pick_up_an_inherited_rotation_or_crop_box() {
+    let r = renderer();
+    let source = inherited_geometry(true);
+    let geometry = source.page_geometry(0).unwrap();
+    assert_eq!((geometry.rotation, geometry.display_size()), (90, (492.0, 500.0)), "the fixture inherits both");
+
+    // An inserted blank page has the size it was given, upright; the other pages keep theirs.
+    let mut blank = source.clone();
+    blank.insert_blank_page(4, Some((612.0, 792.0))).unwrap();
+    let geometry = blank.page_geometry(4).unwrap();
+    assert_eq!((geometry.rotation, geometry.display_size()), (0, (612.0, 792.0)));
+    assert_eq!(rendered_size(&mut blank, 4), (612, 792));
+    let geometry = blank.page_geometry(1).unwrap();
+    assert_eq!((geometry.rotation, geometry.display_size()), (90, (492.0, 500.0)));
+    assert_eq!(rendered_size(&mut blank, 1), (492, 500));
+
+    // Imposed Letter sheets are Letter landscape, not rotated or cropped like the source pages.
+    let options = ImpositionOptions { media: Media::Named("Letter".into()), ..Default::default() };
+    let mut sheets = source.impose(&options, None).unwrap();
+    for sheet in 0..sheets.page_count() {
+        let geometry = sheets.page_geometry(sheet).unwrap();
+        assert_eq!((geometry.rotation, geometry.display_size()), (0, (792.0, 612.0)), "sheet {sheet}");
+        assert_eq!(rendered_size(&mut sheets, sheet), (792, 612), "sheet {sheet}");
+    }
+    assert!(page_text(r, &mut sheets, 0).contains("PAGE1X"));
+
+    // A redacted page shows exactly what it showed before, whichever node the values came from.
+    for on_root in [true, false] {
+        let mut pdf = inherited_geometry(on_root);
+        let mut before = render(r, &mut pdf, 0);
+        let text_area = Rect::new(0.0, 0.0, 492.0, 500.0);
+        let marked = Rect::new(380.0, 20.0, 80.0, 60.0);
+        pdf.apply_redactions(r, &[Redaction { page: 0, rect: marked }], 150.0).unwrap();
+        let geometry = pdf.page_geometry(0).unwrap();
+        assert_eq!((geometry.rotation, geometry.display_size()), (0, (492.0, 500.0)), "on root: {on_root}");
+        let after = render(r, &mut pdf, 0);
+        assert_eq!(after.dimensions(), (492, 500), "on root: {on_root}");
+        assert!(brightness(&after, marked) < 30.0, "on root: {on_root}: the marked area is not black");
+        // Black the same area in the earlier render: the rest of the page has to match it.
+        for y in (500.0 - marked.max_y()) as u32..(500.0 - marked.y) as u32 {
+            for x in marked.x as u32..marked.max_x() as u32 {
+                before.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+            }
+        }
+        let (a, b) = (brightness(&before, text_area), brightness(&after, text_area));
+        assert!((a - b).abs() < 3.0, "on root: {on_root}: the page changed outside the marked area ({a} -> {b})");
+        // The text at (72, 700), turned a quarter clockwise: a vertical line near x 400.
+        let text_line = Rect::new(390.0, 350.0, 30.0, 85.0);
+        let (a, b) = (brightness(&before, text_line), brightness(&after, text_line));
+        assert!(a < 245.0 && (a - b).abs() < 25.0, "on root: {on_root}: the text moved ({a} -> {b})");
+    }
 }
 
 // ---- reduce file size ----------------------------------------------------------------------
@@ -1521,10 +2405,10 @@ fn batch_reduce_never_damages_originals() {
     let tiny_before = std::fs::read(&tiny).unwrap();
     let photo_before = std::fs::metadata(&photo).unwrap().len();
 
-    // In place (same folder, original names, overwrite on).
+    // In place, as an explicit choice.
     let outcomes = reduce_files(
         &[photo.clone(), tiny.clone(), broken.clone()],
-        &OutputOptions::default(),
+        &OutputOptions::in_place(),
         &ReduceOptions::default(),
     );
     assert!(outcomes[0].warning.is_none() && outcomes[0].report.is_some());
@@ -1541,15 +2425,80 @@ fn batch_reduce_never_damages_originals() {
     options.allow_copying = false;
     std::fs::write(&protected, photo_pdf().to_encrypted_bytes(&options).unwrap()).unwrap();
     let before = std::fs::read(&protected).unwrap();
-    let outcomes = reduce_files(std::slice::from_ref(&protected), &OutputOptions::default(), &ReduceOptions::default());
+    let outcomes = reduce_files(std::slice::from_ref(&protected), &OutputOptions::in_place(), &ReduceOptions::default());
     assert_eq!(outcomes[0].warning.as_deref(), Some(reduce_messages::PROTECTED));
     assert_eq!(std::fs::read(&protected).unwrap(), before);
 
     // Naming and overwrite rules.
-    let named = OutputOptions { prefix: "small-".into(), overwrite: false, ..Default::default() };
+    let named = OutputOptions { prefix: "small-".into(), suffix: String::new(), overwrite: false, ..Default::default() };
     assert_eq!(named.output_path(&photo).unwrap(), dir.join("small-photo.pdf"));
     std::fs::write(dir.join("small-photo.pdf"), b"existing").unwrap();
     assert_eq!(named.output_path(&photo), Err(reduce_messages::FILE_EXISTS));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn batch_reduce_keeps_originals_and_refuses_names_that_collide() {
+    let dir = scratch_dir("reduce-names");
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    photo_pdf().save(a.join("x.pdf")).unwrap();
+    photo_pdf().save(b.join("x.pdf")).unwrap();
+    let originals = |paths: &[PathBuf]| paths.iter().map(|p| std::fs::read(p).unwrap()).collect::<Vec<_>>();
+
+    // By default the results go next to the originals under new names, and the originals stay.
+    let inputs = [a.join("x.pdf"), b.join("x.pdf")];
+    let before = originals(&inputs);
+    let outcomes = reduce_files(&inputs, &OutputOptions::default(), &ReduceOptions::default());
+    assert!(outcomes.iter().all(|o| o.warning.is_none()), "{outcomes:?}");
+    assert_eq!(outcomes[0].output.as_deref(), Some(a.join("x-reduced.pdf").as_path()));
+    assert_eq!(originals(&inputs), before);
+    // Again: the reduced copies are there now, and are not replaced without asking.
+    let outcomes = reduce_files(&inputs, &OutputOptions::default(), &ReduceOptions::default());
+    assert!(outcomes.iter().all(|o| o.warning.as_deref() == Some(reduce_messages::FILE_EXISTS)), "{outcomes:?}");
+    // So is a link there, even one that leads nowhere: nothing is written where it leads.
+    #[cfg(unix)]
+    {
+        let elsewhere = dir.join("elsewhere.pdf");
+        std::fs::remove_file(a.join("x-reduced.pdf")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, a.join("x-reduced.pdf")).unwrap();
+        let outcomes = reduce_files(&inputs[..1], &OutputOptions::default(), &ReduceOptions::default());
+        assert_eq!(outcomes[0].warning.as_deref(), Some(reduce_messages::FILE_EXISTS));
+        assert!(!elsewhere.exists());
+    }
+
+    // Both into b, with their own names, replacing what is there (b/x.pdf with its own result):
+    // a's result would replace b/x.pdf before it is read.
+    let into_b = OutputOptions { folder: TargetFolder::Specific(b.clone()), ..OutputOptions::in_place() };
+    let outcomes = reduce_files(&inputs, &into_b, &ReduceOptions::default());
+    assert_eq!(outcomes[0].warning.as_deref(), Some(reduce_messages::OUTPUT_COLLIDES));
+    assert_eq!(outcomes[1].warning.as_deref(), Some(reduce_messages::OUTPUT_COLLIDES));
+    assert!(outcomes.iter().all(|o| o.output.is_none()));
+    assert_eq!(originals(&inputs), before, "nothing is touched");
+
+    // A result named like another input in the same folder, and two results with one name.
+    let small = a.join("x-small.pdf");
+    photo_pdf().save(&small).unwrap();
+    let small_before = std::fs::read(&small).unwrap();
+    let suffixed = OutputOptions { suffix: "-small".into(), overwrite: true, ..Default::default() };
+    let outcomes = reduce_files(&[a.join("x.pdf"), small.clone(), b.join("x.pdf")], &suffixed, &ReduceOptions::default());
+    assert_eq!(outcomes[0].warning.as_deref(), Some(reduce_messages::OUTPUT_COLLIDES));
+    assert_eq!(outcomes[2].warning.as_deref(), Some(reduce_messages::BATCH_STOPPED), "nothing at all is reduced");
+    assert_eq!(std::fs::read(&small).unwrap(), small_before);
+    let same_name = OutputOptions { folder: TargetFolder::Specific(dir.clone()), overwrite: true, ..Default::default() };
+    let outcomes = reduce_files(&inputs, &same_name, &ReduceOptions::default());
+    assert!(outcomes.iter().all(|o| o.warning.as_deref() == Some(reduce_messages::OUTPUT_COLLIDES)), "{outcomes:?}");
+    assert!(!dir.join("x-reduced.pdf").exists());
+
+    // Replacing the originals takes the explicit choice.
+    let same_names = OutputOptions { suffix: String::new(), overwrite: true, ..Default::default() };
+    let outcomes = reduce_files(&inputs, &same_names, &ReduceOptions::default());
+    assert!(outcomes.iter().all(|o| o.warning.as_deref() == Some(reduce_messages::REPLACES_ORIGINAL)), "{outcomes:?}");
+    assert_eq!(originals(&inputs), before);
+    let outcomes = reduce_files(&inputs, &OutputOptions::in_place(), &ReduceOptions::default());
+    assert!(outcomes.iter().all(|o| o.warning.is_none()), "{outcomes:?}");
+    assert!(std::fs::read(&inputs[0]).unwrap().len() < before[0].len() / 10);
     let _ = std::fs::remove_dir_all(dir);
 }
 

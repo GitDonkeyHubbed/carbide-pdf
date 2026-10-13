@@ -12,7 +12,7 @@ use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, FontId, Frame, Key, Margin, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui,
 };
 
-use crate::dialogs::{AfterSave, Dialog};
+use crate::dialogs::{AfterSave, Dialog, Export};
 use crate::icons::{self, Glyph};
 use crate::ribbon::{self, Cmd, RibbonTab};
 use crate::{paths, theme, CarbideApp, Tool};
@@ -337,8 +337,8 @@ impl CarbideApp {
             }
             Cmd::Compare => self.compare_with(),
             Cmd::Ocr => self.start_ocr(),
-            Cmd::ExportImages => self.export_images(),
-            Cmd::ExportText => self.export_text(),
+            Cmd::ExportImages => self.export(Export::Images),
+            Cmd::ExportText => self.export(Export::Text),
             Cmd::SaveRevision => self.dialog = Some(Dialog::SaveRevision { label: String::new(), error: None }),
             Cmd::OpenRevision => {
                 let items = self.doc.as_ref().map(|d| d.pdf.revisions()).unwrap_or_default();
@@ -347,6 +347,7 @@ impl CarbideApp {
 
             Cmd::MarkRedaction => self.tool = Tool::Redact,
             Cmd::ApplyRedactions => self.apply_redactions(),
+            Cmd::RemoveHidden => self.dialog = self.doc.as_ref().map(|d| Dialog::remove_hidden(d.id)),
             Cmd::SignVisible => {
                 self.tool = Tool::Sign;
                 self.status = "Drag a rectangle on the page to place the signature.".into();
@@ -373,7 +374,7 @@ impl CarbideApp {
             }
 
             Cmd::AutoSaveSettings => self.dialog = Some(Dialog::preferences(&self.settings)),
-            Cmd::AutoRecovery => self.dialog = Some(Dialog::AutoRecovery),
+            Cmd::AutoRecovery => self.dialog = Some(Dialog::auto_recovery()),
             Cmd::Quit => {} // Handled by the window itself.
         }
     }
@@ -583,12 +584,15 @@ impl CarbideApp {
     /// Saves every modified document, then quits. Documents that save without a question go
     /// first; then the first one that has to ask does, and quitting carries on once it is answered.
     pub(crate) fn save_all_and_quit(&mut self, ctx: &egui::Context) {
-        let indices: Vec<usize> = (0..self.tabs.len()).filter(|&i| self.tab_label(i).1).collect();
+        // Followed by document, not by tab: a save can close another tab on the same file.
+        let modified: Vec<u64> =
+            (0..self.tabs.len()).filter(|&i| self.tab_label(i).1).filter_map(|i| self.doc_at(i).map(|d| d.id)).collect();
         let mut asks = None;
-        for index in indices {
+        for id in modified {
+            let Some(index) = self.tab_of(id) else { continue };
             self.activate(Some(index));
             if self.save_needs_question() {
-                asks.get_or_insert(index);
+                asks.get_or_insert(id);
             } else {
                 self.save();
             }
@@ -597,7 +601,7 @@ impl CarbideApp {
         if self.dialog.is_some() {
             return;
         }
-        if let Some(index) = asks {
+        if let Some(index) = asks.and_then(|id| self.tab_of(id)) {
             self.shell.quit_prompt = false;
             self.activate(Some(index));
             return self.save_then(AfterSave::Quit);

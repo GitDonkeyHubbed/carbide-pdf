@@ -70,9 +70,11 @@ impl Pdf {
         Ok(out)
     }
 
-    /// Writes the document to `path`, replacing a file there in one step.
+    /// Writes the document to `path` as [`Pdf::to_file_bytes`] does, replacing a file there in one
+    /// step: a document that carries a protection is written encrypted with it. One protected with
+    /// an open password needs that password, given to `to_file_bytes`.
     pub fn save(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let bytes = self.to_bytes()?;
+        let bytes = self.to_file_bytes(None)?;
         crate::fs::write_replacing(path.as_ref(), &bytes)?;
         Ok(())
     }
@@ -206,6 +208,11 @@ impl Pdf {
         let root = self.doc.get_dictionary_mut(root_id)?;
         root.set("Kids", ids.iter().map(|id| Object::Reference(*id)).collect::<Vec<_>>());
         root.set("Count", ids.len() as i64);
+        // Every page holds its own values now. Left on the root they would also reach pages added
+        // later, which have their own size and orientation.
+        for key in INHERITABLE {
+            root.remove(key);
+        }
         Ok(())
     }
 
@@ -225,7 +232,9 @@ impl Pdf {
     }
 
     /// Deletes pages. A document must keep at least one page. Nothing of a deleted page stays in
-    /// the document: its form fields, its tags and the resources only it used go with it.
+    /// the document: its form fields, its tags and the resources only it used go with it, and so do
+    /// the outline items, named destinations and other entries that lead only to it. The pages that
+    /// stay keep their page labels.
     pub fn delete_pages(&mut self, pages: &[usize]) -> Result<()> {
         let count = self.page_count();
         let mut unique: Vec<usize> = pages.to_vec();
@@ -243,8 +252,13 @@ impl Pdf {
         // signature only sits on a page because every field has to; it is not the page's content.
         self.drop_form_fields_on(&doomed, &|_, widget, signature| !signature || widget_area(widget).is_some());
         self.drop_structure_of(&doomed);
+        self.drop_navigation_to(&doomed);
+        let labels = self.page_labels_without(&unique);
         let numbers: Vec<u32> = unique.iter().map(|&p| p as u32 + 1).collect();
         self.doc.delete_pages(&numbers);
+        if let Some(labels) = labels {
+            self.doc.catalog_mut()?.set("PageLabels", labels);
+        }
         self.trim_resources()
     }
 
@@ -261,10 +275,13 @@ impl Pdf {
         };
         self.flatten_page_tree()?;
         let root_id = self.pages_root()?;
+        let page_box = vec![0.into(), 0.into(), Object::Real(width), Object::Real(height)];
         let page_id = self.doc.add_object(dictionary! {
             "Type" => "Page",
             "Parent" => root_id,
-            "MediaBox" => vec![0.into(), 0.into(), Object::Real(width), Object::Real(height)],
+            "MediaBox" => page_box.clone(),
+            "CropBox" => page_box,
+            "Rotate" => 0,
             "Resources" => Dictionary::new(),
         });
         let root = self.doc.get_dictionary_mut(root_id)?;
@@ -294,6 +311,7 @@ impl Pdf {
 
     /// A new document holding only the given pages, in the given order. Nothing of the other
     /// pages is carried along, not through form fields, tags, links or shared resources either.
+    /// It carries this document's protection (see [`Pdf::protection`]).
     pub fn extract_pages(&self, pages: &[usize]) -> Result<Pdf> {
         let count = self.page_count();
         if pages.is_empty() {
@@ -344,10 +362,13 @@ impl Pdf {
     }
 
     /// Concatenates documents. Outlines and named destinations of the inputs are not carried over.
+    /// The result carries the protection its protected inputs share; inputs protected in different
+    /// ways are refused (see [`Pdf::shared_protection`]).
     pub fn merge(documents: &[&Pdf]) -> Result<Pdf> {
         if documents.is_empty() {
             return Ok(Pdf::new());
         }
+        let protection = Pdf::shared_protection(documents)?;
         // The new document already owns a few low object ids (catalog, page tree); the inputs
         // are renumbered to start after them so nothing collides.
         let mut result = Pdf::new();
@@ -387,6 +408,7 @@ impl Pdf {
         let root = result.doc.get_dictionary_mut(root_id)?;
         root.set("Kids", page_ids.iter().map(|id| Object::Reference(*id)).collect::<Vec<_>>());
         root.set("Count", page_ids.len() as i64);
+        result.set_protection(protection);
         Ok(result)
     }
 

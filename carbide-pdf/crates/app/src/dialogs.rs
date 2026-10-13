@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 
-use carbide_engine::autosave::{format_time, messages as autosave_messages, AutoSaveSettings, RowKind};
+use carbide_engine::autosave::{format_time, messages as autosave_messages, AutoSaveSettings, RecordId, RowKind};
+use carbide_engine::fs::Existing;
 use carbide_engine::imposition::{ImpositionOptions, Media, RegistrationStyle, PAPER_SIZES};
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PrintingOrder, Style};
 use carbide_engine::reduce::{
@@ -12,7 +13,7 @@ use carbide_engine::signature::{
     CertifyLevel, HttpTimestampSource, Identity, SignOptions, SignatureReport, SubFilter, TimestampSource, Validity,
 };
 use carbide_engine::{
-    validate_label, BatesOptions, PageAnchor, PageDiff, Pdf, ProtectionOptions, Rect, Revision, StandardFont,
+    validate_label, BatesOptions, HiddenItem, PageAnchor, PageDiff, Pdf, ProtectionOptions, Rect, Revision, StandardFont,
     WatermarkOptions,
 };
 use eframe::egui;
@@ -61,6 +62,8 @@ pub struct ReduceForm {
     prefix: String,
     suffix: String,
     overwrite: bool,
+    /// With the same file names: replace the originals with the reduced copies.
+    replace_originals: bool,
     results: Option<Vec<FileOutcome>>,
 }
 
@@ -136,6 +139,21 @@ impl SignRequest {
     }
 }
 
+/// Files about to be written into a folder, some of whose names are already taken there.
+pub enum Writing {
+    /// An image of every page.
+    Images { folder: PathBuf },
+    /// One file per page range.
+    Split { folder: PathBuf, ranges: String },
+}
+
+/// What a document is exported as.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Export {
+    Images,
+    Text,
+}
+
 /// What is carried out once a save has written the file.
 pub enum AfterSave {
     Nothing,
@@ -163,6 +181,20 @@ pub enum Dialog {
         drops_revisions: bool,
         then: AfterSave,
     },
+    /// Writing files for document `doc` would replace the files `taken`.
+    ExistingFiles { doc: u64, writing: Writing, taken: Vec<PathBuf> },
+    /// Exporting the protected document `doc` gives files that are not protected.
+    ConfirmExport { doc: u64, export: Export },
+    /// Appending `others` (named `names`) to document `doc`: `protected` are protected in a way it
+    /// does not share, so their pages would be saved with its protection (`keeps_protection`) or
+    /// none.
+    ConfirmMerge { doc: u64, others: Vec<Pdf>, names: Vec<String>, protected: Vec<String>, keeps_protection: bool },
+    /// The files to combine are protected in different ways, so the result cannot keep them all.
+    ConfirmCombine { documents: Vec<Pdf> },
+    /// Remove Hidden Information from document `doc`, with each item and whether it is chosen.
+    RemoveHidden { doc: u64, chosen: Vec<(HiddenItem, bool)> },
+    /// Redactions were just applied to document `doc`: offer to remove its hidden information too.
+    SuggestRemoveHidden { doc: u64 },
     Watermark(WatermarkForm),
     Bates(BatesForm),
     Protect(ProtectForm),
@@ -173,11 +205,34 @@ pub enum Dialog {
     Impose(Box<ImposeForm>),
     Reduce(Box<ReduceForm>),
     Compare { title: String, diffs: Vec<PageDiff> },
-    AutoRecovery,
+    /// The Auto Recovery panel, with the question it is asking, if any.
+    AutoRecovery { question: Option<RecoveryQuestion> },
+    /// Saving the recovered document `doc` would replace `path`, the file it was recovered for.
+    ReplaceOriginal { doc: u64, path: PathBuf, then: AfterSave },
     Preferences { enabled: bool, minutes: String, error: Option<&'static str> },
 }
 
 impl Dialog {
+    /// The document a question is about, for a question that only makes sense while that document
+    /// is in front.
+    pub fn document(&self) -> Option<u64> {
+        match self {
+            Dialog::ConfirmRewrite { doc, .. }
+            | Dialog::ExistingFiles { doc, .. }
+            | Dialog::ConfirmExport { doc, .. }
+            | Dialog::ConfirmMerge { doc, .. }
+            | Dialog::RemoveHidden { doc, .. }
+            | Dialog::SuggestRemoveHidden { doc }
+            | Dialog::ReplaceOriginal { doc, .. } => Some(*doc),
+            _ => None,
+        }
+    }
+
+    /// Remove Hidden Information for document `doc`, with the usual items chosen.
+    pub fn remove_hidden(doc: u64) -> Dialog {
+        Dialog::RemoveHidden { doc, chosen: HiddenItem::ALL.into_iter().map(|item| (item, item.chosen_by_default())).collect() }
+    }
+
     pub fn watermark() -> Dialog {
         Dialog::Watermark(WatermarkForm {
             text: "CONFIDENTIAL".into(),
@@ -244,12 +299,19 @@ impl Dialog {
             slider: carbide_engine::reduce::DEFAULT_IMAGE_FACTOR,
             same_folder: true,
             folder: None,
-            add_to_names: false,
+            // Next to the originals under new names: the originals are kept unless replacing
+            // them is chosen.
+            add_to_names: true,
             prefix: String::new(),
-            suffix: String::new(),
-            overwrite: true,
+            suffix: carbide_engine::reduce::DEFAULT_SUFFIX.into(),
+            overwrite: false,
+            replace_originals: false,
             results: None,
         }))
+    }
+
+    pub fn auto_recovery() -> Dialog {
+        Dialog::AutoRecovery { question: None }
     }
 
     pub fn preferences(settings: &AutoSaveSettings) -> Dialog {
@@ -460,6 +522,140 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                 if ok {
                     let then = std::mem::replace(then, AfterSave::Nothing);
                     app.confirm_rewrite(*doc, &path.clone(), then);
+                    open = false;
+                }
+                open &= !cancel;
+            });
+        }
+
+        Dialog::ExistingFiles { doc, writing, taken } => {
+            window("Replace Files?").show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                let folder = match writing {
+                    Writing::Images { folder } | Writing::Split { folder, .. } => folder.display().to_string(),
+                };
+                let name = |path: &PathBuf| path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if let [only] = taken.as_slice() {
+                    ui.label(format!("\"{}\" already exists in {folder}.", name(only)));
+                } else {
+                    ui.label(format!("{} files with these names already exist in {folder}:", taken.len()));
+                    for path in taken.iter().take(6) {
+                        ui.label(format!("  {}", name(path)));
+                    }
+                    if taken.len() > 6 {
+                        ui.label(format!("  and {} more", taken.len() - 6));
+                    }
+                }
+                ui.weak("Replace them, or keep them and give the new files numbered names.");
+                ui.add_space(6.0);
+                let mut choice = None;
+                ui.horizontal(|ui| {
+                    if ui.button("Replace").clicked() {
+                        choice = Some(Existing::Replace);
+                    }
+                    if ui.button("Keep Both").clicked() {
+                        choice = Some(Existing::KeepBoth);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        open = false;
+                    }
+                });
+                if let Some(existing) = choice {
+                    let writing = std::mem::replace(writing, Writing::Images { folder: PathBuf::new() });
+                    app.continue_writing(*doc, writing, existing);
+                    open = false;
+                }
+            });
+        }
+
+        Dialog::ConfirmExport { doc, export } => {
+            window("Export").show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                let what = match export {
+                    Export::Images => "images",
+                    Export::Text => "text",
+                };
+                let name = app.doc.as_ref().map(|d| d.title()).unwrap_or_default();
+                ui.label(format!("\"{name}\" is password-protected, but the exported {what} will not be."));
+                ui.label("Anyone who can open the exported files can read the content.");
+                let (ok, cancel) = buttons(ui, "Export Anyway", true);
+                if ok {
+                    app.export_confirmed(*doc, *export);
+                    open = false;
+                }
+                open &= !cancel;
+            });
+        }
+
+        Dialog::ConfirmMerge { doc, others, names, protected, keeps_protection } => {
+            window("Merge PDFs").show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                let list = protected.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+                ui.label(format!("{list} {} password-protected.", if protected.len() == 1 { "is" } else { "are" }));
+                ui.label(if *keeps_protection {
+                    "Merged into this document, those pages are saved with this document's passwords and permissions instead."
+                } else {
+                    "This document is not protected, so merged into it those pages are saved without protection."
+                });
+                let (ok, cancel) = buttons(ui, "Merge", true);
+                if ok {
+                    if app.doc.as_ref().map(|d| d.id) == Some(*doc) {
+                        app.merge_into_current(std::mem::take(others), std::mem::take(names), true);
+                    }
+                    open = false;
+                }
+                open &= !cancel;
+            });
+        }
+
+        Dialog::ConfirmCombine { documents } => {
+            window("Combine Files").show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label("These files are protected with different passwords or permissions, so one document cannot keep the protection of all of them.");
+                ui.label("Combine them into a document without protection?");
+                let (ok, cancel) = buttons(ui, "Combine Without Protection", true);
+                if ok {
+                    app.combine(std::mem::take(documents), true);
+                    open = false;
+                }
+                open &= !cancel;
+            });
+        }
+
+        Dialog::RemoveHidden { doc, chosen } => {
+            window("Remove Hidden Information").show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label("Remove what the document holds besides what its pages show:");
+                for (item, on) in chosen.iter_mut() {
+                    ui.checkbox(on, item.label());
+                }
+                ui.weak("The document is written in full when it is saved, so nothing removed stays in the file.");
+                let items: Vec<HiddenItem> = chosen.iter().filter(|(_, on)| *on).map(|(item, _)| *item).collect();
+                let (ok, cancel) = buttons(ui, "Remove", !items.is_empty());
+                if ok {
+                    open = false;
+                    app.remove_hidden_information(*doc, items);
+                }
+                open &= !cancel;
+            });
+        }
+
+        Dialog::SuggestRemoveHidden { doc } => {
+            window("Redaction").show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label("The marked content is gone from the pages.");
+                ui.label(
+                    "The same text can still be in the document's information, bookmarks, attachments, comments or \
+                     other content the pages do not show. Remove hidden information now?",
+                );
+                let (ok, cancel) = buttons(ui, "Remove Hidden Information...", true);
+                if ok {
+                    let mut dialog = Dialog::remove_hidden(*doc);
+                    // Bookmark titles often repeat what was redacted.
+                    if let Dialog::RemoveHidden { chosen, .. } = &mut dialog {
+                        chosen.iter_mut().for_each(|(_, on)| *on = true);
+                    }
+                    app.dialog = Some(dialog);
                     open = false;
                 }
                 open &= !cancel;
@@ -710,8 +906,39 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::AutoRecovery => {
-            open = recovery_panel(app, ctx);
+        Dialog::AutoRecovery { question } => {
+            open = recovery_panel(app, ctx, question);
+        }
+
+        Dialog::ReplaceOriginal { doc, path, then } => {
+            window("Save Recovered Document").show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                ui.label(format!("Save the recovered document over \"{name}\"?"));
+                ui.label(format!("This replaces {} on disk with the recovered version.", path.display()));
+                ui.add_space(6.0);
+                let mut choice = None;
+                ui.horizontal(|ui| {
+                    if ui.button("Replace").clicked() {
+                        choice = Some(true);
+                    }
+                    if ui.button("Save As...").clicked() {
+                        choice = Some(false);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        open = false;
+                    }
+                });
+                if let Some(replace) = choice {
+                    open = false;
+                    let then = std::mem::replace(then, AfterSave::Nothing);
+                    if replace {
+                        app.replace_original(*doc, &path.clone(), then);
+                    } else {
+                        app.save_as_then(then);
+                    }
+                }
+            });
         }
 
         Dialog::Preferences { enabled, minutes, error } => {
@@ -758,22 +985,11 @@ fn anchor_name(anchor: PageAnchor) -> &'static str {
 
 fn split_document(app: &mut CarbideApp, ranges: &str) {
     let Some(doc) = app.doc.as_ref() else { return };
-    let parsed = match Pdf::parse_ranges(ranges, doc.pdf.page_count()) {
-        Ok(r) => r,
-        Err(e) => return app.alert(e.to_string()),
-    };
-    let Some(folder) = rfd::FileDialog::new().set_title("Choose Folder").pick_folder() else { return };
-    let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
-    let mut written = 0;
-    for range in parsed {
-        let name = format!("{stem}-pages-{}-{}.pdf", range.start() + 1, range.end() + 1);
-        let result = doc.pdf.extract_pages(&range.clone().collect::<Vec<_>>()).and_then(|mut p| p.save(folder.join(&name)));
-        match result {
-            Ok(()) => written += 1,
-            Err(e) => return app.alert(format!("Could not write {name}: {e}")),
-        }
+    if let Err(e) = Pdf::parse_ranges(ranges, doc.pdf.page_count()) {
+        return app.alert(e.to_string());
     }
-    app.status = format!("Wrote {written} file(s) to {}", folder.display());
+    let Some(folder) = rfd::FileDialog::new().set_title("Choose Folder").pick_folder() else { return };
+    app.split_into(folder, ranges, None);
 }
 
 // ---- imposition ----------------------------------------------------------------------------
@@ -929,7 +1145,9 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
     ui.horizontal(|ui| {
         if ui.button("Save Settings...").clicked() {
             if let Some(path) = rfd::FileDialog::new().set_file_name("imposition.ini").save_file() {
-                let _ = std::fs::write(path, o.to_ini());
+                if let Err(e) = carbide_engine::fs::write_replacing(&path, o.to_ini().as_bytes()) {
+                    form.error = Some(format!("Could not save the settings: {e}"));
+                }
             }
         }
         if ui.button("Load Settings...").clicked() {
@@ -959,8 +1177,10 @@ fn run_imposition(app: &mut CarbideApp, form: &ImposeForm) -> Result<(), String>
     let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name("New Imposition.pdf").save_file() else {
         return Err("No output file was chosen.".into());
     };
+    // The sheets are protected like the document.
     let mut imposed = doc.pdf.impose(&form.options, None).map_err(|e| e.to_string())?;
-    imposed.save(&path).map_err(|e| e.to_string())?;
+    let bytes = doc.derived_bytes(&mut imposed).map_err(|e| e.to_string())?;
+    carbide_engine::fs::write_replacing(&path, &bytes).map_err(|e| e.to_string())?;
     app.spawn_window(&path);
     Ok(())
 }
@@ -1065,6 +1285,9 @@ fn reduce_dialog(app: &mut CarbideApp, ctx: &egui::Context, form: &mut ReduceFor
                 ui.text_edit_singleline(&mut form.suffix);
             });
         }
+        if !form.add_to_names {
+            ui.checkbox(&mut form.replace_originals, "Replace the original files");
+        }
         ui.checkbox(&mut form.overwrite, "Overwrite existing files");
         ui.horizontal(|ui| {
             if ui.add_enabled(!form.files.is_empty(), egui::Button::new("OK")).clicked() {
@@ -1077,6 +1300,7 @@ fn reduce_dialog(app: &mut CarbideApp, ctx: &egui::Context, form: &mut ReduceFor
                     prefix: if form.add_to_names { form.prefix.clone() } else { String::new() },
                     suffix: if form.add_to_names { form.suffix.clone() } else { String::new() },
                     overwrite: form.overwrite,
+                    replace_originals: form.replace_originals && !form.add_to_names,
                 };
                 form.results = Some(reduce_files(&form.files, &output, &ReduceOptions { image_factor: form.slider }));
             }
@@ -1096,7 +1320,9 @@ fn reduce_current(app: &mut CarbideApp, slider: u8) -> bool {
         app.alert("Reduce File Size is not available for password-protected documents.".into());
         return true;
     }
-    let name = doc.title();
+    // A new name by default, so the original is only replaced when the user picks it.
+    let stem = doc.title().strip_suffix(".pdf").map(str::to_owned).unwrap_or_else(|| doc.title());
+    let name = format!("{stem}{}.pdf", carbide_engine::reduce::DEFAULT_SUFFIX);
     let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name(name).save_file() else {
         return false;
     };
@@ -1134,15 +1360,114 @@ fn format_size(bytes: u64) -> String {
 
 // ---- auto recovery -------------------------------------------------------------------------
 
-/// Returns `false` when the panel should close.
-fn recovery_panel(app: &mut CarbideApp, ctx: &egui::Context) -> bool {
-    let mut keep = true;
-    let rows = app.autosave.as_ref().map(|s| s.panel_rows()).unwrap_or_default();
-    let mut open_original: Option<usize> = None;
-    let mut open_recovered: Option<usize> = None;
-    let mut delete: Option<(usize, RowKind)> = None;
-    let mut clear_all = false;
+/// A question the Auto Recovery panel asks before it deletes recovered work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryQuestion {
+    /// Delete the recovered copy of the document `name`.
+    Delete { record: RecordId, name: String },
+    /// Delete every recovered document.
+    ClearAll,
+}
 
+impl RecoveryQuestion {
+    pub fn message(&self) -> String {
+        match self {
+            RecoveryQuestion::Delete { name, .. } => autosave_messages::delete_recovered(name),
+            RecoveryQuestion::ClearAll => autosave_messages::DELETE_ALL.to_string(),
+        }
+    }
+}
+
+/// What the user does in the Auto Recovery panel.
+#[derive(Clone, Debug)]
+pub enum RecoveryAction {
+    Open(RecordId, RowKind),
+    Delete(RecordId, RowKind),
+    ClearAll,
+    /// Yes to the panel's question.
+    Confirm,
+    /// No to the panel's question.
+    Cancel,
+}
+
+/// Carries out `action` in the Auto Recovery panel, whose pending question is `question`. Deleting
+/// a recovered copy, or all of them, only asks; it happens on `Confirm`. Returns whether the panel
+/// stays open.
+pub fn recovery_action(app: &mut CarbideApp, question: &mut Option<RecoveryQuestion>, action: RecoveryAction) -> bool {
+    match action {
+        RecoveryAction::Open(record, RowKind::Original) => {
+            let path = app.autosave.as_ref().and_then(|s| s.record(record)).and_then(|r| r.original.as_ref()).map(|o| o.path.clone());
+            match path {
+                Some(path) if path.exists() => {
+                    app.open_path(&path);
+                    return false;
+                }
+                _ => {
+                    if let Some(store) = app.autosave.as_mut() {
+                        let _ = store.remove_original(record);
+                    }
+                    app.alert("The original file no longer exists.".into());
+                }
+            }
+        }
+        RecoveryAction::Open(record, RowKind::Recovered) => {
+            app.open_recovered(record);
+            return false;
+        }
+        // The original row only lists the file; the file itself is never touched.
+        RecoveryAction::Delete(record, RowKind::Original) => {
+            if let Some(store) = app.autosave.as_mut() {
+                let _ = store.remove_original(record);
+            }
+        }
+        RecoveryAction::Delete(record, RowKind::Recovered) => {
+            let name = app.autosave.as_ref().and_then(|s| s.record(record)).map(|r| r.display_name()).unwrap_or_default();
+            *question = Some(RecoveryQuestion::Delete { record, name });
+        }
+        RecoveryAction::ClearAll => *question = Some(RecoveryQuestion::ClearAll),
+        RecoveryAction::Confirm => match question.take() {
+            Some(RecoveryQuestion::Delete { record, .. }) => {
+                if let Some(store) = app.autosave.as_mut() {
+                    let _ = store.remove_recovered(record);
+                }
+            }
+            Some(RecoveryQuestion::ClearAll) => {
+                if let Some(store) = app.autosave.as_mut() {
+                    let _ = store.remove_all_loaded();
+                }
+            }
+            None => {}
+        },
+        RecoveryAction::Cancel => *question = None,
+    }
+    true
+}
+
+/// Returns `false` when the panel should close.
+fn recovery_panel(app: &mut CarbideApp, ctx: &egui::Context, question: &mut Option<RecoveryQuestion>) -> bool {
+    let mut keep = true;
+    let mut action: Option<RecoveryAction> = None;
+
+    if let Some(asked) = question.clone() {
+        window(autosave_messages::PANEL_TITLE).show(ctx, |ui| {
+            ui.set_max_width(400.0);
+            ui.label(asked.message());
+            ui.weak("This cannot be undone.");
+            let (ok, cancel) = buttons(ui, "Delete", true);
+            if ok {
+                action = Some(RecoveryAction::Confirm);
+            }
+            if cancel {
+                action = Some(RecoveryAction::Cancel);
+            }
+        });
+        return match action {
+            Some(action) => recovery_action(app, question, action),
+            None => keep,
+        };
+    }
+
+    let rows = app.autosave.as_ref().map(|s| s.panel_rows()).unwrap_or_default();
     window(autosave_messages::PANEL_TITLE).show(ctx, |ui| {
         if rows.is_empty() {
             ui.label("There are no recovered documents.");
@@ -1157,67 +1482,27 @@ fn recovery_panel(app: &mut CarbideApp, ctx: &egui::Context) -> bool {
                 ui.label(row.last_saved);
                 ui.label(format_time(row.save_time));
                 if ui.button("Open").clicked() {
-                    match row.kind {
-                        RowKind::Original => open_original = Some(row.record as usize),
-                        RowKind::Recovered => open_recovered = Some(row.record as usize),
-                    }
+                    action = Some(RecoveryAction::Open(row.record, row.kind));
                 }
                 if ui.button("Delete").clicked() {
-                    delete = Some((row.record as usize, row.kind));
+                    action = Some(RecoveryAction::Delete(row.record, row.kind));
                 }
                 ui.end_row();
             }
         });
         ui.horizontal(|ui| {
             if ui.add_enabled(!rows.is_empty(), egui::Button::new(autosave_messages::CLEAR_ALL)).clicked() {
-                clear_all = true;
+                action = Some(RecoveryAction::ClearAll);
             }
             if ui.button("Close").clicked() {
                 keep = false;
             }
         });
     });
-
-    if let Some(id) = open_original {
-        let path = app.autosave.as_ref().and_then(|s| s.record(id as u64)).and_then(|r| r.original.as_ref()).map(|o| o.path.clone());
-        match path {
-            Some(path) if path.exists() => app.spawn_window(&path),
-            _ => {
-                if let Some(store) = app.autosave.as_mut() {
-                    let _ = store.remove_original(id as u64);
-                }
-                app.alert("The original file no longer exists.".into());
-            }
-        }
+    match action {
+        Some(action) => recovery_action(app, question, action) && keep,
+        None => keep,
     }
-    if let Some(id) = open_recovered {
-        let opened = app.autosave.as_ref().map(|s| s.open_recovered(id as u64, None));
-        match opened {
-            Some(Ok((mut pdf, title))) => {
-                let target = std::env::temp_dir().join(format!("{}.pdf", title.replace(['/', ':'], "-")));
-                match pdf.save(&target) {
-                    Ok(()) => app.spawn_window(&target),
-                    Err(e) => app.alert(e.to_string()),
-                }
-            }
-            Some(Err(e)) => app.alert(e.to_string()),
-            None => {}
-        }
-    }
-    if let Some((id, kind)) = delete {
-        if let Some(store) = app.autosave.as_mut() {
-            let _ = match kind {
-                RowKind::Original => store.remove_original(id as u64),
-                RowKind::Recovered => store.remove_recovered(id as u64),
-            };
-        }
-    }
-    if clear_all {
-        if let Some(store) = app.autosave.as_mut() {
-            let _ = store.remove_all_loaded();
-        }
-    }
-    keep
 }
 
 /// The time a document time stamp gives, in local time.

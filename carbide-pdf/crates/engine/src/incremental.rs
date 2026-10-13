@@ -3,6 +3,9 @@
 //! The bytes of the original file are never touched, which keeps earlier revisions recoverable and
 //! keeps digital signatures over earlier byte ranges valid.
 
+use std::collections::HashSet;
+
+use lopdf::xref::XrefEntry;
 use lopdf::{Document, IncrementalDocument, Object, ObjectId};
 
 use crate::error::{Error, Result};
@@ -96,8 +99,35 @@ impl Pdf {
     }
 }
 
-/// Cross-reference and object streams belong to how a file was written, not to the document: every
-/// save builds its own and an update never carries them.
-fn is_file_structure(object: &Object) -> bool {
+/// Cross-reference and object streams, and a linearization dictionary, belong to how a file was
+/// written, not to the document: every save builds its own and an update never carries them.
+pub(crate) fn is_file_structure(object: &Object) -> bool {
     object.type_name().is_ok_and(|name| name == b"XRef" || name == b"ObjStm")
+        || object.as_dict().is_ok_and(|dict| dict.has(b"Linearized"))
+}
+
+/// The objects of `doc` that belong to how its file was written rather than to the document: those
+/// [`is_file_structure`] names, the hint streams of a linearized file (found at the offsets its
+/// linearization dictionary gives), and lone numbers, booleans and nulls. A stream length kept as an
+/// object of its own is such a number, and nothing refers to it once the stream has been read.
+pub(crate) fn file_structure(doc: &Document) -> HashSet<ObjectId> {
+    // /H holds the offset and length of the primary hint stream, then those of an overflow one.
+    let hint_offsets: Vec<u32> = doc
+        .objects
+        .values()
+        .filter_map(|object| object.as_dict().ok().filter(|dict| dict.has(b"Linearized")))
+        .filter_map(|dict| dict.get(b"H").and_then(Object::as_array).ok())
+        .flat_map(|hints| hints.iter().step_by(2).filter_map(|offset| u32::try_from(offset.as_i64().ok()?).ok()))
+        .collect();
+    let hints = doc.reference_table.entries.iter().filter_map(|(&number, entry)| match *entry {
+        XrefEntry::Normal { offset, generation } if hint_offsets.contains(&offset) => Some((number, generation)),
+        _ => None,
+    });
+    let lone = |object: &Object| matches!(object, Object::Integer(_) | Object::Real(_) | Object::Boolean(_) | Object::Null);
+    doc.objects
+        .iter()
+        .filter(|(_, object)| is_file_structure(object) || lone(object))
+        .map(|(id, _)| *id)
+        .chain(hints)
+        .collect()
 }
