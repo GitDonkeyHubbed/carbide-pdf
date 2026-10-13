@@ -209,6 +209,13 @@ fn split_and_image_export_replace_files_only_with_force() {
     let output = carbide(&["split", input, "1,2", parts.to_str().unwrap(), "--force"]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(Pdf::open(parts.join("doc-pages-2-2.pdf")).unwrap().page_count(), 1);
+    // A range given twice would write one part over the other: refused before anything is written.
+    let again = dir.join("again");
+    std::fs::create_dir_all(&again).unwrap();
+    let output = carbide(&["split", input, "1-2,2,1-2", again.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("doc-pages-1-2.pdf twice"), "{}", stderr(&output));
+    assert_eq!(std::fs::read_dir(&again).unwrap().count(), 0, "a part was written");
 
     let images = dir.join("images");
     std::fs::create_dir_all(&images).unwrap();
@@ -265,7 +272,16 @@ fn reduce_keeps_the_originals_and_refuses_names_that_collide() {
     assert!(stderr(&output).contains("same file"), "{}", stderr(&output));
     assert_eq!(std::fs::read(&b_x).unwrap(), b_before);
 
-    // Replacing the originals takes --in-place.
+    // Replacing the originals takes --in-place, and the refusal says so.
+    let output = carbide(&["reduce", path, "--suffix", ""]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("--in-place"), "{}", stderr(&output));
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+    // --no-overwrite, the default now, is still accepted.
+    std::fs::remove_file(&reduced).unwrap();
+    let output = carbide(&["reduce", path, "--no-overwrite"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(reduced.exists());
     let output = carbide(&["reduce", path, "--in-place"]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(std::fs::read(&file).unwrap().len() < before.len());

@@ -203,6 +203,10 @@ enum Command {
         /// Replace each original with its reduced copy.
         #[arg(long, conflicts_with_all = ["out_dir", "prefix", "suffix"])]
         in_place: bool,
+        /// Refusing to replace files is what Reduce does by default; kept so scripts that ask for
+        /// it still run.
+        #[arg(long, hide = true, conflicts_with_all = ["overwrite", "in_place"])]
+        no_overwrite: bool,
     },
     /// Remove hidden information: document information, XMP metadata, attachments, scripts, form
     /// values, comments, thumbnails, unused objects and private application data, and with
@@ -556,7 +560,14 @@ fn write_output(pdf: &mut Pdf, output: &Path, out: Unprotected, password: Option
         pdf.set_protection(None);
     }
     let bytes = pdf.to_file_bytes(password)?;
-    write_file(output, &bytes, existing).map_err(|e| format!("{}: {e}", output.display()))?;
+    write_file(output, &bytes, existing).map_err(|e| {
+        // Some errors name the file already.
+        let shown = output.display().to_string();
+        match e.to_string() {
+            text if text.contains(&shown) => text,
+            text => format!("{shown}: {text}"),
+        }
+    })?;
     match pdf.is_protected() {
         true => println!("wrote {} (password-protected like its input)", output.display()),
         false => println!("wrote {}", output.display()),
@@ -585,6 +596,27 @@ fn refuse_existing(outputs: &[PathBuf], force: bool) -> Result<Existing, Failure
     match outputs.iter().find(|path| path.symlink_metadata().is_ok()) {
         Some(taken) => Err(format!("{} already exists (use --force to replace it)", taken.display()).into()),
         None => Ok(Existing::Refuse),
+    }
+}
+
+/// Refuses, before anything is written, when two of `outputs` are the same file.
+fn refuse_repeated(outputs: &[PathBuf], what: &str) -> Result<(), Failure> {
+    let mut seen = std::collections::HashSet::new();
+    match outputs.iter().find(|path| !seen.insert(*path)) {
+        Some(repeated) => Err(format!("{what} would write {} twice: give each one once", repeated.display()).into()),
+        None => Ok(()),
+    }
+}
+
+/// What a Reduce warning says on the command line, where the choices are flags.
+fn reduce_message(message: &str) -> String {
+    use carbide_engine::reduce::messages;
+    match message {
+        messages::REPLACES_ORIGINAL => {
+            "the result would replace the original: add a --prefix or --suffix, choose an --out-dir, or use --in-place to replace the originals".into()
+        }
+        messages::FILE_EXISTS => "a file is already where the result goes (use --overwrite to replace it)".into(),
+        other => other.replace('\n', " "),
     }
 }
 
@@ -680,6 +712,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let ranges = Pdf::parse_ranges(&ranges, pdf.page_count())?;
             let outputs: Vec<PathBuf> =
                 ranges.iter().map(|r| folder.join(format!("{stem}-pages-{}-{}.pdf", r.start() + 1, r.end() + 1))).collect();
+            refuse_repeated(&outputs, "the ranges")?;
             let existing = refuse_existing(&outputs, force)?;
             for (range, output) in ranges.iter().zip(&outputs) {
                 refuse_over_protected(&input, &pdf, output, out)?;
@@ -818,7 +851,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let mut pdf = open(&input, &Password { password: Some(password) })?;
             write_output(&mut pdf, &output, Unprotected { unprotected: true }, None, Existing::Replace)?;
         }
-        Command::Reduce { inputs, slider, out_dir, prefix, suffix, overwrite, in_place } => {
+        Command::Reduce { inputs, slider, out_dir, prefix, suffix, overwrite, in_place, no_overwrite: _ } => {
             let output = match in_place {
                 true => OutputOptions::in_place(),
                 false => OutputOptions {
@@ -843,7 +876,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                     ),
                     (Some(message), _, _) => {
                         warnings += 1;
-                        eprintln!("{}: {}", outcome.input.display(), message.replace('\n', " "));
+                        eprintln!("{}: {}", outcome.input.display(), reduce_message(message));
                     }
                     _ => {}
                 }

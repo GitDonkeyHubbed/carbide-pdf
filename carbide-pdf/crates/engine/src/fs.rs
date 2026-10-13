@@ -22,20 +22,13 @@ pub enum Existing {
 pub fn write_file(path: &Path, bytes: &[u8], existing: Existing) -> io::Result<PathBuf> {
     match existing {
         Existing::Replace => write_replacing(path, bytes).map(|()| path.to_path_buf()),
-        Existing::Refuse => write_new(path, bytes).map(|()| path.to_path_buf()),
-        Existing::KeepBoth => {
-            for n in 1..10_000 {
-                let candidate = numbered(path, n);
-                match write_new(&candidate, bytes) {
-                    Ok(()) => return Ok(candidate),
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                    Err(e) => return Err(e),
-                }
-            }
-            Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("no free name next to {}", path.display())))
-        }
+        Existing::Refuse => write_first_free(path, bytes, 1),
+        Existing::KeepBoth => write_first_free(path, bytes, MAX_NUMBER),
     }
 }
+
+/// The highest number [`Existing::KeepBoth`] tries before giving up.
+const MAX_NUMBER: usize = 9_999;
 
 /// `path` itself for `n` 1, otherwise `path` with ` (n)` added to its name before the extension.
 fn numbered(path: &Path, n: usize) -> PathBuf {
@@ -53,23 +46,42 @@ fn numbered(path: &Path, n: usize) -> PathBuf {
 /// Writes `bytes` to a new file at `path`, never touching a file that is already there: the new
 /// file appears whole or not at all. Fails with `AlreadyExists` when the path is taken.
 pub fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_first_free(path, bytes, 1).map(|_| ())
+}
+
+/// Writes `bytes` once, to a temporary file next to `path`, and gives it the first of the names
+/// `path` numbered 1 to `last` (see [`numbered`]) that nothing has yet. Names already taken are
+/// passed over without writing anything again. Returns the name it got.
+fn write_first_free(path: &Path, bytes: &[u8], last: usize) -> io::Result<PathBuf> {
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
         _ => PathBuf::from("."),
     };
     let (temp, mut file) = create_temp(&dir, 0o666)?;
-    let written = (|| {
+    let named = (|| {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        link_new(&temp, path)
+        for n in 1..=last {
+            let candidate = numbered(path, n);
+            if n < last && fs::symlink_metadata(&candidate).is_ok() {
+                continue;
+            }
+            match link_new(&temp, &candidate) {
+                Ok(()) => return Ok(candidate),
+                // Taken since it was looked at: on to the next number.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < last => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("no free name next to {}", path.display())))
     })();
     let _ = fs::remove_file(&temp);
-    written?;
+    let named = named?;
     if let Ok(handle) = File::open(&dir) {
         let _ = handle.sync_all();
     }
-    Ok(())
+    Ok(named)
 }
 
 /// Gives the finished file `temp` the name `path`, unless something already has that name.
@@ -133,13 +145,16 @@ pub fn private_temp_file(name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
     Err(io::Error::other("could not create a private temporary folder"))
 }
 
-/// True for a file [`private_temp_file`] made.
+/// True for a file [`private_temp_file`] made, also when `path` reaches the temporary folder
+/// another way (through a link, such as `/private/var` for `/var` on macOS).
 pub fn is_private_temp_file(path: &Path) -> bool {
     let Some(dir) = path.parent() else { return false };
     let named_so = dir.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix(PRIVATE_PREFIX)).is_some_and(|digits| {
         digits.len() == PRIVATE_DIGITS && digits.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     });
-    named_so && dir.parent() == Some(std::env::temp_dir().as_path())
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let temp = std::env::temp_dir();
+    named_so && dir.parent().is_some_and(|parent| parent == temp || canonical(parent) == canonical(&temp))
 }
 
 /// Removes a file [`private_temp_file`] made, and its folder. Any other path is refused.
@@ -352,6 +367,25 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn keep_both_writes_once_however_many_names_are_taken() {
+        let dir = scratch("keep-both");
+        let path = dir.join("page.png");
+        for n in 1..=50 {
+            fs::write(numbered(&path, n), b"taken").unwrap();
+        }
+        // A link that leads nowhere takes its name too.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("nowhere"), numbered(&path, 51)).unwrap();
+        #[cfg(not(unix))]
+        fs::write(numbered(&path, 51), b"taken").unwrap();
+        assert_eq!(write_file(&path, b"new", Existing::KeepBoth).unwrap(), dir.join("page (52).png"));
+        assert_eq!(fs::read(dir.join("page (52).png")).unwrap(), b"new");
+        assert!(!dir.join("nowhere").exists());
+        assert!(!names(&dir).iter().any(|n| n.ends_with(".tmp")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_temporary_files_are_new_and_only_for_the_user() {
@@ -365,6 +399,9 @@ mod tests {
         // Two copies never share a folder.
         let other = private_temp_file("revision - v1.pdf", b"copy").unwrap();
         assert_ne!(other.parent(), path.parent());
+
+        // However the temporary folder is reached.
+        assert!(is_private_temp_file(&path.canonicalize().unwrap()));
 
         assert!(private_temp_file("../escape.pdf", b"x").is_err());
         assert!(remove_private_temp_file(&std::env::temp_dir().join("not-ours.pdf")).is_err());

@@ -462,6 +462,20 @@ fn removing_hidden_information_also_rewrites_what_only_the_file_holds() {
     assert_eq!(Pdf::from_bytes(&written).unwrap().annotations(0).unwrap().len(), 1, "the text box was kept");
 }
 
+#[test]
+fn split_refuses_ranges_that_would_write_one_part_twice() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["ONE", "TWO"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    let parts = dir.join("parts");
+    std::fs::create_dir_all(&parts).unwrap();
+    app.split_into(parts.clone(), "1,1", None);
+    let Some(Dialog::Message(message)) = &app.dialog else { panic!("splitting did not refuse") };
+    assert!(message.contains("a-pages-1-1.pdf twice"), "{message}");
+    assert_eq!(std::fs::read_dir(&parts).unwrap().count(), 0, "a part was written");
+}
+
 /// Simulates an earlier session that auto-saved `edited` copies of `originals` (a document never
 /// saved for `None`) and then ended without closing them, as a crash does.
 fn crashed_session(dir: &Path, originals: &[Option<&Path>]) {

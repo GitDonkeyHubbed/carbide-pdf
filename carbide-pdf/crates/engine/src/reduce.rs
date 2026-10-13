@@ -20,6 +20,7 @@ use lopdf::content::Content;
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::error::{Error, Result};
+use crate::fs::Existing;
 use crate::pdf::Pdf;
 
 pub const DEFAULT_IMAGE_FACTOR: u8 = 50;
@@ -638,10 +639,22 @@ impl OutputOptions {
         if file_identity(&path) == file_identity(input) {
             return if self.replace_originals { Ok(path) } else { Err(messages::REPLACES_ORIGINAL) };
         }
-        if !self.overwrite && path.exists() {
+        // A link counts as taken even when it leads nowhere: writing would create its target.
+        if !self.overwrite && path.symlink_metadata().is_ok() {
             return Err(messages::FILE_EXISTS);
         }
         Ok(path)
+    }
+
+    /// What writing a result to `target`, planned for `input`, does with a file already there:
+    /// replace it only when that was chosen (`overwrite`, or replacing the original itself).
+    fn existing(&self, input: &Path, target: &Path) -> Existing {
+        let replaces_original = self.replace_originals && file_identity(target) == file_identity(input);
+        if self.overwrite || replaces_original {
+            Existing::Replace
+        } else {
+            Existing::Refuse
+        }
     }
 
     /// Where each of `inputs` goes. When two of them would be written to the same file, or one's
@@ -727,9 +740,12 @@ pub fn reduce_files(inputs: &[PathBuf], output: &OutputOptions, options: &Reduce
             match pdf.reduce(options, Some(bytes.len())) {
                 Ok((reduced, report)) => {
                     // Replaced in one step, so a crash never leaves a half-written file where the
-                    // original was.
-                    if crate::fs::write_replacing(&target, &reduced).is_err() {
-                        return fail(messages::SAVE_ERROR);
+                    // original was. Without the choice to replace files, one that appeared since
+                    // the batch was planned is left alone.
+                    match crate::fs::write_file(&target, &reduced, output.existing(input, &target)) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return fail(messages::FILE_EXISTS),
+                        Err(_) => return fail(messages::SAVE_ERROR),
                     }
                     FileOutcome { input: input.clone(), output: Some(target), warning: None, report: Some(report) }
                 }

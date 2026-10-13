@@ -2457,6 +2457,16 @@ fn batch_reduce_keeps_originals_and_refuses_names_that_collide() {
     // Again: the reduced copies are there now, and are not replaced without asking.
     let outcomes = reduce_files(&inputs, &OutputOptions::default(), &ReduceOptions::default());
     assert!(outcomes.iter().all(|o| o.warning.as_deref() == Some(reduce_messages::FILE_EXISTS)), "{outcomes:?}");
+    // So is a link there, even one that leads nowhere: nothing is written where it leads.
+    #[cfg(unix)]
+    {
+        let elsewhere = dir.join("elsewhere.pdf");
+        std::fs::remove_file(a.join("x-reduced.pdf")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, a.join("x-reduced.pdf")).unwrap();
+        let outcomes = reduce_files(&inputs[..1], &OutputOptions::default(), &ReduceOptions::default());
+        assert_eq!(outcomes[0].warning.as_deref(), Some(reduce_messages::FILE_EXISTS));
+        assert!(!elsewhere.exists());
+    }
 
     // Both into b, with their own names, replacing what is there (b/x.pdf with its own result):
     // a's result would replace b/x.pdf before it is read.

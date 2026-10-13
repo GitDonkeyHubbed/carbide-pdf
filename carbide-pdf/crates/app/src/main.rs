@@ -1488,6 +1488,11 @@ impl CarbideApp {
         let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
         let targets: Vec<PathBuf> =
             parsed.iter().map(|r| folder.join(format!("{stem}-pages-{}-{}.pdf", r.start() + 1, r.end() + 1))).collect();
+        let mut seen = std::collections::HashSet::new();
+        if let Some(repeated) = targets.iter().find(|t| !seen.insert(*t)) {
+            let name = repeated.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            return self.alert(format!("The ranges would write {name} twice. Give each range once."));
+        }
         let existing = match existing {
             Some(existing) => existing,
             None => {
