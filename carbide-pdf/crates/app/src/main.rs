@@ -146,6 +146,20 @@ struct OcrJob {
     result: Option<OcrResult>,
 }
 
+/// A signature that waits for a time stamp authority, made on a copy of one document.
+struct SignJob {
+    /// The document and the version of it that was signed. The result replaces its file, so it is
+    /// only written while the document is still exactly that version.
+    doc: u64,
+    version: u64,
+    path: PathBuf,
+    /// The status line once the signed file is written.
+    done: String,
+    receiver: std::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+    /// Received, and waiting for its document to come back to the front.
+    result: Option<Result<Vec<u8>, String>>,
+}
+
 #[derive(Clone, Copy)]
 struct DragState {
     page: usize,
@@ -180,6 +194,8 @@ pub struct CarbideApp {
     last_autosave: Instant,
     /// A running (or finished, not yet applied) OCR job.
     ocr_job: Option<OcrJob>,
+    /// A signature waiting for (or holding, not yet written) its time stamp.
+    sign_job: Option<SignJob>,
     /// The document notice bar text (signature summary).
     pub notice: Option<String>,
     /// One slot per open document, in tab order. The active document lives in `doc`, and its slot
@@ -236,6 +252,7 @@ impl CarbideApp {
             settings,
             last_autosave: Instant::now(),
             ocr_job: None,
+            sign_job: None,
             notice: None,
             tabs: Vec::new(),
             active_tab: None,
@@ -1072,26 +1089,78 @@ impl CarbideApp {
             Ok(i) => i,
             Err(message) => return self.alert(message),
         };
-        let authority = request.timestamp_source();
-        let options = request.options(identity.as_ref(), authority.as_ref());
-        let result = doc.pdf.sign(&base, &options).map_err(|e| e.to_string()).and_then(|bytes| {
-            carbide_engine::fs::write_replacing(&path, &bytes).map_err(|e| e.to_string())?;
+        let done = match &identity {
+            Some(id) => format!("Signed {} as {}", path.display(), id.common_name()),
+            None => format!("Time stamped {}", path.display()),
+        };
+        let Some(authority) = request.timestamp_source() else {
+            let signed = doc.pdf.sign(&base, &request.options(identity.as_ref(), None)).map_err(|e| e.to_string());
+            return self.finish_signing(&path, done, signed);
+        };
+        // A time stamp authority can take a while to answer, so the window stays responsive: the
+        // signature is made on a copy, and written in `poll_sign` when it is ready.
+        if self.sign_job.is_some() {
+            return self.alert("Another signature is still waiting for its time stamp.".into());
+        }
+        let (id, version, copy) = (doc.id, doc.version, doc.pdf.clone());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let options = request.options(identity.as_ref(), Some(&authority));
+            let _ = sender.send(copy.sign(&base, &options).map_err(|e| e.to_string()));
+        });
+        self.sign_job = Some(SignJob { doc: id, version, path, done, receiver, result: None });
+        self.status = "Waiting for the time stamp authority...".into();
+    }
+
+    /// Writes signed bytes over the active document's file and reloads the document from it.
+    fn finish_signing(&mut self, path: &Path, done: String, signed: Result<Vec<u8>, String>) {
+        let Some(doc) = self.doc.as_mut() else { return };
+        let result = signed.and_then(|bytes| {
+            carbide_engine::fs::write_replacing(path, &bytes).map_err(|e| e.to_string())?;
             Ok(doc.adopt_saved(bytes).map_err(|e| format!("Signed {}, but could not read it back: {e}", path.display())))
         });
         let result = match result {
             Ok(reloaded) => {
-                self.after_writing(&path);
+                self.after_writing(path);
                 reloaded
             }
             Err(message) => Err(message),
         };
         match result {
-            Ok(()) => {
-                self.status = match &identity {
-                    Some(id) => format!("Signed {} as {}", path.display(), id.common_name()),
-                    None => format!("Time stamped {}", path.display()),
-                };
+            Ok(()) => self.status = done,
+            Err(message) => self.alert(message),
+        }
+    }
+
+    /// Writes a signature whose time stamp has arrived. It replaces the file only while its
+    /// document is unchanged since signing began (an edit or save in the meantime would be lost
+    /// otherwise), and it waits while another document is in front.
+    fn poll_sign(&mut self) {
+        let Some(job) = self.sign_job.as_mut() else { return };
+        if job.result.is_none() {
+            match job.receiver.try_recv() {
+                Ok(result) => job.result = Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.sign_job = None;
+                    return self.alert("Signing stopped unexpectedly.".into());
+                }
             }
+        }
+        let (doc, version) = (job.doc, job.version);
+        let active = self.doc.as_ref().map(|d| (d.id, d.version));
+        if active.map(|(id, _)| id) != Some(doc) {
+            let still_open = (0..self.tabs.len()).any(|i| self.doc_at(i).is_some_and(|d| d.id == doc));
+            if !still_open {
+                self.sign_job = None;
+                self.status = "The document was closed before its time stamp arrived, so it was not signed.".into();
+            }
+            return;
+        }
+        let Some(SignJob { path, done, result: Some(result), .. }) = self.sign_job.take() else { return };
+        match result {
+            Ok(bytes) if active == Some((doc, version)) => self.finish_signing(&path, done, Ok(bytes)),
+            Ok(_) => self.alert("The document was not signed: it changed while waiting for the time stamp. Sign it again.".into()),
             Err(message) => self.alert(message),
         }
     }
@@ -1213,7 +1282,9 @@ impl eframe::App for CarbideApp {
 
         self.autosave_tick();
         self.poll_ocr();
-        ui.ctx().request_repaint_after(if self.ocr_job.is_some() { Duration::from_millis(250) } else { Duration::from_secs(5) });
+        self.poll_sign();
+        let waiting = self.ocr_job.is_some() || self.sign_job.is_some();
+        ui.ctx().request_repaint_after(if waiting { Duration::from_millis(250) } else { Duration::from_secs(5) });
 
         self.draw_shell(ui);
 

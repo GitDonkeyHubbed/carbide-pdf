@@ -229,6 +229,7 @@ impl CarbideApp {
             Cmd::Redo => doc.is_some_and(|d| !d.redo.is_empty()),
             Cmd::ApplyRedactions => doc.is_some() && !self.pending_redactions.is_empty(),
             Cmd::Ocr => doc.is_some() && self.ocr_job.is_none(),
+            Cmd::SignVisible | Cmd::SignInvisible | Cmd::TimeStamp => doc.is_some() && self.sign_job.is_none(),
             Cmd::OpenRevision => doc.is_some_and(|d| d.pdf.can_open_revision()),
             Cmd::FirstPage | Cmd::PrevPage => doc.is_some() && self.current_page > 0,
             Cmd::NextPage | Cmd::LastPage => doc.is_some_and(|d| self.current_page + 1 < d.pdf.page_count()),
