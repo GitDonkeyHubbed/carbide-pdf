@@ -195,3 +195,50 @@ fn split_and_image_export_replace_files_only_with_force() {
     assert!(images.join("doc-002.png").exists());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn reduce_keeps_the_originals_and_refuses_names_that_collide() {
+    let dir = scratch("reduce");
+    // A long text box whose drawing is stored uncompressed, so reducing it gains a lot.
+    let bulky = |path: &Path| {
+        let mut pdf = Pdf::new();
+        pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+        pdf.add_text_box(0, 72.0, 720.0, &"lorem ipsum dolor sit amet ".repeat(400), 10.0).unwrap();
+        std::fs::write(path, pdf.to_bytes().unwrap()).unwrap();
+    };
+    let file = dir.join("big.pdf");
+    bulky(&file);
+    let before = std::fs::read(&file).unwrap();
+    let path = file.to_str().unwrap();
+
+    let output = carbide(&["reduce", path]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(std::fs::read(&file).unwrap(), before, "the original was replaced");
+    let reduced = dir.join("big-reduced.pdf");
+    assert!(std::fs::metadata(&reduced).unwrap().len() < before.len() as u64);
+    // The reduced copy is not replaced without --overwrite.
+    std::fs::write(&reduced, b"kept").unwrap();
+    assert!(!carbide(&["reduce", path]).status.success());
+    assert_eq!(std::fs::read(&reduced).unwrap(), b"kept");
+    assert!(carbide(&["reduce", path, "--overwrite"]).status.success());
+    assert_ne!(std::fs::read(&reduced).unwrap(), b"kept");
+
+    // Two files called x.pdf into one folder: refused before either is touched.
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    bulky(&a.join("x.pdf"));
+    bulky(&b.join("x.pdf"));
+    let (a_x, b_x) = (a.join("x.pdf"), b.join("x.pdf"));
+    let b_before = std::fs::read(&b_x).unwrap();
+    let output = carbide(&["reduce", a_x.to_str().unwrap(), b_x.to_str().unwrap(), "--out-dir", b.to_str().unwrap(), "--suffix", "", "--overwrite"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("same file"), "{}", stderr(&output));
+    assert_eq!(std::fs::read(&b_x).unwrap(), b_before);
+
+    // Replacing the originals takes --in-place.
+    let output = carbide(&["reduce", path, "--in-place"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(std::fs::read(&file).unwrap().len() < before.len());
+    let _ = std::fs::remove_dir_all(dir);
+}

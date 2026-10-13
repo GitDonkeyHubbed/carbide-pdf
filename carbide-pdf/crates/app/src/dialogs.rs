@@ -62,6 +62,8 @@ pub struct ReduceForm {
     prefix: String,
     suffix: String,
     overwrite: bool,
+    /// With the same file names: replace the originals with the reduced copies.
+    replace_originals: bool,
     results: Option<Vec<FileOutcome>>,
 }
 
@@ -282,10 +284,13 @@ impl Dialog {
             slider: carbide_engine::reduce::DEFAULT_IMAGE_FACTOR,
             same_folder: true,
             folder: None,
-            add_to_names: false,
+            // Next to the originals under new names: the originals are kept unless replacing
+            // them is chosen.
+            add_to_names: true,
             prefix: String::new(),
-            suffix: String::new(),
-            overwrite: true,
+            suffix: carbide_engine::reduce::DEFAULT_SUFFIX.into(),
+            overwrite: false,
+            replace_originals: false,
             results: None,
         }))
     }
@@ -1190,6 +1195,9 @@ fn reduce_dialog(app: &mut CarbideApp, ctx: &egui::Context, form: &mut ReduceFor
                 ui.text_edit_singleline(&mut form.suffix);
             });
         }
+        if !form.add_to_names {
+            ui.checkbox(&mut form.replace_originals, "Replace the original files");
+        }
         ui.checkbox(&mut form.overwrite, "Overwrite existing files");
         ui.horizontal(|ui| {
             if ui.add_enabled(!form.files.is_empty(), egui::Button::new("OK")).clicked() {
@@ -1202,6 +1210,7 @@ fn reduce_dialog(app: &mut CarbideApp, ctx: &egui::Context, form: &mut ReduceFor
                     prefix: if form.add_to_names { form.prefix.clone() } else { String::new() },
                     suffix: if form.add_to_names { form.suffix.clone() } else { String::new() },
                     overwrite: form.overwrite,
+                    replace_originals: form.replace_originals && !form.add_to_names,
                 };
                 form.results = Some(reduce_files(&form.files, &output, &ReduceOptions { image_factor: form.slider }));
             }
@@ -1221,7 +1230,9 @@ fn reduce_current(app: &mut CarbideApp, slider: u8) -> bool {
         app.alert("Reduce File Size is not available for password-protected documents.".into());
         return true;
     }
-    let name = doc.title();
+    // A new name by default, so the original is only replaced when the user picks it.
+    let stem = doc.title().strip_suffix(".pdf").map(str::to_owned).unwrap_or_else(|| doc.title());
+    let name = format!("{stem}{}.pdf", carbide_engine::reduce::DEFAULT_SUFFIX);
     let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name(name).save_file() else {
         return false;
     };

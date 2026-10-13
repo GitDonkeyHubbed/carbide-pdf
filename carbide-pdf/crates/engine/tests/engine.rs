@@ -12,7 +12,7 @@ use carbide_engine::signature::{
     messages as sig_messages, notice_text, CertifyLevel, Detail, HttpTimestampSource, Identity, SignOptions, SubFilter,
     TimestampSource, TrustStore, Validity,
 };
-use carbide_engine::reduce::{messages as reduce_messages, reduce_files, OutputOptions, ReduceOptions};
+use carbide_engine::reduce::{messages as reduce_messages, reduce_files, OutputOptions, ReduceOptions, TargetFolder};
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PlanOptions, PrintingOrder, Style};
 use carbide_engine::{
     compare_documents, export_images, export_text, image_paths, open_revision_bytes, pdf_date_now, BatesOptions, Error,
@@ -1806,10 +1806,10 @@ fn batch_reduce_never_damages_originals() {
     let tiny_before = std::fs::read(&tiny).unwrap();
     let photo_before = std::fs::metadata(&photo).unwrap().len();
 
-    // In place (same folder, original names, overwrite on).
+    // In place, as an explicit choice.
     let outcomes = reduce_files(
         &[photo.clone(), tiny.clone(), broken.clone()],
-        &OutputOptions::default(),
+        &OutputOptions::in_place(),
         &ReduceOptions::default(),
     );
     assert!(outcomes[0].warning.is_none() && outcomes[0].report.is_some());
@@ -1826,15 +1826,70 @@ fn batch_reduce_never_damages_originals() {
     options.allow_copying = false;
     std::fs::write(&protected, photo_pdf().to_encrypted_bytes(&options).unwrap()).unwrap();
     let before = std::fs::read(&protected).unwrap();
-    let outcomes = reduce_files(std::slice::from_ref(&protected), &OutputOptions::default(), &ReduceOptions::default());
+    let outcomes = reduce_files(std::slice::from_ref(&protected), &OutputOptions::in_place(), &ReduceOptions::default());
     assert_eq!(outcomes[0].warning.as_deref(), Some(reduce_messages::PROTECTED));
     assert_eq!(std::fs::read(&protected).unwrap(), before);
 
     // Naming and overwrite rules.
-    let named = OutputOptions { prefix: "small-".into(), overwrite: false, ..Default::default() };
+    let named = OutputOptions { prefix: "small-".into(), suffix: String::new(), overwrite: false, ..Default::default() };
     assert_eq!(named.output_path(&photo).unwrap(), dir.join("small-photo.pdf"));
     std::fs::write(dir.join("small-photo.pdf"), b"existing").unwrap();
     assert_eq!(named.output_path(&photo), Err(reduce_messages::FILE_EXISTS));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn batch_reduce_keeps_originals_and_refuses_names_that_collide() {
+    let dir = scratch_dir("reduce-names");
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    photo_pdf().save(a.join("x.pdf")).unwrap();
+    photo_pdf().save(b.join("x.pdf")).unwrap();
+    let originals = |paths: &[PathBuf]| paths.iter().map(|p| std::fs::read(p).unwrap()).collect::<Vec<_>>();
+
+    // By default the results go next to the originals under new names, and the originals stay.
+    let inputs = [a.join("x.pdf"), b.join("x.pdf")];
+    let before = originals(&inputs);
+    let outcomes = reduce_files(&inputs, &OutputOptions::default(), &ReduceOptions::default());
+    assert!(outcomes.iter().all(|o| o.warning.is_none()), "{outcomes:?}");
+    assert_eq!(outcomes[0].output.as_deref(), Some(a.join("x-reduced.pdf").as_path()));
+    assert_eq!(originals(&inputs), before);
+    // Again: the reduced copies are there now, and are not replaced without asking.
+    let outcomes = reduce_files(&inputs, &OutputOptions::default(), &ReduceOptions::default());
+    assert!(outcomes.iter().all(|o| o.warning.as_deref() == Some(reduce_messages::FILE_EXISTS)), "{outcomes:?}");
+
+    // Both into b, with their own names, replacing what is there (b/x.pdf with its own result):
+    // a's result would replace b/x.pdf before it is read.
+    let into_b = OutputOptions { folder: TargetFolder::Specific(b.clone()), ..OutputOptions::in_place() };
+    let outcomes = reduce_files(&inputs, &into_b, &ReduceOptions::default());
+    assert_eq!(outcomes[0].warning.as_deref(), Some(reduce_messages::OUTPUT_COLLIDES));
+    assert_eq!(outcomes[1].warning.as_deref(), Some(reduce_messages::OUTPUT_COLLIDES));
+    assert!(outcomes.iter().all(|o| o.output.is_none()));
+    assert_eq!(originals(&inputs), before, "nothing is touched");
+
+    // A result named like another input in the same folder, and two results with one name.
+    let small = a.join("x-small.pdf");
+    photo_pdf().save(&small).unwrap();
+    let small_before = std::fs::read(&small).unwrap();
+    let suffixed = OutputOptions { suffix: "-small".into(), overwrite: true, ..Default::default() };
+    let outcomes = reduce_files(&[a.join("x.pdf"), small.clone(), b.join("x.pdf")], &suffixed, &ReduceOptions::default());
+    assert_eq!(outcomes[0].warning.as_deref(), Some(reduce_messages::OUTPUT_COLLIDES));
+    assert_eq!(outcomes[2].warning.as_deref(), Some(reduce_messages::BATCH_STOPPED), "nothing at all is reduced");
+    assert_eq!(std::fs::read(&small).unwrap(), small_before);
+    let same_name = OutputOptions { folder: TargetFolder::Specific(dir.clone()), overwrite: true, ..Default::default() };
+    let outcomes = reduce_files(&inputs, &same_name, &ReduceOptions::default());
+    assert!(outcomes.iter().all(|o| o.warning.as_deref() == Some(reduce_messages::OUTPUT_COLLIDES)), "{outcomes:?}");
+    assert!(!dir.join("x-reduced.pdf").exists());
+
+    // Replacing the originals takes the explicit choice.
+    let same_names = OutputOptions { suffix: String::new(), overwrite: true, ..Default::default() };
+    let outcomes = reduce_files(&inputs, &same_names, &ReduceOptions::default());
+    assert!(outcomes.iter().all(|o| o.warning.as_deref() == Some(reduce_messages::REPLACES_ORIGINAL)), "{outcomes:?}");
+    assert_eq!(originals(&inputs), before);
+    let outcomes = reduce_files(&inputs, &OutputOptions::in_place(), &ReduceOptions::default());
+    assert!(outcomes.iter().all(|o| o.warning.is_none()), "{outcomes:?}");
+    assert!(std::fs::read(&inputs[0]).unwrap().len() < before[0].len() / 10);
     let _ = std::fs::remove_dir_all(dir);
 }
 

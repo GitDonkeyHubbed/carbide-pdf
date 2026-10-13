@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use carbide_engine::imposition::{ImpositionOptions, Margins, Media, RegistrationStyle};
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PlanOptions, PrintingOrder, Style};
-use carbide_engine::reduce::{reduce_files, OutputOptions, ReduceOptions, TargetFolder};
+use carbide_engine::reduce::{reduce_files, OutputOptions, ReduceOptions, TargetFolder, DEFAULT_SUFFIX};
 use carbide_engine::signature::{
     notice_text, CertifyLevel, HttpTimestampSource, Identity, SignOptions, SubFilter, TrustStore, Validity,
 };
@@ -176,7 +176,8 @@ enum Command {
     },
     /// Remove password protection (needs the password).
     Decrypt { input: PathBuf, output: PathBuf, #[arg(long)] password: String },
-    /// Reduce file size (image slider 0 to 100, default 50).
+    /// Reduce file size (image slider 0 to 100, default 50). The results go next to the originals
+    /// with "-reduced" added to their names; the originals are kept.
     Reduce {
         inputs: Vec<PathBuf>,
         #[arg(long, default_value_t = 50)]
@@ -186,11 +187,14 @@ enum Command {
         out_dir: Option<PathBuf>,
         #[arg(long, default_value = "", allow_hyphen_values = true)]
         prefix: String,
-        #[arg(long, default_value = "", allow_hyphen_values = true)]
+        #[arg(long, default_value = DEFAULT_SUFFIX, allow_hyphen_values = true)]
         suffix: String,
-        /// Refuse to overwrite existing files.
+        /// Replace other files already where the results go.
         #[arg(long)]
-        no_overwrite: bool,
+        overwrite: bool,
+        /// Replace each original with its reduced copy.
+        #[arg(long, conflicts_with_all = ["out_dir", "prefix", "suffix"])]
+        in_place: bool,
     },
     /// Recognize text on scanned pages and add an invisible, searchable text layer.
     Ocr {
@@ -754,12 +758,16 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let mut pdf = open(&input, &Password { password: Some(password) })?;
             write_output(&mut pdf, &output, Unprotected { unprotected: true }, None, Existing::Replace)?;
         }
-        Command::Reduce { inputs, slider, out_dir, prefix, suffix, no_overwrite } => {
-            let output = OutputOptions {
-                folder: out_dir.map(TargetFolder::Specific).unwrap_or(TargetFolder::SameAsOriginal),
-                prefix,
-                suffix,
-                overwrite: !no_overwrite,
+        Command::Reduce { inputs, slider, out_dir, prefix, suffix, overwrite, in_place } => {
+            let output = match in_place {
+                true => OutputOptions::in_place(),
+                false => OutputOptions {
+                    folder: out_dir.map(TargetFolder::Specific).unwrap_or(TargetFolder::SameAsOriginal),
+                    prefix,
+                    suffix,
+                    overwrite,
+                    replace_originals: false,
+                },
             };
             let mut warnings = 0;
             for outcome in reduce_files(&inputs, &output, &ReduceOptions { image_factor: slider }) {
