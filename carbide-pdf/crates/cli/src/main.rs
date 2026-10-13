@@ -12,8 +12,9 @@ use carbide_engine::reduce::{reduce_files, OutputOptions, ReduceOptions, TargetF
 use carbide_engine::signature::{
     notice_text, CertifyLevel, HttpTimestampSource, Identity, SignOptions, SubFilter, TrustStore, Validity,
 };
+use carbide_engine::fs::{write_file, write_replacing, Existing};
 use carbide_engine::{
-    compare_documents, export_images, export_text, open_revision_bytes, pdf_date_now, revision_display_name,
+    compare_documents, export_images, export_text, image_paths, open_revision_bytes, pdf_date_now, revision_display_name,
     BatesOptions, ImageFormat, MarkupStyle, PageAnchor, Pdf, ProtectionOptions, Rect, Redaction, Renderer,
     SavePlan, SavedFile, StandardFont, WatermarkOptions,
 };
@@ -44,7 +45,16 @@ enum Command {
     /// Copy selected pages (e.g. "1-3,5") into a new file.
     Extract { input: PathBuf, pages: String, output: PathBuf, #[command(flatten)] pw: Password },
     /// Split into one file per range (e.g. "1-3,4-6") inside a folder.
-    Split { input: PathBuf, ranges: String, folder: PathBuf, #[command(flatten)] pw: Password },
+    Split {
+        input: PathBuf,
+        ranges: String,
+        folder: PathBuf,
+        /// Replace files of the same names already in the folder.
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        pw: Password,
+    },
     /// Delete pages.
     Delete { input: PathBuf, pages: String, output: PathBuf, #[command(flatten)] pw: Password },
     /// Rotate pages by a multiple of 90 degrees.
@@ -105,6 +115,9 @@ enum Command {
         dpi: f32,
         #[arg(long)]
         jpeg: bool,
+        /// Replace images of the same names already in the folder.
+        #[arg(long)]
+        force: bool,
         #[command(flatten)]
         pw: Password,
     },
@@ -437,9 +450,27 @@ fn parse_color(hex: &str) -> Result<[f32; 3], Failure> {
 }
 
 fn save(pdf: &mut Pdf, output: &Path) -> Result<(), Failure> {
-    pdf.save(output)?;
+    write_output(pdf, output, Existing::Replace)
+}
+
+/// Writes a new document to `output`; `existing` says what happens to a file already there.
+fn write_output(pdf: &mut Pdf, output: &Path, existing: Existing) -> Result<(), Failure> {
+    let bytes = pdf.to_bytes()?;
+    write_file(output, &bytes, existing).map_err(|e| format!("{}: {e}", output.display()))?;
     println!("wrote {}", output.display());
     Ok(())
+}
+
+/// Refuses, before anything is written, when one of `outputs` is already there and `force` was
+/// not given.
+fn refuse_existing(outputs: &[PathBuf], force: bool) -> Result<Existing, Failure> {
+    if force {
+        return Ok(Existing::Replace);
+    }
+    match outputs.iter().find(|path| path.symlink_metadata().is_ok()) {
+        Some(taken) => Err(format!("{} already exists (use --force to replace it)", taken.display()).into()),
+        None => Ok(Existing::Refuse),
+    }
 }
 
 /// Opens an input that is edited and written out again, together with the file it came from.
@@ -464,7 +495,7 @@ fn save_edit(pdf: &mut Pdf, saved: &SavedFile, content_removed: bool, input: &Pa
     }
     let bytes = pdf.save_bytes(plan, Some(saved))?;
     if !(plan == SavePlan::Unchanged && same_file(input, output)) {
-        carbide_engine::fs::write_replacing(output, &bytes)?;
+        write_replacing(output, &bytes)?;
     }
     println!("wrote {}", output.display());
     Ok(())
@@ -519,15 +550,18 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let selected = pages_arg(&pages, &pdf)?;
             save(&mut pdf.extract_pages(&selected)?, &output)?;
         }
-        Command::Split { input, ranges, folder, pw } => {
+        Command::Split { input, ranges, folder, force, pw } => {
             let pdf = open(&input, &pw)?;
             std::fs::create_dir_all(&folder)?;
             let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            for range in Pdf::parse_ranges(&ranges, pdf.page_count())? {
-                let name = format!("{stem}-pages-{}-{}.pdf", range.start() + 1, range.end() + 1);
-                refuse_over_protected(&input, &pdf, &folder.join(&name))?;
+            let ranges = Pdf::parse_ranges(&ranges, pdf.page_count())?;
+            let outputs: Vec<PathBuf> =
+                ranges.iter().map(|r| folder.join(format!("{stem}-pages-{}-{}.pdf", r.start() + 1, r.end() + 1))).collect();
+            let existing = refuse_existing(&outputs, force)?;
+            for (range, output) in ranges.iter().zip(&outputs) {
+                refuse_over_protected(&input, &pdf, output)?;
                 let mut part = pdf.extract_pages(&range.clone().collect::<Vec<_>>())?;
-                save(&mut part, &folder.join(name))?;
+                write_output(&mut part, output, existing)?;
             }
         }
         Command::Delete { input, pages, output, pw } => {
@@ -631,11 +665,12 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 diff.added.iter().for_each(|l| println!("  + {l}"));
             }
         }
-        Command::Images { input, folder, dpi, jpeg, pw } => {
+        Command::Images { input, folder, dpi, jpeg, force, pw } => {
             let mut pdf = open(&input, &pw)?;
             let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let format = if jpeg { ImageFormat::Jpeg } else { ImageFormat::Png };
-            for path in export_images(renderer()?, &mut pdf, &folder, &stem, format, dpi)? {
+            let existing = refuse_existing(&image_paths(&pdf, &folder, &stem, format), force)?;
+            for path in export_images(renderer()?, &mut pdf, &folder, &stem, format, dpi, existing)? {
                 println!("wrote {}", path.display());
             }
         }
@@ -716,7 +751,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 options.description = None;
             }
             if let Some(path) = &a.save_settings {
-                std::fs::write(path, options.to_ini())?;
+                write_replacing(path, options.to_ini().as_bytes())?;
             }
             let mut last = 0;
             let mut progress = |percent: u32| {
@@ -770,7 +805,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 timestamp: authority.as_ref().map(|t| t as &dyn carbide_engine::signature::TimestampSource),
                 signing_time: None,
             };
-            carbide_engine::fs::write_replacing(&a.output, &pdf.sign(&base, &options)?)?;
+            write_replacing(&a.output, &pdf.sign(&base, &options)?)?;
             println!("signed {} as {}", a.output.display(), identity.common_name());
         }
         Command::Timestamp { input, output, tsa, tsa_user, tsa_password } => {
@@ -783,7 +818,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 timestamp: Some(&authority),
                 ..Default::default()
             };
-            carbide_engine::fs::write_replacing(&output, &pdf.sign(&base, &options)?)?;
+            write_replacing(&output, &pdf.sign(&base, &options)?)?;
             println!("wrote {}", output.display());
         }
         Command::Verify { input, trust } => {
@@ -832,7 +867,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 let base = std::fs::read(&file)?;
                 let pdf = Pdf::from_bytes(&base)?;
                 let updated = pdf.save_revision(&base, &label, &pdf_date_now())?;
-                carbide_engine::fs::write_replacing(&file, &updated)?;
+                write_replacing(&file, &updated)?;
                 println!("saved revision {:?} in {}", label, file.display());
             }
             RevisionAction::List { file } => {
@@ -851,7 +886,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 let revision = revisions
                     .get(one_based(number, "revision")?)
                     .ok_or_else(|| format!("{} has {} revision(s)", file.display(), revisions.len()))?;
-                carbide_engine::fs::write_replacing(&output, &open_revision_bytes(&bytes, revision)?)?;
+                write_replacing(&output, &open_revision_bytes(&bytes, revision)?)?;
                 let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 println!("wrote {} ({})", output.display(), revision_display_name(&name, revision));
             }

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use carbide_engine::autosave::{AutoSaveStore, RowKind};
+use carbide_engine::fs::Existing;
 use carbide_engine::imposition::{ImpositionOptions, Margins, Media};
 use carbide_engine::ocr::OcrOptions;
 use carbide_engine::signature::{
@@ -14,7 +15,7 @@ use carbide_engine::signature::{
 use carbide_engine::reduce::{messages as reduce_messages, reduce_files, OutputOptions, ReduceOptions};
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PlanOptions, PrintingOrder, Style};
 use carbide_engine::{
-    compare_documents, export_images, export_text, open_revision_bytes, pdf_date_now, BatesOptions, Error,
+    compare_documents, export_images, export_text, image_paths, open_revision_bytes, pdf_date_now, BatesOptions, Error,
     ImageFormat, MarkupStyle, PageAnchor, Pdf, ProtectionOptions, Rect, Redaction, Renderer, SavePlan, SavedFile,
     WatermarkOptions,
 };
@@ -293,12 +294,44 @@ fn compare_reports_line_changes() {
 fn export_images_and_text() {
     let r = renderer();
     let mut pdf = text_pdf(&[&["page one"], &["page two"]]);
-    let dir = std::env::temp_dir().join(format!("carbide-export-{}", std::process::id()));
-    let paths = export_images(&r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0).unwrap();
+    let dir = scratch_dir("export");
+    let paths = export_images(&r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::Refuse).unwrap();
     let names: Vec<_> = paths.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
     assert_eq!(names, vec!["doc-001.png", "doc-002.png"]);
+    assert_eq!(paths, image_paths(&pdf, &dir, "doc", ImageFormat::Png));
     assert_eq!(image::open(&paths[0]).unwrap().width(), 612);
+    let jpegs = export_images(&r, &mut pdf, &dir, "doc", ImageFormat::Jpeg, 72.0, Existing::Refuse).unwrap();
+    assert_eq!(image::open(&jpegs[1]).unwrap().width(), 612);
     assert!(export_text(&r, &mut pdf).unwrap().contains("page two"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn exported_images_never_replace_files_unless_asked() {
+    let r = renderer();
+    let mut pdf = text_pdf(&[&["page one"], &["page two"]]);
+    let dir = scratch_dir("export-existing");
+    std::fs::create_dir_all(&dir).unwrap();
+    // An earlier export of another document with the same name.
+    std::fs::write(dir.join("doc-002.png"), b"earlier export").unwrap();
+    let listing = |dir: &PathBuf| {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    };
+
+    let refused = export_images(&r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::Refuse).unwrap_err();
+    assert!(refused.to_string().contains("doc-002.png"), "{refused}");
+    assert_eq!(listing(&dir), ["doc-002.png"], "nothing is written when a name is taken");
+
+    let kept = export_images(&r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::KeepBoth).unwrap();
+    assert_eq!(kept, [dir.join("doc-001.png"), dir.join("doc-002 (2).png")]);
+    assert_eq!(std::fs::read(dir.join("doc-002.png")).unwrap(), b"earlier export");
+
+    let replaced = export_images(&r, &mut pdf, &dir, "doc", ImageFormat::Png, 72.0, Existing::Replace).unwrap();
+    assert_eq!(replaced, [dir.join("doc-001.png"), dir.join("doc-002.png")]);
+    assert_eq!(image::open(dir.join("doc-002.png")).unwrap().width(), 612);
+    assert_eq!(listing(&dir), ["doc-001.png", "doc-002 (2).png", "doc-002.png"], "no temporary files are left");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1154,6 +1187,44 @@ fn replacing_a_file_keeps_its_mode_and_follows_symbolic_links() {
     let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
     names.sort();
     assert_eq!(names, ["fresh.pdf", "link.pdf", "locked.pdf", "private.pdf", "target.pdf"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_and_protected_copies_replace_files_in_one_step() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let dir = scratch_dir("safe-save");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+    // Saving over a private file keeps it private.
+    let private = dir.join("private.pdf");
+    std::fs::write(&private, b"old").unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+    text_pdf(&[&["saved"]]).save(&private).unwrap();
+    assert_eq!(mode(&private), 0o600);
+    assert_eq!(Pdf::open(&private).unwrap().page_count(), 1);
+
+    // A protected copy written through a link replaces the file it points to.
+    let link = dir.join("link.pdf");
+    symlink("private.pdf", &link).unwrap();
+    text_pdf(&[&["protected"]]).save_encrypted(&link, &ProtectionOptions::new("open", "owner")).unwrap();
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(matches!(Pdf::open(&private), Err(Error::PasswordRequired)));
+    assert_eq!(mode(&private), 0o600);
+
+    // A file that cannot be written is refused and left as it was, by both.
+    let locked = dir.join("locked.pdf");
+    std::fs::write(&locked, b"keep").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444)).unwrap();
+    assert!(text_pdf(&[&["x"]]).save(&locked).is_err());
+    assert!(text_pdf(&[&["x"]]).save_encrypted(&locked, &ProtectionOptions::new("", "owner")).is_err());
+    assert_eq!(std::fs::read(&locked).unwrap(), b"keep");
+
+    let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    assert_eq!(names, ["link.pdf", "locked.pdf", "private.pdf"], "no temporary files are left");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

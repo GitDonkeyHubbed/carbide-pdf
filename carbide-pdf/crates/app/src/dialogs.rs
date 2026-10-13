@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use carbide_engine::autosave::{format_time, messages as autosave_messages, AutoSaveSettings, RowKind};
+use carbide_engine::fs::Existing;
 use carbide_engine::imposition::{ImpositionOptions, Media, RegistrationStyle, PAPER_SIZES};
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PrintingOrder, Style};
 use carbide_engine::reduce::{
@@ -136,6 +137,14 @@ impl SignRequest {
     }
 }
 
+/// Files about to be written into a folder, some of whose names are already taken there.
+pub enum Writing {
+    /// An image of every page.
+    Images { folder: PathBuf },
+    /// One file per page range.
+    Split { folder: PathBuf, ranges: String },
+}
+
 /// What is carried out once a save has written the file.
 pub enum AfterSave {
     Nothing,
@@ -163,6 +172,8 @@ pub enum Dialog {
         drops_revisions: bool,
         then: AfterSave,
     },
+    /// Writing files for document `doc` would replace the files `taken`.
+    ExistingFiles { doc: u64, writing: Writing, taken: Vec<PathBuf> },
     Watermark(WatermarkForm),
     Bates(BatesForm),
     Protect(ProtectForm),
@@ -178,6 +189,15 @@ pub enum Dialog {
 }
 
 impl Dialog {
+    /// The document a question is about, for a question that only makes sense while that document
+    /// is in front.
+    pub fn document(&self) -> Option<u64> {
+        match self {
+            Dialog::ConfirmRewrite { doc, .. } | Dialog::ExistingFiles { doc, .. } => Some(*doc),
+            _ => None,
+        }
+    }
+
     pub fn watermark() -> Dialog {
         Dialog::Watermark(WatermarkForm {
             text: "CONFIDENTIAL".into(),
@@ -463,6 +483,46 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                     open = false;
                 }
                 open &= !cancel;
+            });
+        }
+
+        Dialog::ExistingFiles { doc, writing, taken } => {
+            window("Replace Files?").show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                let folder = match writing {
+                    Writing::Images { folder } | Writing::Split { folder, .. } => folder.display().to_string(),
+                };
+                let name = |path: &PathBuf| path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if let [only] = taken.as_slice() {
+                    ui.label(format!("\"{}\" already exists in {folder}.", name(only)));
+                } else {
+                    ui.label(format!("{} files with these names already exist in {folder}:", taken.len()));
+                    for path in taken.iter().take(6) {
+                        ui.label(format!("  {}", name(path)));
+                    }
+                    if taken.len() > 6 {
+                        ui.label(format!("  and {} more", taken.len() - 6));
+                    }
+                }
+                ui.weak("Replace them, or keep them and give the new files numbered names.");
+                ui.add_space(6.0);
+                let mut choice = None;
+                ui.horizontal(|ui| {
+                    if ui.button("Replace").clicked() {
+                        choice = Some(Existing::Replace);
+                    }
+                    if ui.button("Keep Both").clicked() {
+                        choice = Some(Existing::KeepBoth);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        open = false;
+                    }
+                });
+                if let Some(existing) = choice {
+                    let writing = std::mem::replace(writing, Writing::Images { folder: PathBuf::new() });
+                    app.continue_writing(*doc, writing, existing);
+                    open = false;
+                }
             });
         }
 
@@ -758,22 +818,11 @@ fn anchor_name(anchor: PageAnchor) -> &'static str {
 
 fn split_document(app: &mut CarbideApp, ranges: &str) {
     let Some(doc) = app.doc.as_ref() else { return };
-    let parsed = match Pdf::parse_ranges(ranges, doc.pdf.page_count()) {
-        Ok(r) => r,
-        Err(e) => return app.alert(e.to_string()),
-    };
-    let Some(folder) = rfd::FileDialog::new().set_title("Choose Folder").pick_folder() else { return };
-    let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
-    let mut written = 0;
-    for range in parsed {
-        let name = format!("{stem}-pages-{}-{}.pdf", range.start() + 1, range.end() + 1);
-        let result = doc.pdf.extract_pages(&range.clone().collect::<Vec<_>>()).and_then(|mut p| p.save(folder.join(&name)));
-        match result {
-            Ok(()) => written += 1,
-            Err(e) => return app.alert(format!("Could not write {name}: {e}")),
-        }
+    if let Err(e) = Pdf::parse_ranges(ranges, doc.pdf.page_count()) {
+        return app.alert(e.to_string());
     }
-    app.status = format!("Wrote {written} file(s) to {}", folder.display());
+    let Some(folder) = rfd::FileDialog::new().set_title("Choose Folder").pick_folder() else { return };
+    app.split_into(folder, ranges, None);
 }
 
 // ---- imposition ----------------------------------------------------------------------------

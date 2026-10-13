@@ -15,11 +15,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use carbide_engine::autosave::{now_unix, AutoSaveSettings, AutoSaveStore, RecordId};
+use carbide_engine::fs::Existing;
 use carbide_engine::{
     open_revision_bytes, pdf_date_now, revision_display_name, Error as EngineError, MarkupStyle, Pdf, PageGeometry,
     Rect, Redaction, Renderer, Revision, SavePlan, SavedFile,
 };
-use dialogs::{AfterSave, Dialog};
+use dialogs::{AfterSave, Dialog, Writing};
 use eframe::egui;
 
 const MAX_UNDO: usize = 10;
@@ -347,7 +348,7 @@ impl CarbideApp {
     fn park_active(&mut self) {
         let Some(index) = self.active_tab else { return };
         let Some(mut doc) = self.doc.take() else { return };
-        self.drop_save_question();
+        self.drop_document_question();
         doc.view_page = self.current_page;
         doc.view_redactions = std::mem::take(&mut self.pending_redactions);
         doc.view_notice = self.notice.take();
@@ -355,11 +356,11 @@ impl CarbideApp {
         self.active_tab = None;
     }
 
-    /// A pending save question belongs to the active document. Whenever that document is put
-    /// away (another one opened, created or brought forward, or this one closed) the question goes,
-    /// so answering it can never write a different document.
-    fn drop_save_question(&mut self) {
-        if matches!(self.dialog, Some(Dialog::ConfirmRewrite { .. })) {
+    /// A pending question about the active document (whether to save, replace files, ...) belongs
+    /// to it. Whenever that document is put away (another one opened, created or brought forward,
+    /// or this one closed) the question goes, so answering it can never act on a different document.
+    fn drop_document_question(&mut self) {
+        if self.dialog.as_ref().is_some_and(|d| d.document().is_some()) {
             self.dialog = None;
         }
     }
@@ -391,7 +392,7 @@ impl CarbideApp {
         }
         let was_active = self.active_tab == Some(index);
         let doc = if was_active {
-            self.drop_save_question();
+            self.drop_document_question();
             self.active_tab = None;
             self.pending_redactions.clear();
             self.notice = None;
@@ -1182,12 +1183,85 @@ impl CarbideApp {
     // ---- file helpers ------------------------------------------------------------------
 
     fn export_images(&mut self) {
-        let (Some(renderer), Some(doc)) = (self.renderer, self.doc.as_mut()) else { return };
+        if self.renderer.is_none() || self.doc.is_none() {
+            return;
+        }
         let Some(folder) = rfd::FileDialog::new().set_title("Export Here").pick_folder() else { return };
+        self.export_images_to(folder, None);
+    }
+
+    /// Exports every page of the active document as an image into `folder`. When files of those
+    /// names are already there and `existing` does not say what to do with them, the user is asked.
+    pub fn export_images_to(&mut self, folder: PathBuf, existing: Option<Existing>) {
+        let (Some(renderer), Some(doc)) = (self.renderer, self.doc.as_mut()) else { return };
         let base = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "page".into());
-        match carbide_engine::export_images(renderer, &mut doc.pdf, &folder, &base, carbide_engine::ImageFormat::Png, 150.0) {
+        let format = carbide_engine::ImageFormat::Png;
+        let existing = match existing {
+            Some(existing) => existing,
+            None => {
+                let taken = taken(carbide_engine::image_paths(&doc.pdf, &folder, &base, format));
+                if !taken.is_empty() {
+                    self.dialog = Some(Dialog::ExistingFiles { doc: doc.id, writing: Writing::Images { folder }, taken });
+                    return;
+                }
+                Existing::Refuse
+            }
+        };
+        match carbide_engine::export_images(renderer, &mut doc.pdf, &folder, &base, format, 150.0, existing) {
             Ok(paths) => self.status = format!("Exported {} image(s).", paths.len()),
             Err(e) => self.alert(format!("Export failed: {e}")),
+        }
+    }
+
+    /// Writes each of `ranges` of the active document as a file of its own into `folder`, asking
+    /// first when files of those names are already there and `existing` does not say what to do.
+    pub fn split_into(&mut self, folder: PathBuf, ranges: &str, existing: Option<Existing>) {
+        let Some(doc) = self.doc.as_ref() else { return };
+        let parsed = match Pdf::parse_ranges(ranges, doc.pdf.page_count()) {
+            Ok(r) => r,
+            Err(e) => return self.alert(e.to_string()),
+        };
+        let stem = doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
+        let targets: Vec<PathBuf> =
+            parsed.iter().map(|r| folder.join(format!("{stem}-pages-{}-{}.pdf", r.start() + 1, r.end() + 1))).collect();
+        let existing = match existing {
+            Some(existing) => existing,
+            None => {
+                let taken = taken(targets.clone());
+                if !taken.is_empty() {
+                    let writing = Writing::Split { folder, ranges: ranges.to_string() };
+                    self.dialog = Some(Dialog::ExistingFiles { doc: doc.id, writing, taken });
+                    return;
+                }
+                Existing::Refuse
+            }
+        };
+        let mut written = 0;
+        for (range, target) in parsed.iter().zip(&targets) {
+            let result = doc
+                .pdf
+                .extract_pages(&range.clone().collect::<Vec<_>>())
+                .and_then(|mut part| part.to_bytes())
+                .and_then(|bytes| Ok(carbide_engine::fs::write_file(target, &bytes, existing)?));
+            if let Err(e) = result {
+                let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                return self.alert(format!("Could not write {name}: {e}"));
+            }
+            written += 1;
+        }
+        self.status = format!("Wrote {written} file(s) to {}", folder.display());
+    }
+
+    /// Carries on writing files into a folder, once the user said what happens to files already
+    /// there. Nothing is written when the question was about a document no longer in front.
+    pub fn continue_writing(&mut self, doc: u64, writing: Writing, existing: Existing) {
+        if self.doc.as_ref().map(|d| d.id) != Some(doc) {
+            self.status = "Nothing was written: the question was about a document that is no longer in front.".into();
+            return;
+        }
+        match writing {
+            Writing::Images { folder } => self.export_images_to(folder, Some(existing)),
+            Writing::Split { folder, ranges } => self.split_into(folder, &ranges, Some(existing)),
         }
     }
 
@@ -1252,6 +1326,11 @@ impl CarbideApp {
             Err(e) => self.alert(format!("Compare failed: {e}")),
         }
     }
+}
+
+/// Those of `paths` that are already taken.
+fn taken(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.into_iter().filter(|path| path.symlink_metadata().is_ok()).collect()
 }
 
 /// Notice bar text for a document that carries signatures.

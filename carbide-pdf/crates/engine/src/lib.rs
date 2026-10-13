@@ -34,7 +34,7 @@ pub mod stamp;
 pub use annotate::{AnnotationSummary, MarkupStyle};
 pub use compare::{compare_documents, PageDiff};
 pub use error::{Error, Result};
-pub use export::{export_images, export_text, ImageFormat};
+pub use export::{export_images, export_text, image_paths, ImageFormat};
 pub use fonts::StandardFont;
 pub use geometry::{PageGeometry, Rect};
 pub use pdf::Pdf;

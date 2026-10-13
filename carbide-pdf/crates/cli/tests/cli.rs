@@ -71,3 +71,51 @@ fn new_documents_are_not_written_unencrypted_over_a_protected_input() {
     assert!(carbide(&["extract", path, "1", copy.to_str().unwrap()]).status.success());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A plain file with one page per label.
+fn plain(path: &Path, labels: &[&str]) {
+    let mut pdf = Pdf::new();
+    for (i, label) in labels.iter().enumerate() {
+        pdf.insert_blank_page(i, Some((612.0, 792.0))).unwrap();
+        pdf.add_text_box(i, 72.0, 720.0, label, 18.0).unwrap();
+    }
+    std::fs::write(path, pdf.to_bytes().unwrap()).unwrap();
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn split_and_image_export_replace_files_only_with_force() {
+    let dir = scratch("existing");
+    let input = dir.join("doc.pdf");
+    plain(&input, &["one", "two"]);
+    let input = input.to_str().unwrap();
+
+    let parts = dir.join("parts");
+    std::fs::create_dir_all(&parts).unwrap();
+    std::fs::write(parts.join("doc-pages-2-2.pdf"), b"an earlier part").unwrap();
+    let output = carbide(&["split", input, "1,2", parts.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("doc-pages-2-2.pdf already exists") && stderr(&output).contains("--force"), "{}", stderr(&output));
+    assert_eq!(std::fs::read(parts.join("doc-pages-2-2.pdf")).unwrap(), b"an earlier part");
+    assert!(!parts.join("doc-pages-1-1.pdf").exists(), "nothing is written when a name is taken");
+    let output = carbide(&["split", input, "1,2", parts.to_str().unwrap(), "--force"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(Pdf::open(parts.join("doc-pages-2-2.pdf")).unwrap().page_count(), 1);
+
+    let images = dir.join("images");
+    std::fs::create_dir_all(&images).unwrap();
+    std::fs::write(images.join("doc-001.png"), b"an earlier image").unwrap();
+    let output = carbide(&["images", input, images.to_str().unwrap(), "--dpi", "20"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("doc-001.png already exists"), "{}", stderr(&output));
+    assert_eq!(std::fs::read(images.join("doc-001.png")).unwrap(), b"an earlier image");
+    assert!(!images.join("doc-002.png").exists());
+    let output = carbide(&["images", input, images.to_str().unwrap(), "--dpi", "20", "--force"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_ne!(std::fs::read(images.join("doc-001.png")).unwrap(), b"an earlier image");
+    assert!(images.join("doc-002.png").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
