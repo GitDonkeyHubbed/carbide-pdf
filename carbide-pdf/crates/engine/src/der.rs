@@ -302,8 +302,8 @@ mod tests {
 
         // Primitive elements cannot be indefinite, and nesting is bounded.
         assert!(read_ber(&[0x04, 0x80, 0x00, 0x00]).is_none());
-        let mut deep: Vec<u8> = std::iter::repeat([0x30, 0x80]).take(200).flatten().collect();
-        deep.extend(std::iter::repeat(0).take(400));
+        let mut deep: Vec<u8> = std::iter::repeat_n([0x30, 0x80], 200).flatten().collect();
+        deep.extend(std::iter::repeat_n(0, 400));
         assert!(read_ber(&deep).is_none());
     }
 
