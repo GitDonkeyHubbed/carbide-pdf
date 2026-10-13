@@ -14,6 +14,10 @@ const OID_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
 pub(crate) struct SignedData {
     /// DER certificates from the `certificates` field.
     pub certificates: Vec<Vec<u8>>,
+    /// The type of the encapsulated content.
+    pub content_type: String,
+    /// The encapsulated content itself, unless the signature is detached.
+    pub content: Option<Vec<u8>>,
     /// The first signer.
     pub signer: SignerInfo,
 }
@@ -73,6 +77,12 @@ pub(crate) fn parse_signed_data(data: &[u8]) -> Option<SignedData> {
     let signed_data = der::children_ber(explicit.content).into_iter().next().filter(|e| e.tag == der::SEQUENCE)?;
     // version, digestAlgorithms, encapContentInfo, [0] certificates, [1] crls, signerInfos
     let fields = der::children_ber(signed_data.content);
+    let encapsulated = der::children_ber(fields.get(2).filter(|e| e.tag == der::SEQUENCE)?.content);
+    let content_type = oid_of(encapsulated.first()?)?;
+    let content = match encapsulated.get(1) {
+        Some(explicit) if explicit.tag == 0xA0 => Some(der::string_value(der::children_ber(explicit.content).first()?)?),
+        _ => None,
+    };
     let mut certificates = Vec::new();
     let mut signer_infos = None;
     for field in fields.iter().skip(3) {
@@ -89,7 +99,40 @@ pub(crate) fn parse_signed_data(data: &[u8]) -> Option<SignedData> {
         }
     }
     let signer = der::children_ber(signer_infos?.content).into_iter().next()?;
-    Some(SignedData { certificates, signer: parse_signer_info(&signer)? })
+    Some(SignedData { certificates, content_type, content, signer: parse_signer_info(&signer)? })
+}
+
+/// The id-ct-TSTInfo content type carried by an RFC 3161 time-stamp token.
+pub(crate) const OID_TST_INFO: &str = "1.2.840.113549.1.9.16.1.4";
+/// The id-aa-signatureTimeStampToken unsigned attribute.
+pub(crate) const OID_SIGNATURE_TIMESTAMP: &str = "1.2.840.113549.1.9.16.2.14";
+
+/// The parts of a TSTInfo a verifier needs.
+#[derive(Debug)]
+pub(crate) struct TstInfo {
+    /// The messageImprint hash algorithm OID.
+    pub hash_algorithm: String,
+    /// The messageImprint hashed message.
+    pub hashed_message: Vec<u8>,
+    /// genTime, as its raw GeneralizedTime text (e.g. `20261013000000Z`).
+    pub gen_time: String,
+}
+
+/// Parses a TSTInfo (the eContent of a time-stamp token).
+pub(crate) fn parse_tst_info(data: &[u8]) -> Option<TstInfo> {
+    let (tst, _) = der::read_ber(data)?;
+    // version, policy, messageImprint, serialNumber, genTime, ...
+    let fields = der::children_ber(tst.content);
+    let imprint = der::children_ber(fields.get(2).filter(|e| e.tag == der::SEQUENCE)?.content);
+    let (hash_algorithm, _) = algorithm(imprint.first()?)?;
+    let hashed_message = der::string_value(imprint.get(1).filter(|e| e.tag & !0x20 == der::OCTET_STRING)?)?;
+    let gen_time = fields.get(4).filter(|e| e.tag == 0x18).map(|e| String::from_utf8_lossy(e.content).into_owned())?;
+    Some(TstInfo { hash_algorithm, hashed_message, gen_time })
+}
+
+/// The value of the first unsigned attribute of type `oid`, if present.
+pub(crate) fn unsigned_attribute<'a>(signer: &'a SignerInfo, oid: &str) -> Option<&'a [u8]> {
+    signer.unsigned_attributes.iter().find(|(kind, _)| kind == oid).and_then(|(_, values)| values.first()).map(Vec::as_slice)
 }
 
 fn parse_signer_info(signer: &Element<'_>) -> Option<SignerInfo> {

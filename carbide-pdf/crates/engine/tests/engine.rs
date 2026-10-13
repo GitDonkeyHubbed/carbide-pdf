@@ -8,8 +8,8 @@ use carbide_engine::autosave::{AutoSaveStore, RowKind};
 use carbide_engine::imposition::{ImpositionOptions, Margins, Media};
 use carbide_engine::ocr::OcrOptions;
 use carbide_engine::signature::{
-    messages as sig_messages, notice_text, CertifyLevel, Detail, Identity, SignOptions, SubFilter, TimestampSource,
-    TrustStore, Validity,
+    messages as sig_messages, notice_text, CertifyLevel, Detail, HttpTimestampSource, Identity, SignOptions, SubFilter,
+    TimestampSource, TrustStore, Validity,
 };
 use carbide_engine::reduce::{messages as reduce_messages, reduce_files, OutputOptions, ReduceOptions};
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PlanOptions, PrintingOrder, Style};
@@ -1775,51 +1775,6 @@ fn certifying_signature_records_docmdp_and_must_come_first() {
     assert!(err.contains("first signature"), "{err}");
 }
 
-struct FakeAuthority;
-
-impl TimestampSource for FakeAuthority {
-    fn token_for_digest(&self, digest: &[u8; 32]) -> carbide_engine::Result<Vec<u8>> {
-        // Not a real token: a ContentInfo-shaped blob that embeds the imprint it was asked for.
-        let mut inner = vec![0x04, 32];
-        inner.extend_from_slice(digest);
-        let mut blob = vec![0x30, (inner.len() + 2) as u8, 0x06, 0x00];
-        blob.extend(inner);
-        let mut out = vec![0x30];
-        out.push(blob.len() as u8);
-        out.extend(blob);
-        Ok(out)
-    }
-}
-
-#[test]
-fn time_stamps_are_embedded_and_document_time_stamps_check_the_imprint() {
-    let mut doc = text_pdf(&[&["stamped"]]);
-    let base = file_bytes(&mut doc);
-    let authority = FakeAuthority;
-
-    let mut options = sign_options(SubFilter::Pkcs7Detached);
-    options.timestamp = Some(&authority);
-    let signed = doc.sign(&base, &options).unwrap();
-    let reports = verify(&signed, &trust_test_identity());
-    assert!(reports[0].has_embedded_timestamp);
-    assert_eq!(reports[0].validity, Validity::Valid);
-    assert!(reports[0].description_lines().contains(&sig_messages::TIME_STAMPED));
-
-    let stamp_only = SignOptions {
-        sub_filter: SubFilter::DocumentTimeStamp,
-        timestamp: Some(&authority),
-        ..Default::default()
-    };
-    let stamped = doc.sign(&base, &stamp_only).unwrap();
-    let reports = verify(&stamped, &TrustStore::default());
-    assert!(reports[0].document_time_stamp);
-    assert_eq!(reports[0].detail, Detail::DigestOkUntrusted, "imprint matches the covered bytes");
-    let mut tampered = stamped.clone();
-    let at = tampered.windows(7).position(|w| w == b"stamped").unwrap();
-    tampered[at] = b'S';
-    assert_eq!(verify(&tampered, &TrustStore::default())[0].validity, Validity::Invalid);
-}
-
 /// The `/ByteRange` of the last signature in `file`.
 fn byte_range(file: &[u8]) -> [usize; 4] {
     let at = file.windows(10).rposition(|w| w == b"/ByteRange").unwrap();
@@ -2152,6 +2107,149 @@ fn an_unsupported_algorithm_is_reported_as_unknown_not_altered() {
     assert!(!reports[0].description_lines().contains(&sig_messages::DOCUMENT_ALTERED));
 }
 
+
+// ---- time stamps (S3, S8) -----------------------------------------------------------------
+
+/// A test RFC 3161 authority: it signs real time-stamp tokens with an RSA key whose certificate
+/// carries the time-stamping extended key usage.
+struct TestTsa {
+    key: rsa::RsaPrivateKey,
+    cert: Vec<u8>,
+}
+
+fn test_tsa() -> &'static TestTsa {
+    static TSA: OnceLock<TestTsa> = OnceLock::new();
+    TSA.get_or_init(|| {
+        use rsa::pkcs8::EncodePrivateKey;
+        let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+        let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(rcgen::DnType::CommonName, "Test TSA");
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::TimeStamping];
+        let cert = params.self_signed(&pair).unwrap().der().to_vec();
+        TestTsa { key, cert }
+    })
+}
+
+impl TimestampSource for TestTsa {
+    fn token_for_digest(&self, digest: &[u8; 32]) -> carbide_engine::Result<Vec<u8>> {
+        use algo::*;
+        use rsa::Pkcs1v15Sign;
+        let sha256_alg = seq(&[&oid(&[2, 16, 840, 1, 101, 3, 4, 2, 1]), &null()]);
+        // TSTInfo with the message imprint over `digest`.
+        let imprint = seq(&[&sha256_alg, &tlv(0x04, digest)]);
+        let gen_time = tlv(0x18, b"20260101000000Z");
+        let tst_info = seq(&[
+            &tlv(0x02, &[1]),                                 // version
+            &oid(&[1, 2, 3, 4]),                              // policy (arbitrary)
+            &imprint,
+            &tlv(0x02, &[1]),                                 // serialNumber
+            &gen_time,
+        ]);
+        // Signed attributes: contentType = id-ct-TSTInfo, messageDigest = H(TSTInfo).
+        let content_type = seq(&[
+            &oid(&[1, 2, 840, 113549, 1, 9, 3]),
+            &set(&[&oid(&[1, 2, 840, 113549, 1, 9, 16, 1, 4])]),
+        ]);
+        let tst_digest = <sha2::Sha256 as sha2::Digest>::digest(&tst_info);
+        let message_digest = seq(&[
+            &oid(&[1, 2, 840, 113549, 1, 9, 4]),
+            &set(&[&tlv(0x04, &tst_digest)]),
+        ]);
+        let mut attrs = [content_type, message_digest];
+        attrs.sort();
+        let signed_attrs_set = set(&[&attrs[0], &attrs[1]]);
+        let to_sign = <sha2::Sha256 as sha2::Digest>::digest(&signed_attrs_set);
+        let signature = self.key.sign(Pkcs1v15Sign::new::<sha2::Sha256>(), &to_sign).unwrap();
+
+        use x509_cert::der::{Decode, Encode};
+        let cert = x509_cert::Certificate::from_der(&self.cert).unwrap();
+        let issuer = cert.tbs_certificate.issuer.to_der().unwrap();
+        let serial = cert.tbs_certificate.serial_number.to_der().unwrap();
+        let signer_info = seq(&[
+            &tlv(0x02, &[1]),
+            &seq(&[&issuer, &serial]),
+            &sha256_alg,
+            &ctx(0, &[&attrs[0][..], &attrs[1][..]].concat()),
+            &seq(&[&oid(&[1, 2, 840, 113549, 1, 1, 11]), &null()]),
+            &tlv(0x04, &signature),
+        ]);
+        let encap = seq(&[
+            &oid(&[1, 2, 840, 113549, 1, 9, 16, 1, 4]),
+            &ctx(0, &tlv(0x04, &tst_info)),
+        ]);
+        let signed_data = seq(&[
+            &tlv(0x02, &[1]),
+            &set(&[&sha256_alg]),
+            &encap,
+            &ctx(0, &self.cert),
+            &set(&[&signer_info]),
+        ]);
+        Ok(seq(&[&oid(&[1, 2, 840, 113549, 1, 7, 2]), &ctx(0, &signed_data)]))
+    }
+}
+
+fn tsa_trust() -> TrustStore {
+    TrustStore { certificates: vec![test_identity().certificate.clone(), test_tsa().cert.clone()] }
+}
+
+#[test]
+fn an_embedded_time_stamp_is_reported_only_when_it_verifies() {
+    let mut doc = text_pdf(&[&["stamped"]]);
+    let base = file_bytes(&mut doc);
+    let tsa = test_tsa();
+    let mut options = sign_options(SubFilter::Pkcs7Detached);
+    options.timestamp = Some(tsa);
+    let signed = doc.sign(&base, &options).unwrap();
+
+    let reports = verify(&signed, &trust_test_identity());
+    assert_eq!(reports[0].validity, Validity::Valid);
+    assert!(reports[0].has_embedded_timestamp, "a verifying signature time stamp is reported");
+    assert!(reports[0].description_lines().contains(&sig_messages::TIME_STAMPED));
+
+    // A signature with no time stamp says nothing about one.
+    let plain = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    assert!(!verify(&plain, &trust_test_identity())[0].has_embedded_timestamp);
+}
+
+#[test]
+fn a_document_time_stamp_verifies_as_a_time_stamp() {
+    let mut doc = text_pdf(&[&["stamped document"]]);
+    let base = file_bytes(&mut doc);
+    let tsa = test_tsa();
+    let options = SignOptions { sub_filter: SubFilter::DocumentTimeStamp, timestamp: Some(tsa), ..Default::default() };
+    let stamped = doc.sign(&base, &options).unwrap();
+
+    // Trusting the authority: a valid time stamp with its time, not an invalid signature.
+    let reports = verify(&stamped, &tsa_trust());
+    assert!(reports[0].document_time_stamp);
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
+    assert_eq!(reports[0].signer.as_deref(), Some("Test TSA"));
+    assert!(reports[0].signing_time.as_deref().is_some_and(|t| t.contains("20260101")));
+    assert!(reports[0].description_lines().contains(&sig_messages::TIME_STAMPED));
+
+    // Without trusting the authority: the token still verifies, identity not confirmed.
+    let untrusted = verify(&stamped, &TrustStore::default());
+    assert_eq!((untrusted[0].validity, untrusted[0].detail), (Validity::ValidityUnknown, Detail::DigestOkUntrusted));
+
+    // Any change to the covered bytes breaks the message imprint.
+    let mut tampered = stamped.clone();
+    let at = tampered.windows(8).position(|w| w == b"stamped ").unwrap();
+    tampered[at] = b'S';
+    assert_eq!(verify(&tampered, &tsa_trust())[0].validity, Validity::Invalid);
+}
+
+#[test]
+fn a_time_stamp_authority_refuses_credentials_over_plain_http() {
+    let insecure = HttpTimestampSource {
+        url: "http://tsa.example/".into(),
+        username: Some("user".into()),
+        password: Some("secret".into()),
+    };
+    let err = insecure.token_for_digest(&[0u8; 32]).unwrap_err().to_string();
+    assert!(err.contains("https") || err.contains("insecure"), "{err}");
+}
 
 #[test]
 fn identities_load_from_pem_and_pkcs12() {

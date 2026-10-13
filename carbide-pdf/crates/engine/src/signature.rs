@@ -174,22 +174,24 @@ pub struct HttpTimestampSource {
     pub password: Option<String>,
 }
 
-fn timestamp_request(digest: &[u8; 32]) -> Vec<u8> {
+/// A time-stamp request and the random nonce it carries (checked against the response).
+fn timestamp_request(digest: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
     let sha256 = der::sequence(&[&der::oid(&[2, 16, 840, 1, 101, 3, 4, 2, 1]), &der::null()]);
     let imprint = der::sequence(&[&sha256, &der::octet_string(digest)]);
-    let mut nonce = [0u8; 8];
-    let _ = getrandom::fill(&mut nonce);
-    nonce[0] &= 0x7F;
-    der::sequence(&[&der::integer_small(1), &imprint, &der::integer_unsigned(&nonce), &der::boolean(true)])
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).expect("system randomness");
+    nonce[0] &= 0x7F; // a positive INTEGER
+    let request = der::sequence(&[&der::integer_small(1), &imprint, &der::integer_unsigned(&nonce), &der::boolean(true)]);
+    (request, der::integer_unsigned(&nonce))
 }
 
 /// Extracts the token from a `TimeStampResp`; status 0 and 1 are "granted".
 fn timestamp_token_from_response(bytes: &[u8]) -> Result<Vec<u8>> {
-    let (response, _) = der::read(bytes).ok_or_else(|| Error::Other("malformed time stamp response".into()))?;
-    let parts = der::children(response.content);
+    let (response, _) = der::read_ber(bytes).ok_or_else(|| Error::Other("malformed time stamp response".into()))?;
+    let parts = der::children_ber(response.content);
     let status = parts
         .first()
-        .and_then(|s| der::children(s.content).into_iter().next())
+        .and_then(|s| der::children_ber(s.content).into_iter().next())
         .and_then(|i| i.content.last().copied())
         .ok_or_else(|| Error::Other("malformed time stamp status".into()))?;
     if status > 1 {
@@ -201,10 +203,70 @@ fn timestamp_token_from_response(bytes: &[u8]) -> Result<Vec<u8>> {
         .ok_or_else(|| Error::Other("the time stamp response has no token".into()))
 }
 
+/// Checks that a `TimeStampToken` the authority returned covers `digest`, echoes `nonce` (a DER
+/// INTEGER) unchanged if it includes one, and carries a signature that holds.
+fn check_timestamp_response(token: &[u8], digest: &[u8; 32], nonce: &[u8]) -> Result<()> {
+    let cms = cms::parse_signed_data(token)
+        .filter(|cms| cms.content_type == cms::OID_TST_INFO)
+        .ok_or_else(|| Error::Other("the time stamp authority returned a malformed token".into()))?;
+    let info = cms.content.clone().ok_or_else(|| Error::Other("the time stamp token has no content".into()))?;
+    let tst = cms::parse_tst_info(&info).ok_or_else(|| Error::Other("the time stamp token is malformed".into()))?;
+    if tst.hashed_message != digest {
+        return Err(Error::Other("the time stamp token covers the wrong digest".into()));
+    }
+    // TSTInfo: version, policy, messageImprint, serialNumber, genTime, [optional] accuracy, ordering,
+    // nonce. If a nonce is present it must equal the one sent.
+    if let Some(returned) = der::children(&info).into_iter().find(|e| e.tag == der::INTEGER).map(|_| ()) {
+        let _ = returned;
+        let nonce_value = der::read(nonce).map(|(e, _)| e.content.to_vec()).unwrap_or_default();
+        let has_matching = der::children(&info).iter().any(|e| e.tag == der::INTEGER && e.content == nonce_value.as_slice());
+        if !has_matching {
+            return Err(Error::Other("the time stamp authority returned a mismatched nonce".into()));
+        }
+    }
+    if !timestamp_signature_ok(&cms, &info) {
+        return Err(Error::Other("the time stamp token did not verify".into()));
+    }
+    Ok(())
+}
+
+/// Verifies a time-stamp token's own SignerInfo: messageDigest = H(eContent) and the signature over
+/// the signed attributes holds (trust is checked separately).
+fn timestamp_signature_ok(cms: &cms::SignedData, econtent: &[u8]) -> bool {
+    let signer_info = &cms.signer;
+    let certificates: Vec<Certificate> = cms.certificates.iter().filter_map(|c| Certificate::from_der(c).ok()).collect();
+    let Some(signer) = find_signer(&certificates, &signer_info.id) else { return false };
+    if signer_info.signed_attributes.is_none() {
+        return false;
+    }
+    let digest_oid = &signer_info.digest_algorithm;
+    match sigcrypto::digest(digest_oid, &[econtent]) {
+        Some(content_digest) if signer_info.message_digest.as_deref() == Some(&content_digest) => {}
+        _ => return false,
+    }
+    signer_info.signed_attribute_encodings().iter().any(|set| {
+        sigcrypto::verify(
+            signer,
+            &signer_info.signature_algorithm,
+            signer_info.signature_parameters.as_deref(),
+            digest_oid,
+            &[set],
+            &signer_info.signature,
+        ) == Verified::Ok
+    })
+}
+
 impl TimestampSource for HttpTimestampSource {
     fn token_for_digest(&self, digest: &[u8; 32]) -> Result<Vec<u8>> {
         use base64::Engine;
-        let body = timestamp_request(digest);
+        let secure = self.url.trim_start().to_ascii_lowercase().starts_with("https://");
+        let authenticating = self.username.as_ref().is_some_and(|u| !u.is_empty()) || self.password.is_some();
+        if authenticating && !secure {
+            return Err(Error::Other(
+                "refusing to send time stamp credentials over an insecure connection: use an https:// URL".into(),
+            ));
+        }
+        let (body, nonce) = timestamp_request(digest);
         let mut request = ureq::post(&self.url)
             .header("Content-Type", "application/timestamp-query")
             .header("Character-Encoding", "binary")
@@ -220,7 +282,9 @@ impl TimestampSource for HttpTimestampSource {
             .body_mut()
             .read_to_vec()
             .map_err(|e| Error::Other(format!("could not read the time stamp response: {e}")))?;
-        timestamp_token_from_response(&bytes)
+        let token = timestamp_token_from_response(&bytes)?;
+        check_timestamp_response(&token, digest, &nonce)?;
+        Ok(token)
     }
 }
 
@@ -1185,16 +1249,18 @@ fn verify_one(
         invalid(&mut report, Detail::Corrupt);
         return report;
     }
+
+    // A document time stamp is an RFC 3161 token, not an ordinary signature.
+    report.document_time_stamp = report.document_time_stamp || sub_filter.as_deref() == Some("ETSI.RFC3161");
+    if report.document_time_stamp {
+        return verify_document_timestamp(report, &contents, file, b, c, d, trust, now);
+    }
+
     let Some(cms) = cms::parse_signed_data(&contents) else {
-        if report.document_time_stamp && der::read_ber(&contents).is_some() {
-            // A time-stamp token: the digest check is done below; the TSA signature is not.
-            return verify_document_timestamp(report, &contents, file, b, c);
-        }
         invalid(&mut report, Detail::Corrupt);
         return report;
     };
     let signer_info = &cms.signer;
-    report.has_embedded_timestamp = !signer_info.unsigned_attributes.is_empty();
 
     let unknown = |report: &mut SignatureReport, detail: Detail| {
         report.validity = Validity::ValidityUnknown;
@@ -1204,17 +1270,7 @@ fn verify_one(
     // Signer certificate: match issuer and serial, or subject key identifier, else the first
     // embedded certificate.
     let certificates: Vec<Certificate> = cms.certificates.iter().filter_map(|d| Certificate::from_der(d).ok()).collect();
-    let signer = certificates
-        .iter()
-        .find(|c| match &signer_info.id {
-            cms::SignerId::IssuerAndSerial { issuer, serial } => {
-                c.tbs_certificate.issuer.to_der().ok().as_ref() == Some(issuer)
-                    && c.tbs_certificate.serial_number.to_der().ok().as_ref() == Some(serial)
-            }
-            cms::SignerId::KeyIdentifier(id) => subject_key_id(c).as_deref() == Some(id),
-        })
-        .or_else(|| certificates.first());
-    let Some(signer) = signer else {
+    let Some(signer) = find_signer(&certificates, &signer_info.id) else {
         invalid(&mut report, Detail::Corrupt);
         return report;
     };
@@ -1275,6 +1331,11 @@ fn verify_one(
         }
     }
 
+    // An embedded signature time stamp counts only when it is present and itself verifies: its
+    // message imprint is over the signature value, and its own token signature holds.
+    report.has_embedded_timestamp = cms::unsigned_attribute(signer_info, cms::OID_SIGNATURE_TIMESTAMP)
+        .is_some_and(|token| matches!(check_timestamp_token(token, &[&signer_info.signature], trust, now), TokenResult::Verified { .. }));
+
     // 5. Trust and validity period.
     let reference_time = report
         .signing_time
@@ -1317,23 +1378,130 @@ fn verify_one(
     report
 }
 
-fn verify_document_timestamp(mut report: SignatureReport, token: &[u8], file: &[u8], b: usize, c: usize) -> SignatureReport {
-    // The token's message imprint must equal the SHA-256 of the covered ranges.
-    let digest: [u8; 32] = {
-        let mut h = Sha256::new();
-        h.update(&file[..b]);
-        h.update(&file[c..]);
-        h.finalize().into()
-    };
-    let found = token.windows(32).any(|w| w == digest);
-    if found {
-        report.validity = Validity::ValidityUnknown;
-        report.detail = Detail::DigestOkUntrusted;
-    } else {
-        report.validity = Validity::Invalid;
-        report.detail = Detail::DigestMismatch;
+fn verify_document_timestamp(
+    mut report: SignatureReport,
+    token: &[u8],
+    file: &[u8],
+    b: usize,
+    c: usize,
+    d: usize,
+    trust: &TrustStore,
+    now: DateTime<Utc>,
+) -> SignatureReport {
+    let covered: [&[u8]; 2] = [&file[..b], &file[c..c + d]];
+    match check_timestamp_token(token, &covered, trust, now) {
+        TokenResult::NotAToken => {
+            report.validity = Validity::Invalid;
+            report.detail = Detail::Corrupt;
+        }
+        TokenResult::ImprintMismatch => {
+            report.validity = Validity::Invalid;
+            report.detail = Detail::DigestMismatch;
+        }
+        TokenResult::BadSignature => {
+            report.validity = Validity::Invalid;
+            report.detail = Detail::Corrupt;
+        }
+        TokenResult::Verified { gen_time, signer, trust: trusted } => {
+            report.signer = signer;
+            report.signing_time = gen_time.map(|g| format!("D:{g}"));
+            match trusted {
+                Some(level) => {
+                    report.validity = Validity::Valid;
+                    report.detail = level;
+                }
+                None => {
+                    report.validity = Validity::ValidityUnknown;
+                    report.detail = Detail::DigestOkUntrusted;
+                }
+            }
+        }
     }
     report
+}
+
+/// The outcome of checking an RFC 3161 time-stamp token.
+enum TokenResult {
+    /// Not a parseable RFC 3161 token (used where one is required).
+    NotAToken,
+    /// The token's message imprint does not cover the expected data.
+    ImprintMismatch,
+    /// The token's own signature does not hold.
+    BadSignature,
+    /// The token verifies; `trust` is the trust level of the time-stamp authority, if trusted.
+    Verified { gen_time: Option<String>, signer: Option<String>, trust: Option<Detail> },
+}
+
+/// Verifies an RFC 3161 time-stamp token: its message imprint must cover `imprint`, its own
+/// signature must hold, and (for a trusted result) its authority certificate must carry the
+/// time-stamping extended key usage and chain to a trusted certificate, valid at the token's time.
+fn check_timestamp_token(token: &[u8], imprint: &[&[u8]], trust: &TrustStore, now: DateTime<Utc>) -> TokenResult {
+    let Some(cms) = cms::parse_signed_data(token) else { return TokenResult::NotAToken };
+    if cms.content_type != cms::OID_TST_INFO {
+        return TokenResult::NotAToken;
+    }
+    let Some(econtent) = cms.content.as_deref() else { return TokenResult::NotAToken };
+    let Some(info) = cms::parse_tst_info(econtent) else { return TokenResult::NotAToken };
+
+    // The message imprint must hash exactly the data this token is supposed to cover.
+    match sigcrypto::digest(&info.hash_algorithm, imprint) {
+        Some(expected) if expected == info.hashed_message => {}
+        Some(_) => return TokenResult::ImprintMismatch,
+        None => return TokenResult::NotAToken,
+    }
+
+    // The token's own signature, over its signed attributes with messageDigest = H(TSTInfo).
+    if !timestamp_signature_ok(&cms, econtent) {
+        return TokenResult::BadSignature;
+    }
+
+    // Trust: the authority certificate must be for time stamping and chain to a trusted root at the
+    // time the token claims.
+    let certificates: Vec<Certificate> = cms.certificates.iter().filter_map(|c| Certificate::from_der(c).ok()).collect();
+    let signer = find_signer(&certificates, &cms.signer.id);
+    let at = gentime_to_utc(&info.gen_time).unwrap_or(now);
+    let signer_name = signer.map(subject_name);
+    let trust_level = signer
+        .filter(|s| has_timestamping_eku(s) && key_usage_allows(s, |u| u.digital_signature() || u.non_repudiation()))
+        .and_then(|s| trust_level(s, &certificates, trust, at));
+    TokenResult::Verified { gen_time: Some(info.gen_time), signer: signer_name, trust: trust_level }
+}
+
+/// Finds the certificate a SignerInfo names, by issuer and serial or by subject key identifier.
+fn find_signer<'a>(certificates: &'a [Certificate], id: &cms::SignerId) -> Option<&'a Certificate> {
+    certificates
+        .iter()
+        .find(|c| match id {
+            cms::SignerId::IssuerAndSerial { issuer, serial } => {
+                c.tbs_certificate.issuer.to_der().ok().as_ref() == Some(issuer)
+                    && c.tbs_certificate.serial_number.to_der().ok().as_ref() == Some(serial)
+            }
+            cms::SignerId::KeyIdentifier(key_id) => subject_key_id(c).as_deref() == Some(key_id),
+        })
+        .or_else(|| certificates.first())
+}
+
+/// True when `certificate` has the id-kp-timeStamping extended key usage.
+fn has_timestamping_eku(certificate: &Certificate) -> bool {
+    let Some(extensions) = certificate.tbs_certificate.extensions.as_ref() else { return false };
+    let Some(extension) = extensions.iter().find(|e| e.extn_id.to_string() == "2.5.29.37") else { return false };
+    let Ok(usage) = x509_cert::ext::pkix::ExtendedKeyUsage::from_der(extension.extn_value.as_bytes()) else {
+        return false;
+    };
+    usage.0.iter().any(|oid| oid.to_string() == "1.3.6.1.5.5.7.3.8")
+}
+
+/// A GeneralizedTime (`YYYYMMDDHHMMSS[.fff]Z`) as a UTC instant.
+fn gentime_to_utc(text: &str) -> Option<DateTime<Utc>> {
+    let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 14 {
+        return None;
+    }
+    let field = |from: usize, len: usize| digits[from..from + len].parse::<u32>().ok();
+    let year = field(0, 4)? as i32;
+    let (month, day) = (field(4, 2)?, field(6, 2)?);
+    let (hour, minute, second) = (field(8, 2)?, field(10, 2)?, field(12, 2)?);
+    Utc.with_ymd_and_hms(year, month, day, hour, minute, second).single()
 }
 
 impl Pdf {
