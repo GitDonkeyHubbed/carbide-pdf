@@ -234,15 +234,18 @@ pub struct HttpTimestampSource {
     pub password: Option<String>,
 }
 
-/// A time-stamp request and the random nonce it carries (checked against the response).
+/// A time-stamp request, and the content of the random nonce INTEGER it carries (checked against
+/// the response).
 fn timestamp_request(digest: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
-    let sha256 = der::sequence(&[&der::oid(&[2, 16, 840, 1, 101, 3, 4, 2, 1]), &der::null()]);
+    let sha256 = der::sequence(&[&der::oid(OID_SHA256), &der::null()]);
     let imprint = der::sequence(&[&sha256, &der::octet_string(digest)]);
     let mut nonce = [0u8; 16];
     getrandom::fill(&mut nonce).expect("system randomness");
     nonce[0] &= 0x7F; // a positive INTEGER
-    let request = der::sequence(&[&der::integer_small(1), &imprint, &der::integer_unsigned(&nonce), &der::boolean(true)]);
-    (request, der::integer_unsigned(&nonce))
+    let nonce = der::integer_unsigned(&nonce);
+    let request = der::sequence(&[&der::integer_small(1), &imprint, &nonce, &der::boolean(true)]);
+    let content = der::read(&nonce).map(|(e, _)| e.content.to_vec()).unwrap_or_default();
+    (request, content)
 }
 
 /// Extracts the token from a `TimeStampResp`; status 0 and 1 are "granted".
@@ -263,21 +266,19 @@ fn timestamp_token_from_response(bytes: &[u8]) -> Result<Vec<u8>> {
         .ok_or_else(|| Error::Other("the time stamp response has no token".into()))
 }
 
-/// Checks that a `TimeStampToken` the authority returned covers `digest`, echoes `nonce` (a DER
-/// INTEGER) unchanged if it includes one, and carries a signature that holds.
+/// Checks that a `TimeStampToken` the authority returned covers `digest` with SHA-256, as asked,
+/// echoes `nonce` (the content of the INTEGER sent), and carries a signature that holds.
 fn check_timestamp_response(token: &[u8], digest: &[u8; 32], nonce: &[u8]) -> Result<()> {
     let cms = cms::parse_signed_data(token)
         .filter(|cms| cms.content_type == cms::OID_TST_INFO)
         .ok_or_else(|| Error::Other("the time stamp authority returned a malformed token".into()))?;
     let info = cms.content.clone().ok_or_else(|| Error::Other("the time stamp token has no content".into()))?;
     let tst = cms::parse_tst_info(&info).ok_or_else(|| Error::Other("the time stamp token is malformed".into()))?;
-    if tst.hashed_message != digest {
+    if tst.hash_algorithm != "2.16.840.1.101.3.4.2.1" || tst.hashed_message != digest {
         return Err(Error::Other("the time stamp token covers the wrong digest".into()));
     }
     // The token must echo the nonce we sent (RFC 3161 requires it when the request carried one).
-    // The nonce is a large random INTEGER, so finding it among the TSTInfo integers is unambiguous.
-    let nonce_value = der::read(nonce).map(|(e, _)| e.content.to_vec()).unwrap_or_default();
-    if !der::children(&info).iter().any(|e| e.tag == der::INTEGER && e.content == nonce_value.as_slice()) {
+    if tst.nonce.as_deref() != Some(nonce) {
         return Err(Error::Other("the time stamp authority returned a mismatched nonce".into()));
     }
     if timestamp_signature(&cms, &info) != Verified::Ok {
@@ -339,7 +340,11 @@ impl TimestampSource for HttpTimestampSource {
             ));
         }
         let (body, nonce) = timestamp_request(digest);
-        let mut request = ureq::post(&self.url)
+        // An authority that accepts the connection and never answers must not hang the caller.
+        let agent: ureq::Agent =
+            ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(30))).build().into();
+        let mut request = agent
+            .post(&self.url)
             .header("Content-Type", "application/timestamp-query")
             .header("Character-Encoding", "binary")
             .header("User-Agent", "Carbide PDF");

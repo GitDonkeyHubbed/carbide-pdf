@@ -126,18 +126,23 @@ pub(crate) struct TstInfo {
     pub hashed_message: Vec<u8>,
     /// genTime, as its raw GeneralizedTime text (e.g. `20261013000000Z`).
     pub gen_time: String,
+    /// The content of the nonce INTEGER, when the token echoes one.
+    pub nonce: Option<Vec<u8>>,
 }
 
 /// Parses a TSTInfo (the eContent of a time-stamp token).
 pub(crate) fn parse_tst_info(data: &[u8]) -> Option<TstInfo> {
     let (tst, _) = der::read_ber(data)?;
-    // version, policy, messageImprint, serialNumber, genTime, ...
+    // version, policy, messageImprint, serialNumber, genTime, accuracy, ordering, nonce, ...
     let fields = der::children_ber(tst.content);
     let imprint = der::children_ber(fields.get(2).filter(|e| e.tag == der::SEQUENCE)?.content);
     let (hash_algorithm, _) = algorithm(imprint.first()?)?;
     let hashed_message = der::string_value(imprint.get(1).filter(|e| e.tag & !0x20 == der::OCTET_STRING)?)?;
     let gen_time = fields.get(4).filter(|e| e.tag == 0x18).map(|e| String::from_utf8_lossy(e.content).into_owned())?;
-    Some(TstInfo { hash_algorithm, hashed_message, gen_time })
+    // After genTime come the optional accuracy (a SEQUENCE) and ordering (a BOOLEAN), so the first
+    // INTEGER is the nonce.
+    let nonce = fields.iter().skip(5).find(|e| e.tag == der::INTEGER).map(|e| e.content.to_vec());
+    Some(TstInfo { hash_algorithm, hashed_message, gen_time, nonce })
 }
 
 /// The value of the first unsigned attribute of type `oid`, if present.

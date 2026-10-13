@@ -1,9 +1,9 @@
 //! Minimal DER encoding and walking, enough to build and read CMS SignedData and RFC 3161
 //! messages.
 //!
-//! `read` and `children` accept DER only. CMS from other signers often comes in BER, with
-//! indefinite lengths; `read_ber` and `children_ber` accept that too, and `normalize` turns such an
-//! element back into DER where its encoding is hashed.
+//! `read` accepts DER only. CMS from other signers often comes in BER, with indefinite lengths;
+//! `read_ber` and `children_ber` accept that too, and `normalize` turns such an element back into
+//! DER where its encoding is hashed.
 
 pub const SEQUENCE: u8 = 0x30;
 pub const SET: u8 = 0x31;
@@ -158,24 +158,12 @@ fn read_with(data: &[u8], ber_depth: Option<usize>) -> Option<(Element<'_>, &[u8
     Some((Element { tag, content: &data[header..end], raw: &data[..end] }, &data[end..]))
 }
 
-/// All elements directly inside `content`.
-pub fn children(content: &[u8]) -> Vec<Element<'_>> {
-    children_with(content, read)
-}
-
 /// All elements directly inside `content`, which may be BER.
 pub fn children_ber(content: &[u8]) -> Vec<Element<'_>> {
-    children_with(content, read_ber)
-}
-
-/// A reader function (`read` or `read_ber`).
-type Reader = for<'a> fn(&'a [u8]) -> Option<(Element<'a>, &'a [u8])>;
-
-fn children_with(content: &[u8], read: Reader) -> Vec<Element<'_>> {
     let mut out = Vec::new();
     let mut rest = content;
     while !rest.is_empty() {
-        match read(rest) {
+        match read_ber(rest) {
             Some((element, next)) => {
                 out.push(element);
                 rest = next;
@@ -332,9 +320,9 @@ mod tests {
         let data = sequence(&[&integer_small(7), &set(&[&octet_string(b"abc")])]);
         let (root, rest) = read(&data).unwrap();
         assert!(rest.is_empty());
-        let kids = children(root.content);
+        let kids = children_ber(root.content);
         assert_eq!(kids.len(), 2);
         assert_eq!(kids[0].tag, INTEGER);
-        assert_eq!(children(kids[1].content)[0].content, b"abc");
+        assert_eq!(children_ber(kids[1].content)[0].content, b"abc");
     }
 }

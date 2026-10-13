@@ -2576,6 +2576,127 @@ fn a_time_stamp_authority_refuses_credentials_over_plain_http() {
     assert!(err.contains("https") || err.contains("insecure"), "{err}");
 }
 
+/// Answers `requests` HTTP requests on localhost, each with the bytes `answer` gives for its body,
+/// and returns the URL to post to.
+fn serve(requests: usize, answer: impl Fn(&[u8]) -> Vec<u8> + Send + 'static) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(requests) {
+            let mut stream = stream.unwrap();
+            let (mut request, mut chunk) = (Vec::new(), [0u8; 4096]);
+            let body = loop {
+                let n = stream.read(&mut chunk).unwrap();
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length: usize =
+                        headers.lines().find_map(|l| l.strip_prefix("content-length:")).map_or(0, |v| v.trim().parse().unwrap());
+                    if request.len() >= end + 4 + length {
+                        break request[end + 4..end + 4 + length].to_vec();
+                    }
+                }
+                if n == 0 {
+                    break Vec::new();
+                }
+            };
+            let reply = answer(&body);
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/timestamp-reply\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len());
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&reply).unwrap();
+        }
+    });
+    url
+}
+
+/// The message imprint digest and the nonce (an INTEGER's content) of a TimeStampReq.
+fn timestamp_request_parts(request: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+    let children = |data: &[u8]| {
+        let (_, header, total) = der_header(data);
+        let mut rest = &data[header..total];
+        let mut out = Vec::new();
+        while !rest.is_empty() {
+            let (tag, header, total) = der_header(rest);
+            out.push((tag, rest[..total].to_vec(), rest[header..total].to_vec()));
+            rest = &rest[total..];
+        }
+        out
+    };
+    // version, messageImprint { algorithm, hashedMessage }, [reqPolicy], [nonce], [certReq]
+    let fields = children(request);
+    let digest = children(&fields[1].1)[1].2.clone();
+    let nonce = fields.iter().skip(2).find(|(tag, _, _)| *tag == 0x02).map(|(_, _, content)| content.clone());
+    (digest, nonce)
+}
+
+/// A TimeStampResp with `status` and, when given, a token.
+fn timestamp_response(status: u8, token: Option<&[u8]>) -> Vec<u8> {
+    use algo::*;
+    let status = seq(&[&tlv(0x02, &[status])]);
+    match token {
+        Some(token) => seq(&[&status, token]),
+        None => seq(&[&status]),
+    }
+}
+
+#[test]
+fn the_time_stamp_client_checks_what_the_authority_returns() {
+    let source = |url: String| HttpTimestampSource { url, username: None, password: None };
+    let digest = [7u8; 32];
+
+    // A well-behaved authority echoes the nonce over the digest asked for.
+    let url = serve(1, |body| {
+        let (digest, nonce) = timestamp_request_parts(body);
+        timestamp_response(0, Some(&test_tsa().token(SHA256_OID, &digest, nonce.as_deref())))
+    });
+    let token = source(url).token_for_digest(&digest).unwrap();
+    assert!(!token.is_empty());
+
+    // Everything else is refused before it can end up in a signature.
+    type Answer = Box<dyn Fn(&[u8]) -> Vec<u8> + Send>;
+    let cases: Vec<(&str, &str, Answer)> = vec![
+        ("wrong nonce", "nonce", Box::new(|body| {
+            let (digest, nonce) = timestamp_request_parts(body);
+            let mut nonce = nonce.unwrap();
+            *nonce.last_mut().unwrap() ^= 1;
+            timestamp_response(0, Some(&test_tsa().token(SHA256_OID, &digest, Some(&nonce))))
+        })),
+        ("no nonce", "nonce", Box::new(|body| {
+            let (digest, _) = timestamp_request_parts(body);
+            timestamp_response(0, Some(&test_tsa().token(SHA256_OID, &digest, None)))
+        })),
+        ("refused", "refused", Box::new(|_| timestamp_response(2, None))),
+        ("other digest", "wrong digest", Box::new(|body| {
+            let (_, nonce) = timestamp_request_parts(body);
+            timestamp_response(0, Some(&test_tsa().token(SHA256_OID, &[0u8; 32], nonce.as_deref())))
+        })),
+        ("token naming another certificate", "did not verify", Box::new(|body| {
+            let (digest, nonce) = timestamp_request_parts(body);
+            let token = test_tsa().token_with(SHA256_OID, &digest, nonce.as_deref(), &test_identity().certificate);
+            timestamp_response(0, Some(&token))
+        })),
+    ];
+    for (label, expected, answer) in cases {
+        let err = source(serve(1, answer)).token_for_digest(&digest).unwrap_err().to_string();
+        assert!(err.contains(expected), "{label}: {err}");
+    }
+
+    // Signing through the client: one request to size the signature, one for the real token.
+    let url = serve(2, |body| {
+        let (digest, nonce) = timestamp_request_parts(body);
+        timestamp_response(0, Some(&test_tsa().token(SHA256_OID, &digest, nonce.as_deref())))
+    });
+    let http = source(url);
+    let mut doc = text_pdf(&[&["stamped over http"]]);
+    let base = file_bytes(&mut doc);
+    let mut options = sign_options(SubFilter::CadesDetached);
+    options.timestamp = Some(&http);
+    let reports = verify(&doc.sign(&base, &options).unwrap(), &tsa_trust());
+    assert_eq!(reports[0].validity, Validity::Valid);
+    assert!(reports[0].has_embedded_timestamp && reports[0].embedded_timestamp_trusted);
+}
+
 #[test]
 fn an_intact_but_untrusted_signature_is_not_called_valid() {
     let mut doc = text_pdf(&[&["notice"]]);
