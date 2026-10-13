@@ -826,35 +826,73 @@ fn issued_by(child: &Certificate, issuer: &Certificate) -> bool {
     ) == Verified::Ok
 }
 
-fn trust_level(signer: &Certificate, embedded: &[Certificate], store: &TrustStore) -> Option<Detail> {
+/// Builds and trusts a chain from `signer` up to a certificate in `store`. Each issuer must be a CA
+/// (basicConstraints cA=true, keyUsage keyCertSign when present), satisfy its pathLenConstraint, and
+/// be valid at `at`. A non-CA leaf can never act as an issuer, so one leaf cannot vouch for another.
+fn trust_level(signer: &Certificate, embedded: &[Certificate], store: &TrustStore, at: DateTime<Utc>) -> Option<Detail> {
     let trusted: Vec<Certificate> = store.certificates.iter().filter_map(|d| Certificate::from_der(d).ok()).collect();
-    let signer_der = signer.to_der().ok()?;
-    if store.certificates.iter().any(|d| *d == signer_der) {
+    let in_store = |cert: &Certificate| cert.to_der().ok().is_some_and(|der| store.certificates.contains(&der));
+    // A certificate the user trusts outright needs nothing further: this is the "trust one
+    // person's certificate" flow, where that certificate may be an ordinary end-entity one.
+    if in_store(signer) {
         return Some(Detail::TrustedDirectly);
     }
     let mut current = signer.clone();
+    // The number of CA certificates between the leaf and the issuer under consideration.
+    let mut intermediates = 0usize;
     for _ in 0..8 {
         let der = current.to_der().ok()?;
-        if store.certificates.iter().any(|d| *d == der) {
+        let parent = trusted.iter().chain(embedded.iter()).find(|candidate| {
+            candidate.to_der().ok().as_ref() != Some(&der)
+                && can_issue(candidate, intermediates, at)
+                && issued_by(&current, candidate)
+        })?;
+        if in_store(parent) {
             return Some(Detail::TrustedViaChain);
         }
-        let next = trusted
-            .iter()
-            .chain(embedded.iter())
-            .find(|candidate| issued_by(&current, candidate) && candidate.to_der().ok() != Some(der.clone()));
-        match next {
-            Some(parent) => {
-                if let Ok(parent_der) = parent.to_der() {
-                    if store.certificates.iter().any(|d| *d == parent_der) {
-                        return Some(Detail::TrustedViaChain);
-                    }
-                }
-                current = parent.clone();
-            }
-            None => return None,
-        }
+        current = parent.clone();
+        intermediates += 1;
     }
     None
+}
+
+/// Whether `cert` may issue a certificate that has `intermediates` CA certificates below it, and is
+/// valid at `at`: it must be a CA (pathLen permitting), allow key-certificate signing, and be in
+/// its validity period.
+fn can_issue(cert: &Certificate, intermediates: usize, at: DateTime<Utc>) -> bool {
+    let Some(path_len) = basic_constraints_ca(cert) else { return false };
+    if path_len.is_some_and(|limit| (limit as usize) < intermediates) {
+        return false;
+    }
+    key_usage_allows(cert, |usage| usage.key_cert_sign()) && valid_at(cert, at)
+}
+
+/// `Some(pathLenConstraint)` when `cert` has basicConstraints with cA=true, else `None`.
+fn basic_constraints_ca(cert: &Certificate) -> Option<Option<u32>> {
+    let extensions = cert.tbs_certificate.extensions.as_ref()?;
+    let extension = extensions.iter().find(|e| e.extn_id.to_string() == "2.5.29.19")?;
+    let constraints = x509_cert::ext::pkix::BasicConstraints::from_der(extension.extn_value.as_bytes()).ok()?;
+    constraints.ca.then(|| constraints.path_len_constraint.map(u32::from))
+}
+
+/// True when `cert` has no keyUsage extension, or one for which `permitted` holds.
+fn key_usage_allows(cert: &Certificate, permitted: impl Fn(&x509_cert::ext::pkix::KeyUsage) -> bool) -> bool {
+    let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else { return true };
+    let Some(extension) = extensions.iter().find(|e| e.extn_id.to_string() == "2.5.29.15") else { return true };
+    match x509_cert::ext::pkix::KeyUsage::from_der(extension.extn_value.as_bytes()) {
+        Ok(usage) => permitted(&usage),
+        Err(_) => false,
+    }
+}
+
+/// True when `at` falls within `cert`'s validity period.
+fn valid_at(cert: &Certificate, at: DateTime<Utc>) -> bool {
+    let validity = &cert.tbs_certificate.validity;
+    let seconds = |t: x509_cert::time::Time| Utc.timestamp_opt(t.to_unix_duration().as_secs() as i64, 0).single();
+    match (seconds(validity.not_before), seconds(validity.not_after)) {
+        (Some(nb), Some(na)) => at >= nb && at <= na,
+        _ => true,
+    }
 }
 
 /// `/ByteRange [0 b c d]` as offsets into `file`: the first range starts the file, the gap between
@@ -1260,7 +1298,13 @@ fn verify_one(
             return report;
         }
     }
-    match trust_level(signer, &certificates, trust) {
+    // The signer certificate, when it declares a key usage, must allow signing.
+    if !key_usage_allows(signer, |usage| usage.digital_signature() || usage.non_repudiation()) {
+        report.validity = Validity::ValidityUnknown;
+        report.detail = Detail::DigestOkUntrusted;
+        return report;
+    }
+    match trust_level(signer, &certificates, trust, reference_time) {
         Some(level) => {
             report.validity = Validity::Valid;
             report.detail = level;

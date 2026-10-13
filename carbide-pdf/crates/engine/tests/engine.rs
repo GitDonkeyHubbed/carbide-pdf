@@ -2179,6 +2179,126 @@ fn identities_load_from_pem_and_pkcs12() {
     assert_eq!(verify(&signed, &trust_test_identity())[0].validity, Validity::Valid);
 }
 
+// ---- certificate chain rules (S4) ---------------------------------------------------------
+
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+
+/// A fresh RSA key as both an rcgen key pair (for issuing certificates) and an engine signing key.
+fn rsa_key() -> (KeyPair, rsa::RsaPrivateKey) {
+    use rsa::pkcs8::EncodePrivateKey;
+    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let pair = KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    (pair, key)
+}
+
+/// Certificate parameters with a common name, CA flag, key usages and a 2020..2040 validity.
+fn cert_params(cn: &str, is_ca: IsCa, usages: &[KeyUsagePurpose]) -> CertificateParams {
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(DnType::CommonName, cn);
+    params.is_ca = is_ca;
+    params.key_usages = usages.to_vec();
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2040, 1, 1);
+    params
+}
+
+/// Builds a signer identity whose leaf is issued by `issuer`, with the extra chain certificates
+/// (issuer first above the leaf) embedded, and returns the identity and the trust store `anchor`.
+fn chain_identity(issuer: &Issuer<'_, KeyPair>, above: &[Vec<u8>]) -> (Identity, rsa::RsaPrivateKey) {
+    let (leaf_pair, leaf_key) = rsa_key();
+    let params = cert_params("Chain Signer", IsCa::ExplicitNoCa, &[KeyUsagePurpose::DigitalSignature]);
+    let leaf = params.signed_by(&leaf_pair, issuer).unwrap().der().to_vec();
+    let mut chain = vec![leaf];
+    chain.extend_from_slice(above);
+    (Identity::new(chain, leaf_key.clone()).unwrap(), leaf_key)
+}
+
+fn sign_with(identity: &Identity) -> Vec<u8> {
+    let mut doc = text_pdf(&[&["chain"]]);
+    let base = file_bytes(&mut doc);
+    let options = SignOptions { identity: Some(identity), reason: Some("ok".into()), ..Default::default() };
+    doc.sign(&base, &options).unwrap()
+}
+
+#[test]
+fn a_ca_issued_signer_is_trusted_through_its_chain() {
+    // root (pathLen 1) -> intermediate CA -> leaf signer.
+    let (root_pair, _) = rsa_key();
+    let root_params = cert_params("Root CA", IsCa::Ca(BasicConstraints::Constrained(1)), &[KeyUsagePurpose::KeyCertSign]);
+    let root = root_params.self_signed(&root_pair).unwrap().der().to_vec();
+    let root_issuer = Issuer::new(root_params, root_pair);
+
+    let (int_pair, _) = rsa_key();
+    let int_params = cert_params("Intermediate CA", IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+    let intermediate = int_params.signed_by(&int_pair, &root_issuer).unwrap().der().to_vec();
+    let int_issuer = Issuer::new(int_params, int_pair);
+
+    let (identity, _) = chain_identity(&int_issuer, &[intermediate.clone()]);
+    let signed = sign_with(&identity);
+    let reports = verify(&signed, &TrustStore { certificates: vec![root] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedViaChain));
+}
+
+#[test]
+fn chain_rules_reject_bad_issuers() {
+    let (root_pair, _) = rsa_key();
+    let root_params = cert_params("Root CA", IsCa::Ca(BasicConstraints::Constrained(0)), &[KeyUsagePurpose::KeyCertSign]);
+    let root = root_params.self_signed(&root_pair).unwrap().der().to_vec();
+    let root_issuer = Issuer::new(root_params, root_pair);
+    let trust = TrustStore { certificates: vec![root.clone()] };
+
+    // An issuer that is not a CA cannot vouch for a signer: root -> non-CA -> leaf.
+    {
+        let (mid_pair, _) = rsa_key();
+        let mid_params = cert_params("Not A CA", IsCa::ExplicitNoCa, &[KeyUsagePurpose::DigitalSignature]);
+        let mid = mid_params.signed_by(&mid_pair, &root_issuer).unwrap().der().to_vec();
+        let mid_issuer = Issuer::new(mid_params, mid_pair);
+        let (identity, _) = chain_identity(&mid_issuer, &[mid]);
+        let reports = verify(&sign_with(&identity), &trust);
+        assert_eq!(reports[0].detail, Detail::DigestOkUntrusted, "non-CA issuer");
+    }
+
+    // A CA without keyCertSign in its key usage cannot issue.
+    {
+        let (mid_pair, _) = rsa_key();
+        let mid_params = cert_params("No Cert Sign", IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::DigitalSignature]);
+        let mid = mid_params.signed_by(&mid_pair, &root_issuer).unwrap().der().to_vec();
+        let mid_issuer = Issuer::new(mid_params, mid_pair);
+        let (identity, _) = chain_identity(&mid_issuer, &[mid]);
+        let reports = verify(&sign_with(&identity), &trust);
+        assert_eq!(reports[0].detail, Detail::DigestOkUntrusted, "missing keyCertSign");
+    }
+
+    // pathLenConstraint exceeded: root pathLen 0 -> intermediate CA -> leaf.
+    {
+        let (int_pair, _) = rsa_key();
+        let int_params = cert_params("Intermediate CA", IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+        let intermediate = int_params.signed_by(&int_pair, &root_issuer).unwrap().der().to_vec();
+        let int_issuer = Issuer::new(int_params, int_pair);
+        let (identity, _) = chain_identity(&int_issuer, &[intermediate]);
+        let reports = verify(&sign_with(&identity), &trust);
+        assert_eq!(reports[0].detail, Detail::DigestOkUntrusted, "pathLen exceeded");
+    }
+
+    // An expired intermediate is not accepted as an issuer at the signing time.
+    {
+        let (int_pair, _) = rsa_key();
+        let mut int_params = cert_params("Expired CA", IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+        int_params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        int_params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        // This intermediate is issued by a pathLen-permitting root.
+        let wide_params = cert_params("Wide Root", IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+        let (wide_pair, _) = rsa_key();
+        let wide = wide_params.self_signed(&wide_pair).unwrap().der().to_vec();
+        let wide_issuer = Issuer::new(wide_params, wide_pair);
+        let intermediate = int_params.signed_by(&int_pair, &wide_issuer).unwrap().der().to_vec();
+        let int_issuer = Issuer::new(int_params, int_pair);
+        let (identity, _) = chain_identity(&int_issuer, &[intermediate]);
+        let reports = verify(&sign_with(&identity), &TrustStore { certificates: vec![wide] });
+        assert_eq!(reports[0].detail, Detail::DigestOkUntrusted, "expired intermediate");
+    }
+}
+
 // ---- OCR -----------------------------------------------------------------------------------
 
 fn ocr_models() -> PathBuf {
