@@ -2060,6 +2060,46 @@ fn ecdsa_p256_signatures_verify_and_name_comes_from_the_certificate() {
 }
 
 #[test]
+fn signer_names_are_read_from_the_certificate_attributes() {
+    use rcgen::DnType;
+    let email = DnType::CustomDnType(vec![1, 2, 840, 113549, 1, 9, 1]);
+    let cases: [(&[(DnType, &str)], &str); 3] = [
+        // A comma inside the common name is part of the name, not a separator.
+        (&[(DnType::CommonName, "Doe, John"), (DnType::OrganizationName, "Acme")], "Doe, John"),
+        // No common name: the email address.
+        (&[(email, "jane@example.com")], "jane@example.com"),
+        // Text in another attribute that looks like a common name does not become one.
+        (&[(DnType::OrganizationName, "Evil Inc,CN=Bank of America")], ""),
+    ];
+    for (attributes, expected) in cases {
+        use rsa::pkcs8::EncodePrivateKey;
+        let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+        let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new(); // no default common name
+        for (kind, value) in attributes {
+            params.distinguished_name.push(kind.clone(), *value);
+        }
+        let cert = params.self_signed(&pair).unwrap().der().to_vec();
+        let identity = Identity::new(vec![cert.clone()], key).unwrap();
+        let mut doc = text_pdf(&[&["names"]]);
+        let base = file_bytes(&mut doc);
+        let signed = doc.sign(&base, &SignOptions { identity: Some(&identity), ..Default::default() }).unwrap();
+        let report = verify(&signed, &TrustStore { certificates: vec![cert] }).remove(0);
+        let signer = report.signer.unwrap();
+        if expected.is_empty() {
+            assert_ne!(signer, "Bank of America");
+            assert!(signer.contains("Evil Inc"), "{signer}");
+        } else {
+            assert_eq!(signer, expected);
+        }
+        assert_eq!(identity.common_name(), signer);
+        // /Name is written from the same certificate, so it is not repeated as a claimed name.
+        assert_eq!(report.claimed_name, None, "{signer}");
+    }
+}
+
+#[test]
 fn rsa_pss_signatures_verify() {
     use rsa::pkcs8::EncodePrivateKey;
     use rsa::signature::{RandomizedSigner, SignatureEncoding};

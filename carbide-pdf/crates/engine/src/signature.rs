@@ -126,9 +126,10 @@ impl Identity {
         &self.chain[0]
     }
 
-    /// The signer's common name, used for the signature's `/Name`.
+    /// The signer's name as the certificate gives it, used for the signature's `/Name`: the
+    /// common name, else the email address, else the whole subject.
     pub fn common_name(&self) -> String {
-        Certificate::from_der(&self.chain[0]).map(|c| common_name(&c)).unwrap_or_default()
+        Certificate::from_der(&self.chain[0]).map(|c| subject_name(&c)).unwrap_or_default()
     }
 }
 
@@ -154,19 +155,45 @@ fn pem_blocks(text: &str, label: &str) -> Vec<Vec<u8>> {
     out
 }
 
-fn common_name(certificate: &Certificate) -> String {
-    let subject = certificate.tbs_certificate.subject.to_string();
-    subject
-        .split(',')
-        .find_map(|part| part.trim().strip_prefix("CN=").map(|s| s.to_string()))
-        .unwrap_or(subject)
-}
+const OID_COMMON_NAME: &str = "2.5.4.3";
+const OID_EMAIL_ADDRESS: &str = "1.2.840.113549.1.9.1";
 
 /// The signer's display name: common name, else email address, else the whole subject.
 fn subject_name(certificate: &Certificate) -> String {
-    let subject = certificate.tbs_certificate.subject.to_string();
-    let field = |prefix: &str| subject.split(',').find_map(|part| part.trim().strip_prefix(prefix).map(str::to_string));
-    field("CN=").or_else(|| field("E=")).or_else(|| field("emailAddress=")).unwrap_or(subject)
+    let subject = &certificate.tbs_certificate.subject;
+    name_attribute(subject, OID_COMMON_NAME)
+        .or_else(|| name_attribute(subject, OID_EMAIL_ADDRESS))
+        .unwrap_or_else(|| subject.to_string())
+}
+
+/// The value of the most specific `oid` attribute in `name`, read from the attribute itself
+/// rather than from the escaped text form, where a comma inside a value looks like a separator.
+fn name_attribute(name: &x509_cert::name::Name, oid: &str) -> Option<String> {
+    name.0
+        .iter()
+        .rev()
+        .flat_map(|rdn| rdn.0.iter())
+        .find(|attribute| attribute.oid.to_string() == oid)
+        .and_then(|attribute| directory_string(&attribute.value))
+        .filter(|text| !text.is_empty())
+}
+
+/// The text of a DirectoryString (or IA5String) attribute value.
+fn directory_string(value: &x509_cert::der::Any) -> Option<String> {
+    use x509_cert::der::{Tag, Tagged};
+    let bytes = value.value();
+    match value.tag() {
+        Tag::Utf8String | Tag::PrintableString | Tag::Ia5String | Tag::VisibleString => {
+            Some(String::from_utf8_lossy(bytes).into_owned())
+        }
+        // T.61 in theory; Latin-1 in practice.
+        Tag::TeletexString => Some(bytes.iter().map(|b| char::from(*b)).collect()),
+        Tag::BmpString if bytes.len().is_multiple_of(2) => {
+            let units: Vec<u16> = bytes.chunks(2).map(|pair| u16::from_be_bytes([pair[0], pair[1]])).collect();
+            Some(String::from_utf16_lossy(&units))
+        }
+        _ => None,
+    }
 }
 
 /// The certificate's subjectKeyIdentifier extension value, if it has one.
