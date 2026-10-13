@@ -16,7 +16,13 @@ pub mod messages {
     pub const NO_MEDIA: &str = "Choose a media size (or Autosize) before imposing; none is selected.";
     pub const MARGINS: &str = "The margins leave no room on this page size.";
     pub const INVALID_SETTINGS: &str = "The settings file is not valid and could not be loaded.";
+    pub const MEDIA_SIZE: &str = "Sheets must be between 1 and 14400 points (200 inches) on each side.";
+    pub const SPACING: &str = "Margins, gutters, spread and creep must each be between 0 and 14400 points.";
+    pub const SCALE: &str = "Scaling must be between 1% and 1000%.";
 }
+
+/// The largest sheet side, in points: 200 inches, the largest page PDF viewers have to show.
+pub const MAX_SHEET_SIZE: f32 = 14400.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Unit {
@@ -189,6 +195,10 @@ impl ImpositionOptions {
         };
 
         let build = |width: f32, height: f32| -> Result<Grid> {
+            // Autosize follows the page, so a large page or a wide grid can ask for more.
+            if !(width <= MAX_SHEET_SIZE && height <= MAX_SHEET_SIZE) {
+                return Err(Error::Other(messages::MEDIA_SIZE.into()));
+            }
             let usable_w = width - margin_h - gap_total_h;
             let usable_h = height - margin_v - gap_total_v;
             if usable_w <= 0.0 || usable_h <= 0.0 {
@@ -216,11 +226,32 @@ impl ImpositionOptions {
         Ok(upright)
     }
 
+    /// Checks the numbers a settings file or the command line can hold: grid, fold, sheet size,
+    /// margins, gaps and scale. None of them can be absurd (or not a number) once this passes.
+    fn check_values(&self) -> Result<()> {
+        self.plan.validate()?;
+        if let Media::Custom { width, height } = self.media {
+            if !(1.0..=MAX_SHEET_SIZE).contains(&width) || !(1.0..=MAX_SHEET_SIZE).contains(&height) {
+                return Err(Error::Other(messages::MEDIA_SIZE.into()));
+            }
+        }
+        let m = &self.margins;
+        let spacing = [m.left, m.right, m.top, m.bottom, self.gutter_horizontal, self.gutter_vertical, self.spread];
+        if !spacing.iter().all(|v| (0.0..=MAX_SHEET_SIZE).contains(v)) || !(-MAX_SHEET_SIZE..=MAX_SHEET_SIZE).contains(&self.creep) {
+            return Err(Error::Other(messages::SPACING.into()));
+        }
+        if ![self.scale_x_percent, self.scale_y_percent].iter().all(|v| (1.0..=1000.0).contains(v)) {
+            return Err(Error::Other(messages::SCALE.into()));
+        }
+        Ok(())
+    }
+
     /// Checks settings that do not depend on the document. Returns the user-facing message on failure.
     pub fn validate(&self) -> Result<()> {
         if matches!(self.media, Media::None) {
             return Err(Error::Other(messages::NO_MEDIA.into()));
         }
+        self.check_values()?;
         let (cols, rows) = match self.plan.layout {
             LayoutKind::Booklet2Up => (2, 1),
             LayoutKind::Booklet4Up => (2, 2),
@@ -664,6 +695,8 @@ impl ImpositionOptions {
         o.page_info = flag("AddPageInfo", false)?;
         o.scale_large_pages = flag("ScalePage", false)?;
         o.flip_backs = flag("FlipBack", false)?;
+        // A settings file can come from anywhere: numbers out of range make it invalid as a whole.
+        o.check_values().map_err(|_| invalid())?;
         Ok(o)
     }
 }
@@ -710,6 +743,56 @@ mod tests {
         o.media = Media::Named("Letter".into());
         o.margins = Margins { left: 400.0, right: 400.0, top: 0.0, bottom: 0.0 };
         assert_eq!(o.validate().unwrap_err().to_string(), messages::MARGINS);
+    }
+
+    #[test]
+    fn sizes_margins_and_grids_are_bounded() {
+        let ok = ImpositionOptions::default();
+        assert!(ok.validate().is_ok());
+        let refused = |o: ImpositionOptions| o.validate().unwrap_err().to_string();
+
+        for (width, height) in [(0.0, 792.0), (612.0, -1.0), (1.0e9, 792.0), (f32::NAN, 792.0), (612.0, f32::INFINITY)] {
+            assert_eq!(refused(ImpositionOptions { media: Media::Custom { width, height }, ..ok.clone() }), messages::MEDIA_SIZE);
+        }
+        let spaced = |left: f32, gutter: f32, creep: f32| ImpositionOptions {
+            margins: Margins { left, right: 0.0, top: 0.0, bottom: 0.0 },
+            gutter_horizontal: gutter,
+            creep,
+            ..ok.clone()
+        };
+        for o in [spaced(-1.0, 0.0, 0.0), spaced(f32::NAN, 0.0, 0.0), spaced(0.0, 1.0e7, 0.0), spaced(0.0, 0.0, f32::INFINITY)] {
+            assert_eq!(refused(o), messages::SPACING);
+        }
+        for scale in [0.0, -50.0, 1.0e6, f32::NAN] {
+            assert_eq!(refused(ImpositionOptions { scale_x_percent: scale, ..ok.clone() }), messages::SCALE);
+        }
+        let mut grid = ok.clone();
+        grid.plan.layout = LayoutKind::StepAndRepeat;
+        grid.plan.columns = 1_000_000_000;
+        assert_eq!(refused(grid), crate::imposition_plan::messages::GRID);
+
+        // Autosize follows the page: a sheet beyond the largest PDF page is refused.
+        let auto = ImpositionOptions { media: Media::Autosize, ..ok.clone() };
+        assert!(auto.layout_grid(2, 1, (612.0, 792.0)).is_ok());
+        assert_eq!(auto.layout_grid(2, 1, (14400.0, 14400.0)).err().unwrap().to_string(), messages::MEDIA_SIZE);
+    }
+
+    #[test]
+    fn settings_files_with_absurd_numbers_are_invalid() {
+        let base = ImpositionOptions::default().to_ini();
+        for (key, value) in [
+            ("SheetsPerFold", "4611686018427387904"),
+            ("Columns", "1000000000"),
+            ("Rows", "99"),
+            ("MarginLeft", "NaN"),
+            ("GutterVertical", "-3"),
+            ("HorzScale", "inf"),
+        ] {
+            let text = base.lines().map(|l| if l.starts_with(&format!("{key}=")) { format!("{key}={value}") } else { l.to_string() });
+            let text = text.collect::<Vec<_>>().join("\n");
+            assert!(text.contains(&format!("{key}={value}")), "{key}");
+            assert_eq!(ImpositionOptions::from_ini(&text).unwrap_err().to_string(), messages::INVALID_SETTINGS, "{key}={value}");
+        }
     }
 
     #[test]

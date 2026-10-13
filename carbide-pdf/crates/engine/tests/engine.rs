@@ -2166,6 +2166,43 @@ fn printing_order_changes_the_output_order() {
 }
 
 #[test]
+fn odd_plate_counts_print_every_page_once_in_every_order() {
+    // Perfect-bound work and turn (or tumble) makes one plate per fold, so these page counts give
+    // an odd number of plates.
+    let r = renderer();
+    for (layout, style, columns) in [(LayoutKind::Booklet4Up, Style::WorkAndTurn, 2), (LayoutKind::Booklet8Up, Style::WorkAndTumble, 4)] {
+        for pages in [4, 12, 20] {
+            let source = numbered_pages(pages);
+            for printing_order in [PrintingOrder::FrontsThenBacks, PrintingOrder::FrontsThenBacksReversed] {
+                let options = ImpositionOptions {
+                    plan: PlanOptions {
+                        layout,
+                        columns,
+                        rows: 2,
+                        binding: Binding::Perfect,
+                        sheets_per_fold: 1,
+                        style,
+                        double_sided: true,
+                        printing_order,
+                    },
+                    ..Default::default()
+                };
+                let what = format!("{layout:?} {printing_order:?} N={pages}");
+                let mut sheets = source.impose(&options, None).unwrap_or_else(|e| panic!("{what}: {e}"));
+                let mut printed = vec![0; pages];
+                for sheet in 0..sheets.page_count() {
+                    let text = page_text(r, &mut sheets, sheet);
+                    for (n, count) in printed.iter_mut().enumerate() {
+                        *count += text.matches(&format!("PAGE{}X", n + 1)).count();
+                    }
+                }
+                assert!(printed.iter().all(|&c| c == 1), "{what}: times each page was printed: {printed:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn imposition_reports_progress_and_can_be_cancelled() {
     let source = numbered_pages(8);
     let options = ImpositionOptions::default();
