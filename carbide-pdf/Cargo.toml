@@ -22,6 +22,7 @@ eframe = "0.36"
 rfd = "0.17"
 rsa = "0.9"
 sha2 = { version = "0.10", features = ["oid"] }
+md-5 = "0.11"
 x509-cert = "0.2"
 p12-keystore = "0.4"
 ureq = "3"

@@ -806,6 +806,7 @@ dependencies = [
  "getrandom 0.3.4",
  "image",
  "lopdf",
+ "md-5",
  "ocrs",
  "p12-keystore",
  "pdfium-render",

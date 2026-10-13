@@ -694,6 +694,97 @@ fn passwords_are_used_exactly_as_typed() {
     }
 }
 
+/// A file protected the older way other software still writes: RC4 128-bit (revision 3) or AES-128
+/// (revision 4). Their file key is derived from the open password and the file identifier.
+fn legacy_protected(aes: bool, user: &str, owner: &str) -> Vec<u8> {
+    use lopdf::encryption::crypt_filters::{Aes128CryptFilter, CryptFilter};
+    use lopdf::{EncryptionState, EncryptionVersion, Permissions};
+    let mut pdf = text_pdf(&[&["private words"]]);
+    let id = Object::String(b"carbide-test-id1".to_vec(), lopdf::StringFormat::Hexadecimal);
+    pdf.document_mut().trailer.set("ID", vec![id.clone(), id]);
+    let plain = pdf.document().clone();
+    let permissions = Permissions::PRINTABLE | Permissions::COPYABLE;
+    let version = if aes {
+        let mut filters: std::collections::BTreeMap<Vec<u8>, std::sync::Arc<dyn CryptFilter>> = Default::default();
+        filters.insert(b"StdCF".to_vec(), std::sync::Arc::new(Aes128CryptFilter));
+        EncryptionVersion::V4 {
+            document: &plain,
+            encrypt_metadata: true,
+            crypt_filters: filters,
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: owner,
+            user_password: user,
+            permissions,
+        }
+    } else {
+        EncryptionVersion::V2 { document: &plain, owner_password: owner, user_password: user, key_length: 128, permissions }
+    };
+    let state = EncryptionState::try_from(version).unwrap();
+    let mut doc = plain.clone();
+    doc.encrypt(&state).unwrap();
+    let mut out = Vec::new();
+    doc.save_with_options(&mut out, lopdf::SaveOptions::builder().use_object_streams(false).use_xref_streams(false).build())
+        .unwrap();
+    out
+}
+
+#[test]
+fn older_encryption_opens_with_either_password_and_saves_with_the_same_key() {
+    let r = renderer();
+    for aes in [false, true] {
+        for (user, owner, opened_with) in [
+            ("user", "owner", Some("user")),
+            ("user", "owner", Some("owner")),
+            ("pässwörd", "owner", Some("pässwörd")),
+            ("pässwörd", "öwner", Some("öwner")),
+            // An empty owner password opens the file without asking.
+            ("user", "", None),
+        ] {
+            let label = format!("aes {aes}, open {user:?}, owner {owner:?}, opened with {opened_with:?}");
+            let original = legacy_protected(aes, user, owner);
+            assert!(r.page_text_with_password(&original, user, 0).unwrap().contains("private words"), "{label}: fixture");
+            if owner.is_empty() {
+                assert!(Pdf::from_bytes(&original).is_ok(), "{label}");
+            } else {
+                assert!(matches!(Pdf::from_bytes(&original), Err(Error::PasswordRequired)), "{label}");
+                assert!(matches!(Pdf::from_bytes_with_password(&original, "wrong"), Err(Error::WrongPassword)), "{label}");
+            }
+
+            let (mut pdf, saved) = SavedFile::open(original.clone(), opened_with.map(str::to_string)).unwrap();
+            assert!(saved.is_protected(), "{label}");
+            let key = pdf.document().encryption_state.clone().unwrap().file_encryption_key().to_vec();
+            assert!(page_text(r, &mut pdf, 0).contains("private words"), "{label}: decrypted with the wrong key");
+
+            pdf.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
+            let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, false);
+            assert_eq!(plan, CLEAN, "{label}");
+            assert!(!contains(&bytes, b"private words"), "{label}: written in the clear");
+            // PDFium does not take an empty owner password, for the original file either.
+            for password in [user, owner].into_iter().filter(|p| !p.is_empty()) {
+                let text = r.page_text_with_password(&bytes, password, 0).unwrap_or_else(|e| panic!("{label}, read with {password:?}: {e}"));
+                assert!(text.contains("private words") && text.contains("DRAFT"), "{label}, read with {password:?}: {text:?}");
+                let reopened = Pdf::from_bytes_with_password(&bytes, password).unwrap();
+                assert_eq!(reopened.document().encryption_state.as_ref().unwrap().file_encryption_key(), key.as_slice(), "{label}");
+            }
+        }
+    }
+}
+
+#[test]
+fn aes256_passwords_are_prepared_the_way_the_standard_says() {
+    // Option+Space types a no-break space; accents can arrive composed or decomposed.
+    for (set, typed) in [("my\u{a0}pass", "my\u{a0}pass"), ("café", "café"), ("café", "cafe\u{301}")] {
+        let original = text_pdf(&[&["private"]]).to_encrypted_bytes(&ProtectionOptions::new(set, "owner pw")).unwrap();
+        let (mut pdf, saved) = SavedFile::open(original, Some(typed.into())).unwrap_or_else(|e| panic!("{typed:?}: {e}"));
+        assert!(page_text(renderer(), &mut pdf, 0).contains("private"), "{typed:?}");
+        pdf.add_note(0, 100.0, 100.0, "reviewed").unwrap();
+        let (_, bytes) = plan_and_bytes(&mut pdf, &saved, false);
+        assert!(Pdf::from_bytes_with_password(&bytes, typed).is_ok(), "{typed:?}");
+        assert!(Pdf::from_bytes_with_password(&bytes, "owner pw").is_ok(), "{typed:?}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn replacing_a_file_keeps_its_mode_and_follows_symbolic_links() {

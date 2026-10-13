@@ -89,7 +89,16 @@ impl Renderer {
 
     /// Plain text of one page, in reading order as PDFium reports it.
     pub fn page_text(&self, pdf: &[u8], index: usize) -> Result<String> {
-        let document = self.pdfium.load_pdf_from_byte_slice(pdf, None).map_err(render_error)?;
+        self.text_of_page(pdf, None, index)
+    }
+
+    /// Plain text of one page of a file that needs a password to be read.
+    pub fn page_text_with_password(&self, pdf: &[u8], password: &str, index: usize) -> Result<String> {
+        self.text_of_page(pdf, Some(password), index)
+    }
+
+    fn text_of_page(&self, pdf: &[u8], password: Option<&str>, index: usize) -> Result<String> {
+        let document = self.pdfium.load_pdf_from_byte_slice(pdf, password).map_err(render_error)?;
         let page = document
             .pages()
             .get(index as PdfPageIndex)

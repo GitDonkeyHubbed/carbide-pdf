@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use lopdf::{Document, EncryptionState, LoadOptions, Object, ObjectId, SaveOptions};
+use lopdf::{Document, EncryptionState, Object, ObjectId, SaveOptions};
 
 use crate::error::{Error, Result};
 use crate::pdf::Pdf;
@@ -68,7 +68,8 @@ impl SavedFile {
         SavedFile { bytes, password, protection, content }
     }
 
-    /// Opens `bytes` as a document and records them as its file.
+    /// Opens `bytes` as a document and records them as its file. The password is used exactly as
+    /// given; it may be the open password or the owner password.
     pub fn open(bytes: Vec<u8>, password: Option<String>) -> Result<(Pdf, SavedFile)> {
         let pdf = match &password {
             Some(password) => Pdf::from_bytes_with_password(&bytes, password)?,
@@ -104,18 +105,10 @@ impl SavedFile {
 
     /// The file as a document again, decrypted with the same password.
     fn load(&self) -> Result<Document> {
-        let doc = match &self.password {
-            Some(password) => Document::load_mem_with_options(&self.bytes, LoadOptions::with_password(password))
-                .map_err(|e| match e {
-                    lopdf::Error::InvalidPassword | lopdf::Error::Decryption(_) => Error::WrongPassword,
-                    other => other.into(),
-                })?,
-            None => Document::load_mem(&self.bytes)?,
-        };
-        if doc.is_encrypted() {
-            return Err(Error::PasswordRequired);
+        match &self.password {
+            Some(password) => Ok(Pdf::from_bytes_with_password(&self.bytes, password)?.doc),
+            None => Ok(Pdf::from_bytes(&self.bytes)?.doc),
         }
-        Ok(doc)
     }
 }
 
@@ -162,8 +155,8 @@ impl Pdf {
             (SavePlan::FullRewrite { .. }, _) => self.rewrite(protection)?,
             (_, None) => return Err(Error::Other("there is no file to update".into())),
         };
-        if protection.is_some() && !is_encrypted_file(&bytes) {
-            return Err(Error::Other(NOT_ENCRYPTED.into()));
+        if let (Some(saved), Some(protection)) = (saved, protection) {
+            check_encryption(&bytes, saved, protection)?;
         }
         Ok(bytes)
     }
@@ -201,13 +194,32 @@ impl Pdf {
 
 const NOT_ENCRYPTED: &str = "the document could not be encrypted again, so it was not saved";
 
-/// True when `bytes` is a PDF that carries an encryption dictionary.
-fn is_encrypted_file(bytes: &[u8]) -> bool {
-    Document::load_mem(bytes).is_ok_and(|doc| doc.is_encrypted() || doc.was_encrypted())
+/// Fails unless `bytes` open with the password `saved` was opened with, and that password, checked
+/// against the new file's encryption dictionary, gives the file key and the dictionary values of
+/// the original. The key is derived afresh here, so a wrong one in memory cannot slip through.
+fn check_encryption(bytes: &[u8], saved: &SavedFile, protection: &Protection) -> Result<()> {
+    let written = match &saved.password {
+        Some(password) => Pdf::from_bytes_with_password(bytes, password),
+        None => Pdf::from_bytes(bytes),
+    };
+    let Some(state) = written.ok().and_then(|pdf| pdf.doc.encryption_state) else {
+        return Err(Error::Other(NOT_ENCRYPTED.into()));
+    };
+    let original = &protection.state;
+    let same = state.file_encryption_key() == original.file_encryption_key()
+        && (state.version(), state.revision()) == (original.version(), original.revision())
+        && state.permissions() == original.permissions()
+        && (state.owner_value(), state.user_value()) == (original.owner_value(), original.user_value())
+        && (state.owner_encrypted(), state.user_encrypted()) == (original.owner_encrypted(), original.user_encrypted());
+    if same {
+        Ok(())
+    } else {
+        Err(Error::Other(NOT_ENCRYPTED.into()))
+    }
 }
 
 /// Every object reachable from the trailer.
-fn reachable(doc: &Document) -> HashSet<ObjectId> {
+pub(crate) fn reachable(doc: &Document) -> HashSet<ObjectId> {
     fn references(object: &Object, out: &mut Vec<ObjectId>) {
         match object {
             Object::Reference(id) => out.push(*id),

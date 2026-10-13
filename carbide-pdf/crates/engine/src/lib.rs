@@ -7,6 +7,7 @@ pub mod annotate;
 pub mod autosave;
 pub mod compare;
 mod content;
+mod crypt;
 mod der;
 pub mod error;
 pub mod export;

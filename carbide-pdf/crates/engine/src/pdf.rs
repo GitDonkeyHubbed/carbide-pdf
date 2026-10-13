@@ -46,21 +46,18 @@ impl Pdf {
         Self::from_bytes_with_password(&std::fs::read(path)?, password)
     }
 
+    /// Opens a file. An encrypted one opens only when it needs no password to be read (its
+    /// restrictions are kept and saving encrypts it again).
     pub fn from_bytes(bytes: &[u8]) -> Result<Pdf> {
-        let doc = Document::load_mem(bytes)?;
-        if doc.is_encrypted() {
-            return Err(Error::PasswordRequired);
-        }
-        Ok(Pdf { doc })
+        Ok(Pdf { doc: crate::crypt::load(bytes, None)? })
     }
 
+    /// Opens a file with its open password or its owner password, used exactly as given.
     pub fn from_bytes_with_password(bytes: &[u8], password: &str) -> Result<Pdf> {
-        // The password has to be given to the loader: without it only the encryption dictionary
-        // is read and the document comes back empty.
-        match Document::load_mem_with_options(bytes, lopdf::LoadOptions::with_password(password)) {
+        match crate::crypt::load(bytes, Some(password)) {
             Ok(doc) => Ok(Pdf { doc }),
-            Err(lopdf::Error::InvalidPassword) | Err(lopdf::Error::Decryption(_)) => Err(Error::WrongPassword),
-            Err(other) => Err(other.into()),
+            Err(Error::Pdf(lopdf::Error::InvalidPassword | lopdf::Error::Decryption(_))) => Err(Error::WrongPassword),
+            Err(other) => Err(other),
         }
     }
 
