@@ -93,7 +93,8 @@ impl SavedFile {
     }
 
     /// True when `pdf` has lost text or data this file holds: an object that is no longer part of
-    /// the document, or one that no longer carries all of the strings or stream data it had. Objects
+    /// the document, or one that no longer carries all of the strings or stream data it had. An
+    /// annotation counts even when it holds neither, since what it draws is content. Other objects
     /// that hold neither (page-tree nodes, resource dictionaries) are not content and do not count.
     pub fn removed_from(&self, pdf: &Pdf) -> bool {
         let reachable = reachable(&pdf.doc);
@@ -126,7 +127,9 @@ impl Pdf {
         if self.changes_since(&base.doc).is_empty() {
             return Ok(SavePlan::Unchanged);
         }
-        let signed = base.has_signatures();
+        // A signature the file already fails (after an earlier rewrite, say) is not worth keeping
+        // the old bytes for.
+        let signed = base.has_intact_signatures(&saved.bytes);
         let revisions = !base.revisions().is_empty();
         let removed = content_removed || saved.removed_from(self);
         // A file whose cross-reference table had to be rebuilt has nothing for an update to point
@@ -250,7 +253,7 @@ struct Fingerprint {
 }
 
 impl Fingerprint {
-    /// `None` for an object that holds neither strings nor stream data.
+    /// `None` for an object that holds neither strings nor stream data and is not an annotation.
     fn of(object: &Object) -> Option<Fingerprint> {
         fn strings(object: &Object, out: &mut Vec<u64>) {
             match object {
@@ -265,7 +268,7 @@ impl Fingerprint {
         strings(object, &mut found);
         found.sort_unstable();
         let stream = object.as_stream().ok().map(|s| hash(&s.content));
-        (stream.is_some() || !found.is_empty()).then_some(Fingerprint { strings: found, stream })
+        (stream.is_some() || !found.is_empty() || is_annotation(object)).then_some(Fingerprint { strings: found, stream })
     }
 
     /// True when `object` still carries all of this content; added strings do not matter.
@@ -273,6 +276,12 @@ impl Fingerprint {
         let Some(now) = Fingerprint::of(object) else { return false };
         self.stream == now.stream && self.strings.iter().all(|s| now.strings.binary_search(s).is_ok())
     }
+}
+
+/// An annotation dictionary. Ink, shapes and stamps can hold nothing but numbers and names.
+fn is_annotation(object: &Object) -> bool {
+    let Object::Dictionary(dict) = object else { return false };
+    dict.has_type(b"Annot") || (dict.get(b"Subtype").is_ok_and(|s| s.as_name().is_ok()) && dict.has(b"Rect"))
 }
 
 fn hash(bytes: &[u8]) -> u64 {

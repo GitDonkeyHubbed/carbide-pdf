@@ -7,6 +7,7 @@ use lopdf::{Document, IncrementalDocument, Object, ObjectId};
 
 use crate::error::{Error, Result};
 use crate::pdf::Pdf;
+use crate::save::reachable;
 
 /// Trailer entries an update carries over from the document.
 const TRAILER_KEYS: [&[u8]; 2] = [b"Root", b"Info"];
@@ -27,7 +28,8 @@ impl Changes {
 
 impl Pdf {
     /// Returns `base_bytes` followed by an update section holding every object of this document
-    /// that is new or differs from the version in `base_bytes`.
+    /// that is new or differs from the version in `base_bytes`. Objects the document no longer
+    /// refers to are left out, so nothing an edit dropped again ends up in the file.
     ///
     /// When nothing differs, the original bytes are returned unchanged. Appending an empty update
     /// would move the end of the file and make a signature look as if the document had been edited.
@@ -70,12 +72,17 @@ impl Pdf {
         Ok(out)
     }
 
+    /// What an update has to carry: objects that are part of the document (reachable from the
+    /// trailer) and new or different, and the trailer entries that changed.
     pub(crate) fn changes_since(&self, base: &Document) -> Changes {
+        let reachable = reachable(&self.doc);
         let objects = self
             .doc
             .objects
             .iter()
-            .filter(|(id, object)| !is_file_structure(object) && base.objects.get(id) != Some(*object))
+            .filter(|(id, object)| {
+                reachable.contains(id) && !is_file_structure(object) && base.objects.get(id) != Some(*object)
+            })
             .map(|(id, object)| (*id, object.clone()))
             .collect();
         let trailer = TRAILER_KEYS

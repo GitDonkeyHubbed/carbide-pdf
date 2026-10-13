@@ -943,6 +943,23 @@ impl Pdf {
         reports.sort_by_key(|r| r.revision_end);
         Ok(reports)
     }
+
+    /// True when this document, loaded from `file_bytes`, holds a signature that an update appended
+    /// to the file would keep valid. A signature whose byte range no longer fits the file, or whose
+    /// digest no longer matches it (the file was rewritten since), is already broken. One that
+    /// cannot be checked here (an unsupported algorithm, say) counts as intact.
+    pub(crate) fn has_intact_signatures(&self, file_bytes: &[u8]) -> bool {
+        let file_end = file_bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map(|p| p + 1).unwrap_or(0);
+        let trust = TrustStore::default();
+        self.doc.objects.iter().any(|(id, object)| {
+            let Object::Dictionary(v) = object else { return false };
+            if !(v.has(b"ByteRange") && v.has(b"Contents") && v.has(b"SubFilter")) {
+                return false;
+            }
+            let report = verify_one(self, *id, v, None, file_bytes, file_end, &trust, Utc::now());
+            !(report.validity == Validity::Invalid && matches!(report.detail, Detail::BadByteRange | Detail::DigestMismatch))
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

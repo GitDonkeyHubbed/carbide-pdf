@@ -524,6 +524,69 @@ fn deleted_pages_leave_nothing_behind() {
     assert_eq!(Pdf::from_bytes(&bytes).unwrap().page_count(), 1);
 }
 
+/// A signed one-page file whose page carries an ink drawing: numbers only, no appearance stream.
+fn signed_with_ink() -> (Vec<u8>, Vec<Object>) {
+    let mut doc = text_pdf(&[&["contract body"]]);
+    let page = doc.page_id(0).unwrap();
+    let ink = doc.document_mut().add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Ink", "Rect" => vec![100.into(), 100.into(), 200.into(), 200.into()],
+        "InkList" => vec![Object::Array(vec![100.into(), 100.into(), 150.into(), 180.into(), 200.into(), 120.into()])],
+    });
+    doc.document_mut().get_dictionary_mut(page).unwrap().set("Annots", vec![Object::Reference(ink)]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    let annots = Pdf::from_bytes(&signed).unwrap().document().get_dictionary(page).unwrap().get(b"Annots").unwrap().as_array().unwrap().clone();
+    (signed, annots)
+}
+
+#[test]
+fn removing_an_annotation_counts_even_when_it_holds_only_numbers() {
+    let (signed, annots) = signed_with_ink();
+    let (mut pdf, saved) = SavedFile::open(signed, None).unwrap();
+    let page = pdf.page_id(0).unwrap();
+    let ink = annots.iter().find(|a| {
+        pdf.document().get_dictionary(a.as_reference().unwrap()).unwrap().get(b"Subtype").unwrap().as_name().unwrap() == b"Ink"
+    });
+    let kept: Vec<Object> = annots.iter().filter(|a| Some(*a) != ink).cloned().collect();
+    pdf.document_mut().get_dictionary_mut(page).unwrap().set("Annots", kept);
+    assert!(saved.removed_from(&pdf));
+    assert_eq!(pdf.save_plan(Some(&saved), false).unwrap(), SavePlan::FullRewrite { breaks_signatures: true, drops_revisions: false });
+}
+
+#[test]
+fn appended_updates_carry_only_what_the_document_still_uses() {
+    let (signed, annots) = signed_with_ink();
+    let (mut pdf, saved) = SavedFile::open(signed.clone(), None).unwrap();
+    let page = pdf.page_id(0).unwrap();
+    pdf.add_note(0, 300.0, 300.0, "ORPHANSECRET draft").unwrap();
+    pdf.apply_watermark(&WatermarkOptions::new("DRAFT")).unwrap();
+    // The note is taken out again; nothing prunes the document before saving.
+    pdf.document_mut().get_dictionary_mut(page).unwrap().set("Annots", annots);
+    let (plan, bytes) = plan_and_bytes(&mut pdf, &saved, false);
+    assert_eq!(plan, SavePlan::Incremental);
+    assert!(bytes.starts_with(&signed));
+    assert_gone(&bytes, "ORPHANSECRET");
+    assert_eq!(verify(&bytes, &trust_test_identity())[0].validity, Validity::Valid);
+}
+
+#[test]
+fn a_signature_the_file_already_fails_is_not_kept_by_appending() {
+    let r = renderer();
+    let mut doc = text_pdf(&[&["TOP SECRET 12345", "public line"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
+    let (mut pdf, saved) = SavedFile::open(signed, None).unwrap();
+    pdf.apply_redactions(r, &[Redaction { page: 0, rect: Rect::new(60.0, 692.0, 300.0, 28.0) }], 150.0).unwrap();
+    let (plan, rewritten) = plan_and_bytes(&mut pdf, &saved, true);
+    assert!(plan.needs_confirmation());
+
+    // The rewritten file still carries the signature field, but the signature no longer holds:
+    // later edits are written in full and nothing asks about signatures again.
+    let (mut pdf, saved) = SavedFile::open(rewritten, None).unwrap();
+    pdf.add_note(0, 100.0, 100.0, "after the rewrite").unwrap();
+    assert_eq!(pdf.save_plan(Some(&saved), false).unwrap(), CLEAN);
+}
+
 #[test]
 fn unchanged_documents_save_byte_identical() {
     let base = text_pdf(&[&["nothing changes"]]).to_bytes().unwrap();
