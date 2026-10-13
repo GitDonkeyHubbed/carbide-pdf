@@ -59,7 +59,7 @@ pub fn export_images(
         let mut encoded = Cursor::new(Vec::new());
         match format {
             ImageFormat::Png => image.write_to(&mut encoded, image::ImageFormat::Png),
-            ImageFormat::Jpeg => image::DynamicImage::ImageRgb8(image.to_rgb8()).write_to(&mut encoded, image::ImageFormat::Jpeg),
+            ImageFormat::Jpeg => image::DynamicImage::ImageRgb8(image.into_rgb8()).write_to(&mut encoded, image::ImageFormat::Jpeg),
         }
         .map_err(|e| Error::Other(format!("could not encode {}: {e}", target.display())))?;
         let written = crate::fs::write_file(target, encoded.get_ref(), existing)

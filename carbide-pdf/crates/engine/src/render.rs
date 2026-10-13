@@ -18,6 +18,27 @@ fn render_error(error: PdfiumError) -> Error {
     Error::Render(format!("{error:?}"))
 }
 
+/// The most pixels a rendered page has: 50 million, 200 MB as RGBA. A page that would be larger at
+/// the resolution asked for is rendered at a lower one instead.
+pub const MAX_RENDER_PIXELS: f32 = 50_000_000.0;
+
+/// The longest side of a rendered page, in pixels.
+pub const MAX_RENDER_SIDE: f32 = 20_000.0;
+
+/// The scale, in pixels per point, a page displayed `width` by `height` points is rendered at for
+/// `dpi`: `dpi / 72`, or less when that would go past [`MAX_RENDER_PIXELS`] or [`MAX_RENDER_SIDE`].
+pub fn render_scale(width: f32, height: f32, dpi: f32) -> f32 {
+    let scale = dpi / 72.0;
+    let (w, h) = (width.max(1.0) * scale, height.max(1.0) * scale);
+    // A little under the limits, so rounding to whole pixels cannot go past them.
+    let fit = (MAX_RENDER_PIXELS / (w * h)).sqrt().min(MAX_RENDER_SIDE / w.max(h)) * 0.999;
+    if fit < 1.0 {
+        scale * fit
+    } else {
+        scale
+    }
+}
+
 /// Folders searched for PDFium after the executable's own, by absolute path.
 #[cfg(target_os = "macos")]
 const SYSTEM_LIBRARY_DIRS: &[&str] = &["/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"];
@@ -104,19 +125,30 @@ impl Renderer {
         Ok(document.pages().len() as usize)
     }
 
-    /// Renders one page as it is displayed (crop box and rotation applied) at `dpi`.
+    /// Renders one page as it is displayed (crop box and rotation applied) at `dpi`, or at a lower
+    /// resolution when the image would be larger than [`MAX_RENDER_PIXELS`] or
+    /// [`MAX_RENDER_SIDE`]. The size of the image says which; callers that map between the page
+    /// and the image take the scale from it.
     pub fn render_page(&self, pdf: &[u8], index: usize, dpi: f32) -> Result<RgbaImage> {
+        if !(dpi.is_finite() && dpi > 0.0) {
+            return Err(Error::Render(format!("cannot render at {dpi} dpi")));
+        }
         let document = self.pdfium.load_pdf_from_byte_slice(pdf, None).map_err(render_error)?;
         let page = document
             .pages()
             .get(index as PdfPageIndex)
             .map_err(|_| Error::PageOutOfRange { index, count: document.pages().len() as usize })?;
+        let scale = render_scale(page.width().value, page.height().value, dpi);
+        // PDFium writes RGBA directly, so the image is its buffer copied once, not converted.
         let config = PdfRenderConfig::new()
-            .scale_page_by_factor(dpi / 72.0)
+            .scale_page_by_factor(scale)
+            .set_reverse_byte_order(true)
             .render_form_data(true)
             .render_annotations(true);
         let bitmap = page.render_with_config(&config).map_err(render_error)?;
-        Ok(bitmap.as_image().map_err(render_error)?.to_rgba8())
+        let (width, height) = (bitmap.width() as u32, bitmap.height() as u32);
+        RgbaImage::from_raw(width, height, bitmap.as_rgba_bytes())
+            .ok_or_else(|| Error::Render(format!("PDFium returned an unexpected bitmap for a {width} x {height} image")))
     }
 
     /// Plain text of one page, in reading order as PDFium reports it.
@@ -236,6 +268,19 @@ mod tests {
         assert_eq!(plain[0], Path::new("/opt/carbide/bin").join(&name));
         assert_eq!(plain.len(), 1 + SYSTEM_LIBRARY_DIRS.len());
         assert!(library_candidates(None, None).iter().all(|c| c.is_absolute()));
+    }
+
+    #[test]
+    fn rendering_scales_down_pages_that_would_be_too_large() {
+        // A Letter page at 300 dpi is rendered as asked.
+        assert_eq!(render_scale(612.0, 792.0, 300.0), 300.0 / 72.0);
+        // The largest PDF page at 300 dpi would be 60000 pixels square.
+        let scale = render_scale(14400.0, 14400.0, 300.0);
+        let side = (14400.0 * scale).round();
+        assert!(side * side <= MAX_RENDER_PIXELS && side > 7000.0, "{side}");
+        // A long strip is limited by its longest side.
+        let scale = render_scale(14400.0, 100.0, 300.0);
+        assert!((14400.0 * scale).round() <= MAX_RENDER_SIDE);
     }
 
     #[test]

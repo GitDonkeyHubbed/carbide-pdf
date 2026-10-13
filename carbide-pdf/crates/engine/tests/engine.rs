@@ -2462,6 +2462,26 @@ fn decompression_bombs_are_refused_or_never_decoded() {
     assert!(carried, "the content stream was not carried over as it was stored");
 }
 
+#[test]
+fn huge_pages_render_within_the_pixel_limit() {
+    use carbide_engine::render::{MAX_RENDER_PIXELS, MAX_RENDER_SIDE};
+    let r = renderer();
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((14400.0, 14400.0))).unwrap();
+    pdf.insert_blank_page(1, Some((14400.0, 72.0))).unwrap();
+    let bytes = pdf.to_bytes().unwrap();
+    // 60000 pixels square at 300 dpi, 14 GB as RGBA: rendered smaller instead.
+    let square = r.render_page(&bytes, 0, 300.0).unwrap();
+    assert!((square.width() as f32) * (square.height() as f32) <= MAX_RENDER_PIXELS, "{:?}", square.dimensions());
+    assert_eq!(square.width(), square.height(), "the shape is kept");
+    let strip = r.render_page(&bytes, 1, 300.0).unwrap();
+    let ratio = strip.width() as f32 / strip.height() as f32;
+    assert!(strip.width() as f32 <= MAX_RENDER_SIDE && (ratio - 200.0).abs() < 2.5, "{:?}", strip.dimensions());
+    for dpi in [0.0, -72.0, f32::NAN, f32::INFINITY] {
+        assert!(r.render_page(&bytes, 0, dpi).is_err(), "{dpi} dpi");
+    }
+}
+
 // ---- inherited page attributes -------------------------------------------------------------
 
 /// `numbered_pages(4)` with /Rotate 90 and /CropBox [0 300 500 792] (which still shows the text)

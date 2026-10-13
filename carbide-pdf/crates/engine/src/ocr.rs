@@ -90,8 +90,12 @@ struct Line {
     height: f32,
 }
 
-fn recognize(engine: &OcrEngine, image: &image::RgbaImage, dpi: f32, page_height_pt: f32) -> Result<Vec<Line>> {
-    let rgb = image::DynamicImage::ImageRgba8(image.clone()).into_rgb8();
+/// The lines found in `image`, a render of a page displayed `page` (width, height) points large.
+/// The render may have been made at a lower resolution than asked for (see
+/// [`Renderer::render_page`]), so the scale comes from its size.
+fn recognize(engine: &OcrEngine, image: image::RgbaImage, page: (f32, f32)) -> Result<Vec<Line>> {
+    let (sx, sy) = (page.0 / image.width().max(1) as f32, page.1 / image.height().max(1) as f32);
+    let rgb = image::DynamicImage::ImageRgba8(image).into_rgb8();
     let source = ImageSource::from_bytes(rgb.as_raw(), rgb.dimensions())
         .map_err(|e| Error::Other(format!("OCR input error: {e}")))?;
     let input = engine.prepare_input(source).map_err(|e| Error::Other(format!("OCR error: {e}")))?;
@@ -99,7 +103,6 @@ fn recognize(engine: &OcrEngine, image: &image::RgbaImage, dpi: f32, page_height
     let line_rects = engine.find_text_lines(&input, &words);
     let lines = engine.recognize_text(&input, &line_rects).map_err(|e| Error::Other(format!("OCR error: {e}")))?;
 
-    let scale = 72.0 / dpi;
     let mut out = Vec::new();
     for line in lines.into_iter().flatten() {
         let text = line.to_string().trim().to_string();
@@ -111,10 +114,10 @@ fn recognize(engine: &OcrEngine, image: &image::RgbaImage, dpi: f32, page_height
         let (width, height) = (rect.width() as f32, rect.height() as f32);
         out.push(Line {
             text,
-            x: left * scale,
-            y: page_height_pt - (top + height) * scale,
-            width: width * scale,
-            height: height * scale,
+            x: left * sx,
+            y: page.1 - (top + height) * sy,
+            width: width * sx,
+            height: height * sy,
         });
     }
     Ok(out)
@@ -142,9 +145,8 @@ impl Pdf {
             }
             let page_id = ids[page];
             let geometry = self.geometry_of(page_id);
-            let (_, height) = geometry.display_size();
             let image = renderer.render_page(&snapshot, page, options.dpi)?;
-            let lines = recognize(&engine, &image, options.dpi, height)?;
+            let lines = recognize(&engine, image, geometry.display_size())?;
             report.recognized_pages.push(page);
             if lines.is_empty() {
                 continue;
