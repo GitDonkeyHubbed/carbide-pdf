@@ -1365,15 +1365,19 @@ fn verify_one(
     }
 
     // An embedded signature time stamp counts only when it is present and itself verifies: its
-    // message imprint is over the signature value, and its own token signature holds.
-    report.has_embedded_timestamp = cms::unsigned_attribute(signer_info, cms::OID_SIGNATURE_TIMESTAMP)
-        .is_some_and(|token| matches!(check_timestamp_token(token, &[&signer_info.signature], trust, now), TokenResult::Verified { .. }));
+    // message imprint is over the signature value, and its own token signature holds. Its time,
+    // when it verifies, is a better reference than the signer-chosen /M for the validity checks.
+    let embedded = cms::unsigned_attribute(signer_info, cms::OID_SIGNATURE_TIMESTAMP)
+        .map(|token| check_timestamp_token(token, &[&signer_info.signature], trust, now));
+    let timestamp_time = match &embedded {
+        Some(TokenResult::Verified { gen_time, .. }) => gen_time.as_deref().and_then(gentime_to_utc),
+        _ => None,
+    };
+    report.has_embedded_timestamp = matches!(embedded, Some(TokenResult::Verified { .. }));
 
     // 5. Trust and validity period.
-    let reference_time = report
-        .signing_time
-        .as_deref()
-        .and_then(parse_pdf_date)
+    let reference_time = timestamp_time
+        .or_else(|| report.signing_time.as_deref().and_then(parse_pdf_date))
         .unwrap_or(now);
     if reference_time > now + chrono::Duration::minutes(5) {
         report.validity = Validity::ValidityUnknown;
