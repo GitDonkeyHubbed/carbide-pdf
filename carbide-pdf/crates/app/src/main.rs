@@ -58,6 +58,8 @@ pub struct OpenDoc {
     pub dirty: bool,
     /// What a document without a file is called (an earlier revision, say); `None` for Untitled.
     pub name: Option<String>,
+    /// Set for a document opened from an Auto Recovery copy, until it is saved.
+    pub recovered: Option<Recovered>,
     pub geometries: Vec<PageGeometry>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
@@ -65,6 +67,15 @@ pub struct OpenDoc {
     view_page: usize,
     view_redactions: Vec<Redaction>,
     view_notice: Option<String>,
+}
+
+/// Where a document opened from an Auto Recovery copy came from. It has no file of its own: Save
+/// writes over the original, once the user agrees, or asks where to put it.
+pub struct Recovered {
+    /// The file it was being edited from; `None` for a document that was never saved.
+    pub original: Option<PathBuf>,
+    /// The record it was recovered from, which goes once the document is saved.
+    pub record: RecordId,
 }
 
 /// A point in the edit history.
@@ -89,6 +100,7 @@ impl OpenDoc {
             record: None,
             dirty: false,
             name: None,
+            recovered: None,
             geometries,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -259,7 +271,7 @@ impl CarbideApp {
         }
         // Launch: show recovered documents waiting from an earlier session.
         if app.autosave.as_ref().is_some_and(|s| s.any_needs_save()) {
-            app.dialog = Some(Dialog::AutoRecovery);
+            app.dialog = Some(Dialog::auto_recovery());
         }
         app
     }
@@ -346,6 +358,34 @@ impl CarbideApp {
             }
             Err(e) => self.alert(format!("Could not open the copy: {e}")),
         }
+    }
+
+    /// Opens the Auto Recovery copy of `record` as a document with unsaved changes, tied to the file
+    /// it was recovered for. It has no file of its own, so nothing is ever saved into the recovery
+    /// or temporary folder: Save asks to replace the original, or where to put a document that never
+    /// had one. A copy that is already open is brought forward instead.
+    pub fn open_recovered(&mut self, record: RecordId) {
+        let open_at = (0..self.tabs.len()).find(|&i| self.doc_at(i).and_then(|d| d.recovered.as_ref()).is_some_and(|r| r.record == record));
+        if let Some(index) = open_at {
+            return self.activate(Some(index));
+        }
+        let Some(store) = self.autosave.as_ref() else { return };
+        let original = store.record(record).and_then(|r| r.original.as_ref()).map(|o| o.path.clone());
+        let (pdf, title) = match store.open_recovered(record, None) {
+            Ok(opened) => opened,
+            Err(e) => return self.alert(e.to_string()),
+        };
+        self.install(pdf, None, None);
+        let Some(doc) = self.doc.as_mut() else { return };
+        doc.name = Some(title);
+        doc.dirty = true;
+        // Kept for recovery under the original's name, should this session end unexpectedly too.
+        if let (Some(store), Some(id)) = (self.autosave.as_mut(), doc.record) {
+            let _ = store.document_closed(id);
+            doc.record = Some(store.begin_document(original.as_deref(), now_unix()));
+        }
+        doc.recovered = Some(Recovered { original, record });
+        self.status = format!("{} - not saved yet", doc.title());
     }
 
     /// Opens a protected file. The password is used exactly as typed, spaces included.
@@ -629,6 +669,12 @@ impl CarbideApp {
     /// or drops saved revisions); an answer about any other document saves nothing. `then` is
     /// carried out once the file is written.
     pub fn write_to(&mut self, path: &Path, confirmed: Option<u64>, then: AfterSave) {
+        if self.is_private_location(path) {
+            return self.alert(format!(
+                "{} is in a folder Carbide PDF keeps for itself (recovery or temporary copies), so nothing was saved there. Choose another location.",
+                path.display()
+            ));
+        }
         let Some(doc) = self.doc.as_mut() else { return };
         if confirmed.is_some_and(|id| id != doc.id) {
             self.status = "Nothing was saved: the question was about a document that is no longer in front.".into();
@@ -693,12 +739,19 @@ impl CarbideApp {
     }
 
     /// Everything that follows writing the active document to `path`: what is shown and checked
-    /// is the file on disk now, and its Auto Recovery copy is no longer needed.
+    /// is the file on disk now, and its Auto Recovery copies are no longer needed, including the one
+    /// a recovered document was opened from.
     fn after_writing(&mut self, path: &Path) {
         let Some(doc) = self.doc.as_mut() else { return };
         if let (Some(store), Some(id)) = (self.autosave.as_mut(), doc.record) {
             let _ = store.document_saved(id);
             doc.record = Some(store.begin_document(Some(path), now_unix()));
+        }
+        if let Some(recovered) = doc.recovered.take() {
+            doc.name = None;
+            if let Some(store) = self.autosave.as_mut() {
+                let _ = store.remove_record(recovered.record);
+            }
         }
         self.textures.clear();
         self.thumbs.clear();
@@ -711,19 +764,53 @@ impl CarbideApp {
     }
 
     /// Saves the active document over its file (or asks where to, for a new one), then does
-    /// `then`. Nothing follows when the user cancels.
+    /// `then`. A recovered document asks first whether to replace the file it was recovered for.
+    /// Nothing follows when the user cancels.
     pub fn save_then(&mut self, then: AfterSave) {
-        match self.doc.as_ref().and_then(|d| d.path.clone()) {
-            Some(path) => self.write_to(&path, None, then),
+        let Some(doc) = self.doc.as_ref() else { return };
+        if let Some(path) = doc.path.clone() {
+            return self.write_to(&path, None, then);
+        }
+        match doc.recovered.as_ref().and_then(|r| r.original.clone()).filter(|p| p.exists()) {
+            Some(original) => self.dialog = Some(Dialog::ReplaceOriginal { doc: doc.id, path: original, then }),
             None => self.save_as_then(then),
         }
+    }
+
+    /// Answers yes to replacing `path`, the file the recovered document `doc` was recovered for:
+    /// it is saved over it the way Save saves, against the file as it is on disk now.
+    pub fn replace_original(&mut self, doc: u64, path: &Path, then: AfterSave) {
+        let Some(open) = self.doc.as_mut().filter(|d| d.id == doc) else {
+            self.status = "Nothing was saved: the question was about a document that is no longer in front.".into();
+            return;
+        };
+        let read = std::fs::read(path).map_err(EngineError::from).and_then(|bytes| SavedFile::open(bytes, None));
+        match read {
+            Ok((_, saved)) => {
+                open.saved = Some(saved);
+                self.write_to(path, None, then);
+            }
+            Err(e) => self.alert(format!(
+                "{} could not be read ({e}), so the recovered document was not saved over it. Use Save As instead.",
+                path.display()
+            )),
+        }
+    }
+
+    /// True for a place Save never writes to: the Auto Recovery folder, or a private temporary
+    /// folder the app made.
+    fn is_private_location(&self, path: &Path) -> bool {
+        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let folder = path.parent().filter(|p| !p.as_os_str().is_empty()).map(canonical);
+        let recovery = self.autosave.as_ref().map(|s| canonical(s.directory()));
+        carbide_engine::fs::is_private_temp_file(path) || matches!((folder, recovery), (Some(f), Some(r)) if f.starts_with(&r))
     }
 
     fn save_as(&mut self) {
         self.save_as_then(AfterSave::Nothing);
     }
 
-    fn save_as_then(&mut self, then: AfterSave) {
+    pub fn save_as_then(&mut self, then: AfterSave) {
         let name = self.doc.as_ref().map(|d| d.title()).unwrap_or_else(|| "Untitled.pdf".into());
         if let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name(name).save_file() {
             self.write_to(&path, None, then);
@@ -732,8 +819,9 @@ impl CarbideApp {
 
     /// True when saving the active document has to ask first.
     pub fn save_needs_question(&self) -> bool {
-        self.doc.as_ref().is_some_and(|d| {
-            d.path.is_some() && d.pdf.save_plan(d.saved.as_ref(), d.content_removed).is_ok_and(|plan| plan.needs_confirmation())
+        self.doc.as_ref().is_some_and(|d| match &d.path {
+            Some(_) => d.pdf.save_plan(d.saved.as_ref(), d.content_removed).is_ok_and(|plan| plan.needs_confirmation()),
+            None => d.recovered.as_ref().is_some_and(|r| r.original.as_ref().is_some_and(|p| p.exists())),
         })
     }
 

@@ -160,7 +160,8 @@ impl Record {
         self.loaded && self.recovered.is_some()
     }
 
-    fn display_name(&self) -> String {
+    /// The original's file name, or "Untitled" for a document that was never saved.
+    pub fn display_name(&self) -> String {
         self.original
             .as_ref()
             .map(|o| o.file_name.clone())

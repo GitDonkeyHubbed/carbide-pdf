@@ -374,7 +374,7 @@ impl CarbideApp {
             }
 
             Cmd::AutoSaveSettings => self.dialog = Some(Dialog::preferences(&self.settings)),
-            Cmd::AutoRecovery => self.dialog = Some(Dialog::AutoRecovery),
+            Cmd::AutoRecovery => self.dialog = Some(Dialog::auto_recovery()),
             Cmd::Quit => {} // Handled by the window itself.
         }
     }

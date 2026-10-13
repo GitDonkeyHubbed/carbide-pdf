@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use carbide_engine::autosave::{AutoSaveSettings, AutoSaveStore};
+use carbide_engine::autosave::{AutoSaveSettings, AutoSaveStore, RowKind};
 use carbide_engine::ocr::OcrReport;
 use carbide_engine::{pdf_date_now, Pdf, ProtectionOptions};
 use eframe::egui;
 
-use crate::dialogs::{AfterSave, Dialog, Export};
+use crate::dialogs::{recovery_action, AfterSave, Dialog, Export, RecoveryAction, RecoveryQuestion};
 use crate::ribbon::Cmd;
 use crate::{CarbideApp, OcrJob, SignJob};
 
@@ -411,4 +411,96 @@ fn hidden_information_is_removed_as_an_edit_and_offered_after_redacting() {
     app.pending_redactions = vec![carbide_engine::Redaction { page: 0, rect: carbide_engine::Rect::new(60.0, 690.0, 200.0, 40.0) }];
     app.run(Cmd::ApplyRedactions);
     assert!(matches!(app.dialog, Some(Dialog::SuggestRemoveHidden { doc }) if doc == active_id(&app)));
+}
+
+/// Simulates an earlier session that auto-saved `edited` copies of `originals` (a document never
+/// saved for `None`) and then ended without closing them, as a crash does.
+fn crashed_session(dir: &Path, originals: &[Option<&Path>]) {
+    let mut store = AutoSaveStore::open(dir.join("AutoSave")).unwrap();
+    for (i, original) in originals.iter().enumerate() {
+        let id = store.begin_document(*original, 1);
+        let mut edited = match original {
+            Some(path) => Pdf::open(path).unwrap(),
+            None => document(&["NEW DOCUMENT"]),
+        };
+        edited.rotate_pages(&[0], 90).unwrap();
+        store.autosave(id, &mut edited, 2 + i as i64).unwrap();
+    }
+}
+
+#[test]
+fn a_recovered_document_is_unsaved_and_replaces_its_original_only_when_agreed() {
+    let dir = scratch();
+    let original = plain(&dir, "contract.pdf", &["ORIGINAL"]);
+    crashed_session(&dir, &[Some(&original)]);
+    let mut app = app(&dir);
+    assert!(app.autosave.as_ref().unwrap().any_needs_save());
+    let rows = app.autosave.as_ref().unwrap().panel_rows();
+    let recovered = rows.iter().find(|r| r.kind == RowKind::Recovered).unwrap().record;
+
+    let mut question = None;
+    assert!(!recovery_action(&mut app, &mut question, RecoveryAction::Open(recovered, RowKind::Recovered)));
+    let doc = app.doc.as_ref().expect("the recovered copy is open");
+    assert_eq!(doc.title(), "contract.pdf (recovered)");
+    assert!(doc.path.is_none() && doc.dirty, "it is shown as unsaved and has no file of its own");
+    assert_eq!(doc.pdf.page_rotation(0).unwrap(), 90);
+    assert!(!std::env::temp_dir().join("contract.pdf (recovered).pdf").exists());
+
+    // Save asks before replacing the original, and Cancel writes nothing.
+    app.save();
+    let Some(Dialog::ReplaceOriginal { doc, path, .. }) = &app.dialog else { panic!("saving did not ask") };
+    let (doc, path) = (*doc, path.clone());
+    assert_eq!(path, original);
+    app.dialog = None;
+    assert_eq!(Pdf::open(&original).unwrap().page_rotation(0).unwrap(), 0);
+    assert!(app.save_needs_question(), "Save All has to ask about it too");
+
+    // Saving never goes into the recovery folder.
+    let inside = dir.join("AutoSave").join("contract.pdf");
+    app.write_to(&inside, None, AfterSave::Nothing);
+    assert!(!inside.exists());
+    app.dialog = None;
+
+    // Agreed: written over the original, after which it is that file again, and its recovery
+    // copy is gone.
+    app.replace_original(doc, &path, AfterSave::Nothing);
+    assert_eq!(Pdf::open(&original).unwrap().page_rotation(0).unwrap(), 90);
+    let open = app.doc.as_ref().unwrap();
+    assert_eq!((open.path.as_deref(), open.title(), open.dirty), (Some(original.as_path()), "contract.pdf".to_string(), false));
+    assert!(open.recovered.is_none());
+    assert!(app.autosave.as_ref().unwrap().panel_rows().is_empty());
+    assert_eq!(recovery_copies(&dir), 0);
+}
+
+#[test]
+fn recovered_work_is_deleted_only_after_confirming() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["A"]);
+    crashed_session(&dir, &[Some(&a), None]);
+    let mut app = app(&dir);
+    let rows = app.autosave.as_ref().unwrap().panel_rows();
+    let of_a = rows.iter().find(|r| r.kind == RowKind::Recovered && r.name.starts_with("a.pdf")).unwrap().record;
+    assert_eq!(recovery_copies(&dir), 2);
+
+    // Delete asks, with the name of the document, and Cancel keeps the copy.
+    let mut question = None;
+    assert!(recovery_action(&mut app, &mut question, RecoveryAction::Delete(of_a, RowKind::Recovered)));
+    assert_eq!(question.as_ref().map(RecoveryQuestion::message), Some("Delete the recovered copy of a.pdf?".to_string()));
+    assert_eq!(recovery_copies(&dir), 2);
+    recovery_action(&mut app, &mut question, RecoveryAction::Cancel);
+    assert!(question.is_none());
+    assert_eq!(recovery_copies(&dir), 2);
+    recovery_action(&mut app, &mut question, RecoveryAction::Delete(of_a, RowKind::Recovered));
+    recovery_action(&mut app, &mut question, RecoveryAction::Confirm);
+    assert_eq!(recovery_copies(&dir), 1);
+
+    // Clear all asks too.
+    recovery_action(&mut app, &mut question, RecoveryAction::ClearAll);
+    assert_eq!(question, Some(RecoveryQuestion::ClearAll));
+    assert_eq!(question.as_ref().unwrap().message(), carbide_engine::autosave::messages::DELETE_ALL);
+    assert_eq!(recovery_copies(&dir), 1);
+    recovery_action(&mut app, &mut question, RecoveryAction::Confirm);
+    assert_eq!(recovery_copies(&dir), 0);
+    assert!(app.autosave.as_ref().unwrap().panel_rows().is_empty());
+    assert!(a.exists(), "the user's own file is never touched");
 }

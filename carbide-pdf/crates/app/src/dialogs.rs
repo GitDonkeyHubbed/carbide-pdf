@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use carbide_engine::autosave::{format_time, messages as autosave_messages, AutoSaveSettings, RowKind};
+use carbide_engine::autosave::{format_time, messages as autosave_messages, AutoSaveSettings, RecordId, RowKind};
 use carbide_engine::fs::Existing;
 use carbide_engine::imposition::{ImpositionOptions, Media, RegistrationStyle, PAPER_SIZES};
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PrintingOrder, Style};
@@ -205,7 +205,10 @@ pub enum Dialog {
     Impose(Box<ImposeForm>),
     Reduce(Box<ReduceForm>),
     Compare { title: String, diffs: Vec<PageDiff> },
-    AutoRecovery,
+    /// The Auto Recovery panel, with the question it is asking, if any.
+    AutoRecovery { question: Option<RecoveryQuestion> },
+    /// Saving the recovered document `doc` would replace `path`, the file it was recovered for.
+    ReplaceOriginal { doc: u64, path: PathBuf, then: AfterSave },
     Preferences { enabled: bool, minutes: String, error: Option<&'static str> },
 }
 
@@ -219,7 +222,8 @@ impl Dialog {
             | Dialog::ConfirmExport { doc, .. }
             | Dialog::ConfirmMerge { doc, .. }
             | Dialog::RemoveHidden { doc, .. }
-            | Dialog::SuggestRemoveHidden { doc } => Some(*doc),
+            | Dialog::SuggestRemoveHidden { doc }
+            | Dialog::ReplaceOriginal { doc, .. } => Some(*doc),
             _ => None,
         }
     }
@@ -304,6 +308,10 @@ impl Dialog {
             replace_originals: false,
             results: None,
         }))
+    }
+
+    pub fn auto_recovery() -> Dialog {
+        Dialog::AutoRecovery { question: None }
     }
 
     pub fn preferences(settings: &AutoSaveSettings) -> Dialog {
@@ -898,8 +906,39 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::AutoRecovery => {
-            open = recovery_panel(app, ctx);
+        Dialog::AutoRecovery { question } => {
+            open = recovery_panel(app, ctx, question);
+        }
+
+        Dialog::ReplaceOriginal { doc, path, then } => {
+            window("Save Recovered Document").show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                ui.label(format!("Save the recovered document over \"{name}\"?"));
+                ui.label(format!("This replaces {} on disk with the recovered version.", path.display()));
+                ui.add_space(6.0);
+                let mut choice = None;
+                ui.horizontal(|ui| {
+                    if ui.button("Replace").clicked() {
+                        choice = Some(true);
+                    }
+                    if ui.button("Save As...").clicked() {
+                        choice = Some(false);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        open = false;
+                    }
+                });
+                if let Some(replace) = choice {
+                    open = false;
+                    let then = std::mem::replace(then, AfterSave::Nothing);
+                    if replace {
+                        app.replace_original(*doc, &path.clone(), then);
+                    } else {
+                        app.save_as_then(then);
+                    }
+                }
+            });
         }
 
         Dialog::Preferences { enabled, minutes, error } => {
@@ -1321,15 +1360,114 @@ fn format_size(bytes: u64) -> String {
 
 // ---- auto recovery -------------------------------------------------------------------------
 
-/// Returns `false` when the panel should close.
-fn recovery_panel(app: &mut CarbideApp, ctx: &egui::Context) -> bool {
-    let mut keep = true;
-    let rows = app.autosave.as_ref().map(|s| s.panel_rows()).unwrap_or_default();
-    let mut open_original: Option<usize> = None;
-    let mut open_recovered: Option<usize> = None;
-    let mut delete: Option<(usize, RowKind)> = None;
-    let mut clear_all = false;
+/// A question the Auto Recovery panel asks before it deletes recovered work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryQuestion {
+    /// Delete the recovered copy of the document `name`.
+    Delete { record: RecordId, name: String },
+    /// Delete every recovered document.
+    ClearAll,
+}
 
+impl RecoveryQuestion {
+    pub fn message(&self) -> String {
+        match self {
+            RecoveryQuestion::Delete { name, .. } => autosave_messages::delete_recovered(name),
+            RecoveryQuestion::ClearAll => autosave_messages::DELETE_ALL.to_string(),
+        }
+    }
+}
+
+/// What the user does in the Auto Recovery panel.
+#[derive(Clone, Debug)]
+pub enum RecoveryAction {
+    Open(RecordId, RowKind),
+    Delete(RecordId, RowKind),
+    ClearAll,
+    /// Yes to the panel's question.
+    Confirm,
+    /// No to the panel's question.
+    Cancel,
+}
+
+/// Carries out `action` in the Auto Recovery panel, whose pending question is `question`. Deleting
+/// a recovered copy, or all of them, only asks; it happens on `Confirm`. Returns whether the panel
+/// stays open.
+pub fn recovery_action(app: &mut CarbideApp, question: &mut Option<RecoveryQuestion>, action: RecoveryAction) -> bool {
+    match action {
+        RecoveryAction::Open(record, RowKind::Original) => {
+            let path = app.autosave.as_ref().and_then(|s| s.record(record)).and_then(|r| r.original.as_ref()).map(|o| o.path.clone());
+            match path {
+                Some(path) if path.exists() => {
+                    app.open_path(&path);
+                    return false;
+                }
+                _ => {
+                    if let Some(store) = app.autosave.as_mut() {
+                        let _ = store.remove_original(record);
+                    }
+                    app.alert("The original file no longer exists.".into());
+                }
+            }
+        }
+        RecoveryAction::Open(record, RowKind::Recovered) => {
+            app.open_recovered(record);
+            return false;
+        }
+        // The original row only lists the file; the file itself is never touched.
+        RecoveryAction::Delete(record, RowKind::Original) => {
+            if let Some(store) = app.autosave.as_mut() {
+                let _ = store.remove_original(record);
+            }
+        }
+        RecoveryAction::Delete(record, RowKind::Recovered) => {
+            let name = app.autosave.as_ref().and_then(|s| s.record(record)).map(|r| r.display_name()).unwrap_or_default();
+            *question = Some(RecoveryQuestion::Delete { record, name });
+        }
+        RecoveryAction::ClearAll => *question = Some(RecoveryQuestion::ClearAll),
+        RecoveryAction::Confirm => match question.take() {
+            Some(RecoveryQuestion::Delete { record, .. }) => {
+                if let Some(store) = app.autosave.as_mut() {
+                    let _ = store.remove_recovered(record);
+                }
+            }
+            Some(RecoveryQuestion::ClearAll) => {
+                if let Some(store) = app.autosave.as_mut() {
+                    let _ = store.remove_all_loaded();
+                }
+            }
+            None => {}
+        },
+        RecoveryAction::Cancel => *question = None,
+    }
+    true
+}
+
+/// Returns `false` when the panel should close.
+fn recovery_panel(app: &mut CarbideApp, ctx: &egui::Context, question: &mut Option<RecoveryQuestion>) -> bool {
+    let mut keep = true;
+    let mut action: Option<RecoveryAction> = None;
+
+    if let Some(asked) = question.clone() {
+        window(autosave_messages::PANEL_TITLE).show(ctx, |ui| {
+            ui.set_max_width(400.0);
+            ui.label(asked.message());
+            ui.weak("This cannot be undone.");
+            let (ok, cancel) = buttons(ui, "Delete", true);
+            if ok {
+                action = Some(RecoveryAction::Confirm);
+            }
+            if cancel {
+                action = Some(RecoveryAction::Cancel);
+            }
+        });
+        return match action {
+            Some(action) => recovery_action(app, question, action),
+            None => keep,
+        };
+    }
+
+    let rows = app.autosave.as_ref().map(|s| s.panel_rows()).unwrap_or_default();
     window(autosave_messages::PANEL_TITLE).show(ctx, |ui| {
         if rows.is_empty() {
             ui.label("There are no recovered documents.");
@@ -1344,67 +1482,27 @@ fn recovery_panel(app: &mut CarbideApp, ctx: &egui::Context) -> bool {
                 ui.label(row.last_saved);
                 ui.label(format_time(row.save_time));
                 if ui.button("Open").clicked() {
-                    match row.kind {
-                        RowKind::Original => open_original = Some(row.record as usize),
-                        RowKind::Recovered => open_recovered = Some(row.record as usize),
-                    }
+                    action = Some(RecoveryAction::Open(row.record, row.kind));
                 }
                 if ui.button("Delete").clicked() {
-                    delete = Some((row.record as usize, row.kind));
+                    action = Some(RecoveryAction::Delete(row.record, row.kind));
                 }
                 ui.end_row();
             }
         });
         ui.horizontal(|ui| {
             if ui.add_enabled(!rows.is_empty(), egui::Button::new(autosave_messages::CLEAR_ALL)).clicked() {
-                clear_all = true;
+                action = Some(RecoveryAction::ClearAll);
             }
             if ui.button("Close").clicked() {
                 keep = false;
             }
         });
     });
-
-    if let Some(id) = open_original {
-        let path = app.autosave.as_ref().and_then(|s| s.record(id as u64)).and_then(|r| r.original.as_ref()).map(|o| o.path.clone());
-        match path {
-            Some(path) if path.exists() => app.spawn_window(&path),
-            _ => {
-                if let Some(store) = app.autosave.as_mut() {
-                    let _ = store.remove_original(id as u64);
-                }
-                app.alert("The original file no longer exists.".into());
-            }
-        }
+    match action {
+        Some(action) => recovery_action(app, question, action) && keep,
+        None => keep,
     }
-    if let Some(id) = open_recovered {
-        let opened = app.autosave.as_ref().map(|s| s.open_recovered(id as u64, None));
-        match opened {
-            Some(Ok((mut pdf, title))) => {
-                let target = std::env::temp_dir().join(format!("{}.pdf", title.replace(['/', ':'], "-")));
-                match pdf.save(&target) {
-                    Ok(()) => app.spawn_window(&target),
-                    Err(e) => app.alert(e.to_string()),
-                }
-            }
-            Some(Err(e)) => app.alert(e.to_string()),
-            None => {}
-        }
-    }
-    if let Some((id, kind)) = delete {
-        if let Some(store) = app.autosave.as_mut() {
-            let _ = match kind {
-                RowKind::Original => store.remove_original(id as u64),
-                RowKind::Recovered => store.remove_recovered(id as u64),
-            };
-        }
-    }
-    if clear_all {
-        if let Some(store) = app.autosave.as_mut() {
-            let _ = store.remove_all_loaded();
-        }
-    }
-    keep
 }
 
 /// The time a document time stamp gives, in local time.
