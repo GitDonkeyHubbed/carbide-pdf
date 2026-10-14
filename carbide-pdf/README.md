@@ -84,8 +84,12 @@ zoom (fit width, fit page, actual size; pinch or Ctrl-scroll also zooms). All ic
 `crates/app/src/icons.rs`; no artwork from the original product is used.
 
 Shortcuts: Cmd+N new document, Cmd+O open, Cmd+S save, Cmd+W close tab (asks about unsaved changes), Cmd+Z undo,
-Cmd+Shift+Z redo, Cmd+= and Cmd+- zoom. Closing the window, or choosing Quit, asks about every document with unsaved
-changes first (on macOS the application menu's Quit is rewired to close the window so it cannot skip that question).
+Cmd+Shift+Z redo, Cmd+= and Cmd+- zoom. Closing the window, choosing Quit (or Cmd+Q), quitting from the Dock or with
+AppleScript, and logging out, restarting or shutting down all ask about every document with unsaved changes first. A
+quit that macOS asks for while changes are unsaved is cancelled and the question is shown instead (the app adds an
+`applicationShouldTerminate:` handler to the app delegate winit installs); a logout, restart or shutdown then stops,
+macOS names Carbide PDF as the app that stopped it, and it has to be started again once the question is answered. If
+the app ends without asking (it is killed, say), documents with unsaved changes keep their Auto Recovery copies.
 Forms is empty: form fields are not implemented.
 
 Add Location on the Start screen lists the cloud folders it finds on the computer (iCloud Drive, and the folders that the

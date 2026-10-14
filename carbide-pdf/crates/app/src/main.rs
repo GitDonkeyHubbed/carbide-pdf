@@ -3,6 +3,7 @@
 mod dialogs;
 mod icons;
 mod paths;
+mod quit;
 mod ribbon;
 mod shell;
 #[cfg(test)]
@@ -296,7 +297,7 @@ pub struct CarbideApp {
 impl CarbideApp {
     fn new(cc: &eframe::CreationContext<'_>, launch: Option<Launch>) -> Self {
         theme::apply(&cc.egui_ctx);
-        route_quit_through_window_close();
+        guard_quitting(&cc.egui_ctx);
         let (renderer, renderer_error) = match Renderer::global() {
             Ok(r) => (Some(r), None),
             Err(e) => (None, Some(e.to_string())),
@@ -1065,6 +1066,28 @@ impl CarbideApp {
     }
 
     // ---- auto save ---------------------------------------------------------------------
+
+    /// True when some open document has unsaved changes.
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.doc.iter().chain(self.tabs.iter().flatten()).any(|d| d.dirty)
+    }
+
+    /// Lets go of every document as the app ends without its window being closed. A document with
+    /// unsaved changes, which only gets here when something ended the app without the quit
+    /// question, gets a last Auto Recovery copy and keeps its record, so it is offered next time.
+    fn release_on_exit(&mut self) {
+        self.park_active();
+        let Some(store) = self.autosave.as_mut() else { return };
+        for doc in self.tabs.drain(..).flatten() {
+            let Some(id) = doc.record else { continue };
+            let mut copy = doc.pdf.clone();
+            let kept = doc.dirty && !doc.is_protected() && store.autosave(id, &mut copy, now_unix()).is_ok();
+            if !kept {
+                let _ = store.document_closed(id);
+            }
+        }
+        self.active_tab = None;
+    }
 
     /// Writes the Auto Recovery copy of each document whose own interval has passed.
     fn autosave_tick(&mut self) {
@@ -1868,6 +1891,10 @@ impl eframe::App for CarbideApp {
         }
         self.handle_shortcuts(ui.ctx());
         self.handle_close_request(ui.ctx());
+        // Quitting asked for from outside the window: the Dock, logging out, AppleScript, Quit.
+        if quit::take_request() {
+            self.on_system_quit(ui.ctx());
+        }
 
         self.autosave_tick();
         self.poll_ocr();
@@ -1879,6 +1906,13 @@ impl eframe::App for CarbideApp {
 
         dialogs::show(self, ui.ctx());
         self.prompts(ui.ctx());
+        quit::set_unsaved(self.has_unsaved_changes());
+    }
+
+    /// The app ends without its window closing first when quitting went ahead with nothing
+    /// unsaved (see `quit`).
+    fn on_exit(&mut self) {
+        self.release_on_exit();
     }
 }
 
@@ -1918,9 +1952,18 @@ impl eframe::App for IconSheet {
     }
 }
 
-/// winit's application menu ends the process from "Quit" (and Cmd+Q) without any close request, so
-/// unsaved documents would be lost silently. Pointing the item at `performClose:` makes it close the
-/// key window instead, which goes through the same prompt as the window's close button.
+/// Makes every way of quitting ask about unsaved documents first (see `quit`). Where that cannot
+/// be set up, the application menu's Quit (and Cmd+Q) at least goes through the window's close
+/// button, which asks.
+fn guard_quitting(ctx: &egui::Context) {
+    if !quit::install(ctx) {
+        route_quit_through_window_close();
+    }
+}
+
+/// Points the application menu's Quit item (and Cmd+Q) at `performClose:`, so that it closes the
+/// key window, which goes through the same prompt as the window's close button. It then does
+/// nothing while the only window is minimized, which is why this is only the fallback.
 #[cfg(target_os = "macos")]
 fn route_quit_through_window_close() {
     use objc2::{sel, MainThreadMarker};

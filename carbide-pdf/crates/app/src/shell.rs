@@ -546,6 +546,25 @@ impl CarbideApp {
         }
     }
 
+    /// Quitting asked for from outside the window (see `quit`): with unsaved changes the quit
+    /// question goes up; otherwise the documents are let go and the window closes.
+    pub fn on_system_quit(&mut self, ctx: &egui::Context) {
+        if self.shell.quit_confirmed {
+            return;
+        }
+        if self.has_unsaved_changes() {
+            self.shell.quit_prompt = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        } else {
+            self.finish_quit(ctx);
+        }
+    }
+
+    /// True while the question about unsaved changes before quitting is up.
+    pub fn quit_prompt_shown(&self) -> bool {
+        self.shell.quit_prompt
+    }
+
     /// Drops every open document, and with it its Auto Recovery record.
     fn release_all_documents(&mut self) {
         self.park_active();
@@ -654,6 +673,7 @@ impl CarbideApp {
     fn finish_quit(&mut self, ctx: &egui::Context) {
         self.shell.quit_prompt = false;
         self.shell.quit_confirmed = true;
+        crate::quit::set_confirmed();
         self.release_all_documents();
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }

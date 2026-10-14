@@ -913,3 +913,44 @@ fn commands_that_would_do_nothing_are_disabled_and_unchanged_documents_stay_unch
     app.open_path(&plain(&dir, "one.pdf", &["ONLY"]));
     assert!(!app.cmd_enabled(Cmd::PageDelete), "a document keeps at least one page");
 }
+
+#[test]
+fn quitting_from_outside_the_window_asks_about_unsaved_documents() {
+    use crate::quit::may_terminate;
+    // What applicationShouldTerminate: answers: go ahead unless something is unsaved and the
+    // question has not been answered.
+    assert!(may_terminate(false, false));
+    assert!(!may_terminate(true, false));
+    assert!(may_terminate(true, true));
+
+    let ctx = egui::Context::default();
+    let dir = scratch();
+    let mut app = app(&dir);
+    app.open_path(&plain(&dir, "a.pdf", &["A"]));
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    app.open_path(&plain(&dir, "b.pdf", &["B"]));
+    assert!(app.has_unsaved_changes());
+    // The question goes up, and nothing is closed or saved yet.
+    app.on_system_quit(&ctx);
+    assert!(app.quit_prompt_shown());
+    assert_eq!(app.tabs.len(), 2);
+
+    // With nothing unsaved the documents are let go and the window closes.
+    let dir = scratch();
+    let mut clean = crate::tests::app(&dir);
+    clean.open_path(&plain(&dir, "c.pdf", &["C"]));
+    clean.on_system_quit(&ctx);
+    assert!(clean.tabs.is_empty() && !clean.quit_prompt_shown());
+}
+
+#[test]
+fn ending_without_the_quit_question_keeps_unsaved_work_recoverable() {
+    let dir = scratch();
+    let mut app = app(&dir);
+    app.open_path(&plain(&dir, "a.pdf", &["A"]));
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    app.open_path(&plain(&dir, "b.pdf", &["B"]));
+    app.release_on_exit();
+    assert!(app.tabs.is_empty() && app.doc.is_none());
+    assert_eq!(recovery_copies(&dir), 1, "the unsaved document has no recovery copy");
+}
