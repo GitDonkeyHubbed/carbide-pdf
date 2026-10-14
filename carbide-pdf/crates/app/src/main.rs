@@ -3,13 +3,14 @@
 mod dialogs;
 mod icons;
 mod paths;
+mod quit;
 mod ribbon;
 mod shell;
 #[cfg(test)]
 mod tests;
 mod theme;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -56,6 +57,9 @@ pub struct OpenDoc {
     pub version: u64,
     pub record: Option<RecordId>,
     pub dirty: bool,
+    /// When this document's Auto Recovery copy was last considered: each document keeps its own
+    /// interval, counted from when it was opened, so opening one never delays another's copy.
+    autosaved_at: Instant,
     /// What a document without a file is called (an earlier revision, say); `None` for Untitled.
     pub name: Option<String>,
     /// Set for a document opened from an Auto Recovery copy, until it is saved.
@@ -88,7 +92,7 @@ impl OpenDoc {
     fn new(mut pdf: Pdf, path: Option<PathBuf>, saved: Option<SavedFile>) -> Result<Self, EngineError> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let bytes = pdf.to_bytes()?;
-        let geometries = (0..pdf.page_count()).filter_map(|i| pdf.page_geometry(i).ok()).collect();
+        let geometries = pdf.page_geometries();
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             pdf,
@@ -99,6 +103,7 @@ impl OpenDoc {
             version: 0,
             record: None,
             dirty: false,
+            autosaved_at: Instant::now(),
             name: None,
             recovered: None,
             geometries,
@@ -113,7 +118,7 @@ impl OpenDoc {
     /// Re-derives bytes and geometry after the PDF object changed.
     fn refresh(&mut self) -> Result<(), EngineError> {
         self.bytes = self.pdf.to_bytes()?;
-        self.geometries = (0..self.pdf.page_count()).filter_map(|i| self.pdf.page_geometry(i).ok()).collect();
+        self.geometries = self.pdf.page_geometries();
         self.version += 1;
         Ok(())
     }
@@ -229,6 +234,18 @@ struct SignJob {
     result: Option<Result<Vec<u8>, String>>,
 }
 
+/// How an edit changed the pages (see [`CarbideApp::follow_page_change`]).
+#[derive(Clone, Copy, Debug)]
+pub enum PageChange {
+    /// A page was inserted so that it is now at this index.
+    Inserted(usize),
+    Deleted(usize),
+    /// A page was taken out at `from` and put back so that it is at `to`.
+    Moved { from: usize, to: usize },
+    /// A page was turned a quarter turn.
+    Turned { page: usize, clockwise: bool },
+}
+
 #[derive(Clone, Copy)]
 struct DragState {
     page: usize,
@@ -251,16 +268,20 @@ pub struct CarbideApp {
     pub tool: Tool,
     zoom: f32,
     pub status: String,
+    /// The dialog on screen. Others wait in `queued_dialogs` (see [`CarbideApp::queue_dialog`]).
     pub dialog: Option<Dialog>,
+    queued_dialogs: VecDeque<Dialog>,
     textures: HashMap<(u64, usize, u32), egui::TextureHandle>,
     thumbs: HashMap<(u64, usize), egui::TextureHandle>,
+    /// Whether each page of the active document, by version, can be rendered safely (see
+    /// [`Pdf::check_drawable`]).
+    drawable: HashMap<(u64, usize), bool>,
     drag: Option<DragState>,
     pub pending_redactions: Vec<Redaction>,
     pub current_page: usize,
     scroll_to: Option<usize>,
     pub autosave: Option<AutoSaveStore>,
     pub settings: AutoSaveSettings,
-    last_autosave: Instant,
     /// A running (or finished, not yet applied) OCR job.
     ocr_job: Option<OcrJob>,
     /// A signature waiting for (or holding, not yet written) its time stamp.
@@ -279,23 +300,28 @@ pub struct CarbideApp {
 impl CarbideApp {
     fn new(cc: &eframe::CreationContext<'_>, launch: Option<Launch>) -> Self {
         theme::apply(&cc.egui_ctx);
-        route_quit_through_window_close();
+        guard_quitting(&cc.egui_ctx);
         let (renderer, renderer_error) = match Renderer::global() {
             Ok(r) => (Some(r), None),
             Err(e) => (None, Some(e.to_string())),
         };
         let autosave = AutoSaveStore::open(paths::autosave_dir()).ok();
         let mut app = Self::with_parts(renderer, renderer_error, autosave, paths::load_autosave_settings());
+        app.launch(launch);
+        app
+    }
+
+    /// Opens what the window was started with, then offers the documents an earlier session left
+    /// for recovery. The recovery panel waits behind a question the opening asked (a password).
+    fn launch(&mut self, launch: Option<Launch>) {
         match launch {
-            Some(Launch::File(path)) => app.open_path(&path),
-            Some(Launch::Copy(path)) => app.open_copy(&path),
+            Some(Launch::File(path)) => self.open_path(&path),
+            Some(Launch::Copy(path)) => self.open_copy(&path),
             None => {}
         }
-        // Launch: show recovered documents waiting from an earlier session.
-        if app.autosave.as_ref().is_some_and(|s| s.any_needs_save()) {
-            app.dialog = Some(Dialog::auto_recovery());
+        if self.autosave.as_ref().is_some_and(|s| s.any_needs_save()) {
+            self.queue_dialog(Dialog::auto_recovery());
         }
-        app
     }
 
     /// The application state without a window, so it can also be driven by tests.
@@ -313,15 +339,16 @@ impl CarbideApp {
             zoom: 1.25,
             status: "Open a PDF, or drop one on the window.".into(),
             dialog: None,
+            queued_dialogs: VecDeque::new(),
             textures: HashMap::new(),
             thumbs: HashMap::new(),
+            drawable: HashMap::new(),
             drag: None,
             pending_redactions: Vec::new(),
             current_page: 0,
             scroll_to: None,
             autosave,
             settings,
-            last_autosave: Instant::now(),
             ocr_job: None,
             sign_job: None,
             notice: None,
@@ -355,7 +382,7 @@ impl CarbideApp {
                 self.install(pdf, Some(path.to_path_buf()), Some(saved));
             }
             Err(EngineError::PasswordRequired) => {
-                self.dialog = Some(Dialog::Password { path: path.to_path_buf(), bytes, input: String::new(), failed: false });
+                self.open_dialog(Dialog::Password { path: path.to_path_buf(), bytes, input: String::new(), failed: false });
             }
             Err(e) => self.alert(format!("Could not open {}: {e}", path.display())),
         }
@@ -438,7 +465,6 @@ impl CarbideApp {
                 self.pending_redactions.clear();
                 self.current_page = 0;
                 self.scroll_to = Some(0);
-                self.last_autosave = Instant::now();
                 if let Some(path) = path {
                     self.push_recent(&path);
                 }
@@ -448,10 +474,16 @@ impl CarbideApp {
     }
 
     fn reset_view_caches(&mut self) {
-        self.textures.clear();
-        self.thumbs.clear();
+        self.forget_page_images();
         self.drag = None;
         self.shell.forget_caches();
+    }
+
+    /// Drops the page images and what is known about drawing the pages, after the document changed.
+    fn forget_page_images(&mut self) {
+        self.textures.clear();
+        self.thumbs.clear();
+        self.drawable.clear();
     }
 
     /// The document in tab `index`, whether it is the active one or parked.
@@ -481,11 +513,42 @@ impl CarbideApp {
     }
 
     /// A pending question about the active document (whether to save, replace files, ...) belongs
-    /// to it. Whenever that document is put away (another one opened, created or brought forward,
-    /// or this one closed) the question goes, so answering it can never act on a different document.
+    /// to it, and so does a dialog that acts on it. Whenever that document is put away (another one
+    /// opened, created or brought forward, or this one closed) they go, waiting ones included, so
+    /// answering one can never act on a different document.
     fn drop_document_question(&mut self) {
         if self.dialog.as_ref().is_some_and(|d| d.document().is_some()) {
             self.dialog = None;
+        }
+        self.queued_dialogs.retain(|d| d.document().is_none());
+        self.next_dialog();
+    }
+
+    /// Shows `dialog` in place of the one on screen, as a command does. A password question is
+    /// never replaced: the file it would open would be dropped. `dialog` waits behind it instead.
+    pub fn open_dialog(&mut self, dialog: Dialog) {
+        if matches!(self.dialog, Some(Dialog::Password { .. })) {
+            self.queued_dialogs.push_back(dialog);
+        } else {
+            self.dialog = Some(dialog);
+        }
+    }
+
+    /// Shows `dialog` once every dialog before it has closed: now, when none is on screen. What
+    /// background work and launch have to say waits like this, so it never takes the place of a
+    /// dialog the user is answering.
+    pub fn queue_dialog(&mut self, dialog: Dialog) {
+        if self.dialog.is_none() {
+            self.dialog = Some(dialog);
+        } else {
+            self.queued_dialogs.push_back(dialog);
+        }
+    }
+
+    /// Brings up the next waiting dialog when none is on screen.
+    pub(crate) fn next_dialog(&mut self) {
+        if self.dialog.is_none() {
+            self.dialog = self.queued_dialogs.pop_front();
         }
     }
 
@@ -591,7 +654,7 @@ impl CarbideApp {
         }
         let refs: Vec<&Pdf> = documents.iter().collect();
         if Pdf::shared_protection(&refs).is_err() {
-            self.dialog = Some(Dialog::ConfirmCombine { documents });
+            self.open_dialog(Dialog::ConfirmCombine { documents });
             return;
         }
         match Pdf::merge(&refs) {
@@ -611,25 +674,62 @@ impl CarbideApp {
 
     pub fn alert(&mut self, message: String) {
         self.status = message.lines().next().unwrap_or_default().to_string();
-        self.dialog = Some(Dialog::Message(message));
+        self.queue_dialog(Dialog::Message(message));
     }
 
-    /// Runs an edit on the open document with undo support.
-    pub fn edit(&mut self, label: &str, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) {
-        self.run_edit(label, false, f);
+    /// Runs an edit on the open document with undo support, and returns whether it was made.
+    pub fn edit(&mut self, label: &str, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) -> bool {
+        self.run_edit(label, false, f)
     }
 
     /// Runs an edit that takes content out of the document, such as applying redactions or
     /// deleting pages. The next Save then writes a clean file instead of appending to the old one.
-    pub fn edit_removing(&mut self, label: &str, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) {
-        self.run_edit(label, true, f);
+    pub fn edit_removing(&mut self, label: &str, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) -> bool {
+        self.run_edit(label, true, f)
     }
 
-    /// Runs an edit, and returns whether it was made.
+    /// Moves what is placed on pages along with an edit that changed the pages, so that each still
+    /// sits on what it was placed on: the marked redactions, and the page and spot of a note or a
+    /// visible signature waiting in a dialog. One on a deleted page goes, one on a moved page moves,
+    /// one on a turned page turns with it. `before` is the page geometry from before the edit.
+    pub fn follow_page_change(&mut self, change: PageChange, before: &[PageGeometry]) {
+        let marks = std::mem::take(&mut self.pending_redactions);
+        self.pending_redactions = marks
+            .into_iter()
+            .filter_map(|Redaction { page, rect }| {
+                let (page, rect) = follow(change, before, page, rect)?;
+                Some(Redaction { page, rect })
+            })
+            .collect();
+        let dialogs = self.dialog.take().into_iter().chain(std::mem::take(&mut self.queued_dialogs));
+        let kept: VecDeque<Dialog> = dialogs.filter_map(|dialog| dialog.follow(|page, rect| follow(change, before, page, rect))).collect();
+        self.queued_dialogs = kept;
+        self.next_dialog();
+    }
+
+    /// Drops the dialogs that place something on a page, after the pages changed in a way that
+    /// cannot be followed (going back or forward through the edit history).
+    fn drop_placed_dialogs(&mut self) {
+        let dialogs = self.dialog.take().into_iter().chain(std::mem::take(&mut self.queued_dialogs));
+        self.queued_dialogs = dialogs.filter(|dialog| !dialog.places_on_page()).collect();
+        self.next_dialog();
+    }
+
+    /// Runs an edit, and returns whether it was made. One that changed nothing (moving a page to
+    /// where it is, say) is not recorded: no undo step, nothing to save. An edit that removes
+    /// content always counts, since what it removed can be held by the file alone.
     fn run_edit(&mut self, label: &str, removes: bool, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) -> bool {
         let Some(doc) = self.doc.as_mut() else { return false };
         let snapshot = Snapshot { bytes: doc.bytes.clone(), content_removed: doc.content_removed };
+        let version = doc.version;
+        // Compared as objects: writing a file numbers its cross-reference stream afresh each time.
+        let before = (!removes).then(|| doc.pdf.document().objects.clone());
         match f(&mut doc.pdf).and_then(|_| doc.refresh()) {
+            Ok(()) if before.as_ref() == Some(&doc.pdf.document().objects) => {
+                doc.version = version;
+                self.status = format!("{label}: nothing changed.");
+                false
+            }
             Ok(()) => {
                 doc.undo.push(snapshot);
                 if doc.undo.len() > MAX_UNDO {
@@ -639,8 +739,7 @@ impl CarbideApp {
                 doc.content_removed = doc.content_removed || doc.removes_content(removes);
                 doc.dirty = true;
                 self.status = format!("{label} done.");
-                self.textures.clear();
-                self.thumbs.clear();
+                self.forget_page_images();
                 true
             }
             Err(e) => {
@@ -677,9 +776,9 @@ impl CarbideApp {
                 }
                 doc.dirty = true;
                 self.status = if undo { "Undid last change." } else { "Redid last change." }.into();
-                self.textures.clear();
-                self.thumbs.clear();
+                self.forget_page_images();
                 self.pending_redactions.clear();
+                self.drop_placed_dialogs();
             }
             Err(e) => self.alert(format!("Could not {}: {e}", if undo { "undo" } else { "redo" })),
         }
@@ -717,15 +816,15 @@ impl CarbideApp {
         };
         if let SavePlan::FullRewrite { breaks_signatures, drops_revisions } = plan {
             if plan.needs_confirmation() && confirmed.is_none() {
-                self.dialog = Some(Dialog::ConfirmRewrite {
+                let question = Dialog::ConfirmRewrite {
                     doc: doc.id,
                     path: path.to_path_buf(),
                     content_removed: doc.content_removed,
                     breaks_signatures,
                     drops_revisions,
                     then,
-                });
-                return;
+                };
+                return self.open_dialog(question);
             }
         }
         let in_place = doc.path.as_deref() == Some(path);
@@ -789,8 +888,7 @@ impl CarbideApp {
                 let _ = store.remove_record(recovered.record);
             }
         }
-        self.textures.clear();
-        self.thumbs.clear();
+        self.forget_page_images();
         self.shell.forget_caches();
         self.notice = signature_notice(self.doc.as_ref().expect("checked above"));
     }
@@ -808,7 +906,7 @@ impl CarbideApp {
             return self.write_to(&path, None, then);
         }
         match doc.recovered.as_ref().and_then(|r| r.original.clone()).filter(|p| p.exists()) {
-            Some(original) => self.dialog = Some(Dialog::ReplaceOriginal { doc: doc.id, path: original, then }),
+            Some(original) => self.open_dialog(Dialog::ReplaceOriginal { doc: doc.id, path: original, then }),
             None => self.save_as_then(then),
         }
     }
@@ -970,15 +1068,42 @@ impl CarbideApp {
 
     // ---- auto save ---------------------------------------------------------------------
 
+    /// True when some open document has unsaved changes.
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.doc.iter().chain(self.tabs.iter().flatten()).any(|d| d.dirty)
+    }
+
+    /// Lets go of every document as the app ends without its window being closed. A document with
+    /// unsaved changes, which only gets here when something ended the app without the quit
+    /// question, gets a last Auto Recovery copy and keeps its record, so it is offered next time.
+    fn release_on_exit(&mut self) {
+        self.park_active();
+        let Some(store) = self.autosave.as_mut() else { return };
+        for doc in self.tabs.drain(..).flatten() {
+            let Some(id) = doc.record else { continue };
+            let mut copy = doc.pdf.clone();
+            let kept = doc.dirty && !doc.is_protected() && store.autosave(id, &mut copy, now_unix()).is_ok();
+            if !kept {
+                let _ = store.document_closed(id);
+            }
+        }
+        self.active_tab = None;
+    }
+
+    /// Writes the Auto Recovery copy of each document whose own interval has passed.
     fn autosave_tick(&mut self) {
-        if !self.settings.enabled || self.last_autosave.elapsed() < self.settings.interval() {
+        if !self.settings.enabled {
             return;
         }
-        self.last_autosave = Instant::now();
+        let interval = self.settings.interval();
         let Some(store) = self.autosave.as_mut() else { return };
         let mut saved = 0;
         let mut failure = None;
         for doc in self.doc.iter_mut().chain(self.tabs.iter_mut().flatten()) {
+            if doc.autosaved_at.elapsed() < interval {
+                continue;
+            }
+            doc.autosaved_at = Instant::now();
             let Some(id) = doc.record else { continue };
             // Its recovery copy would hold the content unencrypted.
             if doc.is_protected() {
@@ -1007,23 +1132,26 @@ impl CarbideApp {
         let count = doc.pdf.page_count();
         let bytes = &doc.bytes;
         let geometries = &doc.geometries;
+        let drawable = &mut self.drawable;
         let mut goto: Option<usize> = None;
+        let mut shown = std::collections::HashSet::new();
+        let max_side = max_texture_side(ui.ctx().input(|i| i.max_texture_side));
         egui::ScrollArea::vertical().show(ui, |ui| {
             for page in 0..count {
-                let (w, h) = geometries.get(page).map(|g| g.display_size()).unwrap_or((612.0, 792.0));
-                let width = 110.0f32;
-                let size = egui::vec2(width, width * h / w.max(1.0));
-                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+                let (w, h) = layout_size(geometries.get(page).map(|g| g.display_size()).unwrap_or((612.0, 792.0)));
+                let size = thumbnail_size((w, h));
+                let (column, response) = ui.allocate_exact_size(egui::vec2(THUMBNAIL_WIDTH, size.y), egui::Sense::click());
+                let rect = egui::Rect::from_center_size(column.center(), size);
                 if ui.is_rect_visible(rect) {
                     let key = (version, page);
-                    if !self.thumbs.contains_key(&key) {
-                        let dpi = 72.0 * width / w.max(1.0) * ui.ctx().pixels_per_point();
-                        if let Ok(image) = renderer.render_page(bytes, page, dpi) {
-                            let color = egui::ColorImage::from_rgba_unmultiplied(
-                                [image.width() as usize, image.height() as usize],
-                                image.as_raw(),
-                            );
-                            let texture = ui.ctx().load_texture(format!("thumb-{version}-{page}"), color, egui::TextureOptions::LINEAR);
+                    shown.insert(key);
+                    if !self.thumbs.contains_key(&key) && page_drawable(drawable, doc, page) {
+                        let [tw, th] = texture_size((w, h), size.x * ui.ctx().pixels_per_point(), max_side);
+                        let texture = renderer
+                            .render_page_fitting(bytes, page, tw, th)
+                            .ok()
+                            .and_then(|image| page_texture(ui.ctx(), format!("thumb-{version}-{page}"), &image, max_side));
+                        if let Some(texture) = texture {
                             self.thumbs.insert(key, texture);
                         }
                     }
@@ -1034,6 +1162,8 @@ impl CarbideApp {
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
                         );
+                    } else {
+                        ui.painter().rect_filled(rect, 0.0, egui::Color32::WHITE);
                     }
                     let outline = if page == self.current_page { theme::ACCENT } else { egui::Color32::GRAY };
                     ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.5, outline), egui::StrokeKind::Outside);
@@ -1044,6 +1174,10 @@ impl CarbideApp {
                 }
             }
         });
+        // Thumbnails scrolled out of view go once they hold more than their share of memory.
+        if !thumbnails_fit(self.thumbs.values().map(|texture| texture.size())) {
+            self.thumbs.retain(|key, _| shown.contains(key));
+        }
         if let Some(page) = goto {
             self.scroll_to = Some(page);
             self.current_page = page;
@@ -1064,17 +1198,17 @@ impl CarbideApp {
         // Fit modes and pinch / ctrl-scroll zoom adjust the zoom before the pages are laid out.
         let pinch = ui.ctx().input(|i| i.zoom_delta());
         if (pinch - 1.0).abs() > 1e-3 && ui.rect_contains_pointer(ui.max_rect()) {
-            self.zoom = (self.zoom * pinch).clamp(0.25, 6.0);
+            self.zoom = (self.zoom * pinch).clamp(shell::MIN_ZOOM, shell::MAX_ZOOM);
             self.shell.fit = shell::Fit::Manual;
         }
         if self.shell.fit != shell::Fit::Manual {
             if let Some(g) = self.doc.as_ref().and_then(|d| d.geometries.get(self.current_page)) {
-                let (w, h) = g.display_size();
+                let (w, h) = layout_size(g.display_size());
                 let avail = ui.available_size();
                 let by_width = (avail.x - 48.0) / w.max(1.0);
                 let by_height = (avail.y - 24.0) / h.max(1.0);
                 let fitted = if self.shell.fit == shell::Fit::Width { by_width } else { by_width.min(by_height) };
-                self.zoom = fitted.clamp(0.25, 6.0);
+                self.zoom = fitted.clamp(shell::MIN_ZOOM, shell::MAX_ZOOM);
             }
         }
 
@@ -1090,13 +1224,15 @@ impl CarbideApp {
             let geometries = &doc.geometries;
             let pending = &self.pending_redactions;
             let textures = &mut self.textures;
+            let drawable = &mut self.drawable;
             let pixels_per_point = ui.ctx().pixels_per_point();
+            let max_side = max_texture_side(ui.ctx().input(|i| i.max_texture_side));
             let viewport_top = ui.clip_rect().min.y;
 
             egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     for page in 0..count {
-                        let (w, h) = geometries.get(page).map(|g| g.display_size()).unwrap_or((612.0, 792.0));
+                        let (w, h) = layout_size(geometries.get(page).map(|g| g.display_size()).unwrap_or((612.0, 792.0)));
                         let size = egui::vec2(w * zoom, h * zoom);
                         let sense = if tool == Tool::Select { egui::Sense::hover() } else { egui::Sense::click_and_drag() };
                         let (rect, response) = ui.allocate_exact_size(size, sense);
@@ -1111,24 +1247,27 @@ impl CarbideApp {
                         ui.painter().rect_filled(rect.translate(egui::vec2(3.0, 3.0)), 0.0, egui::Color32::from_black_alpha(40));
                         ui.painter().rect_filled(rect, 0.0, egui::Color32::WHITE);
 
-                        if ui.is_rect_visible(rect) {
-                            let px_width = (size.x * pixels_per_point).round().clamp(64.0, 5000.0) as u32;
-                            let key = (version, page, px_width);
+                        if ui.is_rect_visible(rect) && !page_drawable(drawable, doc, page) {
+                            ui.painter().text(
+                                rect.center_top() + egui::vec2(0.0, 40.0),
+                                egui::Align2::CENTER_CENTER,
+                                "This page is too complex to show safely.",
+                                egui::FontId::proportional(14.0),
+                                egui::Color32::DARK_GRAY,
+                            );
+                        } else if ui.is_rect_visible(rect) {
+                            let [tw, th] = texture_size((w, h), size.x * pixels_per_point, max_side);
+                            let key = (version, page, tw);
                             if !textures.contains_key(&key) {
-                                if textures.len() > 24 {
+                                let cached: usize = textures.values().map(|t| t.size()[0] * t.size()[1]).sum();
+                                if textures.len() > 24 || cached + (tw * th) as usize > TEXTURE_CACHE_PIXELS {
                                     textures.clear();
                                 }
-                                let dpi = 72.0 * px_width as f32 / w.max(1.0);
-                                if let Ok(image) = renderer.render_page(bytes, page, dpi) {
-                                    let color = egui::ColorImage::from_rgba_unmultiplied(
-                                        [image.width() as usize, image.height() as usize],
-                                        image.as_raw(),
-                                    );
-                                    let texture = ui.ctx().load_texture(
-                                        format!("page-{version}-{page}-{px_width}"),
-                                        color,
-                                        egui::TextureOptions::LINEAR,
-                                    );
+                                let texture = renderer
+                                    .render_page_fitting(bytes, page, tw, th)
+                                    .ok()
+                                    .and_then(|image| page_texture(ui.ctx(), format!("page-{version}-{page}-{tw}"), &image, max_side));
+                                if let Some(texture) = texture {
                                     textures.insert(key, texture);
                                 }
                             }
@@ -1210,10 +1349,11 @@ impl CarbideApp {
         }
         self.drag = drag;
 
+        let doc_id = self.doc.as_ref().map(|d| d.id).unwrap_or_default();
         for action in actions {
             match action {
                 Action::SignArea { page, rect } => {
-                    self.dialog = Some(Dialog::sign(Some((page, rect)), false));
+                    self.open_dialog(Dialog::sign(doc_id, Some((page, rect)), false));
                     self.tool = Tool::Select;
                 }
                 Action::Visible(page) => self.current_page = page,
@@ -1222,13 +1362,15 @@ impl CarbideApp {
                     self.status = "Redaction marked. Security > Apply removes the marked content.".into();
                 }
                 Action::NotePrompt { page, x, y, on_page } => {
-                    self.dialog = Some(Dialog::Note { page, x, y, on_page, text: String::new() });
+                    self.open_dialog(Dialog::Note { doc: doc_id, page, x, y, on_page, text: String::new() });
                 }
                 Action::Markup { page, rect, style, snap } => {
-                    let (bytes, geometry) = match self.doc.as_ref() {
-                        Some(d) => (d.bytes.clone(), d.geometries.get(page).copied()),
+                    let (bytes, geometry, readable) = match self.doc.as_ref() {
+                        Some(d) => (d.bytes.clone(), d.geometries.get(page).copied(), page_drawable(&mut self.drawable, d, page)),
                         None => continue,
                     };
+                    // Reading the text of a page that cannot be rendered safely is no safer.
+                    let snap = snap && readable;
                     // Snap to the text lines inside the dragged area; fall back to the area itself.
                     let lines = match (snap, geometry) {
                         (true, Some(g)) => match renderer.text_line_rects(&bytes, page, &g, rect) {
@@ -1313,7 +1455,12 @@ impl CarbideApp {
     // ---- signatures --------------------------------------------------------------------
 
     /// Signs the document file in place. The document is saved first when it has unsaved edits.
+    /// Nothing is signed when the document the request was made for is no longer in front.
     pub fn sign_document(&mut self, request: dialogs::SignRequest) {
+        if self.doc.as_ref().map(|d| d.id) != Some(request.doc) {
+            self.status = "Nothing was signed: the document it was for is no longer in front.".into();
+            return;
+        }
         if self.doc.as_ref().and_then(|d| d.saved.as_ref()).is_some_and(SavedFile::is_protected) {
             return self.alert("Password-protected documents cannot be signed.".into());
         }
@@ -1411,13 +1558,13 @@ impl CarbideApp {
 
     pub fn validate_signatures(&mut self) {
         let Some(doc) = self.doc.as_ref() else { return };
-        let bytes = doc.saved.as_ref().map(|s| s.bytes().to_vec()).unwrap_or_else(|| doc.bytes.clone());
-        match Pdf::verify_signatures(&bytes, &paths::load_trust_store(), chrono::Utc::now()) {
+        let (bytes, password) = signed_file(doc);
+        match Pdf::verify_signatures_with_password(bytes, password, &paths::load_trust_store(), chrono::Utc::now()) {
             Ok(reports) if reports.is_empty() => self.alert("This document has no signatures.".into()),
             Ok(reports) => {
                 let notice = carbide_engine::signature::notice_text(&reports).unwrap_or_default().to_string();
                 self.notice = Some(notice.clone());
-                self.dialog = Some(Dialog::Signatures { reports, notice });
+                self.open_dialog(Dialog::Signatures { doc: doc.id, reports, notice });
             }
             Err(e) => self.alert(format!("Could not read the signatures: {e}")),
         }
@@ -1430,7 +1577,7 @@ impl CarbideApp {
     pub fn export(&mut self, export: Export) {
         let Some(doc) = self.doc.as_ref() else { return };
         if doc.is_protected() {
-            self.dialog = Some(Dialog::ConfirmExport { doc: doc.id, export });
+            self.open_dialog(Dialog::ConfirmExport { doc: doc.id, export });
             return;
         }
         self.export_confirmed(doc.id, export);
@@ -1465,8 +1612,8 @@ impl CarbideApp {
             None => {
                 let taken = taken(carbide_engine::image_paths(&doc.pdf, &folder, &base, format));
                 if !taken.is_empty() {
-                    self.dialog = Some(Dialog::ExistingFiles { doc: doc.id, writing: Writing::Images { folder }, taken });
-                    return;
+                    let question = Dialog::ExistingFiles { doc: doc.id, writing: Writing::Images { folder }, taken };
+                    return self.open_dialog(question);
                 }
                 Existing::Refuse
             }
@@ -1499,7 +1646,7 @@ impl CarbideApp {
                 let taken = taken(targets.clone());
                 if !taken.is_empty() {
                     let writing = Writing::Split { folder, ranges: ranges.to_string() };
-                    self.dialog = Some(Dialog::ExistingFiles { doc: doc.id, writing, taken });
+                    self.open_dialog(Dialog::ExistingFiles { doc: doc.id, writing, taken });
                     return;
                 }
                 Existing::Refuse
@@ -1568,7 +1715,7 @@ impl CarbideApp {
         if !confirmed && others.iter().any(differs) {
             let protected =
                 others.iter().zip(&names).filter(|(other, _)| differs(other)).map(|(_, name)| name.clone()).collect();
-            self.dialog = Some(Dialog::ConfirmMerge { doc: doc.id, others, names, protected, keeps_protection: protection.is_some() });
+            self.open_dialog(Dialog::ConfirmMerge { doc: doc.id, others, names, protected, keeps_protection: protection.is_some() });
             return;
         }
         for other in others.iter_mut().filter(|other| differs(other)) {
@@ -1612,14 +1759,17 @@ impl CarbideApp {
     }
 
     fn apply_redactions(&mut self) {
-        let (Some(renderer), redactions) = (self.renderer, std::mem::take(&mut self.pending_redactions)) else { return };
-        if redactions.is_empty() {
+        let Some(renderer) = self.renderer else { return };
+        if self.pending_redactions.is_empty() {
             return;
         }
+        // The marks stay until the redaction is made, so a failed one loses none of them.
+        let redactions = self.pending_redactions.clone();
         if self.run_edit("Apply redactions", true, move |pdf| pdf.apply_redactions(renderer, &redactions, 200.0)) {
+            self.pending_redactions.clear();
             // The same text may still be elsewhere in the document, so offer to look.
             if let Some(doc) = self.doc.as_ref() {
-                self.dialog = Some(Dialog::SuggestRemoveHidden { doc: doc.id });
+                self.open_dialog(Dialog::SuggestRemoveHidden { doc: doc.id });
             }
         }
     }
@@ -1635,6 +1785,7 @@ impl CarbideApp {
         let file = self.doc.as_ref().and_then(|d| d.saved.clone());
         let was_dirty = self.doc.as_ref().is_some_and(|d| d.dirty);
         let mut report = None;
+        // Removing content always counts as an edit, so an empty report is undone below.
         self.edit_removing("Remove hidden information", |pdf| {
             report = Some(pdf.remove_hidden_information_from(&items, file.as_ref())?);
             Ok(())
@@ -1671,11 +1822,37 @@ impl CarbideApp {
         match carbide_engine::compare_documents(renderer, &mut original, &mut revised) {
             Ok(diffs) => {
                 let title = format!("{} -> {}", doc.title(), path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-                self.dialog = Some(Dialog::Compare { title, diffs });
+                self.open_dialog(Dialog::Compare { title, diffs });
             }
             Err(e) => self.alert(format!("Compare failed: {e}")),
         }
     }
+}
+
+/// Where `rect` on page `page` (display space) is after the pages changed by `change`, `before`
+/// being the page geometry from before; `None` when its page was deleted.
+fn follow(change: PageChange, before: &[PageGeometry], page: usize, rect: Rect) -> Option<(usize, Rect)> {
+    let page = match change {
+        PageChange::Inserted(at) if page >= at => page + 1,
+        PageChange::Deleted(gone) if page == gone => return None,
+        PageChange::Deleted(gone) if page > gone => page - 1,
+        PageChange::Moved { from, to } if page == from => to,
+        PageChange::Moved { from, to } if from < to && (from + 1..=to).contains(&page) => page - 1,
+        PageChange::Moved { from, to } if to < from && (to..from).contains(&page) => page + 1,
+        _ => page,
+    };
+    let rect = match change {
+        PageChange::Turned { page: turned, clockwise } if turned == page => {
+            let (w, h) = before.get(page)?.display_size();
+            if clockwise {
+                Rect::new(rect.y, w - rect.max_x(), rect.height, rect.width)
+            } else {
+                Rect::new(h - rect.max_y(), rect.x, rect.height, rect.width)
+            }
+        }
+        _ => rect,
+    };
+    Some((page, rect))
 }
 
 /// Those of `paths` that are already taken.
@@ -1683,15 +1860,105 @@ fn taken(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths.into_iter().filter(|path| path.symlink_metadata().is_ok()).collect()
 }
 
+/// The bytes whose signatures are checked for `doc`, the file it came from when it has one, with
+/// the password that file needs.
+fn signed_file(doc: &OpenDoc) -> (&[u8], Option<&str>) {
+    match &doc.saved {
+        Some(saved) => (saved.bytes(), saved.password()),
+        None => (&doc.bytes, None),
+    }
+}
+
 /// Notice bar text for a document that carries signatures.
 fn signature_notice(doc: &OpenDoc) -> Option<String> {
     if !doc.pdf.has_signatures() {
         return None;
     }
-    let bytes = doc.saved.as_ref().map(SavedFile::bytes).unwrap_or(&doc.bytes);
+    let (bytes, password) = signed_file(doc);
     let trust = paths::load_trust_store();
-    let reports = Pdf::verify_signatures(bytes, &trust, chrono::Utc::now()).ok()?;
+    let reports = Pdf::verify_signatures_with_password(bytes, password, &trust, chrono::Utc::now()).ok()?;
     carbide_engine::signature::notice_text(&reports).map(str::to_string)
+}
+
+/// Whether page `page` of `doc` can be rendered safely (see [`Pdf::check_drawable`]), worked out
+/// once for each version of the document.
+fn page_drawable(drawable: &mut HashMap<(u64, usize), bool>, doc: &OpenDoc, page: usize) -> bool {
+    *drawable.entry((doc.version, page)).or_insert_with(|| doc.pdf.check_drawable(page).is_ok())
+}
+
+/// The longest side a page is laid out with, in points: as far as page boxes reach.
+const MAX_LAYOUT_SIDE: f32 = 2.0 * carbide_engine::pagetree::MAX_COORDINATE;
+
+/// The size a page displayed `page` (width, height) points large is laid out at: each side a
+/// number from 1 to [`MAX_LAYOUT_SIDE`], whatever the file says, so that layout never meets a
+/// size that is not a number.
+pub fn layout_size(page: (f32, f32)) -> (f32, f32) {
+    let side = |v: f32| if v.is_nan() { 1.0 } else { v.clamp(1.0, MAX_LAYOUT_SIDE) };
+    (side(page.0), side(page.1))
+}
+
+/// How wide the thumbnail column is, in points.
+const THUMBNAIL_WIDTH: f32 = 110.0;
+
+/// The size a thumbnail of a page laid out `page` (width, height) points large is shown at: the
+/// width of the column, or less for a page more than four times as tall as it is wide, so that a
+/// strip of a page does not take the whole panel.
+pub fn thumbnail_size(page: (f32, f32)) -> egui::Vec2 {
+    let (w, h) = layout_size(page);
+    let scale = (THUMBNAIL_WIDTH / w).min(4.0 * THUMBNAIL_WIDTH / h);
+    egui::vec2((w * scale).clamp(2.0, THUMBNAIL_WIDTH), (h * scale).clamp(2.0, 4.0 * THUMBNAIL_WIDTH))
+}
+
+/// The most pixels the thumbnail images kept for redrawing hold together: 64 MB.
+const THUMBNAIL_CACHE_PIXELS: usize = 16 << 20;
+
+/// True while thumbnail images of `sizes` hold no more than [`THUMBNAIL_CACHE_PIXELS`].
+pub fn thumbnails_fit(sizes: impl Iterator<Item = [usize; 2]>) -> bool {
+    sizes.map(|[w, h]| w * h).sum::<usize>() <= THUMBNAIL_CACHE_PIXELS
+}
+
+/// The texture side assumed when egui does not say what the GPU takes; every GPU egui runs on
+/// takes at least this much.
+const FALLBACK_TEXTURE_SIDE: usize = 8192;
+/// The most pixels one page texture has: 16 million, 64 MB.
+const MAX_TEXTURE_PIXELS: f32 = 16_777_216.0;
+/// The most pixels the page textures kept for redrawing hold together: 512 MB.
+const TEXTURE_CACHE_PIXELS: usize = 128 << 20;
+
+/// The largest texture side egui says the GPU takes (`reported`), or [`FALLBACK_TEXTURE_SIDE`]
+/// when it says nothing.
+pub fn max_texture_side(reported: usize) -> usize {
+    if reported == 0 {
+        FALLBACK_TEXTURE_SIDE
+    } else {
+        reported
+    }
+}
+
+/// The size, in pixels, of the texture a page displayed `page` (width, height) points large is
+/// drawn from when it is shown `wanted_width` pixels wide. It is at most 5000 pixels wide, no side
+/// is longer than `max_side`, and it holds at most [`MAX_TEXTURE_PIXELS`]: a very tall page, or a
+/// large zoom, gets a texture of lower resolution, drawn stretched over the page's place. The
+/// page's shape is kept, as far as whole pixels allow.
+pub fn texture_size(page: (f32, f32), wanted_width: f32, max_side: usize) -> [u32; 2] {
+    let positive = |v: f32| if v.is_finite() && v >= 1.0 { v } else { 1.0 };
+    let (w, h) = (positive(page.0), positive(page.1));
+    let side = max_side.max(1) as f32;
+    let width = if wanted_width.is_finite() { wanted_width.clamp(64.0, 5000.0) } else { 64.0 };
+    let width = width.min(side).min(side * w / h).min((MAX_TEXTURE_PIXELS * w / h).sqrt()).floor().max(1.0);
+    let height = (width * h / w).round().clamp(1.0, side);
+    [width as u32, height as u32]
+}
+
+/// A texture of `image`, unless it is larger than the GPU takes (`max_side`): uploading that would
+/// end the program. Rendering keeps within it, so this is a last guard.
+fn page_texture(ctx: &egui::Context, name: String, image: &image::RgbaImage, max_side: usize) -> Option<egui::TextureHandle> {
+    let size = [image.width() as usize, image.height() as usize];
+    if size[0] == 0 || size[1] == 0 || size[0] > max_side || size[1] > max_side {
+        return None;
+    }
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    Some(ctx.load_texture(name, color, egui::TextureOptions::LINEAR))
 }
 
 fn pdf_rect_to_screen(page_rect: egui::Rect, zoom: f32, page_height: f32, r: Rect) -> egui::Rect {
@@ -1708,6 +1975,10 @@ impl eframe::App for CarbideApp {
         }
         self.handle_shortcuts(ui.ctx());
         self.handle_close_request(ui.ctx());
+        // Quitting asked for from outside the window: the Dock, logging out, AppleScript, Quit.
+        if quit::take_request() {
+            self.on_system_quit(ui.ctx());
+        }
 
         self.autosave_tick();
         self.poll_ocr();
@@ -1719,6 +1990,13 @@ impl eframe::App for CarbideApp {
 
         dialogs::show(self, ui.ctx());
         self.prompts(ui.ctx());
+        quit::set_unsaved(self.has_unsaved_changes());
+    }
+
+    /// The app ends without its window closing first when quitting went ahead with nothing
+    /// unsaved (see `quit`).
+    fn on_exit(&mut self) {
+        self.release_on_exit();
     }
 }
 
@@ -1758,9 +2036,18 @@ impl eframe::App for IconSheet {
     }
 }
 
-/// winit's application menu ends the process from "Quit" (and Cmd+Q) without any close request, so
-/// unsaved documents would be lost silently. Pointing the item at `performClose:` makes it close the
-/// key window instead, which goes through the same prompt as the window's close button.
+/// Makes every way of quitting ask about unsaved documents first (see `quit`). Where that cannot
+/// be set up, the application menu's Quit (and Cmd+Q) at least goes through the window's close
+/// button, which asks.
+fn guard_quitting(ctx: &egui::Context) {
+    if !quit::install(ctx) {
+        route_quit_through_window_close();
+    }
+}
+
+/// Points the application menu's Quit item (and Cmd+Q) at `performClose:`, so that it closes the
+/// key window, which goes through the same prompt as the window's close button. It then does
+/// nothing while the only window is minimized, which is why this is only the fallback.
 #[cfg(target_os = "macos")]
 fn route_quit_through_window_close() {
     use objc2::{sel, MainThreadMarker};

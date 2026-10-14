@@ -343,3 +343,144 @@ fn sanitize_removes_what_is_chosen_and_keeps_protection() {
     assert!(Pdf::from_bytes_with_password(&bytes, "user pw").unwrap().annotations(0).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Mean brightness (0..255) of the display-space rect (x, y, w, h) of page `page` of `path`,
+/// rendered at 72 dpi.
+fn brightness(path: &Path, page: usize, (x, y, w, h): (u32, u32, u32, u32)) -> f32 {
+    let image = carbide_engine::Renderer::global().unwrap().render_page(&std::fs::read(path).unwrap(), page, 72.0).unwrap();
+    let top = image.height() - y - h;
+    let mut total = 0.0;
+    for row in top..top + h {
+        for column in x..x + w {
+            let p = image.get_pixel(column, row);
+            total += (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0;
+        }
+    }
+    total / (w * h) as f32
+}
+
+#[test]
+fn arguments_that_would_do_the_wrong_thing_are_refused_or_read_as_meant() {
+    let dir = scratch("arguments");
+    let file = dir.join("f.pdf");
+    plain_file(&file, &["ONE", "TWO"]);
+    let (path, out) = (file.to_str().unwrap(), dir.join("out.pdf"));
+    let out_path = out.to_str().unwrap();
+
+    // Turning the other way is a negative number of degrees; only quarter turns are taken.
+    let output = carbide(&["rotate", path, "1", "-90", out_path]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(Pdf::open(&out).unwrap().page_rotation(0).unwrap(), 270);
+    let output = carbide(&["rotate", path, "1", "45", out_path]);
+    assert!(!output.status.success() && stderr(&output).contains("multiple of 90"), "{}", stderr(&output));
+    // A page named more than once is turned once.
+    assert!(carbide(&["rotate", path, "1,1,1-2", "90", out_path]).status.success());
+    let turned = Pdf::open(&out).unwrap();
+    assert_eq!((turned.page_rotation(0).unwrap(), turned.page_rotation(1).unwrap()), (90, 90));
+
+    // Merging nothing writes nothing over the output.
+    let before = std::fs::read(&out).unwrap();
+    let output = carbide(&["merge", out_path]);
+    assert!(!output.status.success());
+    assert_eq!(std::fs::read(&out).unwrap(), before);
+
+    // Bates numbers that cannot be stamped are an error, not a crash.
+    for extra in [["--digits", "70000"], ["--start", "18446744073709551615"]] {
+        let output = carbide(&[&["bates", path, out_path][..], &extra[..]].concat());
+        assert!(!output.status.success() && stderr(&output).starts_with("error: "), "{extra:?}: {}", stderr(&output));
+    }
+
+    // An absurd imposition grid is refused before any work.
+    let output = carbide(&["impose", path, out_path, "--layout", "step-and-repeat", "--columns", "1000000000"]);
+    assert!(!output.status.success() && stderr(&output).contains("Columns and rows"), "{}", stderr(&output));
+
+    // A rectangle given from its other corner redacts the same area; one with no area is refused.
+    let output = carbide(&["redact", path, out_path, "--rect", "1:360,720,-300,-28"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(brightness(&out, 0, (70, 694, 280, 24)) < 30.0, "the area was not blacked out");
+    for rect in ["1:100,100,0,50", "1:nan,100,10,10", "1:100,100,inf,10"] {
+        let output = carbide(&["redact", path, out_path, "--rect", rect]);
+        assert!(!output.status.success(), "{rect}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn verify_reads_files_that_need_their_open_password() {
+    let dir = scratch("verify");
+    let file = dir.join("locked.pdf");
+    protected(&file, "user pw", "owner pw");
+    let path = file.to_str().unwrap();
+    let output = carbide(&["verify", path]);
+    assert!(!output.status.success() && stderr(&output).contains("password"), "{}", stderr(&output));
+    let output = carbide(&["verify", path, "--password", "user pw"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No signatures found."));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn inputs_that_cannot_work_are_refused_with_messages_that_say_why() {
+    let dir = scratch("inputs");
+    let file = dir.join("f.pdf");
+    plain_file(&file, &["ONE", "TWO"]);
+    let (path, out) = (file.to_str().unwrap(), dir.join("out.pdf"));
+    let out_path = out.to_str().unwrap();
+
+    // A watermark that cannot be drawn is refused, and nothing is written.
+    for extra in [&["--size", "nan"][..], &["--size", "inf"], &["--size", "0"], &["--size=-5"], &["--angle", "nan"], &["--opacity", "2"]] {
+        let output = carbide(&[&["watermark", path, out_path, "--text", "HI"][..], extra].concat());
+        assert!(!output.status.success() && stderr(&output).contains("watermark size"), "{extra:?}: {}", stderr(&output));
+        assert!(!out.exists(), "{extra:?}: an output was written");
+    }
+    // A redacted page rasterized at 1 dpi would be unreadable.
+    let output = carbide(&["redact", path, out_path, "--rect", "1:72,700,100,30", "--dpi", "1"]);
+    assert!(!output.status.success() && stderr(&output).contains("72 dpi"), "{}", stderr(&output));
+
+    // Pages are named the way they were given, counted from 1.
+    let output = carbide(&["move", path, "6", "1", out_path]);
+    assert!(stderr(&output).contains("page 6 does not exist (the document has 2 pages)"), "{}", stderr(&output));
+    let output = carbide(&["blank", path, "7", out_path]);
+    assert!(stderr(&output).contains("page 7 does not exist"), "{}", stderr(&output));
+    // A file that cannot be read is named.
+    let missing = dir.join("missing.pdf");
+    let output = carbide(&["verify", missing.to_str().unwrap()]);
+    assert!(!output.status.success() && stderr(&output).contains("missing.pdf"), "{}", stderr(&output));
+
+    // A page tree whose count is too large a number for the file to be read: every viewer shows
+    // its pages, so it is refused rather than read as a document without pages.
+    let damaged = dir.join("damaged.pdf");
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 9223372036854775808 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+    ];
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    std::fs::write(&damaged, bytes).unwrap();
+    for args in [&["info", damaged.to_str().unwrap()][..], &["sanitize", damaged.to_str().unwrap(), out_path]] {
+        let output = carbide(args);
+        assert!(!output.status.success() && stderr(&output).contains("page tree is damaged"), "{args:?}: {}", stderr(&output));
+    }
+    assert!(!out.exists());
+
+    // PDFium that cannot be loaded is said once.
+    let bogus = dir.join("libpdfium.dylib");
+    std::fs::write(&bogus, b"not a library").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carbide")).args(["text", path]).env("CARBIDE_PDFIUM_LIB", &bogus).output().unwrap();
+    if !output.status.success() {
+        assert_eq!(stderr(&output).matches("rendering backend").count(), 1, "{}", stderr(&output));
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

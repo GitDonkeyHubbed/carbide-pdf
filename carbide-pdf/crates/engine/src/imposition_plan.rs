@@ -56,6 +56,29 @@ pub struct PlanOptions {
     pub printing_order: PrintingOrder,
 }
 
+/// The most columns, and the most rows, a plate can have.
+pub const MAX_GRID: usize = 32;
+/// The most sheets a perfect-bound fold can have.
+pub const MAX_SHEETS_PER_FOLD: usize = 64;
+
+pub mod messages {
+    pub const GRID: &str = "Columns and rows must each be between 1 and 32.";
+    pub const SHEETS_PER_FOLD: &str = "Sheets per fold must be between 1 and 64.";
+}
+
+impl PlanOptions {
+    /// Checks the grid and fold sizes, so that planning never has to work with absurd numbers.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=MAX_GRID).contains(&self.columns) || !(1..=MAX_GRID).contains(&self.rows) {
+            return Err(Error::Other(messages::GRID.into()));
+        }
+        if !(1..=MAX_SHEETS_PER_FOLD).contains(&self.sheets_per_fold) {
+            return Err(Error::Other(messages::SHEETS_PER_FOLD.into()));
+        }
+        Ok(())
+    }
+}
+
 impl Default for PlanOptions {
     fn default() -> Self {
         Self {
@@ -119,6 +142,7 @@ pub fn plan_plates(options: &PlanOptions, total_pages: usize) -> Result<Vec<Plat
     if total_pages == 0 {
         return Err(Error::Other("the document has no pages".into()));
     }
+    options.validate()?;
     match options.layout {
         LayoutKind::Sequential => Ok(plan_sequential(options, total_pages)),
         LayoutKind::StepAndRepeat | LayoutKind::CutStacks => plan_tiled(options, total_pages),
@@ -410,8 +434,12 @@ fn plan_booklet(options: &PlanOptions, total: usize) -> Result<Vec<Plate>> {
 
 /// For each output page `i`, the plate that is printed there.
 ///
-/// The remap only applies for double-sided output and when the style is sheetwise or the layout
-/// is perfect bound (`sheets_per_fold_active`).
+/// Plates come as front, back, front, back, so the even positions are the fronts. "Fronts then
+/// backs" prints every front first and then every back, in order or reversed. The remap only
+/// applies for double-sided output and when the style is sheetwise or the layout is perfect bound
+/// (`sheets_per_fold_active`). The result is always an ordering of `0..plate_count`, each plate
+/// once: with an odd count (perfect-bound work and turn makes one plate per fold) the last front
+/// has no back.
 pub fn output_order(
     plate_count: usize,
     mode: PrintingOrder,
@@ -419,27 +447,18 @@ pub fn output_order(
     style: Style,
     sheets_per_fold_active: bool,
 ) -> Vec<usize> {
-    let identity = || (0..plate_count).collect::<Vec<_>>();
     let applies = mode != PrintingOrder::Interleaved
         && double_sided
         && (style == Style::Sheetwise || sheets_per_fold_active);
     if !applies {
-        return identity();
+        return (0..plate_count).collect();
     }
-    let half = plate_count / 2;
-    (0..plate_count)
-        .map(|i| {
-            if i < half {
-                2 * i
-            } else {
-                let back = 2 * (i - half) + 1;
-                match mode {
-                    PrintingOrder::FrontsThenBacksReversed => plate_count - back,
-                    _ => back,
-                }
-            }
-        })
-        .collect()
+    let fronts = (0..plate_count).step_by(2);
+    let backs = (1..plate_count).step_by(2);
+    match mode {
+        PrintingOrder::FrontsThenBacksReversed => fronts.chain(backs.rev()).collect(),
+        _ => fronts.chain(backs).collect(),
+    }
 }
 
 #[cfg(test)]
@@ -550,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_layouts_follow_the_recovered_formulas() {
+    fn simple_layouts_place_pages_in_the_expected_cells() {
         // Step and repeat, 2 x 2, single sided: contiguous blocks, row-major.
         let step = PlanOptions {
             layout: LayoutKind::StepAndRepeat,
@@ -582,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn printing_order_matches_the_recovered_examples() {
+    fn printing_orders_arrange_fronts_and_backs_as_described() {
         let order = |mode| output_order(4, mode, true, Style::Sheetwise, false);
         assert_eq!(order(PrintingOrder::Interleaved), vec![0, 1, 2, 3]);
         assert_eq!(order(PrintingOrder::FrontsThenBacks), vec![0, 2, 1, 3]);
@@ -596,6 +615,100 @@ mod tests {
             output_order(4, PrintingOrder::FrontsThenBacks, false, Style::Sheetwise, false),
             vec![0, 1, 2, 3]
         );
+    }
+
+    /// Every combination of layout, binding, style, fold size, grid, sides and printing order, for
+    /// every page count up to 100: the printed plates hold each source page exactly once, and the
+    /// printing order prints each plate exactly once, whatever the plate count.
+    #[test]
+    fn every_page_is_printed_exactly_once_in_every_printing_order() {
+        use LayoutKind::*;
+        let orders = [PrintingOrder::Interleaved, PrintingOrder::FrontsThenBacks, PrintingOrder::FrontsThenBacksReversed];
+        let mut odd_counts = 0;
+        for pages in 1..=100 {
+            for layout in [Booklet2Up, Booklet4Up, Booklet8Up, Sequential, StepAndRepeat, CutStacks] {
+                // Booklets have a fixed grid and vary the fold; the tiled layouts vary the grid.
+                let shapes: Vec<(usize, usize, usize)> = match layout {
+                    Booklet2Up => (1..=3).map(|k| (2, 1, k)).collect(),
+                    Booklet4Up => (1..=3).map(|k| (2, 2, k)).collect(),
+                    Booklet8Up => (1..=3).map(|k| (4, 2, k)).collect(),
+                    Sequential => vec![(1, 1, 1)],
+                    _ => vec![(1, 1, 1), (2, 1, 1), (3, 2, 1), (1, 4, 1)],
+                };
+                for (columns, rows, sheets_per_fold) in shapes {
+                    for binding in [Binding::Saddle, Binding::Perfect] {
+                        for style in [Style::Sheetwise, Style::WorkAndTurn, Style::WorkAndTumble] {
+                            for double_sided in [true, false] {
+                                for printing_order in orders {
+                                    let options = PlanOptions {
+                                        layout,
+                                        columns,
+                                        rows,
+                                        binding,
+                                        sheets_per_fold,
+                                        style,
+                                        double_sided,
+                                        printing_order,
+                                    };
+                                    let what = format!("{options:?} N={pages}");
+                                    let plates = plan_plates(&options, pages).unwrap();
+                                    odd_counts += plates.len() % 2;
+                                    let order = output_order(
+                                        plates.len(),
+                                        printing_order,
+                                        double_sided,
+                                        style,
+                                        binding == Binding::Perfect,
+                                    );
+                                    let mut sorted = order.clone();
+                                    sorted.sort_unstable();
+                                    assert_eq!(sorted, (0..plates.len()).collect::<Vec<_>>(), "{what}: {order:?}");
+                                    let mut seen: Vec<usize> = order
+                                        .iter()
+                                        .flat_map(|&p| plates[p].cells.iter().filter_map(|c| c.page))
+                                        .collect();
+                                    seen.sort_unstable();
+                                    assert_eq!(seen, (0..pages).collect::<Vec<_>>(), "{what}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(odd_counts > 0, "odd plate counts were covered");
+    }
+
+    #[test]
+    fn odd_plate_counts_keep_every_plate() {
+        // Perfect-bound work and turn: one plate per fold, so 3 folds give 3 plates.
+        assert_eq!(output_order(3, PrintingOrder::FrontsThenBacks, true, Style::WorkAndTurn, true), vec![0, 2, 1]);
+        assert_eq!(output_order(3, PrintingOrder::FrontsThenBacksReversed, true, Style::WorkAndTurn, true), vec![0, 2, 1]);
+        assert_eq!(output_order(5, PrintingOrder::FrontsThenBacksReversed, true, Style::Sheetwise, false), vec![0, 2, 4, 3, 1]);
+        assert_eq!(output_order(1, PrintingOrder::FrontsThenBacks, true, Style::Sheetwise, true), vec![0]);
+        assert!(output_order(0, PrintingOrder::FrontsThenBacks, true, Style::Sheetwise, true).is_empty());
+    }
+
+    #[test]
+    fn absurd_grids_and_folds_are_refused_before_planning() {
+        let base = PlanOptions { layout: LayoutKind::StepAndRepeat, ..Default::default() };
+        for (columns, rows) in [(0, 1), (1, 0), (MAX_GRID + 1, 1), (1, 1_000_000_000), (usize::MAX, usize::MAX)] {
+            let options = PlanOptions { columns, rows, ..base };
+            assert_eq!(plan_plates(&options, 10).unwrap_err().to_string(), messages::GRID, "{columns} x {rows}");
+        }
+        let fold = PlanOptions {
+            layout: LayoutKind::Booklet4Up,
+            columns: 2,
+            rows: 2,
+            binding: Binding::Perfect,
+            ..Default::default()
+        };
+        for sheets_per_fold in [0, MAX_SHEETS_PER_FOLD + 1, 4_611_686_018_427_387_904, usize::MAX] {
+            let options = PlanOptions { sheets_per_fold, ..fold };
+            assert_eq!(plan_plates(&options, 10).unwrap_err().to_string(), messages::SHEETS_PER_FOLD);
+        }
+        let largest = PlanOptions { sheets_per_fold: MAX_SHEETS_PER_FOLD, ..fold };
+        assert!(plan_plates(&largest, 3).is_ok());
     }
 
     fn plan(layout: LayoutKind, binding: Binding, style: Style, k: usize, pages: usize) -> Vec<Plate> {

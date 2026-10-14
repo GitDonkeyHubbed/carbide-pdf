@@ -16,11 +16,12 @@ use std::path::{Path, PathBuf};
 
 use flate2::{write::ZlibEncoder, Compression};
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, ExtendedColorType, ImageFormat};
-use lopdf::content::Content;
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
+use crate::content::{tokens, Token};
 use crate::error::{Error, Result};
 use crate::fs::Existing;
+use crate::limits::DecodeBudget;
 use crate::pdf::Pdf;
 
 pub const DEFAULT_IMAGE_FACTOR: u8 = 50;
@@ -170,81 +171,152 @@ fn matrix_from(object: Option<&Object>) -> [f32; 6] {
     [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
 }
 
+/// The most forms followed while looking for the sizes images are drawn at, and the most bytes of
+/// their content read, each counted every time a form is drawn. Images drawn only by forms past
+/// these are recompressed but not down-sampled.
+const MAX_FORMS_FOLLOWED: usize = 100_000;
+const MAX_FORM_BYTES_READ: usize = crate::limits::MAX_DECODED;
+
+/// What scanning the content of a document for drawn image sizes has decoded and followed so far.
+struct Scan {
+    budget: DecodeBudget,
+    forms: HashMap<ObjectId, std::rc::Rc<Vec<u8>>>,
+    /// The forms being drawn, outermost first. A form that draws itself is not followed again.
+    path: Vec<ObjectId>,
+    /// How many forms have been followed, and how many bytes of their content read.
+    followed: usize,
+    read: usize,
+}
+
 impl Pdf {
     /// Largest drawn size, in points, of every image XObject (page content and nested forms).
-    fn drawn_sizes(&self) -> HashMap<ObjectId, (f32, f32)> {
+    /// Content is decoded within one budget for the whole document (see [`crate::limits`]).
+    fn drawn_sizes(&self) -> Result<HashMap<ObjectId, (f32, f32)>> {
         let mut sizes: HashMap<ObjectId, (f32, f32)> = HashMap::new();
+        let mut scan = Scan { budget: DecodeBudget::new(), forms: HashMap::new(), path: Vec::new(), followed: 0, read: 0 };
         for page_id in self.page_ids() {
             let resources = self
                 .inherited(page_id, b"Resources")
                 .and_then(|o| o.as_dict().ok().cloned())
                 .unwrap_or_default();
-            let content = self.doc.get_page_content(page_id);
-            self.scan_content(&content, &resources, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], 0, &mut sizes);
+            let content = scan.budget.page_content(&self.doc, page_id)?;
+            self.scan_content(&content, &resources, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], &mut sizes, &mut scan)?;
         }
-        sizes
+        Ok(sizes)
     }
 
+    /// Records the size each image `content` draws is drawn at, `base` being the matrix the
+    /// content is drawn with, and follows the forms it draws.
     fn scan_content(
         &self,
         content: &[u8],
         resources: &Dictionary,
         base: [f32; 6],
-        depth: usize,
         sizes: &mut HashMap<ObjectId, (f32, f32)>,
-    ) {
-        if depth > 8 {
-            return;
+        scan: &mut Scan,
+    ) -> Result<()> {
+        if scan.path.len() > 8 {
+            return Ok(());
         }
-        let Ok(parsed) = Content::decode(content) else { return };
         let xobjects = match resources.get(b"XObject").map(|o| self.resolve(o)) {
             Ok(Object::Dictionary(d)) => d,
-            _ => return,
+            _ => return Ok(()),
         };
         let mut ctm = base;
         let mut stack: Vec<[f32; 6]> = Vec::new();
-        for op in parsed.operations {
-            match op.operator.as_str() {
-                "q" => stack.push(ctm),
-                "Q" => {
+        // The operands since the last operator: how many, the numbers among the first six, and the
+        // last name.
+        let (mut operands, mut numbers, mut name) = (0usize, Vec::with_capacity(6), None);
+        let mut failure = None;
+        tokens(content, |token| {
+            let operator = match token {
+                Token::Operator(operator) => operator,
+                other => {
+                    operands += 1;
+                    match other {
+                        Token::Number(n) if numbers.len() < 6 => numbers.push(n),
+                        Token::Name(n) => name = Some(n),
+                        _ => {}
+                    }
+                    return;
+                }
+            };
+            match operator {
+                b"q" => stack.push(ctm),
+                b"Q" => {
                     if let Some(saved) = stack.pop() {
                         ctm = saved;
                     }
                 }
-                "cm" if op.operands.len() == 6 => {
-                    let v: Vec<f32> = op.operands.iter().filter_map(number).collect();
-                    if v.len() == 6 {
-                        ctm = multiply([v[0], v[1], v[2], v[3], v[4], v[5]], ctm);
-                    }
+                b"cm" if operands == 6 && numbers.len() == 6 => {
+                    ctm = multiply([numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], numbers[5]], ctm);
                 }
-                "Do" => {
-                    let Some(Object::Name(name)) = op.operands.first() else { continue };
-                    let Ok(entry) = xobjects.get(name) else { continue };
-                    let Ok(id) = entry.as_reference() else { continue };
-                    let Ok(Object::Stream(stream)) = self.doc.get_object(id) else { continue };
-                    match stream.dict.get(b"Subtype").and_then(|o| o.as_name()) {
-                        Ok(b"Image") => {
-                            let w = (ctm[0] * ctm[0] + ctm[1] * ctm[1]).sqrt();
-                            let h = (ctm[2] * ctm[2] + ctm[3] * ctm[3]).sqrt();
-                            let slot = sizes.entry(id).or_insert((0.0, 0.0));
-                            slot.0 = slot.0.max(w);
-                            slot.1 = slot.1.max(h);
+                b"Do" if operands == 1 && failure.is_none() => {
+                    if let Some(name) = name {
+                        if let Err(error) = self.draw(&xobjects, &crate::content::name(name), resources, ctm, sizes, scan) {
+                            failure = Some(error);
                         }
-                        Ok(b"Form") => {
-                            let form_resources = match stream.dict.get(b"Resources").map(|o| self.resolve(o)) {
-                                Ok(Object::Dictionary(d)) => d,
-                                _ => resources.clone(),
-                            };
-                            let matrix = matrix_from(stream.dict.get(b"Matrix").ok());
-                            let body = stream.get_plain_content().unwrap_or_default();
-                            self.scan_content(&body, &form_resources, multiply(matrix, ctm), depth + 1, sizes);
-                        }
-                        _ => {}
                     }
                 }
                 _ => {}
             }
+            (operands, name) = (0, None);
+            numbers.clear();
+        });
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Records what drawing the XObject `name` of `xobjects` with the matrix `ctm` draws.
+    fn draw(
+        &self,
+        xobjects: &Dictionary,
+        name: &[u8],
+        resources: &Dictionary,
+        ctm: [f32; 6],
+        sizes: &mut HashMap<ObjectId, (f32, f32)>,
+        scan: &mut Scan,
+    ) -> Result<()> {
+        let Ok(id) = xobjects.get(name).and_then(Object::as_reference) else { return Ok(()) };
+        let Ok(Object::Stream(stream)) = self.doc.get_object(id) else { return Ok(()) };
+        match stream.dict.get(b"Subtype").and_then(|o| o.as_name()) {
+            Ok(b"Image") => {
+                let w = (ctm[0] * ctm[0] + ctm[1] * ctm[1]).sqrt();
+                let h = (ctm[2] * ctm[2] + ctm[3] * ctm[3]).sqrt();
+                let slot = sizes.entry(id).or_insert((0.0, 0.0));
+                slot.0 = slot.0.max(w);
+                slot.1 = slot.1.max(h);
+            }
+            Ok(b"Form") if !scan.path.contains(&id) && scan.followed < MAX_FORMS_FOLLOWED => {
+                scan.followed += 1;
+                let form_resources = match stream.dict.get(b"Resources").map(|o| self.resolve(o)) {
+                    Ok(Object::Dictionary(d)) => d,
+                    _ => resources.clone(),
+                };
+                let matrix = matrix_from(stream.dict.get(b"Matrix").ok());
+                // A form drawn on every page is decoded once.
+                let body = match scan.forms.get(&id) {
+                    Some(body) => body.clone(),
+                    None => {
+                        let body = match scan.budget.stream(stream) {
+                            Err(Error::TooLarge(message)) => return Err(Error::TooLarge(message)),
+                            other => std::rc::Rc::new(other.unwrap_or_default()),
+                        };
+                        scan.forms.insert(id, body.clone());
+                        body
+                    }
+                };
+                if scan.read.saturating_add(body.len()) > MAX_FORM_BYTES_READ {
+                    return Ok(());
+                }
+                scan.read += body.len();
+                scan.path.push(id);
+                let scanned = self.scan_content(&body, &form_resources, multiply(matrix, ctm), sizes, scan);
+                scan.path.pop();
+                scanned?;
+            }
+            _ => {}
         }
+        Ok(())
     }
 
     /// Objects used as soft masks or stencil masks. They are only re-Flated, never JPEG-encoded
@@ -335,8 +407,21 @@ struct Decoded {
     source: Source,
 }
 
-/// Decodes an 8-bit gray or RGB image, or `None` when this image should be left alone.
-fn decode_image(doc: &Document, stream: &Stream) -> Option<Decoded> {
+/// The most bytes one image's samples may take to be re-encoded: 128 MB, a page scanned in colour
+/// at 600 dpi. A larger image is left as it is, so that reducing never holds more than a few
+/// times this.
+const MAX_IMAGE_BYTES: u64 = 128 << 20;
+
+/// What the images of one reduce may decode to in all: 1 GB, and 32 times what they take in the
+/// file, so that real images, which compress far less than that, are all decoded, while a few
+/// kilobytes of data that decode to gigabytes are not. Images past it are left as they are.
+fn image_budget(stored: usize) -> usize {
+    crate::limits::MAX_DECODED.saturating_add(stored.saturating_mul(32))
+}
+
+/// Decodes an 8-bit gray or RGB image, or `None` when this image should be left alone. What it
+/// decodes to is taken from `budget`; an image that would take more than is left is not decoded.
+fn decode_image(doc: &Document, stream: &Stream, budget: &mut usize) -> Option<Decoded> {
     let dict = &stream.dict;
     if matches!(dict.get(b"ImageMask"), Ok(Object::Boolean(true))) {
         return None;
@@ -358,9 +443,12 @@ fn decode_image(doc: &Document, stream: &Stream) -> Option<Decoded> {
         },
         _ => return None, // ICCBased, Indexed, Separation, ...: leave unchanged
     };
-    if width == 0 || height == 0 || width as u64 * height as u64 > 100_000_000 {
+    let expected = width as u64 * height as u64 * components as u64;
+    if width == 0 || height == 0 || expected > MAX_IMAGE_BYTES {
         return None;
     }
+    let expected = expected as usize;
+    *budget = budget.checked_sub(expected)?;
 
     let filter: Vec<Vec<u8>> = match dict.get(b"Filter") {
         Ok(Object::Name(n)) => vec![n.clone()],
@@ -371,7 +459,6 @@ fn decode_image(doc: &Document, stream: &Stream) -> Option<Decoded> {
 
     match filter.as_slice() {
         [] if bpc == 8 => {
-            let expected = (width * height * components) as usize;
             (stream.content.len() == expected).then(|| Decoded {
                 width,
                 height,
@@ -381,12 +468,19 @@ fn decode_image(doc: &Document, stream: &Stream) -> Option<Decoded> {
             })
         }
         [f] if f == b"FlateDecode" && bpc == 8 && !dict.has(b"DecodeParms") => {
-            let samples = stream.get_plain_content().ok()?;
-            let expected = (width * height * components) as usize;
+            // The samples of an image this size, and no more.
+            let samples = stream.get_plain_content_with_limit(expected).ok()?;
             (samples.len() == expected).then_some(Decoded { width, height, components, samples, source: Source::Flate })
         }
         [f] if f == b"DCTDecode" && bpc == 8 => {
-            let image = image::load_from_memory_with_format(&stream.content, ImageFormat::Jpeg).ok()?;
+            // The JPEG data says its own size, which may not be the one in the dictionary.
+            let mut reader = image::ImageReader::with_format(Cursor::new(&stream.content), ImageFormat::Jpeg);
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(width);
+            limits.max_image_height = Some(height);
+            limits.max_alloc = Some(MAX_IMAGE_BYTES * 2);
+            reader.limits(limits);
+            let image = reader.decode().ok()?;
             let (w, h) = (image.width(), image.height());
             let (samples, n) = match components {
                 1 => (image.to_luma8().into_raw(), 1),
@@ -407,8 +501,8 @@ fn encode_jpeg(samples: &[u8], width: u32, height: u32, components: u32, quality
 
 impl Pdf {
     /// Re-encodes images in place. Returns (recompressed, downsampled).
-    fn recompress_images(&mut self, options: &ReduceOptions) -> (usize, usize) {
-        let drawn = self.drawn_sizes();
+    fn recompress_images(&mut self, options: &ReduceOptions) -> Result<(usize, usize)> {
+        let drawn = self.drawn_sizes()?;
         let masks = self.mask_ids();
         let ids: Vec<ObjectId> = self
             .doc
@@ -422,16 +516,19 @@ impl Pdf {
             })
             .collect();
 
+        let stored = ids.iter().filter_map(|id| self.doc.get_object(*id).and_then(Object::as_stream).ok()).map(|s| s.content.len()).sum();
+        let mut budget = image_budget(stored);
         let (mut recompressed, mut downsampled) = (0, 0);
         for id in ids {
             let Ok(Object::Stream(original)) = self.doc.get_object(id).cloned() else { continue };
             let is_mask = masks.contains(&id);
             let old_len = original.content.len();
-            let Some(decoded) = decode_image(&self.doc, &original) else { continue };
+            let Some(decoded) = decode_image(&self.doc, &original, &mut budget) else { continue };
+            drop(original);
+            let Decoded { width, height, components, samples, source } = decoded;
 
             // Target size from how large the image is drawn.
-            let (mut width, mut height) = (decoded.width, decoded.height);
-            let mut samples = decoded.samples.clone();
+            let (mut width, mut height, mut samples) = (width, height, samples);
             let mut resized = false;
             if !is_mask {
                 if let Some(&(draw_w, draw_h)) = drawn.get(&id) {
@@ -443,11 +540,11 @@ impl Pdf {
                         if scale < 1.0 {
                             let (nw, nh) = ((width as f32 * scale) as u32, (height as f32 * scale) as u32);
                             if nw >= MIN_SIDE && nh >= MIN_SIDE {
-                                let resized_samples = if decoded.components == 1 {
-                                    image::GrayImage::from_raw(width, height, samples.clone())
+                                let resized_samples = if components == 1 {
+                                    image::GrayImage::from_raw(width, height, std::mem::take(&mut samples))
                                         .map(|img| image::imageops::resize(&img, nw, nh, FilterType::Triangle).into_raw())
                                 } else {
-                                    image::RgbImage::from_raw(width, height, samples.clone())
+                                    image::RgbImage::from_raw(width, height, std::mem::take(&mut samples))
                                         .map(|img| image::imageops::resize(&img, nw, nh, FilterType::Triangle).into_raw())
                                 };
                                 if let Some(new_samples) = resized_samples {
@@ -466,14 +563,14 @@ impl Pdf {
             let sample_for_estimate = &samples[..samples.len().min(1 << 20)];
             let flate_ratio = flate(sample_for_estimate).len() as f32 / sample_for_estimate.len().max(1) as f32;
             let photo_like = flate_ratio > 0.25 && width as u64 * height as u64 > 64 * 1024;
-            let use_jpeg = !is_mask && photo_like && (decoded.source != Source::Jpeg || resized || options.f() < 0.5);
+            let use_jpeg = !is_mask && photo_like && (source != Source::Jpeg || resized || options.f() < 0.5);
 
             let (data, filter): (Vec<u8>, &'static str) = if use_jpeg {
-                match encode_jpeg(&samples, width, height, decoded.components, options.jpeg_quality()) {
+                match encode_jpeg(&samples, width, height, components, options.jpeg_quality()) {
                     Some(jpeg) => (jpeg, "DCTDecode"),
                     None => continue,
                 }
-            } else if decoded.source == Source::Jpeg && !resized {
+            } else if source == Source::Jpeg && !resized {
                 continue; // nothing to gain without changing the pixels
             } else {
                 (flate(&samples), "FlateDecode")
@@ -483,7 +580,7 @@ impl Pdf {
             if data.len() >= old_len && !resized {
                 continue;
             }
-            if data.len() >= old_len && resized && decoded.source == Source::Jpeg && filter == "FlateDecode" {
+            if data.len() >= old_len && resized && source == Source::Jpeg && filter == "FlateDecode" {
                 continue;
             }
 
@@ -503,7 +600,7 @@ impl Pdf {
                 }
             }
         }
-        (recompressed, downsampled)
+        Ok((recompressed, downsampled))
     }
 
     /// Re-Flates other streams stored uncompressed or with an older filter.
@@ -557,11 +654,12 @@ impl Pdf {
         let mut work = self.clone();
         let mut report = ReduceReport { size_before: before, ..Default::default() };
         report.streams_merged = work.merge_identical_streams();
-        let (recompressed, downsampled) = work.recompress_images(options);
+        let (recompressed, downsampled) = work.recompress_images(options)?;
         report.images_recompressed = recompressed;
         report.images_downsampled = downsampled;
         report.streams_recompressed = work.reflate_streams();
-        work.doc.prune_objects();
+        crate::save::prune(&mut work.doc);
+        crate::pdf::writable_numbers(&mut work.doc);
 
         let save = lopdf::SaveOptions::builder()
             .use_object_streams(true)
@@ -759,6 +857,26 @@ pub fn reduce_files(inputs: &[PathBuf], output: &OutputOptions, options: &Reduce
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
+
+    #[test]
+    fn images_are_decoded_within_the_budget_of_the_operation() {
+        let doc = Document::with_version("1.5");
+        let dict = dictionary! {
+            "Subtype" => "Image", "Width" => 100, "Height" => 100, "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8,
+            "Filter" => "FlateDecode",
+        };
+        let image = Stream::new(dict, flate(&[0u8; 10_000]));
+        // An image larger than what is left is not decoded, and takes nothing.
+        let mut budget = 9_999;
+        assert!(decode_image(&doc, &image, &mut budget).is_none());
+        assert_eq!(budget, 9_999);
+        let mut budget = 25_000;
+        assert_eq!(decode_image(&doc, &image, &mut budget).unwrap().samples.len(), 10_000);
+        assert_eq!(budget, 15_000);
+        // Real images, which compress a few dozen times at most, always fit.
+        assert!(image_budget(100 << 20) > crate::limits::MAX_DECODED + 3000 * (1 << 20));
+    }
 
     #[test]
     fn slider_maps_like_the_original() {

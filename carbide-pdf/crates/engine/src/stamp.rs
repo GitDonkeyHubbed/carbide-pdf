@@ -61,15 +61,30 @@ impl WatermarkOptions {
     }
 }
 
+impl WatermarkOptions {
+    /// Checks that the watermark can be drawn: text, a size larger than 0 and no larger than a page
+    /// can be, an angle, and an opacity and colour between 0 and 1.
+    pub fn validate(&self) -> Result<()> {
+        if self.text.trim().is_empty() {
+            return Err(Error::Other("watermark text is empty".into()));
+        }
+        let fraction = |v: f32| (0.0..=1.0).contains(&v);
+        let sized = self.font_size.is_finite() && self.font_size > 0.0 && self.font_size <= crate::pdf::MAX_PAGE_SIDE;
+        if !(sized && self.rotation_degrees.is_finite() && fraction(self.opacity) && self.color.iter().all(|&c| fraction(c))) {
+            return Err(Error::Other(messages::WATERMARK.into()));
+        }
+        Ok(())
+    }
+}
+
 impl Pdf {
     /// Centers a rotated, semi-transparent text watermark on the selected pages.
     pub fn apply_watermark(&mut self, options: &WatermarkOptions) -> Result<()> {
-        if options.text.trim().is_empty() {
-            return Err(Error::Other("watermark text is empty".into()));
-        }
+        options.validate()?;
         let count = self.page_count();
+        // A page listed twice is stamped once.
         let selected: Vec<usize> = match &options.pages {
-            Some(p) => p.clone(),
+            Some(p) => crate::pdf::once_each(p),
             None => (0..count).collect(),
         };
         let width = options.font.text_width(&options.text, options.font_size);
@@ -77,12 +92,13 @@ impl Pdf {
         let drop = options.font.cap_height() * options.font_size / 2.0;
         let [r, g, b] = options.color;
 
+        let ids = self.page_ids();
         for index in selected {
-            let page_id = self.page_id(index)?;
-            let geometry = self.page_geometry(index)?;
+            let page_id = *ids.get(index).ok_or(Error::PageOutOfRange { index, count })?;
+            let geometry = self.geometry_of(page_id);
             let (w, h) = geometry.display_size();
             let font_name = self.add_standard_font(page_id, options.font)?;
-            let state_name = self.add_alpha_state(page_id, options.opacity.clamp(0.0, 1.0))?;
+            let state_name = self.add_alpha_state(page_id, options.opacity)?;
 
             let mut content: Vec<u8> = Vec::new();
             let header = format!(
@@ -142,20 +158,47 @@ impl Default for BatesOptions {
     }
 }
 
+/// The most digits a Bates number is padded to: as many as the largest number has.
+pub const MAX_BATES_DIGITS: usize = 20;
+
+pub mod messages {
+    pub const BATES_DIGITS: &str = "Bates numbers can be padded to between 1 and 20 digits.";
+    pub const BATES_RANGE: &str = "The Bates numbers would go past 18446744073709551615, the largest that can be stamped.";
+    pub const BATES_TEXT: &str = "The Bates text size and margin have to be numbers, and the size larger than 0.";
+    pub const WATERMARK: &str = "The watermark size and angle have to be numbers, the size larger than 0, and the opacity \
+and colour between 0 and 1.";
+}
+
 impl BatesOptions {
     /// The label for the page at `page_index` (zero-based, relative to the first stamped page).
+    /// Numbers past the largest one stop there, and the padding is at most [`MAX_BATES_DIGITS`];
+    /// [`BatesOptions::validate`] refuses options that would need either.
     pub fn label(&self, page_index: usize) -> String {
-        let number = self.start_number + page_index as u64;
-        format!("{}{:0width$}{}", self.prefix, number, self.suffix, width = self.digits.max(1))
+        let number = self.start_number.saturating_add(page_index as u64);
+        format!("{}{:0width$}{}", self.prefix, number, self.suffix, width = self.digits.clamp(1, MAX_BATES_DIGITS))
+    }
+
+    /// Checks that `pages` pages can be numbered with these options.
+    pub fn validate(&self, pages: usize) -> Result<()> {
+        if !(1..=MAX_BATES_DIGITS).contains(&self.digits) {
+            return Err(Error::Other(messages::BATES_DIGITS.into()));
+        }
+        if self.start_number.checked_add(pages.saturating_sub(1) as u64).is_none() {
+            return Err(Error::Other(messages::BATES_RANGE.into()));
+        }
+        if !(self.font_size.is_finite() && self.font_size > 0.0 && self.margin.is_finite()) {
+            return Err(Error::Other(messages::BATES_TEXT.into()));
+        }
+        Ok(())
     }
 }
 
 impl Pdf {
     /// Stamps a sequential label on every page.
     pub fn apply_bates(&mut self, options: &BatesOptions) -> Result<()> {
-        for index in 0..self.page_count() {
-            let page_id = self.page_id(index)?;
-            let geometry = self.page_geometry(index)?;
+        options.validate(self.page_count())?;
+        for (index, page_id) in self.page_ids().into_iter().enumerate() {
+            let geometry = self.geometry_of(page_id);
             let (w, h) = geometry.display_size();
             let label = options.label(index);
             let text_width = options.font.text_width(&label, options.font_size);
@@ -203,5 +246,23 @@ mod tests {
         };
         assert_eq!(options.label(0), "ABC-00041");
         assert_eq!(options.label(2), "ABC-00043");
+    }
+
+    #[test]
+    fn bates_options_that_cannot_be_stamped_are_refused() {
+        let fine = BatesOptions::default();
+        assert!(fine.validate(3).is_ok());
+        for digits in [0, 21, 70_000, usize::MAX] {
+            let options = BatesOptions { digits, ..Default::default() };
+            assert_eq!(options.validate(3).unwrap_err().to_string(), messages::BATES_DIGITS);
+            // Formatting never panics, whatever the width asked for.
+            assert!(!options.label(0).is_empty());
+        }
+        let last = BatesOptions { start_number: u64::MAX, ..Default::default() };
+        assert!(last.validate(1).is_ok());
+        assert_eq!(last.validate(2).unwrap_err().to_string(), messages::BATES_RANGE);
+        assert_eq!(last.label(5), u64::MAX.to_string());
+        let size = BatesOptions { font_size: f32::NAN, ..Default::default() };
+        assert_eq!(size.validate(1).unwrap_err().to_string(), messages::BATES_TEXT);
     }
 }

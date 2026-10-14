@@ -14,7 +14,14 @@ Carbide PDF is a free, open-source PDF editor written in Rust. Its window layout
 
 **Rust toolchain.** Cargo workspace, edition 2021. The repository does not pin a minimum Rust version.
 
-**PDFium (runtime, for rendering and text).** Needed by `images`, `text`, `compare`, `redact`, `ocr`, and the GUI page view. Other commands do not need it. Download a prebuilt library from https://github.com/bblanchon/pdfium-binaries and set `CARBIDE_PDFIUM_LIB` to the path of the library file (or to the folder containing it). If the variable is not set, the engine also looks in the current directory and then in the executable's directory.
+**PDFium (runtime, for rendering and text).** Needed by `images`, `text`, `compare`, `redact`, `ocr`, and the GUI page view. Other commands do not need it. Download a prebuilt library from https://github.com/bblanchon/pdfium-binaries and set `CARBIDE_PDFIUM_LIB` to the path of the library file (or to the folder containing it). The engine looks for `libpdfium.dylib` (`libpdfium.so`, `pdfium.dll`) in this order and loads the first it finds:
+
+1. `CARBIDE_PDFIUM_LIB`, the file or the folder it names;
+2. the folder holding the executable file (with symbolic links followed, then the folder of the link it was started through, if any);
+3. inside an app bundle, its `Contents/Frameworks` and then `Contents/Resources` folders;
+4. the system library folders, by absolute path (`/opt/homebrew/lib`, `/usr/local/lib`, `/usr/lib` on macOS).
+
+The current directory is never searched, not even through the system loader's own search: loading a library runs its code, and a file with that name in the folder a command is run from (an unpacked download, say) could be anyone's.
 
 ```
 export CARBIDE_PDFIUM_LIB=/path/to/lib/libpdfium.dylib
@@ -77,8 +84,12 @@ zoom (fit width, fit page, actual size; pinch or Ctrl-scroll also zooms). All ic
 `crates/app/src/icons.rs`; no artwork from the original product is used.
 
 Shortcuts: Cmd+N new document, Cmd+O open, Cmd+S save, Cmd+W close tab (asks about unsaved changes), Cmd+Z undo,
-Cmd+Shift+Z redo, Cmd+= and Cmd+- zoom. Closing the window, or choosing Quit, asks about every document with unsaved
-changes first (on macOS the application menu's Quit is rewired to close the window so it cannot skip that question).
+Cmd+Shift+Z redo, Cmd+= and Cmd+- zoom. Closing the window, choosing Quit (or Cmd+Q), quitting from the Dock or with
+AppleScript, and logging out, restarting or shutting down all ask about every document with unsaved changes first. A
+quit that macOS asks for while changes are unsaved is cancelled and the question is shown instead (the app adds an
+`applicationShouldTerminate:` handler to the app delegate winit installs); a logout, restart or shutdown then stops,
+macOS names Carbide PDF as the app that stopped it, and it has to be started again once the question is answered. If
+the app ends without asking (it is killed, say), documents with unsaved changes keep their Auto Recovery copies.
 Forms is empty: form fields are not implemented.
 
 Add Location on the Start screen lists the cloud folders it finds on the computer (iCloud Drive, and the folders that the
@@ -121,7 +132,12 @@ carbide ocr scan.pdf scan-searchable.pdf --dpi 300 --pages 1-4
 - Extracted pages, split parts, imposed sheets and merged documents made from a protected document keep its passwords and permissions. Documents protected in different ways are only merged without protection, which the GUI asks about and the CLI needs `--unprotected` for. Exporting images or text of a protected document asks first in the GUI.
 - Signing and saving revisions of encrypted files are not supported. Reduce File Size refuses encrypted files, and Auto Recovery keeps no copy of them.
 - Reduce File Size writes its results under new names next to the originals by default; replacing the originals is a separate choice. A batch in which two files would be written to the same file is refused before anything is reduced.
-- Auto Recovery: each window keeps its own recovery records, and only those of windows that are no longer running are offered for recovery. Records an earlier version of the app kept (it had no per-window lock) are offered once they have not changed for longer than the longest auto-save interval. A recovered document opens as an unsaved document; Save asks before replacing the file it was recovered for, and refuses while that file is open in another tab with unsaved changes. Deleting recovered copies asks first.
+- Auto Recovery: each window keeps its own recovery records, and only those of windows that are no longer running are offered for recovery. Records an earlier version of the app kept (it had no per-window lock) are offered once they have not changed for longer than the longest auto-save interval. A recovered document opens as an unsaved document; Save asks before replacing the file it was recovered for, and refuses while that file is open in another tab with unsaved changes. Deleting recovered copies asks first. Each document counts its own auto-save interval from when it was opened.
+- Damaged page trees (pages or nodes without a type, loops through `/Kids` or `/Parent`, wrong page counts, a page listed twice, kids that name their page through another reference or with another generation number) are repaired when a file is opened, so that editing and rendering agree on every page number; the repairs are written with the next save. Copies made by a repair share large values instead of duplicating them. A page tree nested more than 128 levels deep, one that lists the same group of pages twice, one that lists pages so often that the copies would hold more than a million values, and one with a page or node that the file holds but that cannot be read (left out, it would be missing from the file after the next save) are refused. A `/Rotate` that is not a plain quarter turn is read the way PDFium reads it; page boxes with coordinates past 1,000,000 units are brought within that, a media box without an area is a US Letter page (as PDFium shows it), and numbers too large to be written out and read back are brought within range when a file is read and again before it is written.
+- Page-label trees that list a node more than once or are nested more than 32 levels deep are rebuilt as one list of labels, and a form field listed more than once in the field tree is kept only where it is first listed, when a file is opened. PDFium reads both whenever it opens a page and follows them without limit, so such a file would otherwise crash or freeze the app.
+- Limits against hostile files: content the engine decompresses itself may come to 256 MB for one page or object, and to 1 GB in all for imposition (pages drawn by several content streams) and Reduce; past that the command fails with a message. The clean-up after deleting, redacting or extracting pages reads each page's content within the 256 MB limit, and fails with a message rather than keep resources that removed content alone may have used. Content is read token by token, never parsed into a list of operations. Object streams are unpacked by the engine, each within 16 MB and all of them within 256 times the size of the file (at least 256 MB, at most 2 GB, counting the memory of the objects parsed from them); a file past that is refused. Reduce decodes images within 1 GB plus 32 times what they take in the file, and leaves the rest, and any image of more than 128 MB of samples, as they are.
+- PDFium has no such limits of its own, so before a page is rendered or its text read the engine checks it: its content, with the forms it and its annotations draw counted each time they are drawn, may decode to 256 MB and hold 4 million operators, and no form may draw itself. Redaction, OCR, Compare and the image and text exports refuse a page past that with a message; the GUI shows a notice in its place. Pages are rendered at a lower resolution when the image would exceed 50 million pixels or 20000 pixels on a side; the GUI's page images stay within what the GPU takes (8192 pixels on a side unless egui reports otherwise) and 16 million pixels, thumbnails kept for redrawing within 16 million pixels in all, and page sizes no file could mean are laid out as the largest a page box can have. Imposition takes at most 32 columns and rows, 64 sheets per fold, and sheets, margins and gaps up to 14400 points; Bates numbers have 1 to 20 digits.
+- Page lists that name a page more than once (`1-3,2`) act on it once. `rotate` takes multiples of 90 degrees, negative ones included. Rectangles given with a negative width or height count from the other corner. A watermark needs a size larger than 0 (and no larger than a page can be), an angle, and an opacity and colour between 0 and 1. Redacted pages are rasterized at 72 dpi or more. Merging nothing is refused.
 
 Interface differences, as found in the code:
 

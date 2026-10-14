@@ -52,6 +52,7 @@ enum Command {
     /// result keeps; --password opens every protected input.
     Merge {
         output: PathBuf,
+        #[arg(required = true)]
         inputs: Vec<PathBuf>,
         #[command(flatten)]
         out: Unprotected,
@@ -83,8 +84,16 @@ enum Command {
     },
     /// Delete pages.
     Delete { input: PathBuf, pages: String, output: PathBuf, #[command(flatten)] pw: Password },
-    /// Rotate pages by a multiple of 90 degrees.
-    Rotate { input: PathBuf, pages: String, degrees: i32, output: PathBuf, #[command(flatten)] pw: Password },
+    /// Rotate pages clockwise by a multiple of 90 degrees (negative turns them the other way).
+    Rotate {
+        input: PathBuf,
+        pages: String,
+        #[arg(allow_negative_numbers = true)]
+        degrees: i32,
+        output: PathBuf,
+        #[command(flatten)]
+        pw: Password,
+    },
     /// Insert a blank page so that it becomes page AT.
     Blank { input: PathBuf, at: usize, output: PathBuf, #[command(flatten)] pw: Password },
     /// Move a page to a new position.
@@ -257,12 +266,14 @@ enum Command {
         #[arg(long)]
         tsa_password: Option<String>,
     },
-    /// Validate every signature in a file.
+    /// Validate every signature in a file. --password reads a file that needs its open password.
     Verify {
         input: PathBuf,
         /// PEM certificate(s) to treat as trusted; repeatable.
         #[arg(long = "trust")]
         trust: Vec<PathBuf>,
+        #[command(flatten)]
+        pw: Password,
     },
     /// Named revisions stored inside the file.
     Revision {
@@ -511,8 +522,9 @@ fn renderer() -> Result<&'static Renderer, Failure> {
     Ok(Renderer::global()?)
 }
 
+/// A page list such as "1-3,5": each page once, however often it is named.
 fn pages_arg(text: &str, pdf: &Pdf) -> Result<Vec<usize>, Failure> {
-    Ok(Pdf::parse_ranges(text, pdf.page_count())?.into_iter().flatten().collect())
+    Ok(Pdf::parse_pages(text, pdf.page_count())?)
 }
 
 fn one_based(n: usize, what: &str) -> Result<usize, Failure> {
@@ -522,18 +534,24 @@ fn one_based(n: usize, what: &str) -> Result<usize, Failure> {
 fn parse_numbers(text: &str, expected: usize) -> Result<Vec<f32>, Failure> {
     let values: Result<Vec<f32>, _> = text.split(',').map(|s| s.trim().parse::<f32>()).collect();
     let values = values.map_err(|_| format!("expected {expected} numbers, got {text:?}"))?;
-    if values.len() != expected {
+    // "nan" and "inf" parse as numbers, but mean no place on a page.
+    if values.len() != expected || !values.iter().all(|v| v.is_finite()) {
         return Err(format!("expected {expected} numbers, got {text:?}").into());
     }
     Ok(values)
 }
 
-/// `PAGE:X,Y,W,H` -> (zero-based page, rect)
+/// `PAGE:X,Y,W,H` -> (zero-based page, rect). A negative width or height counts from the other
+/// corner, so the rect always comes back with a positive size.
 fn parse_rect(text: &str) -> Result<(usize, Rect), Failure> {
     let (page, numbers) = text.split_once(':').ok_or("rectangle must look like PAGE:X,Y,W,H")?;
     let page = one_based(page.trim().parse::<usize>()?, "page")?;
     let v = parse_numbers(numbers, 4)?;
-    Ok((page, Rect::new(v[0], v[1], v[2], v[3])))
+    let rect = Rect::new(v[0], v[1], v[2], v[3]).normalized();
+    if rect.is_empty() {
+        return Err(format!("rectangle {text:?} has no width or no height").into());
+    }
+    Ok((page, rect))
 }
 
 fn parse_point(text: &str) -> Result<(usize, f32, f32), Failure> {
@@ -674,8 +692,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Command::Info { input, pw } => {
             let pdf = open(&input, &pw)?;
             println!("{}: {} page(s)", input.display(), pdf.page_count());
-            for i in 0..pdf.page_count() {
-                let g = pdf.page_geometry(i)?;
+            for (i, g) in pdf.page_geometries().into_iter().enumerate() {
                 let (w, h) = g.display_size();
                 println!("  page {}: {:.0} x {:.0} pt, rotation {}", i + 1, w, h, g.rotation);
             }
@@ -957,7 +974,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 }
                 _ => return Err("give --p12, or --cert and --key".into()),
             };
-            let base = std::fs::read(&a.input)?;
+            let base = std::fs::read(&a.input).map_err(|e| format!("{}: {e}", a.input.display()))?;
             let pdf = open(&a.input, &a.pw)?;
             let authority = a.tsa.as_ref().map(|url| HttpTimestampSource {
                 url: url.clone(),
@@ -990,7 +1007,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             println!("signed {} as {}", a.output.display(), identity.common_name());
         }
         Command::Timestamp { input, output, tsa, tsa_user, tsa_password } => {
-            let base = std::fs::read(&input)?;
+            let base = std::fs::read(&input).map_err(|e| format!("{}: {e}", input.display()))?;
             let pdf = Pdf::from_bytes(&base)?;
             let authority =
                 HttpTimestampSource { url: tsa, username: tsa_user, password: secret(tsa_password, "CARBIDE_TSA_PASSWORD") };
@@ -1002,16 +1019,16 @@ fn run(cli: Cli) -> Result<(), Failure> {
             write_replacing(&output, &pdf.sign(&base, &options)?)?;
             println!("wrote {}", output.display());
         }
-        Command::Verify { input, trust } => {
-            let bytes = std::fs::read(&input)?;
+        Command::Verify { input, trust, pw } => {
+            let bytes = std::fs::read(&input).map_err(|e| format!("{}: {e}", input.display()))?;
             let mut store = TrustStore::default();
             for path in trust {
-                let bytes = std::fs::read(&path)?;
+                let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
                 let certificates = carbide_engine::signature::read_certificates(&bytes)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
                 store.certificates.extend(certificates);
             }
-            let reports = Pdf::verify_signatures(&bytes, &store, chrono::Utc::now())?;
+            let reports = Pdf::verify_signatures_with_password(&bytes, pw.password.as_deref(), &store, chrono::Utc::now())?;
             if reports.is_empty() {
                 println!("No signatures found.");
             }
@@ -1045,7 +1062,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Command::Revision { action } => match action {
             RevisionAction::Save { file, label } => {
-                let base = std::fs::read(&file)?;
+                let base = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
                 let pdf = Pdf::from_bytes(&base)?;
                 let updated = pdf.save_revision(&base, &label, &pdf_date_now())?;
                 write_replacing(&file, &updated)?;
@@ -1061,7 +1078,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 }
             }
             RevisionAction::Open { file, number, output } => {
-                let bytes = std::fs::read(&file)?;
+                let bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
                 let pdf = Pdf::from_bytes(&bytes)?;
                 let revisions = pdf.revisions();
                 let revision = revisions

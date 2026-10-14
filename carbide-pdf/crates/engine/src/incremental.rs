@@ -40,7 +40,7 @@ impl Pdf {
     /// `base_bytes` must be the file this document was loaded from (or a later save of it).
     /// Encrypted files are not supported, including those that open without a password.
     pub fn incremental_update(&self, base_bytes: &[u8]) -> Result<Vec<u8>> {
-        let base = Document::load_mem(base_bytes)?;
+        let base = crate::crypt::load_bounded(base_bytes)?;
         if base.is_encrypted() || base.was_encrypted() || self.doc.is_encrypted() {
             return Err(Error::Unsupported("incremental updates of encrypted files are not supported".into()));
         }
@@ -57,7 +57,8 @@ impl Pdf {
 
         let max_id = self.doc.max_id.max(base.max_id);
         let mut update = IncrementalDocument::create_from(base_bytes.to_vec(), base);
-        for (id, object) in changes.objects {
+        for (id, mut object) in changes.objects {
+            crate::pdf::writable(&mut object);
             update.new_document.set_object(id, object);
         }
         for (key, value) in changes.trailer {

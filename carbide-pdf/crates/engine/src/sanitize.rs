@@ -146,7 +146,7 @@ impl Pdf {
         if chosen(HiddenItem::UnusedObjects) {
             let structure = file_structure(&self.doc);
             self.trim_resources()?;
-            let removed = self.doc.prune_objects().into_iter().filter(|id| !structure.contains(id) && !in_file.contains(id)).count();
+            let removed = crate::save::prune(&mut self.doc).into_iter().filter(|id| !structure.contains(id) && !in_file.contains(id)).count();
             report.removed.push((HiddenItem::UnusedObjects, removed));
         }
         for item in HiddenItem::ALL.into_iter().filter(|&i| chosen(i) && i != HiddenItem::UnusedObjects) {
@@ -169,7 +169,7 @@ impl Pdf {
             report.removed.push((item, count));
         }
         // What the removals left unused goes too, so it is not written out with the document.
-        self.doc.prune_objects();
+        crate::save::prune(&mut self.doc);
         Ok(report)
     }
 
@@ -191,7 +191,7 @@ impl Pdf {
     fn remove_name_tree(&mut self, key: &[u8]) -> usize {
         let Some(tree) = self.name_tree(key) else { return 0 };
         let mut pairs = Vec::new();
-        collect_pairs(&self.doc, &tree, b"Names", &mut pairs, 0);
+        collect_pairs(&self.doc, &tree, b"Names", &mut pairs);
         let names = self.doc.catalog().ok().and_then(|c| c.get(b"Names").ok().cloned());
         match names {
             Some(Object::Reference(id)) => {

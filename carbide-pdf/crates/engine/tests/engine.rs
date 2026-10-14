@@ -517,7 +517,7 @@ fn page_text_that_looks_like_the_length_placeholder_is_left_alone() {
     assert!(page_text(r, &mut saved, 0).contains("0000000000"), "the page text was patched");
 }
 
-// ---- saving over the file ----------------------------------------------------------------
+// ---- saving over the file ------------------------------------------------------------------
 
 fn contains(bytes: &[u8], needle: &[u8]) -> bool {
     bytes.windows(needle.len()).any(|w| w == needle)
@@ -2166,6 +2166,43 @@ fn printing_order_changes_the_output_order() {
 }
 
 #[test]
+fn odd_plate_counts_print_every_page_once_in_every_order() {
+    // Perfect-bound work and turn (or tumble) makes one plate per fold, so these page counts give
+    // an odd number of plates.
+    let r = renderer();
+    for (layout, style, columns) in [(LayoutKind::Booklet4Up, Style::WorkAndTurn, 2), (LayoutKind::Booklet8Up, Style::WorkAndTumble, 4)] {
+        for pages in [4, 12, 20] {
+            let source = numbered_pages(pages);
+            for printing_order in [PrintingOrder::FrontsThenBacks, PrintingOrder::FrontsThenBacksReversed] {
+                let options = ImpositionOptions {
+                    plan: PlanOptions {
+                        layout,
+                        columns,
+                        rows: 2,
+                        binding: Binding::Perfect,
+                        sheets_per_fold: 1,
+                        style,
+                        double_sided: true,
+                        printing_order,
+                    },
+                    ..Default::default()
+                };
+                let what = format!("{layout:?} {printing_order:?} N={pages}");
+                let mut sheets = source.impose(&options, None).unwrap_or_else(|e| panic!("{what}: {e}"));
+                let mut printed = vec![0; pages];
+                for sheet in 0..sheets.page_count() {
+                    let text = page_text(r, &mut sheets, sheet);
+                    for (n, count) in printed.iter_mut().enumerate() {
+                        *count += text.matches(&format!("PAGE{}X", n + 1)).count();
+                    }
+                }
+                assert!(printed.iter().all(|&c| c == 1), "{what}: times each page was printed: {printed:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn imposition_reports_progress_and_can_be_cancelled() {
     let source = numbered_pages(8);
     let options = ImpositionOptions::default();
@@ -2183,6 +2220,1030 @@ fn imposition_reports_progress_and_can_be_cancelled() {
     let broken = ImpositionOptions { media: Media::None, ..Default::default() };
     assert!(source.impose(&broken, None).unwrap_err().to_string().starts_with("Choose a media size"));
     let _ = (Binding::Saddle, Style::Sheetwise);
+}
+
+// ---- damaged page trees --------------------------------------------------------------------
+
+/// Three pages showing "AAA first", "BBB SECRET" and "CCC third", with `damage` done to the page
+/// tree (given the root and the page ids) and written out as is, the way another program would.
+fn damaged_tree(damage: impl FnOnce(&mut Document, lopdf::ObjectId, &[lopdf::ObjectId])) -> Vec<u8> {
+    let mut pdf = text_pdf(&[&["AAA first"], &["BBB SECRET"], &["CCC third"]]);
+    let ids = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let root = doc.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+    damage(doc, root, &ids);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn set_kids(doc: &mut Document, node: lopdf::ObjectId, kids: Vec<Object>) {
+    doc.get_dictionary_mut(node).unwrap().set("Kids", kids);
+}
+
+/// Runs `work` on another thread and fails the test if it does not finish within half a minute.
+fn finishes<T: Send + 'static>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver.recv_timeout(std::time::Duration::from_secs(30)).unwrap_or_else(|_| panic!("{what} did not finish"))
+}
+
+/// The text of every page, after checking that PDFium finds exactly the pages the engine finds.
+fn texts_seen_by_both(pdf: &mut Pdf) -> Vec<String> {
+    let bytes = pdf.to_bytes().unwrap();
+    assert_eq!(renderer().page_count(&bytes).unwrap(), pdf.page_count(), "PDFium and the engine count different pages");
+    (0..pdf.page_count()).map(|page| renderer().page_text(&bytes, page).unwrap().trim().to_string()).collect()
+}
+
+#[test]
+fn damaged_page_trees_read_the_same_to_the_engine_and_to_pdfium() {
+    type Damage = fn(&mut Document, lopdf::ObjectId, &[lopdf::ObjectId]);
+    let all = ["AAA first", "BBB SECRET", "CCC third"];
+    let cases: Vec<(&str, Damage, Vec<&str>)> = vec![
+        ("untyped page", |doc, _, ids| {
+            doc.get_dictionary_mut(ids[1]).unwrap().remove(b"Type");
+        }, all.to_vec()),
+        ("page typed as a node", |doc, _, ids| {
+            doc.get_dictionary_mut(ids[1]).unwrap().set("Type", "Pages");
+        }, all.to_vec()),
+        ("untyped node", |doc, root, ids| {
+            let node = doc.add_object(dictionary! { "Parent" => root, "Kids" => vec![ids[1].into(), ids[2].into()], "Count" => 2 });
+            set_kids(doc, root, vec![ids[0].into(), node.into()]);
+        }, all.to_vec()),
+        ("page given directly", |doc, root, ids| {
+            let direct = doc.get_dictionary(ids[1]).unwrap().clone();
+            set_kids(doc, root, vec![ids[0].into(), Object::Dictionary(direct), ids[2].into()]);
+        }, all.to_vec()),
+        ("loop through a node", |doc, root, ids| {
+            let node = doc.add_object(dictionary! { "Type" => "Pages", "Parent" => root, "Kids" => vec![ids[1].into(), root.into()], "Count" => 1 });
+            set_kids(doc, root, vec![ids[0].into(), node.into(), ids[2].into()]);
+        }, all.to_vec()),
+        ("root lists itself", |doc, root, ids| {
+            set_kids(doc, root, vec![ids[0].into(), root.into(), ids[1].into(), ids[2].into()]);
+        }, all.to_vec()),
+        ("huge count", |doc, root, _| {
+            doc.get_dictionary_mut(root).unwrap().set("Count", 1_000_000);
+        }, all.to_vec()),
+        ("missing and non-dictionary kids", |doc, root, ids| {
+            let number = doc.add_object(Object::Integer(7));
+            set_kids(doc, root, vec![ids[0].into(), (9999, 0).into(), ids[1].into(), number.into(), Object::Null, ids[2].into()]);
+        }, all.to_vec()),
+        ("page listed twice", |doc, root, ids| {
+            set_kids(doc, root, vec![ids[0].into(), ids[1].into(), ids[1].into(), ids[2].into()]);
+        }, vec!["AAA first", "BBB SECRET", "BBB SECRET", "CCC third"]),
+        ("parent loops", |doc, root, ids| {
+            doc.get_dictionary_mut(root).unwrap().set("Parent", root);
+            let node = doc.add_object(dictionary! { "Type" => "Pages", "Kids" => vec![ids[1].into()], "Count" => 1 });
+            doc.get_dictionary_mut(node).unwrap().set("Parent", ids[1]);
+            doc.get_dictionary_mut(ids[1]).unwrap().set("Parent", node);
+            set_kids(doc, root, vec![ids[0].into(), node.into(), ids[2].into()]);
+        }, all.to_vec()),
+    ];
+    for (what, damage, expected) in cases {
+        let bytes = damaged_tree(damage);
+        let mut pdf = Pdf::from_bytes(&bytes).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(texts_seen_by_both(&mut pdf), expected, "{what}");
+
+        // Structural edits keep every page and finish, whatever /Parent says.
+        let mut inserted = pdf.clone();
+        inserted.insert_blank_page(0, None).unwrap();
+        assert_eq!(texts_seen_by_both(&mut inserted)[1..], expected[..], "{what}: insert");
+        let mut deleted = finishes(what, move || {
+            pdf.delete_pages(&[0]).unwrap();
+            pdf
+        });
+        assert_eq!(texts_seen_by_both(&mut deleted), expected[1..], "{what}: delete");
+    }
+
+    // A page listed twice became two pages: rotating one leaves the other alone.
+    let mut twice = Pdf::from_bytes(&damaged_tree(|doc, root, ids| {
+        set_kids(doc, root, vec![ids[0].into(), ids[1].into(), ids[1].into(), ids[2].into()]);
+    }))
+    .unwrap();
+    twice.rotate_pages(&[1], 90).unwrap();
+    assert_eq!((twice.page_rotation(1).unwrap(), twice.page_rotation(2).unwrap()), (90, 0));
+}
+
+#[test]
+fn redaction_lands_on_the_page_shown_even_when_the_tree_is_damaged() {
+    let r = renderer();
+    let bytes = damaged_tree(|doc, _, ids| {
+        doc.get_dictionary_mut(ids[1]).unwrap().remove(b"Type");
+    });
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+    pdf.apply_redactions(r, &[Redaction { page: 1, rect: Rect::new(60.0, 692.0, 300.0, 28.0) }], 150.0).unwrap();
+    let out = pdf.to_bytes().unwrap();
+    assert_eq!(r.page_count(&out).unwrap(), 3);
+    assert_eq!(r.page_text(&out, 0).unwrap().trim(), "AAA first");
+    assert_eq!(r.page_text(&out, 1).unwrap().trim(), "", "the page shown second was not redacted");
+    assert_eq!(r.page_text(&out, 2).unwrap().trim(), "CCC third", "another page was redacted instead");
+    assert!(!contains(&out, b"BBB SECRET"));
+}
+
+#[test]
+fn redaction_refuses_when_the_renderer_counts_other_pages() {
+    // Damage done after loading, which the repair on opening never saw.
+    let mut pdf = text_pdf(&[&["AAA first"], &["BBB SECRET"], &["CCC third"]]);
+    let ids = pdf.page_ids();
+    pdf.document_mut().get_dictionary_mut(ids[1]).unwrap().remove(b"Type");
+    pdf.to_bytes().unwrap();
+    let before = pdf.document().objects.clone();
+    let refused = pdf.apply_redactions(renderer(), &[Redaction { page: 1, rect: Rect::new(60.0, 692.0, 300.0, 28.0) }], 150.0);
+    assert!(refused.unwrap_err().to_string().contains("page tree is damaged"));
+    assert_eq!(pdf.document().objects, before, "a refused redaction changed the document");
+}
+
+#[test]
+fn deleting_pages_finishes_when_parent_chains_loop_after_loading() {
+    for (what, damage) in [
+        ("root names itself", 0usize),
+        ("page names itself", 1),
+        ("page and node name each other", 2),
+    ] {
+        let mut pdf = text_pdf(&[&["ONE"], &["TWO"], &["THREE"]]);
+        let ids = pdf.page_ids();
+        let doc = pdf.document_mut();
+        let root = doc.catalog().unwrap().get(b"Pages").unwrap().as_reference().unwrap();
+        match damage {
+            0 => doc.get_dictionary_mut(root).unwrap().set("Parent", root),
+            1 => doc.get_dictionary_mut(ids[1]).unwrap().set("Parent", ids[1]),
+            _ => {
+                doc.get_dictionary_mut(root).unwrap().set("Parent", ids[1]);
+                doc.get_dictionary_mut(ids[1]).unwrap().set("Parent", root);
+            }
+        }
+        let mut pdf = finishes(what, move || {
+            pdf.delete_pages(&[1]).unwrap();
+            pdf
+        });
+        assert_eq!(pdf.page_count(), 2, "{what}");
+        let bytes = pdf.to_bytes().unwrap();
+        assert_eq!(renderer().page_count(&bytes).unwrap(), 2, "{what}");
+        assert!(!contains(&bytes, b"TWO"), "{what}");
+    }
+}
+
+#[test]
+fn page_trees_that_cannot_be_read_safely_are_refused() {
+    use carbide_engine::pagetree::{messages, MAX_DEPTH};
+    let deep = damaged_tree(|doc, root, ids| {
+        let mut below: Object = ids[0].into();
+        for _ in 0..MAX_DEPTH + 5 {
+            below = doc.add_object(dictionary! { "Type" => "Pages", "Kids" => vec![below], "Count" => 1 }).into();
+        }
+        set_kids(doc, root, vec![below]);
+    });
+    assert_eq!(Pdf::from_bytes(&deep).unwrap_err().to_string(), messages::TOO_DEEP);
+
+    let shared = damaged_tree(|doc, root, ids| {
+        let node = doc.add_object(dictionary! { "Type" => "Pages", "Parent" => root, "Kids" => vec![ids[1].into()], "Count" => 1 });
+        set_kids(doc, root, vec![ids[0].into(), node.into(), node.into()]);
+    });
+    assert_eq!(Pdf::from_bytes(&shared).unwrap_err().to_string(), messages::SHARED_BRANCH);
+}
+
+#[test]
+fn a_sound_page_tree_is_not_rewritten_by_the_repair() {
+    // Nested nodes with inherited values: opening changes no object, and saving writes nothing new.
+    let bytes = inherited_geometry(false).to_bytes().unwrap();
+    let (pdf, saved) = SavedFile::open(bytes.clone(), None).unwrap();
+    assert_eq!(pdf.document().objects, Document::load_mem(&bytes).unwrap().objects);
+    assert_eq!(pdf.save_plan(Some(&saved), false).unwrap(), SavePlan::Unchanged);
+
+    // A damaged one is repaired when saved, also when the save appends an update.
+    let damaged = damaged_tree(|doc, root, _| {
+        doc.get_dictionary_mut(root).unwrap().set("Count", 1_000_000);
+    });
+    let (pdf, saved) = SavedFile::open(damaged, None).unwrap();
+    assert_ne!(pdf.save_plan(Some(&saved), false).unwrap(), SavePlan::Unchanged);
+}
+
+/// Three pages as `damaged_tree` makes them, the second without a media box, resources or turn of
+/// its own: it inherits them from the root, `levels` page-tree nodes above it.
+fn deep_page(levels: usize) -> Vec<u8> {
+    damaged_tree(|doc, root, ids| {
+        let page = doc.get_dictionary_mut(ids[1]).unwrap();
+        let resources = page.remove(b"Resources").unwrap();
+        page.remove(b"MediaBox");
+        let node = doc.get_dictionary_mut(root).unwrap();
+        node.set("MediaBox", vec![0.into(), 0.into(), 400.into(), 800.into()]);
+        node.set("Rotate", 90);
+        node.set("Resources", resources);
+        let mut child = ids[1];
+        for _ in 0..levels {
+            let parent = doc.add_object(dictionary! { "Type" => "Pages", "Kids" => vec![child.into()], "Count" => 1 });
+            doc.get_dictionary_mut(child).unwrap().set("Parent", parent);
+            child = parent;
+        }
+        doc.get_dictionary_mut(child).unwrap().set("Parent", root);
+        set_kids(doc, root, vec![ids[0].into(), child.into(), ids[2].into()]);
+    })
+}
+
+#[test]
+fn pages_inherit_from_as_far_up_as_a_tree_can_reach() {
+    use carbide_engine::pagetree::MAX_DEPTH;
+    let r = renderer();
+    for levels in [70, MAX_DEPTH - 2] {
+        let mut pdf = Pdf::from_bytes(&deep_page(levels)).unwrap();
+        let bytes = pdf.to_bytes().unwrap();
+        // Turned a quarter, 400 x 800 becomes 800 x 400, to the engine and to PDFium.
+        assert_eq!(pdf.page_geometry(1).unwrap().display_size(), (800.0, 400.0), "{levels} levels");
+        assert_eq!(r.page_size(&bytes, 1).unwrap(), (800.0, 400.0), "{levels} levels");
+        assert_eq!(texts_seen_by_both(&mut pdf)[1], "BBB SECRET", "{levels} levels");
+
+        // Redacting the whole page shown covers it all, not a part of a page of another size.
+        let mut redacted = pdf.clone();
+        redacted.apply_redactions(r, &[Redaction { page: 1, rect: Rect::new(0.0, 0.0, 800.0, 400.0) }], 100.0).unwrap();
+        let image = render(r, &mut redacted, 1);
+        assert_eq!(image.dimensions(), (800, 400), "{levels} levels");
+        assert!(brightness(&image, Rect::new(0.0, 0.0, 800.0, 400.0)) < 5.0, "{levels} levels: the page is not all black");
+        assert!(!contains(&redacted.to_bytes().unwrap(), b"BBB SECRET"));
+
+        // Flattening the tree for an edit keeps what the page inherited.
+        let mut inserted = pdf.clone();
+        inserted.insert_blank_page(0, None).unwrap();
+        assert_eq!(inserted.page_geometry(2).unwrap().display_size(), (800.0, 400.0), "{levels} levels");
+        assert_eq!(texts_seen_by_both(&mut inserted)[2], "BBB SECRET", "{levels} levels");
+    }
+}
+
+/// How many values `doc` holds, nested ones included.
+fn values(doc: &Document) -> usize {
+    fn count(object: &Object) -> usize {
+        1 + match object {
+            Object::Array(items) => items.iter().map(count).sum(),
+            Object::Dictionary(dict) => dict.iter().map(|(_, v)| count(v)).sum(),
+            Object::Stream(stream) => stream.dict.iter().map(|(_, v)| count(v)).sum(),
+            _ => 0,
+        }
+    }
+    doc.objects.values().map(count).sum()
+}
+
+#[test]
+fn repairs_share_what_they_copy_and_stay_linear() {
+    // A page holding a large array directly, listed 300 times: 300 pages that share the array.
+    let junk = || Object::Array(vec![Object::Integer(0); 50_000]);
+    let listed = damaged_tree(|doc, root, ids| {
+        doc.get_dictionary_mut(ids[1]).unwrap().set("Junk", junk());
+        set_kids(doc, root, vec![ids[1].into(); 300]);
+    });
+    let pdf = finishes("listed 300 times", move || Pdf::from_bytes(&listed).unwrap());
+    assert_eq!(pdf.page_count(), 300);
+    assert!(values(pdf.document()) < 2 * 50_000, "the array was copied: {} values", values(pdf.document()));
+
+    // Pages under the root naming, as /Parent, the head of a long chain of nodes outside the tree
+    // that gives them a turn: each page's chain is read once, not once per page and attribute.
+    let chained = damaged_tree(|doc, root, ids| {
+        let template = doc.get_dictionary(ids[0]).unwrap().clone();
+        let mut next = doc.add_object(dictionary! { "Type" => "Pages", "Rotate" => 90 });
+        for _ in 0..8000 {
+            next = doc.add_object(dictionary! { "Type" => "Pages", "Parent" => next });
+        }
+        let pages: Vec<Object> = (0..8000)
+            .map(|_| {
+                let mut page = template.clone();
+                page.set("Parent", next);
+                doc.add_object(page).into()
+            })
+            .collect();
+        set_kids(doc, root, pages);
+    });
+    let pdf = finishes("a long /Parent chain", move || Pdf::from_bytes(&chained).unwrap());
+    assert_eq!(pdf.page_count(), 8000);
+    // The turn is further up than a tree can be deep, so no page takes it.
+    assert_eq!(pdf.page_rotation(0).unwrap(), 0);
+    let near = damaged_tree(|doc, root, ids| {
+        let turn = doc.add_object(dictionary! { "Type" => "Pages", "Rotate" => 90 });
+        let head = doc.add_object(dictionary! { "Type" => "Pages", "Parent" => turn, "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()] });
+        doc.get_dictionary_mut(ids[1]).unwrap().set("Parent", head);
+        doc.get_dictionary_mut(ids[1]).unwrap().remove(b"MediaBox");
+        let _ = root;
+    });
+    let mut near = Pdf::from_bytes(&near).unwrap();
+    assert_eq!(near.page_rotation(1).unwrap(), 90);
+    assert_eq!(texts_seen_by_both(&mut near)[1], "BBB SECRET");
+    assert_eq!(renderer().page_size(&near.to_bytes().unwrap(), 1).unwrap(), (300.0, 300.0));
+
+    // Listing a page more often than copying can afford is refused.
+    let many = damaged_tree(|doc, root, ids| {
+        let page = doc.get_dictionary_mut(ids[1]).unwrap();
+        for n in 0..100 {
+            page.set(format!("Key{n}"), n);
+        }
+        set_kids(doc, root, vec![ids[1].into(); 10_000]);
+    });
+    let refused = finishes("listed 10000 times", move || Pdf::from_bytes(&many).map(|_| ()));
+    assert_eq!(refused.unwrap_err().to_string(), carbide_engine::pagetree::messages::TOO_MANY_COPIES);
+
+    // Flattening the tree shares a large inherited value instead of copying it onto every page.
+    let inherited = damaged_tree(|doc, root, ids| {
+        let mut resources = doc.get_dictionary(ids[0]).unwrap().get(b"Resources").unwrap().as_dict().unwrap().clone();
+        resources.set("Junk", junk());
+        for id in ids {
+            doc.get_dictionary_mut(*id).unwrap().remove(b"Resources");
+        }
+        doc.get_dictionary_mut(root).unwrap().set("Resources", resources);
+    });
+    let mut pdf = Pdf::from_bytes(&inherited).unwrap();
+    pdf.insert_blank_page(0, None).unwrap();
+    assert!(values(pdf.document()) < 2 * 50_000, "the resources were copied: {} values", values(pdf.document()));
+    assert_eq!(texts_seen_by_both(&mut pdf)[1..], ["AAA first", "BBB SECRET", "CCC third"]);
+}
+
+#[test]
+fn kids_that_name_their_page_another_way_name_it_directly() {
+    let bytes = damaged_tree(|doc, root, ids| {
+        // A reference to a reference, and a generation number the object does not have (PDFium
+        // goes by the object number alone).
+        let alias = doc.add_object(Object::Reference(ids[1]));
+        set_kids(doc, root, vec![ids[0].into(), alias.into(), (ids[2].0, 7).into()]);
+    });
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+    assert_eq!(texts_seen_by_both(&mut pdf), ["AAA first", "BBB SECRET", "CCC third"]);
+}
+
+/// A file of `objects` (object 1 first, the catalog), written by hand: values lopdf cannot read
+/// can be written this way, as other programs might.
+fn handwritten(objects: &[&str]) -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1).as_bytes());
+    out
+}
+
+/// Two pages, each showing its number, with `second` as the second page's dictionary and
+/// `count` as the root's /Count.
+fn two_pages(second: &str, count: &str) -> Vec<u8> {
+    let page = |content: u32, extra: &str| {
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {content} 0 R /Resources << /Font << /F1 7 0 R >> >> {extra} >>")
+    };
+    handwritten(&[
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        &format!("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count {count} >>"),
+        &page(5, ""),
+        &page(6, second),
+        "<< /Length 31 >>\nstream\nBT /F1 18 Tf 72 700 Td (ONE) Tj ET\nendstream",
+        "<< /Length 31 >>\nstream\nBT /F1 18 Tf 72 700 Td (TWO) Tj ET\nendstream",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ])
+}
+
+#[test]
+fn pages_that_cannot_be_read_are_refused_instead_of_dropped() {
+    use carbide_engine::pagetree::messages::UNREADABLE;
+    // A sound file opens: the fixture itself is right.
+    let mut sound = Pdf::from_bytes(&two_pages("", "2")).unwrap();
+    assert_eq!(texts_seen_by_both(&mut sound), ["ONE", "TWO"]);
+    for (what, file) in [
+        ("an integer too large in a page box", two_pages("/CropBox [0 0 300000000000000000000000000000000000000 792]", "2")),
+        ("an integer too large for /Rotate", two_pages("/Rotate 100000000000000000000", "2")),
+        ("a dictionary that does not end", two_pages("/Foo <<", "2")),
+        ("an integer too large for the root's /Count", two_pages("", "99999999999999999999999")),
+        ("a /Count of 2 to the 63rd", two_pages("", "9223372036854775808")),
+    ] {
+        // PDFium shows every page of these.
+        assert_eq!(renderer().page_count(&file).unwrap(), 2, "{what}");
+        let refused = Pdf::from_bytes(&file).map(|pdf| pdf.page_count());
+        assert_eq!(refused.unwrap_err().to_string(), UNREADABLE, "{what}");
+    }
+}
+
+#[test]
+fn numbers_too_large_to_write_are_brought_within_range() {
+    use carbide_engine::pagetree::MAX_COORDINATE;
+    use carbide_engine::pdf::MAX_PAGE_SIDE;
+    let file = |media_box: &str| {
+        handwritten(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            &format!("<< /Type /Page /Parent 2 0 R /MediaBox {media_box} /Huge 1000000000000000000000000000000.0 >>"),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ])
+    };
+    for media_box in [
+        "[0 0 1000000000000000000000000000000.0 1000000000000000000000000000000.0]",
+        "[-300000000000000000000000000000000000000.0 -300000000000000000000000000000000000000.0 \
+300000000000000000000000000000000000000.0 300000000000000000000000000000000000000.0]",
+        "[0 0 9000000000000000000 792]",
+    ] {
+        let mut pdf = Pdf::from_bytes(&file(media_box)).unwrap();
+        let (w, h) = pdf.page_geometry(0).unwrap().display_size();
+        assert!(w.is_finite() && h.is_finite() && w <= 2.0 * MAX_COORDINATE && h <= 2.0 * MAX_COORDINATE, "{media_box}: {w} x {h}");
+        // A page made the size of the first (as far as a new page can be), and the numbers of the
+        // file, read back after saving.
+        pdf.insert_blank_page(1, None).unwrap();
+        let bytes = pdf.to_bytes().unwrap();
+        let again = Pdf::from_bytes(&bytes).unwrap();
+        assert_eq!(again.page_count(), 3, "{media_box}");
+        assert_eq!(renderer().page_count(&bytes).unwrap(), 3, "{media_box}");
+        assert_eq!(again.page_geometry(0).unwrap().display_size(), (w, h), "{media_box}");
+        assert_eq!(again.page_geometry(1).unwrap().display_size(), (w.min(MAX_PAGE_SIDE), h.min(MAX_PAGE_SIDE)), "{media_box}");
+    }
+    // Sizes asked for have to be numbers a page can have.
+    for size in [(f32::NAN, 792.0), (f32::INFINITY, 792.0), (0.0, 792.0), (612.0, 1.0e30)] {
+        assert!(Pdf::new().insert_blank_page(0, Some(size)).is_err(), "{size:?}");
+    }
+    // Numbers an edit puts in are brought within range when the document is written.
+    let mut edited = text_pdf(&[&["ONE"], &["TWO"]]);
+    let id = edited.page_ids()[1];
+    edited.document_mut().get_dictionary_mut(id).unwrap().set("Huge", Object::Real(f32::INFINITY));
+    edited.document_mut().get_dictionary_mut(id).unwrap().set("Large", Object::Real(1.0e30));
+    let mut again = Pdf::from_bytes(&edited.to_bytes().unwrap()).unwrap();
+    assert_eq!(texts_seen_by_both(&mut again), ["ONE", "TWO"]);
+}
+
+#[test]
+fn a_media_box_without_an_area_is_a_letter_page() {
+    for media_box in ["[0 0 0 0]", "[5 5 5 100]", "[0 0 100 0]", "[10 10 10 10]", "[0 0 612]"] {
+        let bytes = handwritten(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            &format!("<< /Type /Page /Parent 2 0 R /MediaBox {media_box} >>"),
+        ]);
+        let pdf = Pdf::from_bytes(&bytes).unwrap();
+        assert_eq!(pdf.page_geometry(0).unwrap().display_size(), (612.0, 792.0), "{media_box}");
+        assert_eq!(renderer().page_size(&bytes, 0).unwrap(), (612.0, 792.0), "{media_box}");
+    }
+}
+
+/// `pdf` with `damage` done to the document's catalog (given the catalog and the page ids) and
+/// read back from a file.
+fn with_catalog(pdf: &Pdf, damage: impl FnOnce(&mut Document, lopdf::ObjectId, &[lopdf::ObjectId])) -> Pdf {
+    let mut pdf = pdf.clone();
+    let ids = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let catalog = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+    damage(doc, catalog, &ids);
+    Pdf::from_bytes(&pdf.to_bytes().unwrap()).unwrap()
+}
+
+#[test]
+fn trees_that_list_themselves_do_not_stop_edits() {
+    let base = text_pdf(&[&["ONE"], &["TWO"], &["THREE"]]);
+    // A node that lists itself twice, on and on, and then `last`: 2 to the 64th visits without a
+    // record of the nodes already seen.
+    let self_listing = |doc: &mut Document, last: Option<lopdf::ObjectId>| {
+        let node = doc.new_object_id();
+        let kids: Vec<Object> = [node, node].into_iter().chain(last).map(Object::from).collect();
+        doc.objects.insert(node, Object::Dictionary(dictionary! { "Kids" => kids }));
+        node
+    };
+    // Nodes that each list the next twice, `levels` deep, above `leaf`: no loop, and as many visits.
+    let doubling = |doc: &mut Document, leaf: lopdf::Dictionary, levels: usize| {
+        let mut next = doc.add_object(leaf);
+        for _ in 0..levels {
+            let mut node = dictionary! { "Kids" => vec![next.into(), next.into()] };
+            node.set("T", Object::string_literal("F"));
+            next = doc.add_object(node);
+        }
+        next
+    };
+    let roman = || dictionary! { "Nums" => vec![0.into(), dictionary! { "S" => "r" }.into()] };
+    let names = with_catalog(&base, |doc, catalog, _| {
+        let tree = self_listing(doc, None);
+        let doubled = doubling(doc, dictionary! { "Names" => Vec::<Object>::new() }, 64);
+        doc.get_dictionary_mut(catalog).unwrap().set("Names", dictionary! { "Dests" => tree, "JavaScript" => doubled });
+    });
+    // PDFium reads the page labels for every page it opens, and would run out of stack on these
+    // or never finish.
+    let labels = with_catalog(&base, |doc, catalog, _| {
+        let leaf = doc.add_object(roman());
+        let tree = self_listing(doc, Some(leaf));
+        doc.get_dictionary_mut(catalog).unwrap().set("PageLabels", tree);
+    });
+    let doubled_labels = with_catalog(&base, |doc, catalog, _| {
+        let tree = doubling(doc, roman(), 64);
+        doc.get_dictionary_mut(catalog).unwrap().set("PageLabels", tree);
+    });
+    let deep_labels = with_catalog(&base, |doc, catalog, _| {
+        let mut next = doc.add_object(roman());
+        for _ in 0..100_000 {
+            next = doc.add_object(dictionary! { "Kids" => vec![next.into()] });
+        }
+        doc.get_dictionary_mut(catalog).unwrap().set("PageLabels", next);
+    });
+    let fields = with_catalog(&base, |doc, catalog, ids| {
+        let field = doc.new_object_id();
+        let widget = dictionary! { "Subtype" => "Widget", "P" => ids[0], "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()] };
+        let widget = doc.add_object(widget);
+        doc.objects.insert(field, Object::Dictionary(dictionary! { "T" => Object::string_literal("F"), "Kids" => vec![field.into(), field.into(), widget.into()] }));
+        doc.get_dictionary_mut(ids[0]).unwrap().set("Annots", vec![widget.into()]);
+        doc.get_dictionary_mut(catalog).unwrap().set("AcroForm", dictionary! { "Fields" => vec![field.into()] });
+    });
+    // PDFium reads the field tree to draw a page with forms, 32 levels deep: 2 to the 32nd visits.
+    let doubled_fields = with_catalog(&base, |doc, catalog, ids| {
+        let widget = dictionary! { "Subtype" => "Widget", "P" => ids[1], "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()] };
+        let widget = doc.add_object(widget);
+        let tree = doubling(doc, dictionary! { "T" => Object::string_literal("leaf"), "Kids" => vec![widget.into()] }, 40);
+        doc.get_dictionary_mut(ids[1]).unwrap().set("Annots", vec![widget.into()]);
+        doc.get_dictionary_mut(catalog).unwrap().set("AcroForm", dictionary! { "Fields" => vec![tree.into(), tree.into()] });
+    });
+    let structure = with_catalog(&base, |doc, catalog, ids| {
+        let element = doc.new_object_id();
+        doc.objects.insert(element, Object::Dictionary(dictionary! { "Type" => "StructElem", "Pg" => ids[1], "K" => vec![element.into(), element.into()] }));
+        let parents = doubling(doc, dictionary! { "Nums" => Vec::<Object>::new() }, 64);
+        let root = doc.add_object(dictionary! { "Type" => "StructTreeRoot", "K" => vec![element.into()], "ParentTree" => parents });
+        doc.get_dictionary_mut(catalog).unwrap().set("StructTreeRoot", root);
+    });
+
+    // The page labels are kept, each once, in a tree PDFium reads safely.
+    for pdf in [&labels, &doubled_labels, &deep_labels] {
+        let tree = pdf.document().catalog().unwrap().get(b"PageLabels").unwrap().as_reference().unwrap();
+        assert_eq!(pdf.document().get_dictionary(tree).unwrap(), &roman());
+    }
+    let cases = [
+        ("names", names),
+        ("labels", labels),
+        ("doubled labels", doubled_labels),
+        ("deep labels", deep_labels),
+        ("fields", fields),
+        ("doubled fields", doubled_fields),
+        ("structure", structure),
+    ];
+    for (what, pdf) in cases {
+        let mut shown = pdf.clone();
+        let texts = finishes(what, move || (texts_seen_by_both(&mut shown), render(renderer(), &mut shown, 1).dimensions()));
+        assert_eq!(texts, (vec!["ONE".to_string(), "TWO".into(), "THREE".into()], (612, 792)), "{what}");
+        let mut deleted = pdf.clone();
+        finishes(what, move || deleted.delete_pages(&[1]).unwrap());
+        let extracted = pdf.clone();
+        finishes(what, move || extracted.extract_pages(&[0, 2]).unwrap());
+        let mut redacted = pdf.clone();
+        let area = Redaction { page: 0, rect: Rect::new(0.0, 0.0, 100.0, 100.0) };
+        finishes(what, move || redacted.apply_redactions(renderer(), &[area], 72.0).unwrap());
+        let mut sanitized = pdf.clone();
+        finishes(what, move || sanitized.remove_hidden_information(&HiddenItem::ALL).unwrap());
+    }
+
+    // A sound label tree is left as it is.
+    let sound = with_catalog(&base, |doc, catalog, _| {
+        let leaf = doc.add_object(roman());
+        let tree = doc.add_object(dictionary! { "Kids" => vec![leaf.into()] });
+        doc.get_dictionary_mut(catalog).unwrap().set("PageLabels", tree);
+    });
+    let tree = sound.document().catalog().unwrap().get(b"PageLabels").unwrap().as_reference().unwrap();
+    assert!(sound.document().get_dictionary(tree).unwrap().has(b"Kids"));
+}
+
+// ---- resource limits -----------------------------------------------------------------------
+
+/// A Flate stream of `size` spaces: a few hundred kilobytes in the file, `size` bytes decoded.
+fn flate_bomb(size: usize) -> Stream {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    let chunk = vec![b' '; 1 << 20];
+    for _ in 0..size.div_ceil(chunk.len()) {
+        encoder.write_all(&chunk).unwrap();
+    }
+    Stream::new(dictionary! { "Filter" => "FlateDecode" }, encoder.finish().unwrap()).with_compression(false)
+}
+
+/// Two pages, the second drawn by its own content followed by `bomb` (`joined`), or by `bomb`
+/// alone.
+fn bombed(bomb: &Stream, joined: bool) -> Pdf {
+    let mut pdf = text_pdf(&[&["SMALL PAGE"], &["BOMB PAGE"]]);
+    let ids = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let bomb = doc.add_object(bomb.clone());
+    let own = doc.get_dictionary(ids[1]).unwrap().get(b"Contents").unwrap().clone();
+    let contents: Object = if joined { vec![own, bomb.into()].into() } else { bomb.into() };
+    doc.get_dictionary_mut(ids[1]).unwrap().set("Contents", contents);
+    pdf
+}
+
+#[test]
+fn decompression_bombs_are_refused_or_never_decoded() {
+    let bomb = flate_bomb(300 << 20);
+    assert!(bomb.content.len() < 4 << 20, "the fixture is small in the file");
+    let too_large = |result: Result<(), Error>, what: &str| match result {
+        Err(Error::TooLarge(message)) => assert_eq!(message, carbide_engine::limits::messages::TOO_LARGE, "{what}"),
+        other => panic!("{what}: {other:?}"),
+    };
+
+    // Content split over several streams has to be decoded, and is refused past the limit.
+    let pdf = bombed(&bomb, true);
+    too_large(pdf.impose(&ImpositionOptions::default(), None).map(|_| ()), "impose");
+    too_large(pdf.clone().reduce(&ReduceOptions::default(), None).map(|_| ()), "reduce");
+    // Removing another page needs to know what the page that stays draws, which is past the
+    // limit: refused, rather than keep resources only the removed page may have used.
+    too_large(pdf.clone().delete_pages(&[0]), "delete");
+    // PDFium would decode it all to render the page or read its text, so neither is tried.
+    let complex = |result: Result<(), Error>, what: &str| match result {
+        Err(Error::TooLarge(message)) => assert_eq!(message, carbide_engine::limits::messages::TOO_COMPLEX, "{what}"),
+        other => panic!("{what}: {other:?}"),
+    };
+    complex(pdf.check_drawable(1), "check");
+    pdf.check_drawable(0).unwrap();
+    complex(export_text(renderer(), &mut pdf.clone()).map(|_| ()), "export text");
+    let redaction = Redaction { page: 1, rect: Rect::new(0.0, 0.0, 10.0, 10.0) };
+    complex(pdf.clone().apply_redactions(renderer(), &[redaction], 150.0), "redact");
+
+    // A single content stream goes onto the imposed sheet as it is stored, never decoded.
+    let pdf = bombed(&bomb, false);
+    let options = ImpositionOptions { plan: PlanOptions { layout: LayoutKind::Sequential, ..Default::default() }, ..Default::default() };
+    let sheets = pdf.impose(&options, None).unwrap();
+    let carried = sheets.document().objects.values().filter_map(|o| o.as_stream().ok()).any(|stream| {
+        stream.dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Form") && stream.content == bomb.content
+    });
+    assert!(carried, "the content stream was not carried over as it was stored");
+}
+
+/// `data` compressed with Flate.
+fn deflated(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// A one-page file whose catalog names object 5, `object`, stored in an object stream (Flate) with
+/// a cross-reference stream, the way most programs write files now.
+fn packed(object: &[u8]) -> Vec<u8> {
+    let header = b"5 0 ";
+    let mut plain = header.to_vec();
+    plain.extend_from_slice(object);
+    let packed = deflated(&plain);
+    let mut out = b"%PDF-1.5\n".to_vec();
+    let mut offsets = [0usize; 7];
+    fn write(out: &mut Vec<u8>, offsets: &mut [usize], number: usize, dict: String, stream: Option<&[u8]>) {
+        offsets[number] = out.len();
+        out.extend_from_slice(format!("{number} 0 obj\n{dict}\n").as_bytes());
+        if let Some(data) = stream {
+            out.extend_from_slice(b"stream\n");
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream\n");
+        }
+        out.extend_from_slice(b"endobj\n");
+    }
+    write(&mut out, &mut offsets, 1, "<< /Type /Catalog /Pages 2 0 R /Junk 5 0 R >>".into(), None);
+    write(&mut out, &mut offsets, 2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(), None);
+    write(&mut out, &mut offsets, 3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(), None);
+    let dict = format!("<< /Type /ObjStm /N 1 /First {} /Filter /FlateDecode /Length {} >>", header.len(), packed.len());
+    write(&mut out, &mut offsets, 4, dict, Some(&packed));
+    let xref_at = out.len();
+    let mut entries = Vec::new();
+    for number in 0..7u32 {
+        let (kind, field, index): (u8, u32, u16) = match number {
+            0 => (0, 0, 0xffff),
+            5 => (2, 4, 0),
+            6 => (1, xref_at as u32, 0),
+            n => (1, offsets[n as usize] as u32, 0),
+        };
+        entries.push(kind);
+        entries.extend_from_slice(&field.to_be_bytes());
+        entries.extend_from_slice(&index.to_be_bytes());
+    }
+    let dict = format!("<< /Type /XRef /Size 7 /W [1 4 2] /Root 1 0 R /Length {} >>", entries.len());
+    write(&mut out, &mut offsets, 6, dict, Some(&entries));
+    out.extend_from_slice(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes());
+    out
+}
+
+#[test]
+fn object_streams_cannot_unpack_to_gigabytes() {
+    use carbide_engine::limits::messages::TOO_LARGE_TO_READ;
+    // An ordinary packed object reads as lopdf would read it.
+    let pdf = Pdf::from_bytes(&packed(b"[1 2 3]")).unwrap();
+    assert_eq!(pdf.page_count(), 1);
+    let catalog = pdf.document().catalog().unwrap();
+    let junk = pdf.document().get_object(catalog.get(b"Junk").unwrap().as_reference().unwrap()).unwrap();
+    assert_eq!(junk.as_array().unwrap().len(), 3);
+
+    let too_large = |file: Vec<u8>, what: &str| match Pdf::from_bytes(&file) {
+        Err(Error::TooLarge(message)) => assert_eq!(message, TOO_LARGE_TO_READ, "{what}"),
+        other => panic!("{what}: {:?}", other.map(|pdf| pdf.page_count())),
+    };
+    // Four million zeros: 8 MB once decoded, about 500 MB once parsed, from a file of a few KB.
+    let mut zeros = b"[".to_vec();
+    zeros.extend(std::iter::repeat_n(&b"0 "[..], 4_000_000).flatten());
+    zeros.push(b']');
+    let file = packed(&zeros);
+    assert!(file.len() < 64 << 10, "the fixture is small: {} bytes", file.len());
+    too_large(file, "zeros");
+    // One stream that decodes to more than one may on its own.
+    let mut long = vec![b' '; 20 << 20];
+    long.extend_from_slice(b"[1]");
+    too_large(packed(&long), "a long stream");
+}
+
+#[test]
+fn content_of_many_operators_is_read_without_parsing_it_whole() {
+    // Eight million `q`: 16 MB decoded, gigabytes as a list of parsed operations.
+    let bomb = Stream::new(dictionary! { "Filter" => "FlateDecode" }, deflated(&b"q\n".repeat(8 << 20))).with_compression(false);
+    let pdf = bombed(&bomb, true);
+    let mut deleted = pdf.clone();
+    finishes("delete", move || deleted.delete_pages(&[0]).unwrap());
+    let extracted = pdf.clone();
+    finishes("extract", move || extracted.extract_pages(&[1]).unwrap());
+    let mut sanitized = pdf.clone();
+    finishes("sanitize", move || sanitized.remove_hidden_information(&[HiddenItem::UnusedObjects]).unwrap());
+    let reduced = pdf.clone();
+    let _ = finishes("reduce", move || reduced.clone().reduce(&ReduceOptions::default(), None).map(|_| ()));
+    // PDFium would keep a saved state for each of them, gigabytes in all, so it is not drawn; three
+    // million are.
+    assert!(matches!(pdf.check_drawable(1), Err(Error::TooLarge(_))));
+    let fewer = Stream::new(dictionary! { "Filter" => "FlateDecode" }, deflated(&b"q\n".repeat(3_000_000))).with_compression(false);
+    bombed(&fewer, false).check_drawable(1).unwrap();
+}
+
+#[test]
+fn deleting_a_page_never_keeps_its_images_when_other_content_cannot_be_checked() {
+    // Every page shares one resource dictionary; only the last page draws the image.
+    let shared = |bomb: Option<&Stream>| {
+        let mut pdf = text_pdf(&[&["ONE"], &["TWO"], &["IMAGE PAGE"]]);
+        let ids = pdf.page_ids();
+        let doc = pdf.document_mut();
+        let image = doc.add_object(Stream::new(
+            dictionary! { "Type" => "XObject", "Subtype" => "Image", "Width" => 4, "Height" => 4, "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8 },
+            b"SECRETIMAGEBYTES".to_vec(),
+        ));
+        let mut resources = doc.get_dictionary(ids[0]).unwrap().get(b"Resources").unwrap().as_dict().unwrap().clone();
+        resources.set("XObject", dictionary! { "Im1" => image });
+        let resources = doc.add_object(resources);
+        for id in &ids {
+            doc.get_dictionary_mut(*id).unwrap().set("Resources", resources);
+        }
+        let draw = doc.add_object(Stream::new(dictionary! {}, b"q 100 0 0 100 72 72 cm /Im1 Do Q".to_vec()));
+        let own = doc.get_dictionary(ids[2]).unwrap().get(b"Contents").unwrap().clone();
+        doc.get_dictionary_mut(ids[2]).unwrap().set("Contents", vec![own, draw.into()]);
+        if let Some(bomb) = bomb {
+            let bomb = doc.add_object(bomb.clone());
+            doc.get_dictionary_mut(ids[1]).unwrap().set("Contents", bomb);
+        }
+        pdf
+    };
+    let mut clean = shared(None);
+    clean.delete_pages(&[2]).unwrap();
+    assert!(!contains(&clean.to_bytes().unwrap(), b"SECRETIMAGEBYTES"));
+
+    // The second page's content is past what one page may decode: what it uses cannot be told,
+    // so the deletion is refused instead of keeping the shared image.
+    let mut refused = shared(Some(&flate_bomb(300 << 20)));
+    assert!(matches!(refused.delete_pages(&[2]), Err(Error::TooLarge(_))));
+}
+
+/// A page drawing the form X, which draws `inside` (`Do` of its own forms) `fanout` times.
+fn recursive_forms(fanout: usize, self_drawing: bool) -> Pdf {
+    let mut pdf = text_pdf(&[&["FORMS"]]);
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let form = doc.new_object_id();
+    let drawn = if self_drawing { form } else { doc.add_object(Stream::new(dictionary! { "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()] }, b"0 0 m 1 1 l S".to_vec())) };
+    let content = "/X Do ".repeat(fanout).into_bytes();
+    let dict = dictionary! {
+        "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+        "Resources" => dictionary! { "XObject" => dictionary! { "X" => drawn } },
+    };
+    doc.objects.insert(form, Object::Stream(Stream::new(dict, content)));
+    let draw = doc.add_object(Stream::new(dictionary! {}, b"/X Do".to_vec()));
+    let mut resources = doc.get_dictionary(page).unwrap().get(b"Resources").unwrap().as_dict().unwrap().clone();
+    resources.set("XObject", dictionary! { "X" => form });
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", resources);
+    page.set("Contents", draw);
+    pdf
+}
+
+#[test]
+fn forms_that_draw_themselves_are_not_rendered_or_followed_forever() {
+    use carbide_engine::limits::messages::TOO_COMPLEX;
+    let complex = |result: Result<(), Error>, what: &str| match result {
+        Err(Error::TooLarge(message)) => assert_eq!(message, TOO_COMPLEX, "{what}"),
+        other => panic!("{what}: {other:?}"),
+    };
+    // PDFium would draw the form inside itself 2 to the 40th times, and never finish.
+    let pdf = recursive_forms(2, true);
+    complex(pdf.check_drawable(0), "check");
+    complex(export_text(renderer(), &mut pdf.clone()).map(|_| ()), "export text");
+    let area = Redaction { page: 0, rect: Rect::new(0.0, 0.0, 10.0, 10.0) };
+    complex(pdf.clone().apply_redactions(renderer(), &[area], 72.0), "redact");
+    // Forms drawn a few times each are fine; drawn millions of times over, they are not.
+    recursive_forms(30, false).check_drawable(0).unwrap();
+    let mut wide = text_pdf(&[&["FORMS"]]);
+    let page = wide.page_ids()[0];
+    let doc = wide.document_mut();
+    let mut next = doc.add_object(Stream::new(dictionary! { "Subtype" => "Form" }, b"0 0 m".to_vec()));
+    for _ in 0..12 {
+        let dict = dictionary! { "Subtype" => "Form", "Resources" => dictionary! { "XObject" => dictionary! { "X" => next } } };
+        next = doc.add_object(Stream::new(dict, b"/X Do /X Do /X Do /X Do".to_vec()));
+    }
+    let draw = doc.add_object(Stream::new(dictionary! {}, b"/X Do".to_vec()));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", dictionary! { "XObject" => dictionary! { "X" => next } });
+    page.set("Contents", draw);
+    complex(finishes("four to the twelfth", move || wide.check_drawable(0)), "fan-out");
+
+    // A form without resources of its own draws with those of what draws it, so it is counted
+    // for each: here once with a form of a few operators, twice with one of three million.
+    let mut borrowed = text_pdf(&[&["FORMS"]]);
+    let page = borrowed.page_ids()[0];
+    let doc = borrowed.document_mut();
+    let cheap = doc.add_object(Stream::new(dictionary! { "Subtype" => "Form" }, b"0 0 m".to_vec()));
+    let costly = Stream::new(dictionary! { "Subtype" => "Form", "Filter" => "FlateDecode" }, deflated(&b"q\n".repeat(3_000_000)));
+    let costly = doc.add_object(costly.with_compression(false));
+    let shared = doc.add_object(Stream::new(dictionary! { "Subtype" => "Form" }, b"/Y Do".to_vec()));
+    let outer_resources = dictionary! { "XObject" => dictionary! { "F" => shared, "Y" => costly } };
+    let outer = doc.add_object(Stream::new(dictionary! { "Subtype" => "Form", "Resources" => outer_resources }, b"/F Do".to_vec()));
+    let draw = doc.add_object(Stream::new(dictionary! {}, b"/F Do /G Do /G Do".to_vec()));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", dictionary! { "XObject" => dictionary! { "F" => shared, "Y" => cheap, "G" => outer } });
+    page.set("Contents", draw);
+    complex(borrowed.check_drawable(0), "resources of what draws it");
+
+    // Reduce looks for the size images are drawn at through forms, once each.
+    let reduced = recursive_forms(30, true);
+    let _ = finishes("reduce", move || reduced.clone().reduce(&ReduceOptions::default(), None).map(|_| ()));
+    // A large form drawn many times is read only so far.
+    let mut repeated = text_pdf(&[&["FORMS"]]);
+    let page = repeated.page_ids()[0];
+    let doc = repeated.document_mut();
+    let large = Stream::new(dictionary! { "Subtype" => "Form", "Filter" => "FlateDecode" }, deflated(&vec![b' '; 64 << 20]));
+    let large = doc.add_object(large.with_compression(false));
+    let draw = doc.add_object(Stream::new(dictionary! {}, b"/X Do\n".repeat(100_000)));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", dictionary! { "XObject" => dictionary! { "X" => large } });
+    page.set("Contents", draw);
+    let _ = finishes("reduce a large form drawn often", move || repeated.reduce(&ReduceOptions::default(), None).map(|_| ()));
+}
+
+#[test]
+fn huge_pages_render_within_the_pixel_limit() {
+    use carbide_engine::render::{MAX_RENDER_PIXELS, MAX_RENDER_SIDE};
+    let r = renderer();
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((14400.0, 14400.0))).unwrap();
+    pdf.insert_blank_page(1, Some((14400.0, 72.0))).unwrap();
+    let bytes = pdf.to_bytes().unwrap();
+    // 60000 pixels square at 300 dpi, 14 GB as RGBA: rendered smaller instead.
+    let square = r.render_page(&bytes, 0, 300.0).unwrap();
+    assert!((square.width() as f32) * (square.height() as f32) <= MAX_RENDER_PIXELS, "{:?}", square.dimensions());
+    assert_eq!(square.width(), square.height(), "the shape is kept");
+    let strip = r.render_page(&bytes, 1, 300.0).unwrap();
+    let ratio = strip.width() as f32 / strip.height() as f32;
+    assert!(strip.width() as f32 <= MAX_RENDER_SIDE && (ratio - 200.0).abs() < 2.5, "{:?}", strip.dimensions());
+    for dpi in [0.0, -72.0, f32::NAN, f32::INFINITY] {
+        assert!(r.render_page(&bytes, 0, dpi).is_err(), "{dpi} dpi");
+    }
+    // Rendering into a box of pixels never comes out larger than the box.
+    for (page, (width, height), fills) in [(0, (5000, 8192), 5000), (1, (300, 8192), 300), (0, (64, 64), 64)] {
+        let image = r.render_page_fitting(&bytes, page, width, height).unwrap();
+        assert!(image.width() <= width && image.height() <= height, "page {page}: {:?} in {width} x {height}", image.dimensions());
+        assert!(image.width() as f32 >= fills as f32 * 0.99, "page {page}: {:?} does not fill {width} x {height}", image.dimensions());
+    }
+    assert!(r.render_page_fitting(&bytes, 0, 0, 100).is_err());
+}
+
+// ---- input validation ----------------------------------------------------------------------
+
+#[test]
+fn rotate_values_are_read_the_way_pdfium_reads_them() {
+    let mut pdf = text_pdf(&[&["ONE"], &["TWO"], &["THREE"], &["FOUR"], &["FIVE"]]);
+    let ids = pdf.page_ids();
+    let doc = pdf.document_mut();
+    doc.get_dictionary_mut(ids[0]).unwrap().set("Rotate", Object::Real(90.0));
+    doc.get_dictionary_mut(ids[1]).unwrap().set("Rotate", 45);
+    doc.get_dictionary_mut(ids[2]).unwrap().set("Rotate", 135);
+    doc.get_dictionary_mut(ids[3]).unwrap().set("Rotate", -90);
+    doc.get_dictionary_mut(ids[4]).unwrap().set("Rotate", i64::MAX);
+    let bytes = pdf.to_bytes().unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+    let rotations: Vec<i32> = (0..5).map(|page| pdf.page_rotation(page).unwrap()).collect();
+    // An integer too large for 32 bits reads as 0 to PDFium.
+    assert_eq!(rotations, [90, 0, 90, 270, 0]);
+    // PDFium turns each page the same way: the render has the displayed size.
+    for (page, geometry) in pdf.page_geometries().into_iter().enumerate() {
+        let (w, h) = geometry.display_size();
+        assert_eq!(render(renderer(), &mut pdf, page).dimensions(), (w as u32, h as u32), "page {page}");
+    }
+}
+
+#[test]
+fn turns_are_whole_quarters_and_each_page_turns_once() {
+    let mut pdf = text_pdf(&[&["ONE"], &["TWO"]]);
+    for degrees in [45, 1, -91, i32::MAX, i32::MIN] {
+        assert!(pdf.rotate_pages(&[0], degrees).is_err(), "{degrees}");
+    }
+    assert_eq!(pdf.page_rotation(0).unwrap(), 0);
+    pdf.rotate_pages(&[1, 1, 1], -90).unwrap();
+    assert_eq!(pdf.page_rotation(1).unwrap(), 270, "turned once");
+    // 270 and 23860929 quarter turns: no overflow, and a whole number of turns plus one quarter.
+    pdf.rotate_pages(&[1], 90 * 23_860_929).unwrap();
+    assert_eq!(pdf.page_rotation(1).unwrap(), 0);
+    assert!(pdf.rotate_pages(&[0, 2], 90).is_err());
+    assert_eq!(pdf.page_rotation(0).unwrap(), 0, "nothing turns when a page is out of range");
+}
+
+#[test]
+fn repeated_pages_are_handled_once() {
+    assert_eq!(Pdf::parse_pages("1-3, 2, 1, 5", 5).unwrap(), vec![0, 1, 2, 4]);
+    let pdf = text_pdf(&[&["ONE"], &["TWO"], &["THREE"]]);
+    let mut extracted = pdf.extract_pages(&[1, 1, 0]).unwrap();
+    assert_eq!(texts_seen_by_both(&mut extracted), ["TWO", "ONE"]);
+
+    let mut stamped = pdf.clone();
+    let mut options = WatermarkOptions::new("ONCE");
+    options.pages = Some(vec![0, 0, 0]);
+    stamped.apply_watermark(&options).unwrap();
+    assert_eq!(page_text(renderer(), &mut stamped, 0).matches("ONCE").count(), 1);
+}
+
+#[test]
+fn merging_nothing_is_refused() {
+    assert!(matches!(Pdf::merge(&[]), Err(Error::Other(message)) if message == "there are no documents to merge"));
+}
+
+#[test]
+fn watermarks_that_cannot_be_drawn_and_unreadable_redactions_are_refused() {
+    use carbide_engine::stamp::messages::WATERMARK;
+    let mut pdf = text_pdf(&[&["ONE"]]);
+    let before = pdf.document().objects.clone();
+    let mut cases = Vec::new();
+    for size in [f32::NAN, f32::INFINITY, 0.0, -5.0, 1.0e30] {
+        cases.push(WatermarkOptions { font_size: size, ..WatermarkOptions::new("HI") });
+    }
+    cases.push(WatermarkOptions { rotation_degrees: f32::NAN, ..WatermarkOptions::new("HI") });
+    cases.push(WatermarkOptions { opacity: 2.0, ..WatermarkOptions::new("HI") });
+    cases.push(WatermarkOptions { color: [0.5, f32::NAN, 0.5], ..WatermarkOptions::new("HI") });
+    for options in cases {
+        let refused = pdf.apply_watermark(&options).unwrap_err().to_string();
+        assert_eq!(refused, WATERMARK, "{options:?}");
+        assert_eq!(pdf.document().objects, before);
+    }
+    // A redaction rasterized at 1 dpi would leave nothing of the page readable.
+    let area = Redaction { page: 0, rect: Rect::new(0.0, 0.0, 100.0, 100.0) };
+    for dpi in [1.0, 71.0, f32::NAN] {
+        assert!(pdf.apply_redactions(renderer(), &[area], dpi).is_err(), "{dpi} dpi");
+    }
+    assert_eq!(pdf.document().objects, before);
+    // Pages are named the way people count them.
+    assert_eq!(pdf.move_page(5, 0).unwrap_err().to_string(), "page 6 does not exist (the document has 1 pages)");
+}
+
+#[test]
+fn bates_numbers_that_cannot_be_stamped_are_refused_before_anything_changes() {
+    let mut pdf = text_pdf(&[&["ONE"], &["TWO"]]);
+    let before = pdf.document().objects.clone();
+    for options in [
+        BatesOptions { digits: 70_000, ..Default::default() },
+        BatesOptions { digits: 0, ..Default::default() },
+        BatesOptions { start_number: u64::MAX, ..Default::default() },
+    ] {
+        assert!(pdf.apply_bates(&options).is_err(), "{options:?}");
+        assert_eq!(pdf.document().objects, before);
+    }
+    pdf.apply_bates(&BatesOptions { start_number: u64::MAX - 1, digits: 20, ..Default::default() }).unwrap();
+    assert!(page_text(renderer(), &mut pdf, 1).contains("18446744073709551615"));
+}
+
+#[test]
+fn areas_given_from_the_other_corner_are_the_same_area() {
+    let r = renderer();
+    // The first line of text, from (60, 692) to (360, 720), given from its top-right corner.
+    let backwards = Rect::new(360.0, 720.0, -300.0, -28.0);
+    let mut pdf = text_pdf(&[&["SECRET LINE"]]);
+    pdf.apply_redactions(r, &[Redaction { page: 0, rect: backwards }], 150.0).unwrap();
+    assert_eq!(page_text(r, &mut pdf, 0).trim(), "");
+    assert!(!contains(&pdf.to_bytes().unwrap(), b"SECRET"));
+
+    let mut pdf = text_pdf(&[&["SECRET LINE"]]);
+    for nothing in [Rect::new(100.0, 100.0, 0.0, 50.0), Rect::new(f32::NAN, 0.0, 10.0, 10.0), Rect::new(0.0, 0.0, f32::INFINITY, 10.0)] {
+        let refused = pdf.apply_redactions(r, &[Redaction { page: 0, rect: nothing }], 150.0).unwrap_err();
+        assert_eq!(refused.to_string(), carbide_engine::redact::messages::BAD_AREA);
+    }
+    assert!(page_text(r, &mut pdf, 0).contains("SECRET"), "a refused redaction changed the page");
+
+    pdf.add_markup(0, &[Rect::new(300.0, 720.0, -200.0, -20.0)], MarkupStyle::Highlight, None).unwrap();
+    let annotation = &pdf.annotations(0).unwrap()[0];
+    let bounds: Vec<f32> = annotation.get(b"Rect").unwrap().as_array().unwrap().iter().map(|v| v.as_float().unwrap()).collect();
+    assert_eq!(bounds, [100.0, 700.0, 300.0, 720.0]);
+    assert!(pdf.add_markup(0, &[Rect::new(f32::NAN, 0.0, 1.0, 1.0)], MarkupStyle::Highlight, None).is_err());
+    assert!(pdf.add_note(0, f32::INFINITY, 0.0, "x").is_err());
+}
+
+#[test]
+fn notes_on_turned_pages_are_turned_only_by_their_appearance() {
+    let mut pdf = text_pdf(&[&["TURNED"]]);
+    pdf.rotate_pages(&[0], 90).unwrap();
+    pdf.add_note(0, 100.0, 300.0, "upright").unwrap();
+    let note = &pdf.annotations(0).unwrap()[0];
+    let flags = note.get(b"F").unwrap().as_i64().unwrap();
+    assert_eq!(flags & 16, 0, "NoRotate would turn the icon a second time in viewers that honour it");
+    let appearance = note.get(b"AP").unwrap().as_dict().unwrap().get(b"N").unwrap().as_reference().unwrap();
+    let matrix = pdf.document().get_object(appearance).unwrap().as_stream().unwrap().dict.get(b"Matrix").unwrap().clone();
+    assert_eq!(matrix.as_array().unwrap().len(), 6, "the appearance is turned upright by its matrix");
 }
 
 // ---- inherited page attributes -------------------------------------------------------------
@@ -3032,7 +4093,32 @@ fn a_signed_file_with_an_open_password_and_a_later_update_takes_appended_edits()
     assert_eq!(pdf.save_plan(Some(&saved), false).unwrap(), SavePlan::Incremental, "the intact signature was treated as broken");
 }
 
-// ---- algorithm coverage (S7, S6) ----------------------------------------------------------
+#[test]
+fn signatures_on_files_with_an_open_password_verify_with_it() {
+    let plain = text_pdf(&[&["locked and signed"]]).to_bytes().unwrap();
+    let protected = Pdf::from_bytes(&plain).unwrap().to_encrypted_bytes(&ProtectionOptions::new("user", "owner")).unwrap();
+    let signed = sign_protected(&protected);
+    let trust = trust_test_identity();
+    assert!(matches!(Pdf::verify_signatures(&signed, &trust, chrono::Utc::now()), Err(Error::PasswordRequired)));
+    for password in ["user", "owner"] {
+        let reports = Pdf::verify_signatures_with_password(&signed, Some(password), &trust, chrono::Utc::now()).unwrap();
+        assert_eq!(reports.len(), 1, "{password}");
+        assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly), "{password}");
+    }
+    let wrong = Pdf::verify_signatures_with_password(&signed, Some("guess"), &trust, chrono::Utc::now());
+    assert!(matches!(wrong, Err(Error::WrongPassword)));
+
+    // A later update is read with the password too, and the signature still covers its revision.
+    let (encrypt, generation) = trailer_numbers(&signed, "Encrypt");
+    let n = trailer_numbers(&signed, "Size").0;
+    let note = format!("{n} 0 obj\n<</Type/Annot/Subtype/Square/Rect[0 0 1 1]>>\nendobj");
+    let updated = append_revision(&signed, &[(n, note)], &format!("/Encrypt {encrypt} {generation} R"));
+    let reports = Pdf::verify_signatures_with_password(&updated, Some("user"), &trust, chrono::Utc::now()).unwrap();
+    assert_eq!(reports[0].validity, Validity::Valid);
+    assert!(reports[0].modified_after_signing);
+}
+
+// ---- algorithm coverage --------------------------------------------------------------------
 
 mod algo {
     //! Minimal DER, enough to wrap a signature of any algorithm into a detached CMS whose signer
@@ -3397,7 +4483,7 @@ fn flipping_an_unsigned_algorithm_identifier_does_not_hide_tampering() {
 }
 
 
-// ---- time stamps (S3, S8) -----------------------------------------------------------------
+// ---- time stamps ---------------------------------------------------------------------------
 
 /// A test RFC 3161 authority: it signs real time-stamp tokens with an RSA key whose certificate
 /// carries the time-stamping extended key usage, critical and alone as RFC 3161 asks.
@@ -3880,7 +4966,7 @@ fn identities_load_from_pem_and_pkcs12() {
     assert_eq!(verify(&signed, &trust_test_identity())[0].validity, Validity::Valid);
 }
 
-// ---- certificate chain rules (S4) ---------------------------------------------------------
+// ---- certificate chain rules ---------------------------------------------------------------
 
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 

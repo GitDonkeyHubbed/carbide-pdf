@@ -52,6 +52,9 @@ pub fn export_images(
             )));
         }
     }
+    for index in 0..targets.len() {
+        pdf.check_drawable(index)?;
+    }
     let bytes = pdf.to_bytes()?;
     let mut paths = Vec::new();
     for (index, target) in targets.iter().enumerate() {
@@ -59,7 +62,7 @@ pub fn export_images(
         let mut encoded = Cursor::new(Vec::new());
         match format {
             ImageFormat::Png => image.write_to(&mut encoded, image::ImageFormat::Png),
-            ImageFormat::Jpeg => image::DynamicImage::ImageRgb8(image.to_rgb8()).write_to(&mut encoded, image::ImageFormat::Jpeg),
+            ImageFormat::Jpeg => image::DynamicImage::ImageRgb8(image.into_rgb8()).write_to(&mut encoded, image::ImageFormat::Jpeg),
         }
         .map_err(|e| Error::Other(format!("could not encode {}: {e}", target.display())))?;
         let written = crate::fs::write_file(target, encoded.get_ref(), existing)
@@ -71,6 +74,9 @@ pub fn export_images(
 
 /// Text of every page, separated by blank lines.
 pub fn export_text(renderer: &Renderer, pdf: &mut Pdf) -> Result<String> {
+    for index in 0..pdf.page_count() {
+        pdf.check_drawable(index)?;
+    }
     let bytes = pdf.to_bytes()?;
     let mut pages = Vec::new();
     for index in 0..pdf.page_count() {

@@ -15,10 +15,13 @@ use eframe::egui::{
 use crate::dialogs::{AfterSave, Dialog, Export};
 use crate::icons::{self, Glyph};
 use crate::ribbon::{self, Cmd, RibbonTab};
-use crate::{paths, theme, CarbideApp, Tool};
+use crate::{paths, theme, CarbideApp, PageChange, Tool};
 
 const DISABLED: Color32 = Color32::from_gray(105);
 const ZOOM_100_PERCENT: f32 = 96.0 / 72.0;
+/// The zoom range, as a scale of points to screen points.
+pub const MIN_ZOOM: f32 = 0.25;
+pub const MAX_ZOOM: f32 = 6.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Fit {
@@ -63,7 +66,9 @@ pub struct ShellState {
     folders_tab: bool,
     start_rows: Option<Vec<StartRow>>,
     page_text: String,
-    pending_close: Option<usize>,
+    /// The document whose close question is up. A document, not a tab: closing other tabs while
+    /// the question is up moves the tabs along.
+    pending_close: Option<u64>,
     locations: Vec<PathBuf>,
     comments: Option<((Option<usize>, u64), Vec<AnnotationSummary>)>,
     window_title: String,
@@ -210,6 +215,14 @@ fn comment_kind(subtype: &str) -> &str {
     }
 }
 
+/// An answer to the question whether to save a document that is being closed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CloseChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
 // ---- commands ----------------------------------------------------------------------------
 
 impl CarbideApp {
@@ -227,12 +240,24 @@ impl CarbideApp {
             | Cmd::Quit => true,
             Cmd::Undo => doc.is_some_and(|d| !d.undo.is_empty()),
             Cmd::Redo => doc.is_some_and(|d| !d.redo.is_empty()),
-            Cmd::ApplyRedactions => doc.is_some() && !self.pending_redactions.is_empty(),
-            Cmd::Ocr => doc.is_some() && self.ocr_job.is_none(),
-            Cmd::SignVisible | Cmd::SignInvisible | Cmd::TimeStamp => doc.is_some() && self.sign_job.is_none(),
+            // These need PDFium, and do nothing without it.
+            Cmd::ApplyRedactions => doc.is_some() && !self.pending_redactions.is_empty() && self.renderer.is_some(),
+            Cmd::Ocr => doc.is_some() && self.ocr_job.is_none() && self.renderer.is_some(),
+            Cmd::Compare | Cmd::ExportImages | Cmd::ExportText => doc.is_some() && self.renderer.is_some(),
+            // Signing and saving revisions refuse password-protected documents (see
+            // `sign_document` and `save_revision`), and a signature waiting for its time stamp
+            // would be dropped by another one written first.
+            Cmd::SignVisible | Cmd::SignInvisible | Cmd::Certify | Cmd::TimeStamp => {
+                doc.is_some_and(|d| !d.is_protected()) && self.sign_job.is_none()
+            }
+            Cmd::SaveRevision => doc.is_some_and(|d| !d.is_protected()),
+            Cmd::ZoomIn => doc.is_some() && self.zoom < MAX_ZOOM,
+            Cmd::ZoomOut => doc.is_some() && self.zoom > MIN_ZOOM,
             Cmd::OpenRevision => doc.is_some_and(|d| d.pdf.can_open_revision()),
-            Cmd::FirstPage | Cmd::PrevPage => doc.is_some() && self.current_page > 0,
-            Cmd::NextPage | Cmd::LastPage => doc.is_some_and(|d| self.current_page + 1 < d.pdf.page_count()),
+            Cmd::FirstPage | Cmd::PrevPage | Cmd::MoveUp => doc.is_some() && self.current_page > 0,
+            Cmd::NextPage | Cmd::LastPage | Cmd::MoveDown => doc.is_some_and(|d| self.current_page + 1 < d.pdf.page_count()),
+            // A document keeps at least one page.
+            Cmd::PageDelete => doc.is_some_and(|d| d.pdf.page_count() > 1),
             _ => doc.is_some(),
         }
     }
@@ -271,7 +296,7 @@ impl CarbideApp {
     }
 
     fn set_zoom(&mut self, zoom: f32) {
-        self.zoom = zoom.clamp(0.25, 6.0);
+        self.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
         self.shell.fit = Fit::Manual;
     }
 
@@ -281,6 +306,9 @@ impl CarbideApp {
             return;
         }
         let page = self.current_page;
+        // The document the dialogs opened below act on. Commands that need one are only enabled
+        // with one in front.
+        let doc = self.doc.as_ref().map(|d| d.id).unwrap_or_default();
         match cmd {
             Cmd::Open => self.pick_and_open(),
             Cmd::Save => self.save(),
@@ -292,28 +320,45 @@ impl CarbideApp {
             Cmd::NewBlank => self.new_blank(),
             Cmd::Combine => self.combine_files(),
 
-            Cmd::PageInsert => self.edit("Insert page", move |p| p.insert_blank_page(page + 1, None)),
+            Cmd::PageInsert => {
+                if self.edit("Insert page", move |p| p.insert_blank_page(page + 1, None)) {
+                    self.follow_page_change(PageChange::Inserted(page + 1), &[]);
+                }
+            }
             Cmd::PageExtract => self.extract_current(),
-            Cmd::PageDelete => self.edit_removing("Delete page", move |p| p.delete_pages(&[page])),
+            Cmd::PageDelete => {
+                if self.edit_removing("Delete page", move |p| p.delete_pages(&[page])) {
+                    self.follow_page_change(PageChange::Deleted(page), &[]);
+                }
+            }
             Cmd::Merge => self.merge_files(),
-            Cmd::Split => self.dialog = Some(Dialog::Split { ranges: "1-2".into() }),
-            Cmd::Imposition => self.dialog = Some(Dialog::impose()),
-            Cmd::RotateLeft => self.edit("Rotate left", move |p| p.rotate_pages(&[page], -90)),
-            Cmd::RotateRight => self.edit("Rotate right", move |p| p.rotate_pages(&[page], 90)),
+            Cmd::Split => self.open_dialog(Dialog::Split { doc, ranges: "1-2".into() }),
+            Cmd::Imposition => self.open_dialog(Dialog::impose(doc)),
+            Cmd::RotateLeft | Cmd::RotateRight => {
+                let clockwise = cmd == Cmd::RotateRight;
+                let before = self.doc.as_ref().map(|d| d.geometries.clone()).unwrap_or_default();
+                let (label, degrees) = if clockwise { ("Rotate right", 90) } else { ("Rotate left", -90) };
+                if self.edit(label, move |p| p.rotate_pages(&[page], degrees)) {
+                    self.follow_page_change(PageChange::Turned { page, clockwise }, &before);
+                }
+            }
             Cmd::MoveUp => {
-                self.edit("Move page up", move |p| if page > 0 { p.move_page(page, page - 1) } else { Ok(()) });
-                if page > 0 {
-                    self.goto_page(page - 1);
+                let to = page.saturating_sub(1);
+                if self.edit("Move page up", move |p| p.move_page(page, to)) {
+                    self.follow_page_change(PageChange::Moved { from: page, to }, &[]);
+                    self.goto_page(to);
                 }
             }
             Cmd::MoveDown => {
-                self.edit("Move page down", move |p| if page + 1 < p.page_count() { p.move_page(page, page + 1) } else { Ok(()) });
-                self.goto_page(page + 1);
+                if self.edit("Move page down", move |p| p.move_page(page, page + 1)) {
+                    self.follow_page_change(PageChange::Moved { from: page, to: page + 1 }, &[]);
+                    self.goto_page(page + 1);
+                }
             }
 
             Cmd::Typewriter => self.tool = Tool::TextBox,
-            Cmd::Watermark => self.dialog = Some(Dialog::watermark()),
-            Cmd::Bates => self.dialog = Some(Dialog::bates()),
+            Cmd::Watermark => self.open_dialog(Dialog::watermark(doc)),
+            Cmd::Bates => self.open_dialog(Dialog::bates(doc)),
 
             Cmd::ZoomIn => self.set_zoom(self.zoom * 1.2),
             Cmd::ZoomOut => self.set_zoom(self.zoom / 1.2),
@@ -333,35 +378,35 @@ impl CarbideApp {
 
             Cmd::Reduce => {
                 let current = self.doc.as_ref().and_then(|d| d.path.clone());
-                self.dialog = Some(Dialog::reduce(current));
+                self.open_dialog(Dialog::reduce(self.doc.as_ref().map(|d| d.id), current));
             }
             Cmd::Compare => self.compare_with(),
             Cmd::Ocr => self.start_ocr(),
             Cmd::ExportImages => self.export(Export::Images),
             Cmd::ExportText => self.export(Export::Text),
-            Cmd::SaveRevision => self.dialog = Some(Dialog::SaveRevision { label: String::new(), error: None }),
+            Cmd::SaveRevision => self.open_dialog(Dialog::SaveRevision { doc, label: String::new(), error: None }),
             Cmd::OpenRevision => {
                 let items = self.doc.as_ref().map(|d| d.pdf.revisions()).unwrap_or_default();
-                self.dialog = Some(Dialog::OpenRevision { items, selected: None });
+                self.open_dialog(Dialog::OpenRevision { doc, items, selected: None });
             }
 
             Cmd::MarkRedaction => self.tool = Tool::Redact,
             Cmd::ApplyRedactions => self.apply_redactions(),
-            Cmd::RemoveHidden => self.dialog = self.doc.as_ref().map(|d| Dialog::remove_hidden(d.id)),
+            Cmd::RemoveHidden => self.open_dialog(Dialog::remove_hidden(doc)),
             Cmd::SignVisible => {
                 self.tool = Tool::Sign;
                 self.status = "Drag a rectangle on the page to place the signature.".into();
             }
-            Cmd::SignInvisible => self.dialog = Some(Dialog::sign(None, false)),
-            Cmd::Certify => self.dialog = Some(Dialog::sign(None, true)),
-            Cmd::TimeStamp => self.dialog = Some(Dialog::timestamp()),
+            Cmd::SignInvisible => self.open_dialog(Dialog::sign(doc, None, false)),
+            Cmd::Certify => self.open_dialog(Dialog::sign(doc, None, true)),
+            Cmd::TimeStamp => self.open_dialog(Dialog::timestamp(doc)),
             Cmd::Verify => self.validate_signatures(),
             Cmd::Protect => {
                 if self.doc.is_none() {
                     self.pick_and_open();
                 }
-                if self.doc.is_some() {
-                    self.dialog = Some(Dialog::protect());
+                if let Some(doc) = self.doc.as_ref().map(|d| d.id) {
+                    self.open_dialog(Dialog::protect(doc));
                 }
             }
             Cmd::TrustCertificate => {
@@ -373,8 +418,8 @@ impl CarbideApp {
                 }
             }
 
-            Cmd::AutoSaveSettings => self.dialog = Some(Dialog::preferences(&self.settings)),
-            Cmd::AutoRecovery => self.dialog = Some(Dialog::auto_recovery()),
+            Cmd::AutoSaveSettings => self.open_dialog(Dialog::preferences(&self.settings)),
+            Cmd::AutoRecovery => self.open_dialog(Dialog::auto_recovery()),
             Cmd::Quit => {} // Handled by the window itself.
         }
     }
@@ -431,25 +476,25 @@ impl CarbideApp {
     /// Closes a tab, asking first when the document has unsaved changes.
     pub fn request_close(&mut self, index: usize) {
         if self.tab_label(index).1 {
-            self.shell.pending_close = Some(index);
+            self.shell.pending_close = self.doc_at(index).map(|d| d.id);
         } else {
             self.close_tab(index);
         }
     }
 
+    /// The document the close question is about, while it is up.
+    pub fn pending_close(&self) -> Option<u64> {
+        self.shell.pending_close
+    }
+
     /// The "save changes?" question shown when a modified document is closed.
     pub fn close_prompt(&mut self, ctx: &egui::Context) {
-        let Some(index) = self.shell.pending_close else { return };
-        if index >= self.tabs.len() {
+        let Some(doc) = self.shell.pending_close else { return };
+        let Some(index) = self.tab_of(doc) else {
             self.shell.pending_close = None;
             return;
-        }
+        };
         let title = self.tab_label(index).0;
-        enum Choice {
-            Save,
-            Discard,
-            Cancel,
-        }
         let mut choice = None;
         egui::Window::new("Carbide PDF").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
             ui.label(format!("Do you want to save the changes you made to \"{title}\"?"));
@@ -457,33 +502,38 @@ impl CarbideApp {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
-                    choice = Some(Choice::Save);
+                    choice = Some(CloseChoice::Save);
                 }
                 if ui.button("Don't Save").clicked() {
-                    choice = Some(Choice::Discard);
+                    choice = Some(CloseChoice::Discard);
                 }
                 if ui.button("Cancel").clicked() {
-                    choice = Some(Choice::Cancel);
+                    choice = Some(CloseChoice::Cancel);
                 }
             });
         });
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            choice = Some(Choice::Cancel);
+            choice = Some(CloseChoice::Cancel);
         }
+        if let Some(choice) = choice {
+            self.answer_close(choice);
+        }
+    }
+
+    /// Carries out the answer to the close question, on the document it is about, wherever its tab
+    /// is now. Nothing happens once that document is no longer open.
+    pub fn answer_close(&mut self, choice: CloseChoice) {
+        let Some(doc) = self.shell.pending_close.take() else { return };
+        let Some(index) = self.tab_of(doc) else { return };
         match choice {
-            Some(Choice::Save) => {
-                self.shell.pending_close = None;
+            CloseChoice::Save => {
                 self.activate(Some(index));
                 // The tab closes once the document is saved, after the answer when saving asks
                 // first. A cancelled Save As leaves it modified and open.
                 self.save_then(AfterSave::CloseTab);
             }
-            Some(Choice::Discard) => {
-                self.shell.pending_close = None;
-                self.close_tab(index);
-            }
-            Some(Choice::Cancel) => self.shell.pending_close = None,
-            None => {}
+            CloseChoice::Discard => self.close_tab(index),
+            CloseChoice::Cancel => {}
         }
     }
 
@@ -505,6 +555,25 @@ impl CarbideApp {
         } else {
             self.release_all_documents();
         }
+    }
+
+    /// Quitting asked for from outside the window (see `quit`): with unsaved changes the quit
+    /// question goes up; otherwise the documents are let go and the window closes.
+    pub fn on_system_quit(&mut self, ctx: &egui::Context) {
+        if self.shell.quit_confirmed {
+            return;
+        }
+        if self.has_unsaved_changes() {
+            self.shell.quit_prompt = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        } else {
+            self.finish_quit(ctx);
+        }
+    }
+
+    /// True while the question about unsaved changes before quitting is up.
+    pub fn quit_prompt_shown(&self) -> bool {
+        self.shell.quit_prompt
     }
 
     /// Drops every open document, and with it its Auto Recovery record.
@@ -588,6 +657,7 @@ impl CarbideApp {
         let modified: Vec<u64> =
             (0..self.tabs.len()).filter(|&i| self.tab_label(i).1).filter_map(|i| self.doc_at(i).map(|d| d.id)).collect();
         let mut asks = None;
+        let mut failed = false;
         for id in modified {
             let Some(index) = self.tab_of(id) else { continue };
             self.activate(Some(index));
@@ -595,10 +665,12 @@ impl CarbideApp {
                 asks.get_or_insert(id);
             } else {
                 self.save();
+                // Still modified: the save failed, and has said why, or Save As was cancelled.
+                failed |= self.tab_of(id).and_then(|i| self.doc_at(i)).is_some_and(|d| d.dirty);
             }
         }
-        // A save that failed has said why; the quit prompt stays up for another try.
-        if self.dialog.is_some() {
+        // The quit prompt stays up for another try.
+        if failed {
             return;
         }
         if let Some(index) = asks.and_then(|id| self.tab_of(id)) {
@@ -615,6 +687,7 @@ impl CarbideApp {
     fn finish_quit(&mut self, ctx: &egui::Context) {
         self.shell.quit_prompt = false;
         self.shell.quit_confirmed = true;
+        crate::quit::set_confirmed();
         self.release_all_documents();
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }

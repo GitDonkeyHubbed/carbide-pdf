@@ -24,28 +24,52 @@ pub struct Redaction {
     pub rect: Rect,
 }
 
+/// The lowest resolution a redacted page is rasterized at. Lower ones would make it unreadable.
+pub const MIN_DPI: f32 = 72.0;
+
+pub mod messages {
+    pub const BAD_AREA: &str = "A redaction area has to be given in numbers and have a width and a height.";
+    pub const BAD_DPI: &str = "Redacted pages are rasterized at 72 dpi or more.";
+}
+
 impl Pdf {
+    /// Removes what lies under each area. An area given from its other corner (a negative width
+    /// or height) is the same area; one that is not a number, or has no width or height, is
+    /// refused before anything changes, since it would black out nothing.
     pub fn apply_redactions(&mut self, renderer: &Renderer, redactions: &[Redaction], dpi: f32) -> Result<()> {
         if redactions.is_empty() {
             return Ok(());
+        }
+        if !(dpi.is_finite() && dpi >= MIN_DPI) {
+            return Err(Error::Other(messages::BAD_DPI.into()));
         }
         let count = self.page_count();
         if let Some(bad) = redactions.iter().find(|r| r.page >= count) {
             return Err(Error::PageOutOfRange { index: bad.page, count });
         }
-        let snapshot = self.to_bytes()?;
-
+        if redactions.iter().any(|r| !r.rect.is_finite() || r.rect.normalized().is_empty()) {
+            return Err(Error::Other(messages::BAD_AREA.into()));
+        }
+        let redactions: Vec<Redaction> = redactions.iter().map(|r| Redaction { page: r.page, rect: r.rect.normalized() }).collect();
+        let redactions = redactions.as_slice();
         let mut pages: Vec<usize> = redactions.iter().map(|r| r.page).collect();
         pages.sort_unstable();
         pages.dedup();
+        for &page in &pages {
+            self.check_drawable(page)?;
+        }
+        let snapshot = self.to_bytes()?;
+        self.check_pages_agree(renderer, &snapshot, &pages)?;
+
         // The rebuilt pages lose their annotations, and with them their form fields: the values
         // and appearances those hold would otherwise stay in the form. A signature field goes
         // only when its signature is drawn inside a redacted area; otherwise it stays (it no
         // longer validates, which saving says).
+        let ids = self.page_ids();
         let mut redacted: HashMap<ObjectId, Vec<Rect>> = HashMap::new();
         for item in redactions {
-            let geometry = self.page_geometry(item.page)?;
-            redacted.entry(self.page_id(item.page)?).or_default().push(geometry.map_rect(item.rect));
+            let geometry = self.geometry_of(ids[item.page]);
+            redacted.entry(ids[item.page]).or_default().push(geometry.map_rect(item.rect));
         }
         let rebuilt: HashSet<ObjectId> = redacted.keys().copied().collect();
         self.drop_form_fields_on(&rebuilt, &|page, widget, signature| {
@@ -58,7 +82,8 @@ impl Pdf {
         });
 
         for page in pages {
-            let geometry = self.page_geometry(page)?;
+            let page_id = ids[page];
+            let geometry = self.geometry_of(page_id);
             let (display_w, display_h) = geometry.display_size();
             let mut image = renderer.render_page(&snapshot, page, dpi)?;
             let sx = image.width() as f32 / display_w;
@@ -98,7 +123,6 @@ impl Pdf {
             let content = format!("q {} 0 0 {} 0 0 cm /CarbideRedacted Do Q\n", fmt(display_w), fmt(display_h));
             let content_id = self.doc.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
 
-            let page_id = self.page_id(page)?;
             let dict = self.doc.get_dictionary_mut(page_id)?;
             for key in [
                 &b"Annots"[..], b"TrimBox", b"BleedBox", b"ArtBox", b"Thumb", b"B", b"AA", b"StructParents", b"Group",

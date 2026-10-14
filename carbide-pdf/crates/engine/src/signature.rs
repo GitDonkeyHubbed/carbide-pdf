@@ -1396,7 +1396,21 @@ impl Pdf {
     /// Validates every signature in `file_bytes` (the file this document was loaded from).
     /// `now` is the reference time for certificate validity when a signature has no usable date.
     pub fn verify_signatures(file_bytes: &[u8], trust: &TrustStore, now: DateTime<Utc>) -> Result<Vec<SignatureReport>> {
-        let pdf = Pdf::from_bytes(file_bytes)?;
+        Self::verify_signatures_with_password(file_bytes, None, trust, now)
+    }
+
+    /// As [`Pdf::verify_signatures`], for a file that needs `password` (its open password or its
+    /// owner password) to be read. The signed revisions are read with it too.
+    pub fn verify_signatures_with_password(
+        file_bytes: &[u8],
+        password: Option<&str>,
+        trust: &TrustStore,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<SignatureReport>> {
+        let pdf = match password {
+            Some(password) => Pdf::from_bytes_with_password(file_bytes, password)?,
+            None => Pdf::from_bytes(file_bytes)?,
+        };
         let file_end = file_bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map(|p| p + 1).unwrap_or(0);
 
         // Field name per signature dictionary id.
@@ -1415,7 +1429,7 @@ impl Pdf {
             if !is_signature_dictionary(v) {
                 continue;
             }
-            reports.push(verify_one(&pdf, *id, v, names.get(id).cloned(), file_bytes, None, file_end, trust, now));
+            reports.push(verify_one(&pdf, *id, v, names.get(id).cloned(), file_bytes, password, file_end, trust, now));
         }
         // A signature field whose value is gone or no longer reads as a signature (bytes written
         // into the gap broke its dictionary, say) is still a signature, and a damaged one.
@@ -1425,7 +1439,7 @@ impl Pdf {
             match pdf.doc.objects.get(&value) {
                 Some(Object::Dictionary(v)) if is_signature_dictionary(v) => {}
                 Some(Object::Dictionary(v)) if v.has(b"ByteRange") => {
-                    reports.push(verify_one(&pdf, value, v, names.get(&value).cloned(), file_bytes, None, file_end, trust, now));
+                    reports.push(verify_one(&pdf, value, v, names.get(&value).cloned(), file_bytes, password, file_end, trust, now));
                 }
                 _ => {
                     let mut report = SignatureReport::new(text_of(field, b"T").unwrap_or_else(|| format!("object {}", value.0)));

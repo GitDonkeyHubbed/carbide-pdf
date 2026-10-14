@@ -271,7 +271,7 @@ fn protected_documents_get_no_recovery_copy_and_saving_retires_one() {
     let a = plain(&dir, "a.pdf", &["A"]);
     let mut app = app(&dir);
     let tick = |app: &mut CarbideApp| {
-        app.last_autosave = Instant::now() - Duration::from_secs(24 * 3600);
+        overdue(app);
         app.autosave_tick();
     };
 
@@ -290,6 +290,34 @@ fn protected_documents_get_no_recovery_copy_and_saving_retires_one() {
     app.save_revision("v1").unwrap();
     assert!(!app.doc.as_ref().unwrap().dirty);
     assert_eq!(recovery_copies(&dir), 0);
+}
+
+/// Makes every open document's Auto Recovery interval pass.
+fn overdue(app: &mut CarbideApp) {
+    let long_ago = Instant::now() - Duration::from_secs(24 * 3600);
+    for doc in app.doc.iter_mut().chain(app.tabs.iter_mut().flatten()) {
+        doc.autosaved_at = long_ago;
+    }
+}
+
+#[test]
+fn opening_a_document_never_delays_another_ones_recovery_copy() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["A"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    overdue(&mut app);
+    // Opening other documents while a.pdf's interval passes leaves its own interval alone.
+    for name in ["b.pdf", "c.pdf"] {
+        app.open_path(&plain(&dir, name, &[name]));
+    }
+    app.autosave_tick();
+    assert_eq!(recovery_copies(&dir), 1, "a.pdf got no recovery copy");
+    // The new documents count from when they were opened.
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    app.autosave_tick();
+    assert_eq!(recovery_copies(&dir), 1, "c.pdf was copied before its interval passed");
 }
 
 #[test]
@@ -643,4 +671,460 @@ fn undo_cannot_go_back_past_a_saved_revision_or_a_signature() {
     assert!(!app.cmd_enabled(Cmd::Undo));
     app.undo();
     assert!(contains(&app.doc.as_ref().unwrap().bytes, "SIGNED"));
+}
+
+#[test]
+fn signatures_of_a_document_opened_with_its_password_can_be_checked() {
+    let dir = scratch();
+    let path = protected(&dir, "locked.pdf", &["LOCKED"], "user pw");
+    let mut app = app(&dir);
+    app.open_path(&path);
+    let Some(Dialog::Password { bytes, .. }) = app.dialog.take() else { panic!("the password is asked for") };
+    assert!(app.open_with_password(path, bytes, "user pw".into()));
+    app.validate_signatures();
+    match &app.dialog {
+        Some(Dialog::Message(text)) => assert_eq!(text, "This document has no signatures."),
+        _ => panic!("no answer about the signatures"),
+    }
+}
+
+#[test]
+fn page_textures_never_exceed_what_the_gpu_takes() {
+    use crate::{max_texture_side, texture_size};
+    let limit = 16_777_216u64;
+    let within = |size: [u32; 2], max_side: u32, what: &str| {
+        assert!(size[0] >= 1 && size[1] >= 1, "{what}: {size:?}");
+        assert!(size[0] <= max_side && size[1] <= max_side, "{what}: {size:?} past {max_side}");
+        assert!(size[0] as u64 * size[1] as u64 <= limit + size[0] as u64, "{what}: {size:?} too many pixels");
+    };
+    // egui says nothing: the usual 8192.
+    assert_eq!(max_texture_side(0), 8192);
+    assert_eq!(max_texture_side(16384), 16384);
+
+    // US Legal at the largest zoom on a Retina display: 5000 x 8235 before, past 8192.
+    let legal = texture_size((612.0, 1008.0), 612.0 * 6.0 * 2.0, 8192);
+    within(legal, 8192, "legal");
+    assert!((legal[1] as f32 / legal[0] as f32 - 1008.0 / 612.0).abs() < 0.01, "the shape is kept: {legal:?}");
+    // A receipt-like page at Fit Width, a strip, and a GPU that takes only 2048.
+    within(texture_size((612.0, 9000.0), 1904.0, 8192), 8192, "tall");
+    within(texture_size((612.0, 1_000_000.0), 2000.0, 8192), 8192, "very tall");
+    within(texture_size((1_000_000.0, 10.0), 2000.0, 8192), 8192, "very wide");
+    within(texture_size((612.0, 792.0), 5000.0, 2048), 2048, "small GPU");
+    // Pages and zooms that are not numbers, or nothing at all, still give a texture.
+    within(texture_size((0.0, 0.0), 0.0, 8192), 8192, "empty page");
+    within(texture_size((f32::NAN, 792.0), f32::INFINITY, 8192), 8192, "not numbers");
+    // An ordinary page at an ordinary zoom is drawn at full resolution.
+    assert_eq!(texture_size((612.0, 792.0), 1224.0, 8192), [1224, 1584]);
+    // Thumbnails keep their usual size.
+    assert_eq!(texture_size((612.0, 792.0), 220.0, 8192), [220, 285]);
+}
+
+#[test]
+fn dialogs_about_a_document_close_when_another_comes_forward() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["A"]);
+    let b = plain(&dir, "b.pdf", &["B"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    let a_id = active_id(&app);
+    app.open_path(&b);
+    let (a_index, b_index) = (app.tab_of(a_id).unwrap(), app.active_tab.unwrap());
+    app.activate(Some(a_index));
+
+    let area = Some((0, carbide_engine::Rect::new(10.0, 10.0, 100.0, 50.0)));
+    let dialogs = vec![
+        Dialog::sign(a_id, area, false),
+        Dialog::timestamp(a_id),
+        Dialog::watermark(a_id),
+        Dialog::bates(a_id),
+        Dialog::protect(a_id),
+        Dialog::impose(a_id),
+        Dialog::reduce(Some(a_id), Some(a.clone())),
+        Dialog::Split { doc: a_id, ranges: "1".into() },
+        Dialog::Note { doc: a_id, page: 0, x: 72.0, y: 72.0, on_page: false, text: "note".into() },
+        Dialog::SaveRevision { doc: a_id, label: String::new(), error: None },
+        Dialog::OpenRevision { doc: a_id, items: Vec::new(), selected: None },
+        Dialog::Signatures { doc: a_id, reports: Vec::new(), notice: String::new() },
+    ];
+    for dialog in dialogs {
+        assert_eq!(dialog.document(), Some(a_id));
+        app.dialog = Some(dialog);
+        app.activate(Some(b_index));
+        assert!(app.dialog.is_none(), "a dialog about a.pdf stayed up over b.pdf");
+        app.activate(Some(a_index));
+    }
+
+    // A dialog still around for a document no longer in front goes without being shown.
+    app.activate(Some(b_index));
+    app.dialog = Some(Dialog::watermark(a_id));
+    crate::dialogs::show(&mut app, &egui::Context::default());
+    assert!(app.dialog.is_none());
+
+    // A signature asked for on one document never signs the one in front.
+    let before = std::fs::read(&b).unwrap();
+    let Dialog::Sign(request) = Dialog::sign(a_id, area, false) else { unreachable!() };
+    app.sign_document(*request);
+    assert_eq!(std::fs::read(&b).unwrap(), before);
+    assert!(app.status.starts_with("Nothing was signed"), "{}", app.status);
+}
+
+#[test]
+fn the_close_question_stays_with_its_document_when_other_tabs_close() {
+    use crate::shell::CloseChoice;
+    let dir = scratch();
+    let mut app = app(&dir);
+    for (name, dirty) in [("clean.pdf", false), ("x.pdf", true), ("y.pdf", true)] {
+        app.open_path(&plain(&dir, name, &[name]));
+        if dirty {
+            app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+        }
+    }
+    let ids: Vec<u64> = (0..3).map(|i| app.doc_at(i).unwrap().id).collect();
+    app.request_close(2);
+    assert_eq!(app.pending_close(), Some(ids[2]));
+    // The clean tab to its left closes while the question is up, so y.pdf moves to tab 1.
+    app.close_tab(0);
+    app.answer_close(CloseChoice::Discard);
+    let open: Vec<u64> = (0..app.tabs.len()).map(|i| app.doc_at(i).unwrap().id).collect();
+    assert_eq!(open, vec![ids[1]], "the wrong document was closed");
+    assert!(app.doc_at(0).unwrap().dirty, "x.pdf lost its changes");
+
+    // Once the document is closed some other way, an answer does nothing.
+    app.request_close(0);
+    app.close_tab(0);
+    app.open_path(&plain(&dir, "z.pdf", &["Z"]));
+    app.answer_close(CloseChoice::Discard);
+    assert_eq!(app.tabs.len(), 1);
+}
+
+#[test]
+fn a_password_question_is_never_replaced_by_what_comes_after_it() {
+    let dir = scratch();
+    let locked = protected(&dir, "locked.pdf", &["LOCKED"], "user pw");
+    let original = plain(&dir, "contract.pdf", &["ORIGINAL"]);
+    crashed_session(&dir, &[Some(&original)]);
+    let mut app = app(&dir);
+
+    // Started with a protected file while recovered work waits: the password is asked for first.
+    app.launch(Some(crate::Launch::File(locked)));
+    assert!(matches!(app.dialog, Some(Dialog::Password { .. })));
+    // What background work says, and a dialog a command opens, wait behind it as well.
+    app.alert("Recognizing text failed.".into());
+    app.run(Cmd::AutoSaveSettings);
+    assert!(matches!(app.dialog, Some(Dialog::Password { .. })), "the password question was replaced");
+
+    // Unlocking the file brings up the rest, one after another.
+    let Some(Dialog::Password { path, bytes, .. }) = app.dialog.take() else { unreachable!() };
+    assert!(app.open_with_password(path, bytes, "user pw".into()));
+    app.next_dialog();
+    assert!(matches!(app.dialog, Some(Dialog::AutoRecovery { .. })));
+    app.dialog = None;
+    app.next_dialog();
+    assert!(matches!(&app.dialog, Some(Dialog::Message(text)) if text == "Recognizing text failed."));
+    app.dialog = None;
+    app.next_dialog();
+    assert!(matches!(app.dialog, Some(Dialog::Preferences { .. })));
+
+    // A waiting question about a document goes when another document comes forward.
+    let doc = active_id(&app);
+    app.dialog = Some(Dialog::Password { path: dir.join("other.pdf"), bytes: Vec::new(), input: String::new(), failed: false });
+    app.queue_dialog(Dialog::ConfirmExport { doc, export: Export::Text });
+    app.new_blank();
+    app.dialog = None;
+    app.next_dialog();
+    assert!(app.dialog.is_none(), "a question about a document no longer in front came back");
+}
+
+#[test]
+fn marked_redactions_follow_the_pages_they_were_drawn_on() {
+    use carbide_engine::{PageGeometry, Rect, Redaction};
+    let dir = scratch();
+    let labels = ["P1", "P2", "P3", "P4", "P5", "P6"];
+    let mut app = app(&dir);
+    app.open_path(&plain(&dir, "six.pdf", &labels));
+    let rect = Rect::new(100.0, 600.0, 200.0, 50.0);
+    app.pending_redactions.push(Redaction { page: 4, rect });
+    let marks = |app: &CarbideApp| app.pending_redactions.iter().map(|r| (r.page, r.rect)).collect::<Vec<_>>();
+
+    // Deleting a page before it, and inserting one, move the mark along.
+    app.current_page = 1;
+    app.run(Cmd::PageDelete);
+    assert_eq!(marks(&app), vec![(3, rect)]);
+    app.current_page = 0;
+    app.run(Cmd::PageInsert);
+    assert_eq!(marks(&app), vec![(4, rect)]);
+    // Moving the marked page, or a page past it, keeps the mark on the same content.
+    app.current_page = 4;
+    app.run(Cmd::MoveDown);
+    assert_eq!(marks(&app), vec![(5, rect)]);
+    app.current_page = 4;
+    app.run(Cmd::MoveDown);
+    assert_eq!(marks(&app), vec![(4, rect)]);
+
+    // Turning the page turns the mark with it: on a 612 x 792 page, a quarter turn clockwise
+    // puts (x, y) at (y, 612 - x).
+    app.current_page = 4;
+    app.run(Cmd::RotateRight);
+    assert_eq!(marks(&app), vec![(4, Rect::new(600.0, 312.0, 50.0, 200.0))]);
+    // The same as the engine maps the page: each corner lands on a corner of the turned mark.
+    let (upright, turned) = (PageGeometry::new(0.0, 0.0, 612.0, 792.0, 0), PageGeometry::new(0.0, 0.0, 612.0, 792.0, 90));
+    for (x, y) in [(100.0, 600.0), (300.0, 650.0)] {
+        let (ux, uy) = upright.map_point(x, y);
+        let (tx, ty) = turned.user_to_display(ux, uy);
+        assert!([600.0, 650.0].contains(&tx.round()) && [312.0, 512.0].contains(&ty.round()), "({x}, {y}) -> ({tx}, {ty})");
+    }
+    app.run(Cmd::RotateLeft);
+    assert_eq!(marks(&app), vec![(4, rect)]);
+
+    // Deleting the marked page takes the mark away.
+    app.run(Cmd::PageDelete);
+    assert!(marks(&app).is_empty());
+
+    // Without a renderer nothing is applied, and the marks are kept.
+    app.pending_redactions.push(Redaction { page: 0, rect });
+    app.run(Cmd::ApplyRedactions);
+    assert_eq!(marks(&app), vec![(0, rect)]);
+}
+
+#[test]
+fn commands_that_would_do_nothing_are_disabled_and_unchanged_documents_stay_unchanged() {
+    let dir = scratch();
+    let mut app = app(&dir);
+    // Reduce from the Start screen works on a list of files: there is no document to reduce.
+    app.run(Cmd::Reduce);
+    assert!(matches!(&app.dialog, Some(Dialog::Reduce(form)) if form.lists_files()));
+    app.dialog = None;
+
+    app.open_path(&plain(&dir, "two.pdf", &["ONE", "TWO"]));
+    app.current_page = 0;
+    assert!(!app.cmd_enabled(Cmd::MoveUp) && app.cmd_enabled(Cmd::MoveDown));
+    app.current_page = 1;
+    assert!(app.cmd_enabled(Cmd::MoveUp) && !app.cmd_enabled(Cmd::MoveDown));
+    // Without PDFium, the commands that need it are off.
+    for cmd in [Cmd::Ocr, Cmd::Compare, Cmd::ExportImages, Cmd::ExportText] {
+        assert!(!app.cmd_enabled(cmd), "{cmd:?}");
+    }
+    // An edit that changes nothing is no edit: no undo step and nothing to save.
+    assert!(!app.edit("Move page", |p| p.move_page(1, 1)));
+    let doc = app.doc.as_ref().unwrap();
+    assert!(!doc.dirty && doc.undo.is_empty());
+    assert!(!app.cmd_enabled(Cmd::Undo));
+
+    app.open_path(&plain(&dir, "one.pdf", &["ONLY"]));
+    assert!(!app.cmd_enabled(Cmd::PageDelete), "a document keeps at least one page");
+}
+
+#[test]
+fn quitting_from_outside_the_window_asks_about_unsaved_documents() {
+    use crate::quit::may_terminate;
+    // What applicationShouldTerminate: answers: go ahead unless something is unsaved and the
+    // question has not been answered.
+    assert!(may_terminate(false, false));
+    assert!(!may_terminate(true, false));
+    assert!(may_terminate(true, true));
+
+    let ctx = egui::Context::default();
+    let dir = scratch();
+    let mut app = app(&dir);
+    app.open_path(&plain(&dir, "a.pdf", &["A"]));
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    app.open_path(&plain(&dir, "b.pdf", &["B"]));
+    assert!(app.has_unsaved_changes());
+    // The question goes up, and nothing is closed or saved yet.
+    app.on_system_quit(&ctx);
+    assert!(app.quit_prompt_shown());
+    assert_eq!(app.tabs.len(), 2);
+
+    // With nothing unsaved the documents are let go and the window closes.
+    let dir = scratch();
+    let mut clean = crate::tests::app(&dir);
+    clean.open_path(&plain(&dir, "c.pdf", &["C"]));
+    clean.on_system_quit(&ctx);
+    assert!(clean.tabs.is_empty() && !clean.quit_prompt_shown());
+}
+
+#[test]
+fn ending_without_the_quit_question_keeps_unsaved_work_recoverable() {
+    let dir = scratch();
+    let mut app = app(&dir);
+    app.open_path(&plain(&dir, "a.pdf", &["A"]));
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    app.open_path(&plain(&dir, "b.pdf", &["B"]));
+    app.release_on_exit();
+    assert!(app.tabs.is_empty() && app.doc.is_none());
+    assert_eq!(recovery_copies(&dir), 1, "the unsaved document has no recovery copy");
+}
+
+#[test]
+fn pages_of_any_size_are_laid_out_and_drawn_within_limits() {
+    use crate::{layout_size, texture_size, thumbnail_size, thumbnails_fit, MAX_LAYOUT_SIDE, THUMBNAIL_CACHE_PIXELS, THUMBNAIL_WIDTH};
+    // Sizes a file can give, and some it cannot once it is read, are laid out as numbers.
+    for page in [(f32::INFINITY, f32::INFINITY), (f32::NAN, 792.0), (0.0, 0.0), (-5.0, 792.0), (1.2e38, 792.0), (612.0, 14_400.0)] {
+        let (w, h) = layout_size(page);
+        assert!((1.0..=MAX_LAYOUT_SIDE).contains(&w) && (1.0..=MAX_LAYOUT_SIDE).contains(&h), "{page:?}: {w} x {h}");
+        let thumbnail = thumbnail_size(page);
+        assert!(thumbnail.x.is_finite() && thumbnail.y.is_finite(), "{page:?}: {thumbnail:?}");
+        assert!(thumbnail.x <= THUMBNAIL_WIDTH && thumbnail.y <= 4.0 * THUMBNAIL_WIDTH, "{page:?}: {thumbnail:?}");
+        let [tw, th] = texture_size((w, h), thumbnail.x * 2.0, 8192);
+        assert!(tw * th <= 4 * 1_000_000, "{page:?}: a thumbnail of {tw} x {th}");
+    }
+    let letter = thumbnail_size((612.0, 792.0));
+    assert!(letter.x == THUMBNAIL_WIDTH && (letter.y - THUMBNAIL_WIDTH * 792.0 / 612.0).abs() < 0.01, "{letter:?}");
+    // Thumbnails kept for redrawing hold no more than their share of memory.
+    assert!(thumbnails_fit(std::iter::repeat_n([220, 285], 200)));
+    assert!(!thumbnails_fit(std::iter::repeat_n([220, 285], THUMBNAIL_CACHE_PIXELS / (220 * 285) + 1)));
+
+    // A document of such pages, and one whose page draws itself, shown at every zoom.
+    let Ok(renderer) = carbide_engine::Renderer::global() else { return };
+    let dir = scratch();
+    let mut pdf = document(&["LETTER"]);
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    pdf.insert_blank_page(2, Some((612.0, 14_400.0))).unwrap();
+    pdf.insert_blank_page(3, Some((1_000_000.0, 1_000_000.0))).unwrap();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let form = doc.new_object_id();
+    let dict = lopdf::dictionary! { "Subtype" => "Form", "Resources" => lopdf::dictionary! { "XObject" => lopdf::dictionary! { "X" => form } } };
+    doc.objects.insert(form, lopdf::Object::Stream(lopdf::Stream::new(dict, b"/X Do /X Do".to_vec())));
+    let draw = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), b"/X Do".to_vec()));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", lopdf::dictionary! { "XObject" => lopdf::dictionary! { "X" => form } });
+    page.set("Contents", draw);
+    let path = dir.join("sizes.pdf");
+    std::fs::write(&path, pdf.to_bytes().unwrap()).unwrap();
+    let mut app = app(&dir);
+    app.renderer = Some(renderer);
+    app.open_path(&path);
+    let ctx = egui::Context::default();
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+        max_texture_side: Some(4096),
+        ..Default::default()
+    };
+    for zoom in [None, Some(crate::shell::MIN_ZOOM), Some(crate::shell::MAX_ZOOM)] {
+        if let Some(zoom) = zoom {
+            app.zoom = zoom;
+            app.shell.fit = crate::shell::Fit::Manual;
+        }
+        for page in 0..4 {
+            app.current_page = page;
+            app.scroll_to = Some(page);
+            // Laying out and scrolling take a few frames.
+            for _ in 0..3 {
+                ctx.run_ui(input(), |ui| app.draw_shell(ui)).drop_without_applying_deltas();
+            }
+        }
+    }
+    let largest = app.textures.values().chain(app.thumbs.values()).map(|t| t.size()).max_by_key(|[w, h]| w * h).unwrap();
+    assert!(largest[0] <= 4096 && largest[1] <= 4096 && largest[0] * largest[1] <= 16 << 20, "{largest:?}");
+    // The page that draws itself is not rendered: PDFium would never finish it. The others are.
+    let version = app.doc.as_ref().unwrap().version;
+    assert_eq!(app.drawable.get(&(version, 0)), Some(&false));
+    assert_eq!(app.drawable.get(&(version, 1)), Some(&true));
+    let pages: Vec<usize> = app.thumbs.keys().map(|&(_, page)| page).chain(app.textures.keys().map(|&(_, page, _)| page)).collect();
+    assert!(!pages.contains(&0) && pages.contains(&1), "{pages:?}");
+}
+
+#[test]
+fn notes_and_signatures_waiting_in_a_dialog_follow_the_pages() {
+    use carbide_engine::Rect;
+    let dir = scratch();
+    let mut app = app(&dir);
+    app.open_path(&plain(&dir, "five.pdf", &["P1", "P2", "P3", "P4", "P5"]));
+    let doc = active_id(&app);
+    let note = |app: &CarbideApp| match &app.dialog {
+        Some(Dialog::Note { page, x, y, .. }) => Some((*page, *x, *y)),
+        _ => None,
+    };
+    // A note being written for the fourth page, while the first is deleted from the ribbon.
+    app.dialog = Some(Dialog::Note { doc, page: 3, x: 100.0, y: 600.0, on_page: false, text: "for P4".into() });
+    app.current_page = 0;
+    app.run(Cmd::PageDelete);
+    assert_eq!(note(&app), Some((2, 100.0, 600.0)), "the note would go on P5");
+    // Turned with its page, it stays on the same spot of the page.
+    app.current_page = 2;
+    app.run(Cmd::RotateRight);
+    assert_eq!(note(&app), Some((2, 600.0, 512.0)));
+    // Moving another page past it moves it along.
+    app.current_page = 1;
+    app.run(Cmd::MoveDown);
+    assert_eq!(note(&app), Some((1, 600.0, 512.0)));
+    // Deleting its page closes it.
+    app.current_page = 1;
+    app.run(Cmd::PageDelete);
+    assert_eq!(note(&app), None);
+    assert!(app.dialog.is_none());
+
+    // A visible signature waiting behind another dialog moves too, and goes with its page.
+    let area = Rect::new(10.0, 10.0, 100.0, 50.0);
+    app.dialog = Some(Dialog::Message("first".into()));
+    app.queue_dialog(Dialog::sign(doc, Some((2, area)), false));
+    app.current_page = 0;
+    app.run(Cmd::PageInsert);
+    app.dialog = None;
+    app.next_dialog();
+    assert!(matches!(&app.dialog, Some(Dialog::Sign(request)) if request.appearance == Some((3, area))));
+    app.current_page = 3;
+    app.run(Cmd::PageDelete);
+    assert!(app.dialog.is_none());
+
+    // Undo changes the pages in ways that cannot be followed: such dialogs close.
+    app.dialog = Some(Dialog::Note { doc, page: 0, x: 72.0, y: 72.0, on_page: true, text: String::new() });
+    app.undo();
+    assert!(app.dialog.is_none());
+    app.dialog = Some(Dialog::watermark(doc));
+    app.redo();
+    assert!(matches!(app.dialog, Some(Dialog::Watermark { .. })), "a dialog that places nothing stays");
+}
+
+#[test]
+fn commands_that_could_only_refuse_are_disabled() {
+    let dir = scratch();
+    let mut app = app(&dir);
+    app.open_path(&plain(&dir, "a.pdf", &["A"]));
+    // Zooming stops at the ends of its range.
+    app.zoom = crate::shell::MAX_ZOOM;
+    assert!(!app.cmd_enabled(Cmd::ZoomIn) && app.cmd_enabled(Cmd::ZoomOut));
+    app.zoom = crate::shell::MIN_ZOOM;
+    assert!(app.cmd_enabled(Cmd::ZoomIn) && !app.cmd_enabled(Cmd::ZoomOut));
+    // While a signature waits for its time stamp, no other signature can be written first.
+    for cmd in [Cmd::SignVisible, Cmd::SignInvisible, Cmd::Certify, Cmd::TimeStamp, Cmd::SaveRevision] {
+        assert!(app.cmd_enabled(cmd), "{cmd:?}");
+    }
+    let doc = app.doc.as_ref().unwrap();
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let path = dir.join("a.pdf");
+    app.sign_job = Some(SignJob { doc: doc.id, version: doc.version, path, done: String::new(), receiver, result: None });
+    for cmd in [Cmd::SignVisible, Cmd::SignInvisible, Cmd::Certify, Cmd::TimeStamp] {
+        assert!(!app.cmd_enabled(cmd), "{cmd:?}");
+    }
+    app.sign_job = None;
+
+    // Password-protected documents are neither signed nor given saved revisions.
+    let locked = protected(&dir, "locked.pdf", &["LOCKED"], "open pw");
+    let bytes = std::fs::read(&locked).unwrap();
+    assert!(app.open_with_password(locked, bytes, "open pw".into()));
+    for cmd in [Cmd::SignVisible, Cmd::SignInvisible, Cmd::Certify, Cmd::TimeStamp, Cmd::SaveRevision] {
+        assert!(!app.cmd_enabled(cmd), "{cmd:?}");
+    }
+}
+
+#[test]
+fn save_all_carries_on_with_another_dialog_on_screen() {
+    let dir = scratch();
+    let a = with_revision(&dir, "a.pdf", &["KEEP", "REMOVED-A"]);
+    let b = plain(&dir, "b.pdf", &["B"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    app.edit_removing("Delete page", |p| p.delete_pages(&[1]));
+    app.open_path(&b);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    let ctx = egui::Context::default();
+    app.on_system_quit(&ctx);
+    app.run(Cmd::AutoSaveSettings);
+    assert!(matches!(app.dialog, Some(Dialog::Preferences { .. })));
+    app.save_all_and_quit(&ctx);
+    assert_eq!(Pdf::open(&b).unwrap().page_rotation(0).unwrap(), 90, "b.pdf was left unsaved");
+    let (_, path) = question(&app).expect("a.pdf asks");
+    assert_eq!(path, a);
 }

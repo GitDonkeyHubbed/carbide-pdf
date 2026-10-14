@@ -18,8 +18,10 @@ pub mod geometry;
 pub mod imposition;
 pub mod imposition_plan;
 pub mod incremental;
+pub mod limits;
 mod navigation;
 pub mod ocr;
+pub mod pagetree;
 pub mod pdf;
 pub mod redact;
 pub mod reduce;
@@ -32,6 +34,7 @@ pub mod security;
 pub mod signature;
 mod sigcrypto;
 pub mod stamp;
+mod trees;
 
 pub use annotate::{AnnotationSummary, MarkupStyle};
 pub use compare::{compare_documents, PageDiff};
