@@ -688,38 +688,31 @@ impl CarbideApp {
         self.run_edit(label, true, f)
     }
 
-    /// Moves the marked redactions along with an edit that changed the pages, so that each still
-    /// covers what it was drawn over: a mark on a deleted page goes, one on a moved page moves, one
-    /// on a turned page turns with it. `before` is the page geometry from before the edit.
+    /// Moves what is placed on pages along with an edit that changed the pages, so that each still
+    /// sits on what it was placed on: the marked redactions, and the page and spot of a note or a
+    /// visible signature waiting in a dialog. One on a deleted page goes, one on a moved page moves,
+    /// one on a turned page turns with it. `before` is the page geometry from before the edit.
     pub fn follow_page_change(&mut self, change: PageChange, before: &[PageGeometry]) {
         let marks = std::mem::take(&mut self.pending_redactions);
         self.pending_redactions = marks
             .into_iter()
-            .filter_map(|mark| {
-                let Redaction { page, rect } = mark;
-                let page = match change {
-                    PageChange::Inserted(at) if page >= at => page + 1,
-                    PageChange::Deleted(gone) if page == gone => return None,
-                    PageChange::Deleted(gone) if page > gone => page - 1,
-                    PageChange::Moved { from, to } if page == from => to,
-                    PageChange::Moved { from, to } if from < to && (from + 1..=to).contains(&page) => page - 1,
-                    PageChange::Moved { from, to } if to < from && (to..from).contains(&page) => page + 1,
-                    _ => page,
-                };
-                let rect = match change {
-                    PageChange::Turned { page: turned, clockwise } if turned == page => {
-                        let (w, h) = before.get(page)?.display_size();
-                        if clockwise {
-                            Rect::new(rect.y, w - rect.max_x(), rect.height, rect.width)
-                        } else {
-                            Rect::new(h - rect.max_y(), rect.x, rect.height, rect.width)
-                        }
-                    }
-                    _ => rect,
-                };
+            .filter_map(|Redaction { page, rect }| {
+                let (page, rect) = follow(change, before, page, rect)?;
                 Some(Redaction { page, rect })
             })
             .collect();
+        let dialogs = self.dialog.take().into_iter().chain(std::mem::take(&mut self.queued_dialogs));
+        let kept: VecDeque<Dialog> = dialogs.filter_map(|dialog| dialog.follow(|page, rect| follow(change, before, page, rect))).collect();
+        self.queued_dialogs = kept;
+        self.next_dialog();
+    }
+
+    /// Drops the dialogs that place something on a page, after the pages changed in a way that
+    /// cannot be followed (going back or forward through the edit history).
+    fn drop_placed_dialogs(&mut self) {
+        let dialogs = self.dialog.take().into_iter().chain(std::mem::take(&mut self.queued_dialogs));
+        self.queued_dialogs = dialogs.filter(|dialog| !dialog.places_on_page()).collect();
+        self.next_dialog();
     }
 
     /// Runs an edit, and returns whether it was made. One that changed nothing (moving a page to
@@ -783,9 +776,9 @@ impl CarbideApp {
                 }
                 doc.dirty = true;
                 self.status = if undo { "Undid last change." } else { "Redid last change." }.into();
-                self.textures.clear();
-                self.thumbs.clear();
+                self.forget_page_images();
                 self.pending_redactions.clear();
+                self.drop_placed_dialogs();
             }
             Err(e) => self.alert(format!("Could not {}: {e}", if undo { "undo" } else { "redo" })),
         }
@@ -1834,6 +1827,32 @@ impl CarbideApp {
             Err(e) => self.alert(format!("Compare failed: {e}")),
         }
     }
+}
+
+/// Where `rect` on page `page` (display space) is after the pages changed by `change`, `before`
+/// being the page geometry from before; `None` when its page was deleted.
+fn follow(change: PageChange, before: &[PageGeometry], page: usize, rect: Rect) -> Option<(usize, Rect)> {
+    let page = match change {
+        PageChange::Inserted(at) if page >= at => page + 1,
+        PageChange::Deleted(gone) if page == gone => return None,
+        PageChange::Deleted(gone) if page > gone => page - 1,
+        PageChange::Moved { from, to } if page == from => to,
+        PageChange::Moved { from, to } if from < to && (from + 1..=to).contains(&page) => page - 1,
+        PageChange::Moved { from, to } if to < from && (to..from).contains(&page) => page + 1,
+        _ => page,
+    };
+    let rect = match change {
+        PageChange::Turned { page: turned, clockwise } if turned == page => {
+            let (w, h) = before.get(page)?.display_size();
+            if clockwise {
+                Rect::new(rect.y, w - rect.max_x(), rect.height, rect.width)
+            } else {
+                Rect::new(h - rect.max_y(), rect.x, rect.height, rect.width)
+            }
+        }
+        _ => rect,
+    };
+    Some((page, rect))
 }
 
 /// Those of `paths` that are already taken.

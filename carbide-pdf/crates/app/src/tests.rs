@@ -1024,3 +1024,107 @@ fn pages_of_any_size_are_laid_out_and_drawn_within_limits() {
     let pages: Vec<usize> = app.thumbs.keys().map(|&(_, page)| page).chain(app.textures.keys().map(|&(_, page, _)| page)).collect();
     assert!(!pages.contains(&0) && pages.contains(&1), "{pages:?}");
 }
+
+#[test]
+fn notes_and_signatures_waiting_in_a_dialog_follow_the_pages() {
+    use carbide_engine::Rect;
+    let dir = scratch();
+    let mut app = app(&dir);
+    app.open_path(&plain(&dir, "five.pdf", &["P1", "P2", "P3", "P4", "P5"]));
+    let doc = active_id(&app);
+    let note = |app: &CarbideApp| match &app.dialog {
+        Some(Dialog::Note { page, x, y, .. }) => Some((*page, *x, *y)),
+        _ => None,
+    };
+    // A note being written for the fourth page, while the first is deleted from the ribbon.
+    app.dialog = Some(Dialog::Note { doc, page: 3, x: 100.0, y: 600.0, on_page: false, text: "for P4".into() });
+    app.current_page = 0;
+    app.run(Cmd::PageDelete);
+    assert_eq!(note(&app), Some((2, 100.0, 600.0)), "the note would go on P5");
+    // Turned with its page, it stays on the same spot of the page.
+    app.current_page = 2;
+    app.run(Cmd::RotateRight);
+    assert_eq!(note(&app), Some((2, 600.0, 512.0)));
+    // Moving another page past it moves it along.
+    app.current_page = 1;
+    app.run(Cmd::MoveDown);
+    assert_eq!(note(&app), Some((1, 600.0, 512.0)));
+    // Deleting its page closes it.
+    app.current_page = 1;
+    app.run(Cmd::PageDelete);
+    assert_eq!(note(&app), None);
+    assert!(app.dialog.is_none());
+
+    // A visible signature waiting behind another dialog moves too, and goes with its page.
+    let area = Rect::new(10.0, 10.0, 100.0, 50.0);
+    app.dialog = Some(Dialog::Message("first".into()));
+    app.queue_dialog(Dialog::sign(doc, Some((2, area)), false));
+    app.current_page = 0;
+    app.run(Cmd::PageInsert);
+    app.dialog = None;
+    app.next_dialog();
+    assert!(matches!(&app.dialog, Some(Dialog::Sign(request)) if request.appearance == Some((3, area))));
+    app.current_page = 3;
+    app.run(Cmd::PageDelete);
+    assert!(app.dialog.is_none());
+
+    // Undo changes the pages in ways that cannot be followed: such dialogs close.
+    app.dialog = Some(Dialog::Note { doc, page: 0, x: 72.0, y: 72.0, on_page: true, text: String::new() });
+    app.undo();
+    assert!(app.dialog.is_none());
+    app.dialog = Some(Dialog::watermark(doc));
+    app.redo();
+    assert!(matches!(app.dialog, Some(Dialog::Watermark { .. })), "a dialog that places nothing stays");
+}
+
+#[test]
+fn commands_that_could_only_refuse_are_disabled() {
+    let dir = scratch();
+    let mut app = app(&dir);
+    app.open_path(&plain(&dir, "a.pdf", &["A"]));
+    // Zooming stops at the ends of its range.
+    app.zoom = crate::shell::MAX_ZOOM;
+    assert!(!app.cmd_enabled(Cmd::ZoomIn) && app.cmd_enabled(Cmd::ZoomOut));
+    app.zoom = crate::shell::MIN_ZOOM;
+    assert!(app.cmd_enabled(Cmd::ZoomIn) && !app.cmd_enabled(Cmd::ZoomOut));
+    // While a signature waits for its time stamp, no other signature can be written first.
+    for cmd in [Cmd::SignVisible, Cmd::SignInvisible, Cmd::Certify, Cmd::TimeStamp, Cmd::SaveRevision] {
+        assert!(app.cmd_enabled(cmd), "{cmd:?}");
+    }
+    let doc = app.doc.as_ref().unwrap();
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let path = dir.join("a.pdf");
+    app.sign_job = Some(SignJob { doc: doc.id, version: doc.version, path, done: String::new(), receiver, result: None });
+    for cmd in [Cmd::SignVisible, Cmd::SignInvisible, Cmd::Certify, Cmd::TimeStamp] {
+        assert!(!app.cmd_enabled(cmd), "{cmd:?}");
+    }
+    app.sign_job = None;
+
+    // Password-protected documents are neither signed nor given saved revisions.
+    let locked = protected(&dir, "locked.pdf", &["LOCKED"], "open pw");
+    let bytes = std::fs::read(&locked).unwrap();
+    assert!(app.open_with_password(locked, bytes, "open pw".into()));
+    for cmd in [Cmd::SignVisible, Cmd::SignInvisible, Cmd::Certify, Cmd::TimeStamp, Cmd::SaveRevision] {
+        assert!(!app.cmd_enabled(cmd), "{cmd:?}");
+    }
+}
+
+#[test]
+fn save_all_carries_on_with_another_dialog_on_screen() {
+    let dir = scratch();
+    let a = with_revision(&dir, "a.pdf", &["KEEP", "REMOVED-A"]);
+    let b = plain(&dir, "b.pdf", &["B"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    app.edit_removing("Delete page", |p| p.delete_pages(&[1]));
+    app.open_path(&b);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    let ctx = egui::Context::default();
+    app.on_system_quit(&ctx);
+    app.run(Cmd::AutoSaveSettings);
+    assert!(matches!(app.dialog, Some(Dialog::Preferences { .. })));
+    app.save_all_and_quit(&ctx);
+    assert_eq!(Pdf::open(&b).unwrap().page_rotation(0).unwrap(), 90, "b.pdf was left unsaved");
+    let (_, path) = question(&app).expect("a.pdf asks");
+    assert_eq!(path, a);
+}

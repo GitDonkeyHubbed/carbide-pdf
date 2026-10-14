@@ -258,6 +258,33 @@ impl Dialog {
         }
     }
 
+    /// True for a dialog that places something on a page: a note, or a visible signature.
+    pub fn places_on_page(&self) -> bool {
+        match self {
+            Dialog::Note { .. } => true,
+            Dialog::Sign(request) => request.appearance.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The dialog with the page and spot it places something on moved by `follow` (see
+    /// [`CarbideApp::follow_page_change`]), or `None` when `follow` says its page is gone.
+    pub fn follow(mut self, follow: impl Fn(usize, Rect) -> Option<(usize, Rect)>) -> Option<Dialog> {
+        match &mut self {
+            Dialog::Note { page, x, y, .. } => {
+                let (moved, spot) = follow(*page, Rect::new(*x, *y, 0.0, 0.0))?;
+                (*page, *x, *y) = (moved, spot.x, spot.y);
+            }
+            Dialog::Sign(request) => {
+                if let Some((page, rect)) = request.appearance {
+                    request.appearance = Some(follow(page, rect)?);
+                }
+            }
+            _ => {}
+        }
+        Some(self)
+    }
+
     /// Remove Hidden Information for document `doc`, with the usual items chosen.
     pub fn remove_hidden(doc: u64) -> Dialog {
         Dialog::RemoveHidden { doc, chosen: HiddenItem::ALL.into_iter().map(|item| (item, item.chosen_by_default())).collect() }

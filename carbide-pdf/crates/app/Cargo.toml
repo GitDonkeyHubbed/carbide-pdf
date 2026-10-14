@@ -19,7 +19,9 @@ chrono.workspace = true
 # Tests build damaged documents object by object.
 lopdf.workspace = true
 
-# Only used to make the application menu's Quit go through the window's close request.
+# Used to ask about unsaved documents on every way of quitting on macOS (an
+# applicationShouldTerminate: handler on winit's app delegate, see src/quit.rs), and, where that cannot
+# be set up, to make the application menu's Quit go through the window's close request instead.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSResponder"] }

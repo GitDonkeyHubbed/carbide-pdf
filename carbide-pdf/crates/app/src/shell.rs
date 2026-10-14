@@ -244,7 +244,15 @@ impl CarbideApp {
             Cmd::ApplyRedactions => doc.is_some() && !self.pending_redactions.is_empty() && self.renderer.is_some(),
             Cmd::Ocr => doc.is_some() && self.ocr_job.is_none() && self.renderer.is_some(),
             Cmd::Compare | Cmd::ExportImages | Cmd::ExportText => doc.is_some() && self.renderer.is_some(),
-            Cmd::SignVisible | Cmd::SignInvisible | Cmd::TimeStamp => doc.is_some() && self.sign_job.is_none(),
+            // Signing and saving revisions refuse password-protected documents (see
+            // `sign_document` and `save_revision`), and a signature waiting for its time stamp
+            // would be dropped by another one written first.
+            Cmd::SignVisible | Cmd::SignInvisible | Cmd::Certify | Cmd::TimeStamp => {
+                doc.is_some_and(|d| !d.is_protected()) && self.sign_job.is_none()
+            }
+            Cmd::SaveRevision => doc.is_some_and(|d| !d.is_protected()),
+            Cmd::ZoomIn => doc.is_some() && self.zoom < MAX_ZOOM,
+            Cmd::ZoomOut => doc.is_some() && self.zoom > MIN_ZOOM,
             Cmd::OpenRevision => doc.is_some_and(|d| d.pdf.can_open_revision()),
             Cmd::FirstPage | Cmd::PrevPage | Cmd::MoveUp => doc.is_some() && self.current_page > 0,
             Cmd::NextPage | Cmd::LastPage | Cmd::MoveDown => doc.is_some_and(|d| self.current_page + 1 < d.pdf.page_count()),
@@ -649,6 +657,7 @@ impl CarbideApp {
         let modified: Vec<u64> =
             (0..self.tabs.len()).filter(|&i| self.tab_label(i).1).filter_map(|i| self.doc_at(i).map(|d| d.id)).collect();
         let mut asks = None;
+        let mut failed = false;
         for id in modified {
             let Some(index) = self.tab_of(id) else { continue };
             self.activate(Some(index));
@@ -656,10 +665,12 @@ impl CarbideApp {
                 asks.get_or_insert(id);
             } else {
                 self.save();
+                // Still modified: the save failed, and has said why, or Save As was cancelled.
+                failed |= self.tab_of(id).and_then(|i| self.doc_at(i)).is_some_and(|d| d.dirty);
             }
         }
-        // A save that failed has said why; the quit prompt stays up for another try.
-        if self.dialog.is_some() {
+        // The quit prompt stays up for another try.
+        if failed {
             return;
         }
         if let Some(index) = asks.and_then(|id| self.tab_of(id)) {
