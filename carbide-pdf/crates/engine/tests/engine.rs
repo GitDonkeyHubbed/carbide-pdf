@@ -517,7 +517,7 @@ fn page_text_that_looks_like_the_length_placeholder_is_left_alone() {
     assert!(page_text(r, &mut saved, 0).contains("0000000000"), "the page text was patched");
 }
 
-// ---- saving over the file ----------------------------------------------------------------
+// ---- saving over the file ------------------------------------------------------------------
 
 fn contains(bytes: &[u8], needle: &[u8]) -> bool {
     bytes.windows(needle.len()).any(|w| w == needle)
@@ -4118,7 +4118,7 @@ fn signatures_on_files_with_an_open_password_verify_with_it() {
     assert!(reports[0].modified_after_signing);
 }
 
-// ---- algorithm coverage (S7, S6) ----------------------------------------------------------
+// ---- algorithm coverage --------------------------------------------------------------------
 
 mod algo {
     //! Minimal DER, enough to wrap a signature of any algorithm into a detached CMS whose signer
@@ -4483,7 +4483,7 @@ fn flipping_an_unsigned_algorithm_identifier_does_not_hide_tampering() {
 }
 
 
-// ---- time stamps (S3, S8) -----------------------------------------------------------------
+// ---- time stamps ---------------------------------------------------------------------------
 
 /// A test RFC 3161 authority: it signs real time-stamp tokens with an RSA key whose certificate
 /// carries the time-stamping extended key usage, critical and alone as RFC 3161 asks.
@@ -4966,7 +4966,7 @@ fn identities_load_from_pem_and_pkcs12() {
     assert_eq!(verify(&signed, &trust_test_identity())[0].validity, Validity::Valid);
 }
 
-// ---- certificate chain rules (S4) ---------------------------------------------------------
+// ---- certificate chain rules ---------------------------------------------------------------
 
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 

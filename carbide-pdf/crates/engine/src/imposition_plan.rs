@@ -569,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_layouts_follow_the_recovered_formulas() {
+    fn simple_layouts_place_pages_in_the_expected_cells() {
         // Step and repeat, 2 x 2, single sided: contiguous blocks, row-major.
         let step = PlanOptions {
             layout: LayoutKind::StepAndRepeat,
@@ -601,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn printing_order_matches_the_recovered_examples() {
+    fn printing_orders_arrange_fronts_and_backs_as_described() {
         let order = |mode| output_order(4, mode, true, Style::Sheetwise, false);
         assert_eq!(order(PrintingOrder::Interleaved), vec![0, 1, 2, 3]);
         assert_eq!(order(PrintingOrder::FrontsThenBacks), vec![0, 2, 1, 3]);
