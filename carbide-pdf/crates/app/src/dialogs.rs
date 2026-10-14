@@ -56,6 +56,13 @@ pub struct ImposeForm {
     error: Option<String>,
 }
 
+impl ReduceForm {
+    /// True while the dialog works on a list of files rather than the document in front.
+    pub fn lists_files(&self) -> bool {
+        self.multi
+    }
+}
+
 pub struct ReduceForm {
     /// The document "OK" reduces, while the dialog is not working on a list of files.
     doc: Option<u64>,
@@ -319,11 +326,12 @@ impl Dialog {
         }))
     }
 
-    /// Reduce File Size for document `doc`, the file `current`.
+    /// Reduce File Size for document `doc`, the file `current`. Without a document it starts with
+    /// the list of files to reduce, since there is no document for "OK" to reduce.
     pub fn reduce(doc: Option<u64>, current: Option<PathBuf>) -> Dialog {
         Dialog::Reduce(Box::new(ReduceForm {
             doc,
-            multi: false,
+            multi: doc.is_none(),
             files: current.into_iter().collect(),
             slider: carbide_engine::reduce::DEFAULT_IMAGE_FACTOR,
             same_folder: true,

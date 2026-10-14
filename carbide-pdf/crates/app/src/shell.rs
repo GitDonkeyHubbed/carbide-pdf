@@ -237,8 +237,10 @@ impl CarbideApp {
             | Cmd::Quit => true,
             Cmd::Undo => doc.is_some_and(|d| !d.undo.is_empty()),
             Cmd::Redo => doc.is_some_and(|d| !d.redo.is_empty()),
-            Cmd::ApplyRedactions => doc.is_some() && !self.pending_redactions.is_empty(),
-            Cmd::Ocr => doc.is_some() && self.ocr_job.is_none(),
+            // These need PDFium, and do nothing without it.
+            Cmd::ApplyRedactions => doc.is_some() && !self.pending_redactions.is_empty() && self.renderer.is_some(),
+            Cmd::Ocr => doc.is_some() && self.ocr_job.is_none() && self.renderer.is_some(),
+            Cmd::Compare | Cmd::ExportImages | Cmd::ExportText => doc.is_some() && self.renderer.is_some(),
             Cmd::SignVisible | Cmd::SignInvisible | Cmd::TimeStamp => doc.is_some() && self.sign_job.is_none(),
             Cmd::OpenRevision => doc.is_some_and(|d| d.pdf.can_open_revision()),
             Cmd::FirstPage | Cmd::PrevPage | Cmd::MoveUp => doc.is_some() && self.current_page > 0,

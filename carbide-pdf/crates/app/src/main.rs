@@ -711,11 +711,21 @@ impl CarbideApp {
             .collect();
     }
 
-    /// Runs an edit, and returns whether it was made.
+    /// Runs an edit, and returns whether it was made. One that changed nothing (moving a page to
+    /// where it is, say) is not recorded: no undo step, nothing to save. An edit that removes
+    /// content always counts, since what it removed can be held by the file alone.
     fn run_edit(&mut self, label: &str, removes: bool, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) -> bool {
         let Some(doc) = self.doc.as_mut() else { return false };
         let snapshot = Snapshot { bytes: doc.bytes.clone(), content_removed: doc.content_removed };
+        let version = doc.version;
+        // Compared as objects: writing a file numbers its cross-reference stream afresh each time.
+        let before = (!removes).then(|| doc.pdf.document().objects.clone());
         match f(&mut doc.pdf).and_then(|_| doc.refresh()) {
+            Ok(()) if before.as_ref() == Some(&doc.pdf.document().objects) => {
+                doc.version = version;
+                self.status = format!("{label}: nothing changed.");
+                false
+            }
             Ok(()) => {
                 doc.undo.push(snapshot);
                 if doc.undo.len() > MAX_UNDO {
@@ -1731,6 +1741,7 @@ impl CarbideApp {
         let file = self.doc.as_ref().and_then(|d| d.saved.clone());
         let was_dirty = self.doc.as_ref().is_some_and(|d| d.dirty);
         let mut report = None;
+        // Removing content always counts as an edit, so an empty report is undone below.
         self.edit_removing("Remove hidden information", |pdf| {
             report = Some(pdf.remove_hidden_information_from(&items, file.as_ref())?);
             Ok(())

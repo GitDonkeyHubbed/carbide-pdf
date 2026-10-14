@@ -885,3 +885,31 @@ fn marked_redactions_follow_the_pages_they_were_drawn_on() {
     app.run(Cmd::ApplyRedactions);
     assert_eq!(marks(&app), vec![(0, rect)]);
 }
+
+#[test]
+fn commands_that_would_do_nothing_are_disabled_and_unchanged_documents_stay_unchanged() {
+    let dir = scratch();
+    let mut app = app(&dir);
+    // Reduce from the Start screen works on a list of files: there is no document to reduce.
+    app.run(Cmd::Reduce);
+    assert!(matches!(&app.dialog, Some(Dialog::Reduce(form)) if form.lists_files()));
+    app.dialog = None;
+
+    app.open_path(&plain(&dir, "two.pdf", &["ONE", "TWO"]));
+    app.current_page = 0;
+    assert!(!app.cmd_enabled(Cmd::MoveUp) && app.cmd_enabled(Cmd::MoveDown));
+    app.current_page = 1;
+    assert!(app.cmd_enabled(Cmd::MoveUp) && !app.cmd_enabled(Cmd::MoveDown));
+    // Without PDFium, the commands that need it are off.
+    for cmd in [Cmd::Ocr, Cmd::Compare, Cmd::ExportImages, Cmd::ExportText] {
+        assert!(!app.cmd_enabled(cmd), "{cmd:?}");
+    }
+    // An edit that changes nothing is no edit: no undo step and nothing to save.
+    assert!(!app.edit("Move page", |p| p.move_page(1, 1)));
+    let doc = app.doc.as_ref().unwrap();
+    assert!(!doc.dirty && doc.undo.is_empty());
+    assert!(!app.cmd_enabled(Cmd::Undo));
+
+    app.open_path(&plain(&dir, "one.pdf", &["ONLY"]));
+    assert!(!app.cmd_enabled(Cmd::PageDelete), "a document keeps at least one page");
+}
