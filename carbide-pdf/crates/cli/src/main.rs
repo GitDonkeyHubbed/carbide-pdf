@@ -266,12 +266,14 @@ enum Command {
         #[arg(long)]
         tsa_password: Option<String>,
     },
-    /// Validate every signature in a file.
+    /// Validate every signature in a file. --password reads a file that needs its open password.
     Verify {
         input: PathBuf,
         /// PEM certificate(s) to treat as trusted; repeatable.
         #[arg(long = "trust")]
         trust: Vec<PathBuf>,
+        #[command(flatten)]
+        pw: Password,
     },
     /// Named revisions stored inside the file.
     Revision {
@@ -1017,7 +1019,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             write_replacing(&output, &pdf.sign(&base, &options)?)?;
             println!("wrote {}", output.display());
         }
-        Command::Verify { input, trust } => {
+        Command::Verify { input, trust, pw } => {
             let bytes = std::fs::read(&input)?;
             let mut store = TrustStore::default();
             for path in trust {
@@ -1026,7 +1028,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                     .map_err(|e| format!("{}: {e}", path.display()))?;
                 store.certificates.extend(certificates);
             }
-            let reports = Pdf::verify_signatures(&bytes, &store, chrono::Utc::now())?;
+            let reports = Pdf::verify_signatures_with_password(&bytes, pw.password.as_deref(), &store, chrono::Utc::now())?;
             if reports.is_empty() {
                 println!("No signatures found.");
             }

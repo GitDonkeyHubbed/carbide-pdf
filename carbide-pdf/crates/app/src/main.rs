@@ -1411,8 +1411,8 @@ impl CarbideApp {
 
     pub fn validate_signatures(&mut self) {
         let Some(doc) = self.doc.as_ref() else { return };
-        let bytes = doc.saved.as_ref().map(|s| s.bytes().to_vec()).unwrap_or_else(|| doc.bytes.clone());
-        match Pdf::verify_signatures(&bytes, &paths::load_trust_store(), chrono::Utc::now()) {
+        let (bytes, password) = signed_file(doc);
+        match Pdf::verify_signatures_with_password(bytes, password, &paths::load_trust_store(), chrono::Utc::now()) {
             Ok(reports) if reports.is_empty() => self.alert("This document has no signatures.".into()),
             Ok(reports) => {
                 let notice = carbide_engine::signature::notice_text(&reports).unwrap_or_default().to_string();
@@ -1683,14 +1683,23 @@ fn taken(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths.into_iter().filter(|path| path.symlink_metadata().is_ok()).collect()
 }
 
+/// The bytes whose signatures are checked for `doc`, the file it came from when it has one, with
+/// the password that file needs.
+fn signed_file(doc: &OpenDoc) -> (&[u8], Option<&str>) {
+    match &doc.saved {
+        Some(saved) => (saved.bytes(), saved.password()),
+        None => (&doc.bytes, None),
+    }
+}
+
 /// Notice bar text for a document that carries signatures.
 fn signature_notice(doc: &OpenDoc) -> Option<String> {
     if !doc.pdf.has_signatures() {
         return None;
     }
-    let bytes = doc.saved.as_ref().map(SavedFile::bytes).unwrap_or(&doc.bytes);
+    let (bytes, password) = signed_file(doc);
     let trust = paths::load_trust_store();
-    let reports = Pdf::verify_signatures(bytes, &trust, chrono::Utc::now()).ok()?;
+    let reports = Pdf::verify_signatures_with_password(bytes, password, &trust, chrono::Utc::now()).ok()?;
     carbide_engine::signature::notice_text(&reports).map(str::to_string)
 }
 

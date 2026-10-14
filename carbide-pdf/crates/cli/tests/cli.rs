@@ -404,3 +404,17 @@ fn arguments_that_would_do_the_wrong_thing_are_refused_or_read_as_meant() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn verify_reads_files_that_need_their_open_password() {
+    let dir = scratch("verify");
+    let file = dir.join("locked.pdf");
+    protected(&file, "user pw", "owner pw");
+    let path = file.to_str().unwrap();
+    let output = carbide(&["verify", path]);
+    assert!(!output.status.success() && stderr(&output).contains("password"), "{}", stderr(&output));
+    let output = carbide(&["verify", path, "--password", "user pw"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No signatures found."));
+    let _ = std::fs::remove_dir_all(dir);
+}

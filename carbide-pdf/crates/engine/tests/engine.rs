@@ -3442,6 +3442,31 @@ fn a_signed_file_with_an_open_password_and_a_later_update_takes_appended_edits()
     assert_eq!(pdf.save_plan(Some(&saved), false).unwrap(), SavePlan::Incremental, "the intact signature was treated as broken");
 }
 
+#[test]
+fn signatures_on_files_with_an_open_password_verify_with_it() {
+    let plain = text_pdf(&[&["locked and signed"]]).to_bytes().unwrap();
+    let protected = Pdf::from_bytes(&plain).unwrap().to_encrypted_bytes(&ProtectionOptions::new("user", "owner")).unwrap();
+    let signed = sign_protected(&protected);
+    let trust = trust_test_identity();
+    assert!(matches!(Pdf::verify_signatures(&signed, &trust, chrono::Utc::now()), Err(Error::PasswordRequired)));
+    for password in ["user", "owner"] {
+        let reports = Pdf::verify_signatures_with_password(&signed, Some(password), &trust, chrono::Utc::now()).unwrap();
+        assert_eq!(reports.len(), 1, "{password}");
+        assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly), "{password}");
+    }
+    let wrong = Pdf::verify_signatures_with_password(&signed, Some("guess"), &trust, chrono::Utc::now());
+    assert!(matches!(wrong, Err(Error::WrongPassword)));
+
+    // A later update is read with the password too, and the signature still covers its revision.
+    let (encrypt, generation) = trailer_numbers(&signed, "Encrypt");
+    let n = trailer_numbers(&signed, "Size").0;
+    let note = format!("{n} 0 obj\n<</Type/Annot/Subtype/Square/Rect[0 0 1 1]>>\nendobj");
+    let updated = append_revision(&signed, &[(n, note)], &format!("/Encrypt {encrypt} {generation} R"));
+    let reports = Pdf::verify_signatures_with_password(&updated, Some("user"), &trust, chrono::Utc::now()).unwrap();
+    assert_eq!(reports[0].validity, Validity::Valid);
+    assert!(reports[0].modified_after_signing);
+}
+
 // ---- algorithm coverage (S7, S6) ----------------------------------------------------------
 
 mod algo {

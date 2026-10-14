@@ -644,3 +644,18 @@ fn undo_cannot_go_back_past_a_saved_revision_or_a_signature() {
     app.undo();
     assert!(contains(&app.doc.as_ref().unwrap().bytes, "SIGNED"));
 }
+
+#[test]
+fn signatures_of_a_document_opened_with_its_password_can_be_checked() {
+    let dir = scratch();
+    let path = protected(&dir, "locked.pdf", &["LOCKED"], "user pw");
+    let mut app = app(&dir);
+    app.open_path(&path);
+    let Some(Dialog::Password { bytes, .. }) = app.dialog.take() else { panic!("the password is asked for") };
+    assert!(app.open_with_password(path, bytes, "user pw".into()));
+    app.validate_signatures();
+    match &app.dialog {
+        Some(Dialog::Message(text)) => assert_eq!(text, "This document has no signatures."),
+        _ => panic!("no answer about the signatures"),
+    }
+}
