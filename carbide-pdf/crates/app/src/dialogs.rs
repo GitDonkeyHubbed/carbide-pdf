@@ -369,9 +369,10 @@ fn buttons(ui: &mut egui::Ui, ok: &str, ok_enabled: bool) -> (bool, bool) {
 /// Draws the active dialog and carries out its action. A dialog about a document that is no
 /// longer in front goes without being shown.
 pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
+    app.next_dialog();
     let Some(mut dialog) = app.dialog.take() else { return };
     if dialog.document().is_some_and(|doc| app.doc.as_ref().map(|d| d.id) != Some(doc)) {
-        return;
+        return app.next_dialog();
     }
     let mut open = true;
 
@@ -999,10 +1000,15 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
         }
     }
 
-    // An action above may have opened a different dialog (an alert, say); that one wins.
-    if open && app.dialog.is_none() {
-        app.dialog = Some(dialog);
+    // An action above may have opened a different dialog (an alert, say). It is shown first, and
+    // this one, when it stays open, comes back after it.
+    if open {
+        match app.dialog {
+            Some(_) => app.queued_dialogs.push_front(dialog),
+            None => app.dialog = Some(dialog),
+        }
     }
+    app.next_dialog();
 }
 
 fn anchor_name(anchor: PageAnchor) -> &'static str {

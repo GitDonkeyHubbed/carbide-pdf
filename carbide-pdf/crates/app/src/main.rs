@@ -9,7 +9,7 @@ mod shell;
 mod tests;
 mod theme;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -251,7 +251,9 @@ pub struct CarbideApp {
     pub tool: Tool,
     zoom: f32,
     pub status: String,
+    /// The dialog on screen. Others wait in `queued_dialogs` (see [`CarbideApp::queue_dialog`]).
     pub dialog: Option<Dialog>,
+    queued_dialogs: VecDeque<Dialog>,
     textures: HashMap<(u64, usize, u32), egui::TextureHandle>,
     thumbs: HashMap<(u64, usize), egui::TextureHandle>,
     drag: Option<DragState>,
@@ -286,16 +288,21 @@ impl CarbideApp {
         };
         let autosave = AutoSaveStore::open(paths::autosave_dir()).ok();
         let mut app = Self::with_parts(renderer, renderer_error, autosave, paths::load_autosave_settings());
+        app.launch(launch);
+        app
+    }
+
+    /// Opens what the window was started with, then offers the documents an earlier session left
+    /// for recovery. The recovery panel waits behind a question the opening asked (a password).
+    fn launch(&mut self, launch: Option<Launch>) {
         match launch {
-            Some(Launch::File(path)) => app.open_path(&path),
-            Some(Launch::Copy(path)) => app.open_copy(&path),
+            Some(Launch::File(path)) => self.open_path(&path),
+            Some(Launch::Copy(path)) => self.open_copy(&path),
             None => {}
         }
-        // Launch: show recovered documents waiting from an earlier session.
-        if app.autosave.as_ref().is_some_and(|s| s.any_needs_save()) {
-            app.dialog = Some(Dialog::auto_recovery());
+        if self.autosave.as_ref().is_some_and(|s| s.any_needs_save()) {
+            self.queue_dialog(Dialog::auto_recovery());
         }
-        app
     }
 
     /// The application state without a window, so it can also be driven by tests.
@@ -313,6 +320,7 @@ impl CarbideApp {
             zoom: 1.25,
             status: "Open a PDF, or drop one on the window.".into(),
             dialog: None,
+            queued_dialogs: VecDeque::new(),
             textures: HashMap::new(),
             thumbs: HashMap::new(),
             drag: None,
@@ -355,7 +363,7 @@ impl CarbideApp {
                 self.install(pdf, Some(path.to_path_buf()), Some(saved));
             }
             Err(EngineError::PasswordRequired) => {
-                self.dialog = Some(Dialog::Password { path: path.to_path_buf(), bytes, input: String::new(), failed: false });
+                self.open_dialog(Dialog::Password { path: path.to_path_buf(), bytes, input: String::new(), failed: false });
             }
             Err(e) => self.alert(format!("Could not open {}: {e}", path.display())),
         }
@@ -481,11 +489,42 @@ impl CarbideApp {
     }
 
     /// A pending question about the active document (whether to save, replace files, ...) belongs
-    /// to it. Whenever that document is put away (another one opened, created or brought forward,
-    /// or this one closed) the question goes, so answering it can never act on a different document.
+    /// to it, and so does a dialog that acts on it. Whenever that document is put away (another one
+    /// opened, created or brought forward, or this one closed) they go, waiting ones included, so
+    /// answering one can never act on a different document.
     fn drop_document_question(&mut self) {
         if self.dialog.as_ref().is_some_and(|d| d.document().is_some()) {
             self.dialog = None;
+        }
+        self.queued_dialogs.retain(|d| d.document().is_none());
+        self.next_dialog();
+    }
+
+    /// Shows `dialog` in place of the one on screen, as a command does. A password question is
+    /// never replaced: the file it would open would be dropped. `dialog` waits behind it instead.
+    pub fn open_dialog(&mut self, dialog: Dialog) {
+        if matches!(self.dialog, Some(Dialog::Password { .. })) {
+            self.queued_dialogs.push_back(dialog);
+        } else {
+            self.dialog = Some(dialog);
+        }
+    }
+
+    /// Shows `dialog` once every dialog before it has closed: now, when none is on screen. What
+    /// background work and launch have to say waits like this, so it never takes the place of a
+    /// dialog the user is answering.
+    pub fn queue_dialog(&mut self, dialog: Dialog) {
+        if self.dialog.is_none() {
+            self.dialog = Some(dialog);
+        } else {
+            self.queued_dialogs.push_back(dialog);
+        }
+    }
+
+    /// Brings up the next waiting dialog when none is on screen.
+    pub(crate) fn next_dialog(&mut self) {
+        if self.dialog.is_none() {
+            self.dialog = self.queued_dialogs.pop_front();
         }
     }
 
@@ -591,7 +630,7 @@ impl CarbideApp {
         }
         let refs: Vec<&Pdf> = documents.iter().collect();
         if Pdf::shared_protection(&refs).is_err() {
-            self.dialog = Some(Dialog::ConfirmCombine { documents });
+            self.open_dialog(Dialog::ConfirmCombine { documents });
             return;
         }
         match Pdf::merge(&refs) {
@@ -611,7 +650,7 @@ impl CarbideApp {
 
     pub fn alert(&mut self, message: String) {
         self.status = message.lines().next().unwrap_or_default().to_string();
-        self.dialog = Some(Dialog::Message(message));
+        self.queue_dialog(Dialog::Message(message));
     }
 
     /// Runs an edit on the open document with undo support.
@@ -717,15 +756,15 @@ impl CarbideApp {
         };
         if let SavePlan::FullRewrite { breaks_signatures, drops_revisions } = plan {
             if plan.needs_confirmation() && confirmed.is_none() {
-                self.dialog = Some(Dialog::ConfirmRewrite {
+                let question = Dialog::ConfirmRewrite {
                     doc: doc.id,
                     path: path.to_path_buf(),
                     content_removed: doc.content_removed,
                     breaks_signatures,
                     drops_revisions,
                     then,
-                });
-                return;
+                };
+                return self.open_dialog(question);
             }
         }
         let in_place = doc.path.as_deref() == Some(path);
@@ -808,7 +847,7 @@ impl CarbideApp {
             return self.write_to(&path, None, then);
         }
         match doc.recovered.as_ref().and_then(|r| r.original.clone()).filter(|p| p.exists()) {
-            Some(original) => self.dialog = Some(Dialog::ReplaceOriginal { doc: doc.id, path: original, then }),
+            Some(original) => self.open_dialog(Dialog::ReplaceOriginal { doc: doc.id, path: original, then }),
             None => self.save_as_then(then),
         }
     }
@@ -1210,7 +1249,7 @@ impl CarbideApp {
         for action in actions {
             match action {
                 Action::SignArea { page, rect } => {
-                    self.dialog = Some(Dialog::sign(doc_id, Some((page, rect)), false));
+                    self.open_dialog(Dialog::sign(doc_id, Some((page, rect)), false));
                     self.tool = Tool::Select;
                 }
                 Action::Visible(page) => self.current_page = page,
@@ -1219,7 +1258,7 @@ impl CarbideApp {
                     self.status = "Redaction marked. Security > Apply removes the marked content.".into();
                 }
                 Action::NotePrompt { page, x, y, on_page } => {
-                    self.dialog = Some(Dialog::Note { doc: doc_id, page, x, y, on_page, text: String::new() });
+                    self.open_dialog(Dialog::Note { doc: doc_id, page, x, y, on_page, text: String::new() });
                 }
                 Action::Markup { page, rect, style, snap } => {
                     let (bytes, geometry) = match self.doc.as_ref() {
@@ -1419,7 +1458,7 @@ impl CarbideApp {
             Ok(reports) => {
                 let notice = carbide_engine::signature::notice_text(&reports).unwrap_or_default().to_string();
                 self.notice = Some(notice.clone());
-                self.dialog = Some(Dialog::Signatures { doc: doc.id, reports, notice });
+                self.open_dialog(Dialog::Signatures { doc: doc.id, reports, notice });
             }
             Err(e) => self.alert(format!("Could not read the signatures: {e}")),
         }
@@ -1432,7 +1471,7 @@ impl CarbideApp {
     pub fn export(&mut self, export: Export) {
         let Some(doc) = self.doc.as_ref() else { return };
         if doc.is_protected() {
-            self.dialog = Some(Dialog::ConfirmExport { doc: doc.id, export });
+            self.open_dialog(Dialog::ConfirmExport { doc: doc.id, export });
             return;
         }
         self.export_confirmed(doc.id, export);
@@ -1467,8 +1506,8 @@ impl CarbideApp {
             None => {
                 let taken = taken(carbide_engine::image_paths(&doc.pdf, &folder, &base, format));
                 if !taken.is_empty() {
-                    self.dialog = Some(Dialog::ExistingFiles { doc: doc.id, writing: Writing::Images { folder }, taken });
-                    return;
+                    let question = Dialog::ExistingFiles { doc: doc.id, writing: Writing::Images { folder }, taken };
+                    return self.open_dialog(question);
                 }
                 Existing::Refuse
             }
@@ -1501,7 +1540,7 @@ impl CarbideApp {
                 let taken = taken(targets.clone());
                 if !taken.is_empty() {
                     let writing = Writing::Split { folder, ranges: ranges.to_string() };
-                    self.dialog = Some(Dialog::ExistingFiles { doc: doc.id, writing, taken });
+                    self.open_dialog(Dialog::ExistingFiles { doc: doc.id, writing, taken });
                     return;
                 }
                 Existing::Refuse
@@ -1570,7 +1609,7 @@ impl CarbideApp {
         if !confirmed && others.iter().any(differs) {
             let protected =
                 others.iter().zip(&names).filter(|(other, _)| differs(other)).map(|(_, name)| name.clone()).collect();
-            self.dialog = Some(Dialog::ConfirmMerge { doc: doc.id, others, names, protected, keeps_protection: protection.is_some() });
+            self.open_dialog(Dialog::ConfirmMerge { doc: doc.id, others, names, protected, keeps_protection: protection.is_some() });
             return;
         }
         for other in others.iter_mut().filter(|other| differs(other)) {
@@ -1621,7 +1660,7 @@ impl CarbideApp {
         if self.run_edit("Apply redactions", true, move |pdf| pdf.apply_redactions(renderer, &redactions, 200.0)) {
             // The same text may still be elsewhere in the document, so offer to look.
             if let Some(doc) = self.doc.as_ref() {
-                self.dialog = Some(Dialog::SuggestRemoveHidden { doc: doc.id });
+                self.open_dialog(Dialog::SuggestRemoveHidden { doc: doc.id });
             }
         }
     }
@@ -1673,7 +1712,7 @@ impl CarbideApp {
         match carbide_engine::compare_documents(renderer, &mut original, &mut revised) {
             Ok(diffs) => {
                 let title = format!("{} -> {}", doc.title(), path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-                self.dialog = Some(Dialog::Compare { title, diffs });
+                self.open_dialog(Dialog::Compare { title, diffs });
             }
             Err(e) => self.alert(format!("Compare failed: {e}")),
         }

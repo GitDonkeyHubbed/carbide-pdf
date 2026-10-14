@@ -309,8 +309,8 @@ impl CarbideApp {
             Cmd::PageExtract => self.extract_current(),
             Cmd::PageDelete => self.edit_removing("Delete page", move |p| p.delete_pages(&[page])),
             Cmd::Merge => self.merge_files(),
-            Cmd::Split => self.dialog = Some(Dialog::Split { doc, ranges: "1-2".into() }),
-            Cmd::Imposition => self.dialog = Some(Dialog::impose(doc)),
+            Cmd::Split => self.open_dialog(Dialog::Split { doc, ranges: "1-2".into() }),
+            Cmd::Imposition => self.open_dialog(Dialog::impose(doc)),
             Cmd::RotateLeft => self.edit("Rotate left", move |p| p.rotate_pages(&[page], -90)),
             Cmd::RotateRight => self.edit("Rotate right", move |p| p.rotate_pages(&[page], 90)),
             Cmd::MoveUp => {
@@ -325,8 +325,8 @@ impl CarbideApp {
             }
 
             Cmd::Typewriter => self.tool = Tool::TextBox,
-            Cmd::Watermark => self.dialog = Some(Dialog::watermark(doc)),
-            Cmd::Bates => self.dialog = Some(Dialog::bates(doc)),
+            Cmd::Watermark => self.open_dialog(Dialog::watermark(doc)),
+            Cmd::Bates => self.open_dialog(Dialog::bates(doc)),
 
             Cmd::ZoomIn => self.set_zoom(self.zoom * 1.2),
             Cmd::ZoomOut => self.set_zoom(self.zoom / 1.2),
@@ -346,35 +346,35 @@ impl CarbideApp {
 
             Cmd::Reduce => {
                 let current = self.doc.as_ref().and_then(|d| d.path.clone());
-                self.dialog = Some(Dialog::reduce(self.doc.as_ref().map(|d| d.id), current));
+                self.open_dialog(Dialog::reduce(self.doc.as_ref().map(|d| d.id), current));
             }
             Cmd::Compare => self.compare_with(),
             Cmd::Ocr => self.start_ocr(),
             Cmd::ExportImages => self.export(Export::Images),
             Cmd::ExportText => self.export(Export::Text),
-            Cmd::SaveRevision => self.dialog = Some(Dialog::SaveRevision { doc, label: String::new(), error: None }),
+            Cmd::SaveRevision => self.open_dialog(Dialog::SaveRevision { doc, label: String::new(), error: None }),
             Cmd::OpenRevision => {
                 let items = self.doc.as_ref().map(|d| d.pdf.revisions()).unwrap_or_default();
-                self.dialog = Some(Dialog::OpenRevision { doc, items, selected: None });
+                self.open_dialog(Dialog::OpenRevision { doc, items, selected: None });
             }
 
             Cmd::MarkRedaction => self.tool = Tool::Redact,
             Cmd::ApplyRedactions => self.apply_redactions(),
-            Cmd::RemoveHidden => self.dialog = self.doc.as_ref().map(|d| Dialog::remove_hidden(d.id)),
+            Cmd::RemoveHidden => self.open_dialog(Dialog::remove_hidden(doc)),
             Cmd::SignVisible => {
                 self.tool = Tool::Sign;
                 self.status = "Drag a rectangle on the page to place the signature.".into();
             }
-            Cmd::SignInvisible => self.dialog = Some(Dialog::sign(doc, None, false)),
-            Cmd::Certify => self.dialog = Some(Dialog::sign(doc, None, true)),
-            Cmd::TimeStamp => self.dialog = Some(Dialog::timestamp(doc)),
+            Cmd::SignInvisible => self.open_dialog(Dialog::sign(doc, None, false)),
+            Cmd::Certify => self.open_dialog(Dialog::sign(doc, None, true)),
+            Cmd::TimeStamp => self.open_dialog(Dialog::timestamp(doc)),
             Cmd::Verify => self.validate_signatures(),
             Cmd::Protect => {
                 if self.doc.is_none() {
                     self.pick_and_open();
                 }
                 if let Some(doc) = self.doc.as_ref().map(|d| d.id) {
-                    self.dialog = Some(Dialog::protect(doc));
+                    self.open_dialog(Dialog::protect(doc));
                 }
             }
             Cmd::TrustCertificate => {
@@ -386,8 +386,8 @@ impl CarbideApp {
                 }
             }
 
-            Cmd::AutoSaveSettings => self.dialog = Some(Dialog::preferences(&self.settings)),
-            Cmd::AutoRecovery => self.dialog = Some(Dialog::auto_recovery()),
+            Cmd::AutoSaveSettings => self.open_dialog(Dialog::preferences(&self.settings)),
+            Cmd::AutoRecovery => self.open_dialog(Dialog::auto_recovery()),
             Cmd::Quit => {} // Handled by the window itself.
         }
     }

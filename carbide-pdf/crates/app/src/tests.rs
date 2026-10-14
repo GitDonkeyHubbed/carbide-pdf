@@ -768,3 +768,41 @@ fn the_close_question_stays_with_its_document_when_other_tabs_close() {
     app.answer_close(CloseChoice::Discard);
     assert_eq!(app.tabs.len(), 1);
 }
+
+#[test]
+fn a_password_question_is_never_replaced_by_what_comes_after_it() {
+    let dir = scratch();
+    let locked = protected(&dir, "locked.pdf", &["LOCKED"], "user pw");
+    let original = plain(&dir, "contract.pdf", &["ORIGINAL"]);
+    crashed_session(&dir, &[Some(&original)]);
+    let mut app = app(&dir);
+
+    // Started with a protected file while recovered work waits: the password is asked for first.
+    app.launch(Some(crate::Launch::File(locked)));
+    assert!(matches!(app.dialog, Some(Dialog::Password { .. })));
+    // What background work says, and a dialog a command opens, wait behind it as well.
+    app.alert("Recognizing text failed.".into());
+    app.run(Cmd::AutoSaveSettings);
+    assert!(matches!(app.dialog, Some(Dialog::Password { .. })), "the password question was replaced");
+
+    // Unlocking the file brings up the rest, one after another.
+    let Some(Dialog::Password { path, bytes, .. }) = app.dialog.take() else { unreachable!() };
+    assert!(app.open_with_password(path, bytes, "user pw".into()));
+    app.next_dialog();
+    assert!(matches!(app.dialog, Some(Dialog::AutoRecovery { .. })));
+    app.dialog = None;
+    app.next_dialog();
+    assert!(matches!(&app.dialog, Some(Dialog::Message(text)) if text == "Recognizing text failed."));
+    app.dialog = None;
+    app.next_dialog();
+    assert!(matches!(app.dialog, Some(Dialog::Preferences { .. })));
+
+    // A waiting question about a document goes when another document comes forward.
+    let doc = active_id(&app);
+    app.dialog = Some(Dialog::Password { path: dir.join("other.pdf"), bytes: Vec::new(), input: String::new(), failed: false });
+    app.queue_dialog(Dialog::ConfirmExport { doc, export: Export::Text });
+    app.new_blank();
+    app.dialog = None;
+    app.next_dialog();
+    assert!(app.dialog.is_none(), "a question about a document no longer in front came back");
+}
