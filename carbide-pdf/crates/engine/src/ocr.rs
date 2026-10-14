@@ -135,6 +135,9 @@ impl Pdf {
         if let Some(&page) = wanted.iter().find(|&&page| page >= count) {
             return Err(Error::PageOutOfRange { index: page, count });
         }
+        for &page in &wanted {
+            self.check_drawable(page)?;
+        }
         let snapshot = self.to_bytes()?;
         self.check_pages_agree(renderer, &snapshot, &wanted)?;
         let mut report = OcrReport::default();

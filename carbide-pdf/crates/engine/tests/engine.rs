@@ -2837,11 +2837,19 @@ fn decompression_bombs_are_refused_or_never_decoded() {
     let pdf = bombed(&bomb, true);
     too_large(pdf.impose(&ImpositionOptions::default(), None).map(|_| ()), "impose");
     too_large(pdf.clone().reduce(&ReduceOptions::default(), None).map(|_| ()), "reduce");
-    // Removing another page still works; the page whose content is too large keeps its resources.
-    let mut deleted = pdf.clone();
-    deleted.delete_pages(&[0]).unwrap();
-    assert_eq!(deleted.page_count(), 1);
-    assert!(!deleted.document().get_dictionary(deleted.page_ids()[0]).unwrap().get(b"Resources").unwrap().as_dict().unwrap().is_empty());
+    // Removing another page needs to know what the page that stays draws, which is past the
+    // limit: refused, rather than keep resources only the removed page may have used.
+    too_large(pdf.clone().delete_pages(&[0]), "delete");
+    // PDFium would decode it all to render the page or read its text, so neither is tried.
+    let complex = |result: Result<(), Error>, what: &str| match result {
+        Err(Error::TooLarge(message)) => assert_eq!(message, carbide_engine::limits::messages::TOO_COMPLEX, "{what}"),
+        other => panic!("{what}: {other:?}"),
+    };
+    complex(pdf.check_drawable(1), "check");
+    pdf.check_drawable(0).unwrap();
+    complex(export_text(renderer(), &mut pdf.clone()).map(|_| ()), "export text");
+    let redaction = Redaction { page: 1, rect: Rect::new(0.0, 0.0, 10.0, 10.0) };
+    complex(pdf.clone().apply_redactions(renderer(), &[redaction], 150.0), "redact");
 
     // A single content stream goes onto the imposed sheet as it is stored, never decoded.
     let pdf = bombed(&bomb, false);
@@ -2851,6 +2859,224 @@ fn decompression_bombs_are_refused_or_never_decoded() {
         stream.dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Form") && stream.content == bomb.content
     });
     assert!(carried, "the content stream was not carried over as it was stored");
+}
+
+/// `data` compressed with Flate.
+fn deflated(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// A one-page file whose catalog names object 5, `object`, stored in an object stream (Flate) with
+/// a cross-reference stream, the way most programs write files now.
+fn packed(object: &[u8]) -> Vec<u8> {
+    let header = b"5 0 ";
+    let mut plain = header.to_vec();
+    plain.extend_from_slice(object);
+    let packed = deflated(&plain);
+    let mut out = b"%PDF-1.5\n".to_vec();
+    let mut offsets = [0usize; 7];
+    fn write(out: &mut Vec<u8>, offsets: &mut [usize], number: usize, dict: String, stream: Option<&[u8]>) {
+        offsets[number] = out.len();
+        out.extend_from_slice(format!("{number} 0 obj\n{dict}\n").as_bytes());
+        if let Some(data) = stream {
+            out.extend_from_slice(b"stream\n");
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\nendstream\n");
+        }
+        out.extend_from_slice(b"endobj\n");
+    }
+    write(&mut out, &mut offsets, 1, "<< /Type /Catalog /Pages 2 0 R /Junk 5 0 R >>".into(), None);
+    write(&mut out, &mut offsets, 2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(), None);
+    write(&mut out, &mut offsets, 3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(), None);
+    let dict = format!("<< /Type /ObjStm /N 1 /First {} /Filter /FlateDecode /Length {} >>", header.len(), packed.len());
+    write(&mut out, &mut offsets, 4, dict, Some(&packed));
+    let xref_at = out.len();
+    let mut entries = Vec::new();
+    for number in 0..7u32 {
+        let (kind, field, index): (u8, u32, u16) = match number {
+            0 => (0, 0, 0xffff),
+            5 => (2, 4, 0),
+            6 => (1, xref_at as u32, 0),
+            n => (1, offsets[n as usize] as u32, 0),
+        };
+        entries.push(kind);
+        entries.extend_from_slice(&field.to_be_bytes());
+        entries.extend_from_slice(&index.to_be_bytes());
+    }
+    let dict = format!("<< /Type /XRef /Size 7 /W [1 4 2] /Root 1 0 R /Length {} >>", entries.len());
+    write(&mut out, &mut offsets, 6, dict, Some(&entries));
+    out.extend_from_slice(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes());
+    out
+}
+
+#[test]
+fn object_streams_cannot_unpack_to_gigabytes() {
+    use carbide_engine::limits::messages::TOO_LARGE_TO_READ;
+    // An ordinary packed object reads as lopdf would read it.
+    let pdf = Pdf::from_bytes(&packed(b"[1 2 3]")).unwrap();
+    assert_eq!(pdf.page_count(), 1);
+    let catalog = pdf.document().catalog().unwrap();
+    let junk = pdf.document().get_object(catalog.get(b"Junk").unwrap().as_reference().unwrap()).unwrap();
+    assert_eq!(junk.as_array().unwrap().len(), 3);
+
+    let too_large = |file: Vec<u8>, what: &str| match Pdf::from_bytes(&file) {
+        Err(Error::TooLarge(message)) => assert_eq!(message, TOO_LARGE_TO_READ, "{what}"),
+        other => panic!("{what}: {:?}", other.map(|pdf| pdf.page_count())),
+    };
+    // Four million zeros: 8 MB once decoded, about 500 MB once parsed, from a file of a few KB.
+    let mut zeros = b"[".to_vec();
+    zeros.extend(std::iter::repeat_n(&b"0 "[..], 4_000_000).flatten());
+    zeros.push(b']');
+    let file = packed(&zeros);
+    assert!(file.len() < 64 << 10, "the fixture is small: {} bytes", file.len());
+    too_large(file, "zeros");
+    // One stream that decodes to more than one may on its own.
+    let mut long = vec![b' '; 20 << 20];
+    long.extend_from_slice(b"[1]");
+    too_large(packed(&long), "a long stream");
+}
+
+#[test]
+fn content_of_many_operators_is_read_without_parsing_it_whole() {
+    // Eight million `q`: 16 MB decoded, gigabytes as a list of parsed operations.
+    let bomb = Stream::new(dictionary! { "Filter" => "FlateDecode" }, deflated(&b"q\n".repeat(8 << 20))).with_compression(false);
+    let pdf = bombed(&bomb, true);
+    let mut deleted = pdf.clone();
+    finishes("delete", move || deleted.delete_pages(&[0]).unwrap());
+    let extracted = pdf.clone();
+    finishes("extract", move || extracted.extract_pages(&[1]).unwrap());
+    let mut sanitized = pdf.clone();
+    finishes("sanitize", move || sanitized.remove_hidden_information(&[HiddenItem::UnusedObjects]).unwrap());
+    let reduced = pdf.clone();
+    let _ = finishes("reduce", move || reduced.clone().reduce(&ReduceOptions::default(), None).map(|_| ()));
+    // PDFium would keep a saved state for each of them, gigabytes in all, so it is not drawn; three
+    // million are.
+    assert!(matches!(pdf.check_drawable(1), Err(Error::TooLarge(_))));
+    let fewer = Stream::new(dictionary! { "Filter" => "FlateDecode" }, deflated(&b"q\n".repeat(3_000_000))).with_compression(false);
+    bombed(&fewer, false).check_drawable(1).unwrap();
+}
+
+#[test]
+fn deleting_a_page_never_keeps_its_images_when_other_content_cannot_be_checked() {
+    // Every page shares one resource dictionary; only the last page draws the image.
+    let shared = |bomb: Option<&Stream>| {
+        let mut pdf = text_pdf(&[&["ONE"], &["TWO"], &["IMAGE PAGE"]]);
+        let ids = pdf.page_ids();
+        let doc = pdf.document_mut();
+        let image = doc.add_object(Stream::new(
+            dictionary! { "Type" => "XObject", "Subtype" => "Image", "Width" => 4, "Height" => 4, "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8 },
+            b"SECRETIMAGEBYTES".to_vec(),
+        ));
+        let mut resources = doc.get_dictionary(ids[0]).unwrap().get(b"Resources").unwrap().as_dict().unwrap().clone();
+        resources.set("XObject", dictionary! { "Im1" => image });
+        let resources = doc.add_object(resources);
+        for id in &ids {
+            doc.get_dictionary_mut(*id).unwrap().set("Resources", resources);
+        }
+        let draw = doc.add_object(Stream::new(dictionary! {}, b"q 100 0 0 100 72 72 cm /Im1 Do Q".to_vec()));
+        let own = doc.get_dictionary(ids[2]).unwrap().get(b"Contents").unwrap().clone();
+        doc.get_dictionary_mut(ids[2]).unwrap().set("Contents", vec![own, draw.into()]);
+        if let Some(bomb) = bomb {
+            let bomb = doc.add_object(bomb.clone());
+            doc.get_dictionary_mut(ids[1]).unwrap().set("Contents", bomb);
+        }
+        pdf
+    };
+    let mut clean = shared(None);
+    clean.delete_pages(&[2]).unwrap();
+    assert!(!contains(&clean.to_bytes().unwrap(), b"SECRETIMAGEBYTES"));
+
+    // The second page's content is past what one page may decode: what it uses cannot be told,
+    // so the deletion is refused instead of keeping the shared image.
+    let mut refused = shared(Some(&flate_bomb(300 << 20)));
+    assert!(matches!(refused.delete_pages(&[2]), Err(Error::TooLarge(_))));
+}
+
+/// A page drawing the form X, which draws `inside` (`Do` of its own forms) `fanout` times.
+fn recursive_forms(fanout: usize, self_drawing: bool) -> Pdf {
+    let mut pdf = text_pdf(&[&["FORMS"]]);
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let form = doc.new_object_id();
+    let drawn = if self_drawing { form } else { doc.add_object(Stream::new(dictionary! { "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()] }, b"0 0 m 1 1 l S".to_vec())) };
+    let content = "/X Do ".repeat(fanout).into_bytes();
+    let dict = dictionary! {
+        "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+        "Resources" => dictionary! { "XObject" => dictionary! { "X" => drawn } },
+    };
+    doc.objects.insert(form, Object::Stream(Stream::new(dict, content)));
+    let draw = doc.add_object(Stream::new(dictionary! {}, b"/X Do".to_vec()));
+    let mut resources = doc.get_dictionary(page).unwrap().get(b"Resources").unwrap().as_dict().unwrap().clone();
+    resources.set("XObject", dictionary! { "X" => form });
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", resources);
+    page.set("Contents", draw);
+    pdf
+}
+
+#[test]
+fn forms_that_draw_themselves_are_not_rendered_or_followed_forever() {
+    use carbide_engine::limits::messages::TOO_COMPLEX;
+    let complex = |result: Result<(), Error>, what: &str| match result {
+        Err(Error::TooLarge(message)) => assert_eq!(message, TOO_COMPLEX, "{what}"),
+        other => panic!("{what}: {other:?}"),
+    };
+    // PDFium would draw the form inside itself 2 to the 40th times, and never finish.
+    let pdf = recursive_forms(2, true);
+    complex(pdf.check_drawable(0), "check");
+    complex(export_text(renderer(), &mut pdf.clone()).map(|_| ()), "export text");
+    let area = Redaction { page: 0, rect: Rect::new(0.0, 0.0, 10.0, 10.0) };
+    complex(pdf.clone().apply_redactions(renderer(), &[area], 72.0), "redact");
+    // Forms drawn a few times each are fine; drawn millions of times over, they are not.
+    recursive_forms(30, false).check_drawable(0).unwrap();
+    let mut wide = text_pdf(&[&["FORMS"]]);
+    let page = wide.page_ids()[0];
+    let doc = wide.document_mut();
+    let mut next = doc.add_object(Stream::new(dictionary! { "Subtype" => "Form" }, b"0 0 m".to_vec()));
+    for _ in 0..12 {
+        let dict = dictionary! { "Subtype" => "Form", "Resources" => dictionary! { "XObject" => dictionary! { "X" => next } } };
+        next = doc.add_object(Stream::new(dict, b"/X Do /X Do /X Do /X Do".to_vec()));
+    }
+    let draw = doc.add_object(Stream::new(dictionary! {}, b"/X Do".to_vec()));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", dictionary! { "XObject" => dictionary! { "X" => next } });
+    page.set("Contents", draw);
+    complex(finishes("four to the twelfth", move || wide.check_drawable(0)), "fan-out");
+
+    // A form without resources of its own draws with those of what draws it, so it is counted
+    // for each: here once with a form of a few operators, twice with one of three million.
+    let mut borrowed = text_pdf(&[&["FORMS"]]);
+    let page = borrowed.page_ids()[0];
+    let doc = borrowed.document_mut();
+    let cheap = doc.add_object(Stream::new(dictionary! { "Subtype" => "Form" }, b"0 0 m".to_vec()));
+    let costly = Stream::new(dictionary! { "Subtype" => "Form", "Filter" => "FlateDecode" }, deflated(&b"q\n".repeat(3_000_000)));
+    let costly = doc.add_object(costly.with_compression(false));
+    let shared = doc.add_object(Stream::new(dictionary! { "Subtype" => "Form" }, b"/Y Do".to_vec()));
+    let outer_resources = dictionary! { "XObject" => dictionary! { "F" => shared, "Y" => costly } };
+    let outer = doc.add_object(Stream::new(dictionary! { "Subtype" => "Form", "Resources" => outer_resources }, b"/F Do".to_vec()));
+    let draw = doc.add_object(Stream::new(dictionary! {}, b"/F Do /G Do /G Do".to_vec()));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", dictionary! { "XObject" => dictionary! { "F" => shared, "Y" => cheap, "G" => outer } });
+    page.set("Contents", draw);
+    complex(borrowed.check_drawable(0), "resources of what draws it");
+
+    // Reduce looks for the size images are drawn at through forms, once each.
+    let reduced = recursive_forms(30, true);
+    let _ = finishes("reduce", move || reduced.clone().reduce(&ReduceOptions::default(), None).map(|_| ()));
+    // A large form drawn many times is read only so far.
+    let mut repeated = text_pdf(&[&["FORMS"]]);
+    let page = repeated.page_ids()[0];
+    let doc = repeated.document_mut();
+    let large = Stream::new(dictionary! { "Subtype" => "Form", "Filter" => "FlateDecode" }, deflated(&vec![b' '; 64 << 20]));
+    let large = doc.add_object(large.with_compression(false));
+    let draw = doc.add_object(Stream::new(dictionary! {}, b"/X Do\n".repeat(100_000)));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", dictionary! { "XObject" => dictionary! { "X" => large } });
+    page.set("Contents", draw);
+    let _ = finishes("reduce a large form drawn often", move || repeated.reduce(&ReduceOptions::default(), None).map(|_| ()));
 }
 
 #[test]

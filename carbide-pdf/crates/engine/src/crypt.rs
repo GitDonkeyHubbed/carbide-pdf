@@ -7,16 +7,18 @@
 //! stream, and saving the document again would destroy its content. So an encrypted file is
 //! loaded with its objects still encrypted, the password is checked against the encryption
 //! dictionary, and only then are the objects decrypted, with the key of the open password.
-
-use std::collections::{BTreeMap, HashMap};
+//!
+//! Object streams are unpacked here too, for every file, within the limits of [`crate::limits`]:
+//! lopdf would unpack them while reading, each within a limit but with none on all of them
+//! together, nor on the memory parsing their objects takes.
 
 use lopdf::encryption::decrypt_object;
 use lopdf::xref::XrefEntry;
-use lopdf::{Document, LoadOptions, Object, ObjectId, ObjectStream};
+use lopdf::{DecompressError, Document, LoadOptions, Object, ObjectId, ObjectStream, Stream};
 use md5::{Digest, Md5};
 
 use crate::error::{Error, Result};
-use crate::limits::MAX_STREAM_ON_LOAD;
+use crate::limits::{load_budget, messages as limit_messages, MAX_STREAM_ON_LOAD};
 
 /// Loads `bytes`, decrypting them when the file is encrypted. Without a password only files that
 /// open with an empty one (permission-only protection) can be read.
@@ -54,6 +56,7 @@ pub(crate) fn load(bytes: &[u8], password: Option<&str>) -> Result<Document> {
         };
         if let Some(open) = open {
             decrypt(&mut doc, &open)?;
+            unpack_object_streams(&mut doc, load_budget(bytes.len()))?;
             return Ok(doc);
         }
     }
@@ -71,21 +74,33 @@ enum Candidate {
 /// stored, still encrypted, and with object streams left packed (their content is encrypted too).
 /// `None` when the file is not encrypted.
 fn load_still_encrypted(bytes: &[u8]) -> Result<Option<Document>> {
-    let Some(hidden) = rename_key(bytes, ENCRYPT, HIDDEN_ENCRYPT) else { return Ok(None) };
-    let hidden = rename_key(&hidden, OBJECT_STREAM, HIDDEN_OBJECT_STREAM).unwrap_or(hidden);
-    let mut doc = load_bounded(&hidden)?;
-    let Some(encrypt) = doc.trailer.remove(&HIDDEN_ENCRYPT[1..]) else { return Ok(None) };
-    doc.trailer.set("Encrypt", encrypt);
-    for object in doc.objects.values_mut() {
-        restore(object);
-    }
-    Ok(Some(doc))
+    let Some((hidden, renamed)) = rename_key(bytes, ENCRYPT, HIDDEN_ENCRYPT) else { return Ok(None) };
+    let doc = load_packed(&hidden, renamed)?;
+    Ok(doc.trailer.has(b"Encrypt").then_some(doc))
 }
 
-/// `bytes` read as a document, each object and cross-reference stream decoded within
-/// [`MAX_STREAM_ON_LOAD`].
+/// `bytes` read as a document, each cross-reference and object stream decoded within
+/// [`MAX_STREAM_ON_LOAD`], and its object streams unpacked within [`load_budget`].
 pub(crate) fn load_bounded(bytes: &[u8]) -> Result<Document> {
-    Ok(Document::load_mem_with_options(bytes, LoadOptions::with_max_decompressed_size(MAX_STREAM_ON_LOAD))?)
+    let mut doc = load_packed(bytes, 0)?;
+    unpack_object_streams(&mut doc, load_budget(bytes.len()))?;
+    Ok(doc)
+}
+
+/// `bytes`, in which `renamed` names were already hidden from the loader, read as a document with
+/// its object streams left packed: `/ObjStm` is hidden too, so that lopdf takes them for plain
+/// streams.
+fn load_packed(bytes: &[u8], renamed: usize) -> Result<Document> {
+    let (hidden, renamed) = match rename_key(bytes, OBJECT_STREAM, HIDDEN_OBJECT_STREAM) {
+        Some((hidden, more)) => (Some(hidden), renamed + more),
+        None => (None, renamed),
+    };
+    let options = LoadOptions::with_max_decompressed_size(MAX_STREAM_ON_LOAD);
+    let mut doc = Document::load_mem_with_options(hidden.as_deref().unwrap_or(bytes), options)?;
+    if renamed > 0 {
+        restore_all(&mut doc, renamed);
+    }
+    Ok(doc)
 }
 
 const ENCRYPT: &[u8] = b"/Encrypt";
@@ -94,21 +109,23 @@ const OBJECT_STREAM: &[u8] = b"/ObjStm";
 const HIDDEN_OBJECT_STREAM: &[u8] = b"/Cb-ObS";
 
 /// `bytes` with every name `key` (followed by whitespace or a delimiter, so `/EncryptMetadata` is
-/// left alone) replaced by `hidden`, which has the same length so no offset moves. `None` when
-/// there is none.
-fn rename_key(bytes: &[u8], key: &[u8], hidden: &[u8]) -> Option<Vec<u8>> {
+/// left alone) replaced by `hidden`, which has the same length so no offset moves, and how many
+/// were replaced. `None` when there is none.
+fn rename_key(bytes: &[u8], key: &[u8], hidden: &[u8]) -> Option<(Vec<u8>, usize)> {
     debug_assert_eq!(key.len(), hidden.len());
     let mut out: Option<Vec<u8>> = None;
+    let mut count = 0;
     let mut at = 0;
     while let Some(found) = find(&bytes[at..], key) {
         let start = at + found;
         let end = start + key.len();
         if bytes.get(end).is_some_and(|&b| ends_name(b)) {
             out.get_or_insert_with(|| bytes.to_vec())[start..end].copy_from_slice(hidden);
+            count += 1;
         }
         at = end;
     }
-    out
+    out.map(|out| (out, count))
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -119,35 +136,67 @@ fn ends_name(byte: u8) -> bool {
     matches!(byte, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ' | b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%')
 }
 
-/// Undoes the renaming wherever it hit something other than the trailer: a dictionary key or
-/// type, or (by chance) bytes inside a string or stream.
-fn restore(object: &mut Object) {
+/// Undoes the renaming of `renamed` names in `doc`. Names and dictionary keys come first; strings
+/// and stream data, where the hidden bytes can only be by chance, are searched only when some of
+/// the renamed names were not found that way.
+fn restore_all(doc: &mut Document, renamed: usize) {
+    let mut found = 0;
+    for object in doc.objects.values_mut() {
+        restore(object, &mut found);
+    }
+    restore_dict(&mut doc.trailer, &mut found);
+    if found < renamed {
+        for object in doc.objects.values_mut() {
+            restore_data(object);
+        }
+    }
+}
+
+/// Undoes the renaming in the names and dictionary keys of `object`, counting them in `found`.
+fn restore(object: &mut Object, found: &mut usize) {
     match object {
-        Object::Name(name) if name.as_slice() == &HIDDEN_OBJECT_STREAM[1..] => *name = OBJECT_STREAM[1..].to_vec(),
-        Object::Name(name) if name.as_slice() == &HIDDEN_ENCRYPT[1..] => *name = ENCRYPT[1..].to_vec(),
+        Object::Name(name) if name.as_slice() == &HIDDEN_OBJECT_STREAM[1..] => {
+            *name = OBJECT_STREAM[1..].to_vec();
+            *found += 1;
+        }
+        Object::Name(name) if name.as_slice() == &HIDDEN_ENCRYPT[1..] => {
+            *name = ENCRYPT[1..].to_vec();
+            *found += 1;
+        }
+        Object::Array(items) => items.iter_mut().for_each(|item| restore(item, found)),
+        Object::Dictionary(dict) => restore_dict(dict, found),
+        Object::Stream(stream) => restore_dict(&mut stream.dict, found),
+        _ => {}
+    }
+}
+
+fn restore_dict(dict: &mut lopdf::Dictionary, found: &mut usize) {
+    if let Some(value) = dict.remove(&HIDDEN_ENCRYPT[1..]) {
+        dict.set(&ENCRYPT[1..], value);
+        *found += 1;
+    }
+    for (_, value) in dict.iter_mut() {
+        restore(value, found);
+    }
+}
+
+/// Undoes the renaming in the strings and stream data of `object`.
+fn restore_data(object: &mut Object) {
+    match object {
         Object::String(bytes, _) => restore_bytes(bytes),
-        Object::Array(items) => items.iter_mut().for_each(restore),
-        Object::Dictionary(dict) => restore_dict(dict),
+        Object::Array(items) => items.iter_mut().for_each(restore_data),
+        Object::Dictionary(dict) => dict.iter_mut().for_each(|(_, value)| restore_data(value)),
         Object::Stream(stream) => {
-            restore_dict(&mut stream.dict);
+            stream.dict.iter_mut().for_each(|(_, value)| restore_data(value));
             restore_bytes(&mut stream.content);
         }
         _ => {}
     }
 }
 
-fn restore_dict(dict: &mut lopdf::Dictionary) {
-    if let Some(value) = dict.remove(&HIDDEN_ENCRYPT[1..]) {
-        dict.set(&ENCRYPT[1..], value);
-    }
-    for (_, value) in dict.iter_mut() {
-        restore(value);
-    }
-}
-
 fn restore_bytes(bytes: &mut Vec<u8>) {
     for (hidden, key) in [(HIDDEN_ENCRYPT, ENCRYPT), (HIDDEN_OBJECT_STREAM, OBJECT_STREAM)] {
-        if let Some(restored) = rename_key(bytes, hidden, key) {
+        if let Some((restored, _)) = rename_key(bytes, hidden, key) {
             *bytes = restored;
         }
     }
@@ -271,39 +320,55 @@ fn decrypt(doc: &mut Document, password: &Candidate) -> Result<()> {
             let _ = decrypt_object(&state, id, object);
         }
     }
-    unpack_object_streams(doc);
     doc.trailer.remove(b"Encrypt");
     doc.objects.remove(&encrypt_id);
     doc.encryption_state = Some(state);
     Ok(())
 }
 
-/// Adds the objects stored in object streams, each from the stream the cross-reference table names
-/// for it.
-fn unpack_object_streams(doc: &mut Document) {
-    let mut unpacked: HashMap<u32, BTreeMap<ObjectId, Object>> = HashMap::new();
-    let packed: Vec<(u32, u32)> = doc
-        .reference_table
-        .entries
+/// Adds the objects stored in object streams the way lopdf would have while reading the file: an
+/// object the cross-reference table places in one stream is taken from that stream, one it does
+/// not place in a stream from any stream holding it, and none replaces an object already read.
+/// Each stream is decoded within [`MAX_STREAM_ON_LOAD`], and all of them within `budget`, which
+/// counts the memory of the objects parsed from them: the bytes, and an object's worth for every
+/// token (a number, a name, a bracket), however short it is written.
+fn unpack_object_streams(doc: &mut Document, budget: usize) -> Result<()> {
+    let too_large = || Error::TooLarge(limit_messages::TOO_LARGE_TO_READ.into());
+    let containers: Vec<ObjectId> = doc
+        .objects
         .iter()
-        .filter_map(|(&number, entry)| match entry {
-            XrefEntry::Compressed { container, .. } => Some((number, *container)),
-            _ => None,
-        })
+        .filter(|(_, object)| object.as_stream().is_ok_and(|stream| stream.dict.has_type(b"ObjStm")))
+        .map(|(id, _)| *id)
         .collect();
-    for (number, container) in packed {
-        let members = unpacked.entry(container).or_insert_with(|| {
-            doc.objects
-                .get(&(container, 0))
-                .and_then(|object| object.as_stream().ok())
-                .and_then(|stream| ObjectStream::new_with_limit(stream, Some(MAX_STREAM_ON_LOAD)).ok())
-                .map(|stream| stream.objects)
-                .unwrap_or_default()
-        });
-        if let Some(object) = members.get(&(number, 0)) {
-            doc.objects.insert((number, 0), object.clone());
-        }
+    let mut left = budget;
+    let mut unpacked = Vec::new();
+    for container in containers {
+        let Ok(stream) = doc.objects[&container].as_stream() else { continue };
+        let data = match stream.get_plain_content_with_limit(MAX_STREAM_ON_LOAD) {
+            Ok(data) => data,
+            Err(lopdf::Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => return Err(too_large()),
+            // lopdf leaves out the objects of a stream it cannot decode, too.
+            Err(_) => continue,
+        };
+        let mut count = 0usize;
+        crate::content::tokens(&data, |_| count += 1);
+        let cost = count.saturating_mul(std::mem::size_of::<Object>()).saturating_add(data.len());
+        left = left.checked_sub(cost).ok_or_else(too_large)?;
+        let mut dict = stream.dict.clone();
+        dict.remove(b"Filter");
+        dict.remove(b"DecodeParms");
+        let Ok(parsed) = ObjectStream::new(&Stream::new(dict, data)) else { continue };
+        let entries = &doc.reference_table.entries;
+        unpacked.extend(parsed.objects.into_iter().filter(|(id, _)| match entries.get(&id.0) {
+            Some(XrefEntry::Compressed { container: placed, .. }) => *placed == container.0,
+            _ => true,
+        }));
     }
+    for (id, object) in unpacked {
+        doc.max_id = doc.max_id.max(id.0);
+        doc.objects.entry(id).or_insert(object);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -405,8 +470,9 @@ mod tests {
     #[test]
     fn names_that_only_start_like_the_key_are_left_alone() {
         let bytes = b"<< /EncryptMetadata false /Encrypt 7 0 R /Encrypt<< >> /Encrypted 1 >>";
-        let renamed = rename_key(bytes, ENCRYPT, HIDDEN_ENCRYPT).unwrap();
+        let (renamed, count) = rename_key(bytes, ENCRYPT, HIDDEN_ENCRYPT).unwrap();
         assert_eq!(renamed.as_slice(), &b"<< /EncryptMetadata false /Cb-Encr 7 0 R /Cb-Encr<< >> /Encrypted 1 >>"[..]);
+        assert_eq!(count, 2);
         assert!(rename_key(b"<< /Root 1 0 R >>", ENCRYPT, HIDDEN_ENCRYPT).is_none());
     }
 }

@@ -48,6 +48,9 @@ impl Pdf {
         let mut pages: Vec<usize> = redactions.iter().map(|r| r.page).collect();
         pages.sort_unstable();
         pages.dedup();
+        for &page in &pages {
+            self.check_drawable(page)?;
+        }
         let snapshot = self.to_bytes()?;
         self.check_pages_agree(renderer, &snapshot, &pages)?;
 

@@ -52,6 +52,9 @@ pub fn export_images(
             )));
         }
     }
+    for index in 0..targets.len() {
+        pdf.check_drawable(index)?;
+    }
     let bytes = pdf.to_bytes()?;
     let mut paths = Vec::new();
     for (index, target) in targets.iter().enumerate() {
@@ -71,6 +74,9 @@ pub fn export_images(
 
 /// Text of every page, separated by blank lines.
 pub fn export_text(renderer: &Renderer, pdf: &mut Pdf) -> Result<String> {
+    for index in 0..pdf.page_count() {
+        pdf.check_drawable(index)?;
+    }
     let bytes = pdf.to_bytes()?;
     let mut pages = Vec::new();
     for index in 0..pdf.page_count() {

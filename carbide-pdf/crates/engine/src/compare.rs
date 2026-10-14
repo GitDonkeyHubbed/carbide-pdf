@@ -26,6 +26,11 @@ fn lines(text: &str) -> Vec<String> {
 
 /// Compares the extracted text of `original` and `revised`.
 pub fn compare_documents(renderer: &Renderer, original: &mut Pdf, revised: &mut Pdf) -> Result<Vec<PageDiff>> {
+    for pdf in [&*original, &*revised] {
+        for index in 0..pdf.page_count() {
+            pdf.check_drawable(index)?;
+        }
+    }
     let old_bytes = original.to_bytes()?;
     let new_bytes = revised.to_bytes()?;
     let (old_count, new_count) = (original.page_count(), revised.page_count());

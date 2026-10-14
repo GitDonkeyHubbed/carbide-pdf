@@ -8,10 +8,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use lopdf::content::Content;
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
-use crate::error::Result;
+use crate::content::{name, tokens, Token};
+use crate::error::{Error, Result};
 use crate::limits::DecodeBudget;
 use crate::pdf::Pdf;
 
@@ -148,6 +148,10 @@ impl Pdf {
     /// and stops page-tree nodes from passing resources down. Images, forms and fonts that only
     /// removed content used are then no longer part of the document, even when the pages shared
     /// one resource dictionary. A page whose content cannot be read keeps all of its resources.
+    ///
+    /// Each page's content, with the forms it draws, is decoded within the limit for one page in
+    /// [`crate::limits`]; past it this fails with [`Error::TooLarge`] rather than keep resources
+    /// that may be what removed content alone used.
     pub(crate) fn trim_resources(&mut self) -> Result<()> {
         let pages = self.page_ids();
         let mut shared = HashSet::new();
@@ -160,11 +164,12 @@ impl Pdf {
             }
         }
         let mut changes = Vec::new();
-        let mut scan = NameScan { budget: DecodeBudget::new(), names: HashMap::new() };
+        let mut scan = NameScan { budget: DecodeBudget::for_page(), names: HashMap::new() };
         for page in &pages {
             let Some(Object::Dictionary(resources)) = self.inherited(*page, b"Resources") else { continue };
             let own = self.doc.get_dictionary(*page)?.get(b"Resources").ok().cloned();
-            let kept = match self.names_used_by_page(*page, &resources, &mut scan) {
+            scan.budget = DecodeBudget::for_page();
+            let kept = match self.names_used_by_page(*page, &resources, &mut scan)? {
                 Some(names) => self.keep_named(&resources, &names),
                 None => resources.clone(),
             };
@@ -200,12 +205,13 @@ impl Pdf {
 
     /// The resource names the page's content refers to, following forms, patterns and Type 3
     /// fonts that use the page's resources instead of their own. `None` when some content cannot
-    /// be read, or when decoding it would go past the limits in [`crate::limits`].
-    fn names_used_by_page(&self, page: ObjectId, resources: &Dictionary, scan: &mut NameScan) -> Option<HashSet<Vec<u8>>> {
+    /// be read; an error when decoding it would go past the limits in [`crate::limits`].
+    fn names_used_by_page(&self, page: ObjectId, resources: &Dictionary, scan: &mut NameScan) -> Result<Option<HashSet<Vec<u8>>>> {
         let mut names = HashSet::new();
         for stream in self.doc.get_page_contents(page) {
-            let content = self.doc.get_object(stream).and_then(Object::as_stream).ok()?;
-            names.extend(scan.names_in(Some(stream), content)?);
+            let Ok(content) = self.doc.get_object(stream).and_then(Object::as_stream) else { return Ok(None) };
+            let Some(found) = scan.names_in(Some(stream), content)? else { return Ok(None) };
+            names.extend(found);
         }
         // Resources that are drawn without resources of their own use the page's.
         let mut followed = HashSet::new();
@@ -226,13 +232,15 @@ impl Pdf {
                     }
                     match resolved {
                         Object::Stream(stream) if !stream.dict.has(b"Resources") => {
-                            more.extend(scan.names_in(value.as_reference().ok(), stream)?);
+                            let Some(found) = scan.names_in(value.as_reference().ok(), stream)? else { return Ok(None) };
+                            more.extend(found);
                         }
                         Object::Dictionary(font) if font.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Type3") && !font.has(b"Resources") => {
                             let Object::Dictionary(procs) = font.get(b"CharProcs").map(|o| self.resolve(o)).unwrap_or(Object::Null) else { continue };
                             for (_, glyph) in procs.iter() {
                                 if let Some(Object::Stream(stream)) = self.resolved(glyph) {
-                                    more.extend(scan.names_in(glyph.as_reference().ok(), stream)?);
+                                    let Some(found) = scan.names_in(glyph.as_reference().ok(), stream)? else { return Ok(None) };
+                                    more.extend(found);
                                 }
                             }
                         }
@@ -243,7 +251,7 @@ impl Pdf {
             let before = names.len();
             names.extend(more);
             if names.len() == before {
-                return Some(names);
+                return Ok(Some(names));
             }
         }
     }
@@ -293,8 +301,8 @@ impl Pdf {
     }
 }
 
-/// The names each content stream uses, found once per stream however many pages draw it, and
-/// decoded within one budget for the whole document.
+/// The names each content stream uses, found once per stream however many pages draw it, each
+/// page's streams decoded within the budget of one page.
 struct NameScan {
     budget: DecodeBudget,
     names: HashMap<ObjectId, Option<HashSet<Vec<u8>>>>,
@@ -302,19 +310,20 @@ struct NameScan {
 
 impl NameScan {
     /// The names `stream` (object `id`, when it is one of its own) uses as operands; `None` when
-    /// it cannot be read or decoding it would go past the budget.
-    fn names_in(&mut self, id: Option<ObjectId>, stream: &lopdf::Stream) -> Option<HashSet<Vec<u8>>> {
+    /// it cannot be decoded, and an error when decoding it would go past the budget.
+    fn names_in(&mut self, id: Option<ObjectId>, stream: &lopdf::Stream) -> Result<Option<HashSet<Vec<u8>>>> {
         if let Some(found) = id.and_then(|id| self.names.get(&id)) {
-            return found.clone();
+            return Ok(found.clone());
         }
-        let found = self.budget.stream(stream).ok().and_then(|plain| {
-            let mut names = HashSet::new();
-            collect_names(&plain, &mut names).map(|_| names)
-        });
+        let found = match self.budget.stream(stream) {
+            Ok(plain) => Some(names_in(&plain)),
+            Err(error @ Error::TooLarge(_)) => return Err(error),
+            Err(_) => None,
+        };
         if let Some(id) = id {
             self.names.insert(id, found.clone());
         }
-        found
+        Ok(found)
     }
 }
 
@@ -327,24 +336,19 @@ pub(crate) fn widget_area(widget: &Dictionary) -> Option<[f32; 4]> {
     (area[2] > area[0] && area[3] > area[1]).then_some(area)
 }
 
-/// Adds every name `content` uses as an operand, including inside dictionaries (marked-content
-/// properties, inline images). `None` when the content cannot be parsed.
-fn collect_names(content: &[u8], names: &mut HashSet<Vec<u8>>) -> Option<()> {
-    fn walk(object: &Object, names: &mut HashSet<Vec<u8>>) {
-        match object {
-            Object::Name(name) => {
-                names.insert(name.clone());
+/// Every name `content` uses as an operand, including inside dictionaries (marked-content
+/// properties, inline images).
+fn names_in(content: &[u8]) -> HashSet<Vec<u8>> {
+    let mut names = HashSet::new();
+    tokens(content, |token| {
+        if let Token::Name(written) = token {
+            let name = name(written);
+            if !names.contains(name.as_ref()) {
+                names.insert(name.into_owned());
             }
-            Object::Array(items) => items.iter().for_each(|item| walk(item, names)),
-            Object::Dictionary(dict) => dict.iter().for_each(|(_, value)| walk(value, names)),
-            _ => {}
         }
-    }
-    let content = Content::decode(content).ok()?;
-    for operation in &content.operations {
-        operation.operands.iter().for_each(|operand| walk(operand, names));
-    }
-    Some(())
+    });
+    names
 }
 
 /// Runs `edit` on the array `holder` is, or refers to, and stores the result where it came from.
