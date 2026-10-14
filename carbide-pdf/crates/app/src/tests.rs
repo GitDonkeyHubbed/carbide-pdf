@@ -659,3 +659,34 @@ fn signatures_of_a_document_opened_with_its_password_can_be_checked() {
         _ => panic!("no answer about the signatures"),
     }
 }
+
+#[test]
+fn page_textures_never_exceed_what_the_gpu_takes() {
+    use crate::{max_texture_side, texture_size};
+    let limit = 16_777_216u64;
+    let within = |size: [u32; 2], max_side: u32, what: &str| {
+        assert!(size[0] >= 1 && size[1] >= 1, "{what}: {size:?}");
+        assert!(size[0] <= max_side && size[1] <= max_side, "{what}: {size:?} past {max_side}");
+        assert!(size[0] as u64 * size[1] as u64 <= limit + size[0] as u64, "{what}: {size:?} too many pixels");
+    };
+    // egui says nothing: the usual 8192.
+    assert_eq!(max_texture_side(0), 8192);
+    assert_eq!(max_texture_side(16384), 16384);
+
+    // US Legal at the largest zoom on a Retina display: 5000 x 8235 before, past 8192.
+    let legal = texture_size((612.0, 1008.0), 612.0 * 6.0 * 2.0, 8192);
+    within(legal, 8192, "legal");
+    assert!((legal[1] as f32 / legal[0] as f32 - 1008.0 / 612.0).abs() < 0.01, "the shape is kept: {legal:?}");
+    // A receipt-like page at Fit Width, a strip, and a GPU that takes only 2048.
+    within(texture_size((612.0, 9000.0), 1904.0, 8192), 8192, "tall");
+    within(texture_size((612.0, 1_000_000.0), 2000.0, 8192), 8192, "very tall");
+    within(texture_size((1_000_000.0, 10.0), 2000.0, 8192), 8192, "very wide");
+    within(texture_size((612.0, 792.0), 5000.0, 2048), 2048, "small GPU");
+    // Pages and zooms that are not numbers, or nothing at all, still give a texture.
+    within(texture_size((0.0, 0.0), 0.0, 8192), 8192, "empty page");
+    within(texture_size((f32::NAN, 792.0), f32::INFINITY, 8192), 8192, "not numbers");
+    // An ordinary page at an ordinary zoom is drawn at full resolution.
+    assert_eq!(texture_size((612.0, 792.0), 1224.0, 8192), [1224, 1584]);
+    // Thumbnails keep their usual size.
+    assert_eq!(texture_size((612.0, 792.0), 220.0, 8192), [220, 285]);
+}

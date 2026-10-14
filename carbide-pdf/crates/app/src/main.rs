@@ -1008,6 +1008,7 @@ impl CarbideApp {
         let bytes = &doc.bytes;
         let geometries = &doc.geometries;
         let mut goto: Option<usize> = None;
+        let max_side = max_texture_side(ui.ctx().input(|i| i.max_texture_side));
         egui::ScrollArea::vertical().show(ui, |ui| {
             for page in 0..count {
                 let (w, h) = geometries.get(page).map(|g| g.display_size()).unwrap_or((612.0, 792.0));
@@ -1017,13 +1018,12 @@ impl CarbideApp {
                 if ui.is_rect_visible(rect) {
                     let key = (version, page);
                     if !self.thumbs.contains_key(&key) {
-                        let dpi = 72.0 * width / w.max(1.0) * ui.ctx().pixels_per_point();
-                        if let Ok(image) = renderer.render_page(bytes, page, dpi) {
-                            let color = egui::ColorImage::from_rgba_unmultiplied(
-                                [image.width() as usize, image.height() as usize],
-                                image.as_raw(),
-                            );
-                            let texture = ui.ctx().load_texture(format!("thumb-{version}-{page}"), color, egui::TextureOptions::LINEAR);
+                        let [tw, th] = texture_size((w, h), width * ui.ctx().pixels_per_point(), max_side);
+                        let texture = renderer
+                            .render_page_fitting(bytes, page, tw, th)
+                            .ok()
+                            .and_then(|image| page_texture(ui.ctx(), format!("thumb-{version}-{page}"), &image, max_side));
+                        if let Some(texture) = texture {
                             self.thumbs.insert(key, texture);
                         }
                     }
@@ -1091,6 +1091,7 @@ impl CarbideApp {
             let pending = &self.pending_redactions;
             let textures = &mut self.textures;
             let pixels_per_point = ui.ctx().pixels_per_point();
+            let max_side = max_texture_side(ui.ctx().input(|i| i.max_texture_side));
             let viewport_top = ui.clip_rect().min.y;
 
             egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
@@ -1112,23 +1113,18 @@ impl CarbideApp {
                         ui.painter().rect_filled(rect, 0.0, egui::Color32::WHITE);
 
                         if ui.is_rect_visible(rect) {
-                            let px_width = (size.x * pixels_per_point).round().clamp(64.0, 5000.0) as u32;
-                            let key = (version, page, px_width);
+                            let [tw, th] = texture_size((w, h), size.x * pixels_per_point, max_side);
+                            let key = (version, page, tw);
                             if !textures.contains_key(&key) {
-                                if textures.len() > 24 {
+                                let cached: usize = textures.values().map(|t| t.size()[0] * t.size()[1]).sum();
+                                if textures.len() > 24 || cached + (tw * th) as usize > TEXTURE_CACHE_PIXELS {
                                     textures.clear();
                                 }
-                                let dpi = 72.0 * px_width as f32 / w.max(1.0);
-                                if let Ok(image) = renderer.render_page(bytes, page, dpi) {
-                                    let color = egui::ColorImage::from_rgba_unmultiplied(
-                                        [image.width() as usize, image.height() as usize],
-                                        image.as_raw(),
-                                    );
-                                    let texture = ui.ctx().load_texture(
-                                        format!("page-{version}-{page}-{px_width}"),
-                                        color,
-                                        egui::TextureOptions::LINEAR,
-                                    );
+                                let texture = renderer
+                                    .render_page_fitting(bytes, page, tw, th)
+                                    .ok()
+                                    .and_then(|image| page_texture(ui.ctx(), format!("page-{version}-{page}-{tw}"), &image, max_side));
+                                if let Some(texture) = texture {
                                     textures.insert(key, texture);
                                 }
                             }
@@ -1701,6 +1697,50 @@ fn signature_notice(doc: &OpenDoc) -> Option<String> {
     let trust = paths::load_trust_store();
     let reports = Pdf::verify_signatures_with_password(bytes, password, &trust, chrono::Utc::now()).ok()?;
     carbide_engine::signature::notice_text(&reports).map(str::to_string)
+}
+
+/// The texture side assumed when egui does not say what the GPU takes; every GPU egui runs on
+/// takes at least this much.
+const FALLBACK_TEXTURE_SIDE: usize = 8192;
+/// The most pixels one page texture has: 16 million, 64 MB.
+const MAX_TEXTURE_PIXELS: f32 = 16_777_216.0;
+/// The most pixels the page textures kept for redrawing hold together: 512 MB.
+const TEXTURE_CACHE_PIXELS: usize = 128 << 20;
+
+/// The largest texture side egui says the GPU takes (`reported`), or [`FALLBACK_TEXTURE_SIDE`]
+/// when it says nothing.
+pub fn max_texture_side(reported: usize) -> usize {
+    if reported == 0 {
+        FALLBACK_TEXTURE_SIDE
+    } else {
+        reported
+    }
+}
+
+/// The size, in pixels, of the texture a page displayed `page` (width, height) points large is
+/// drawn from when it is shown `wanted_width` pixels wide. It is at most 5000 pixels wide, no side
+/// is longer than `max_side`, and it holds at most [`MAX_TEXTURE_PIXELS`]: a very tall page, or a
+/// large zoom, gets a texture of lower resolution, drawn stretched over the page's place. The
+/// page's shape is kept, as far as whole pixels allow.
+pub fn texture_size(page: (f32, f32), wanted_width: f32, max_side: usize) -> [u32; 2] {
+    let positive = |v: f32| if v.is_finite() && v >= 1.0 { v } else { 1.0 };
+    let (w, h) = (positive(page.0), positive(page.1));
+    let side = max_side.max(1) as f32;
+    let width = if wanted_width.is_finite() { wanted_width.clamp(64.0, 5000.0) } else { 64.0 };
+    let width = width.min(side).min(side * w / h).min((MAX_TEXTURE_PIXELS * w / h).sqrt()).floor().max(1.0);
+    let height = (width * h / w).round().clamp(1.0, side);
+    [width as u32, height as u32]
+}
+
+/// A texture of `image`, unless it is larger than the GPU takes (`max_side`): uploading that would
+/// end the program. Rendering keeps within it, so this is a last guard.
+fn page_texture(ctx: &egui::Context, name: String, image: &image::RgbaImage, max_side: usize) -> Option<egui::TextureHandle> {
+    let size = [image.width() as usize, image.height() as usize];
+    if size[0] == 0 || size[1] == 0 || size[0] > max_side || size[1] > max_side {
+        return None;
+    }
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    Some(ctx.load_texture(name, color, egui::TextureOptions::LINEAR))
 }
 
 fn pdf_rect_to_screen(page_rect: egui::Rect, zoom: f32, page_height: f32, r: Rect) -> egui::Rect {

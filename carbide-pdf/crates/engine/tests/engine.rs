@@ -2480,6 +2480,13 @@ fn huge_pages_render_within_the_pixel_limit() {
     for dpi in [0.0, -72.0, f32::NAN, f32::INFINITY] {
         assert!(r.render_page(&bytes, 0, dpi).is_err(), "{dpi} dpi");
     }
+    // Rendering into a box of pixels never comes out larger than the box.
+    for (page, (width, height), fills) in [(0, (5000, 8192), 5000), (1, (300, 8192), 300), (0, (64, 64), 64)] {
+        let image = r.render_page_fitting(&bytes, page, width, height).unwrap();
+        assert!(image.width() <= width && image.height() <= height, "page {page}: {:?} in {width} x {height}", image.dimensions());
+        assert!(image.width() as f32 >= fills as f32 * 0.99, "page {page}: {:?} does not fill {width} x {height}", image.dimensions());
+    }
+    assert!(r.render_page_fitting(&bytes, 0, 0, 100).is_err());
 }
 
 // ---- input validation ----------------------------------------------------------------------

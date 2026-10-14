@@ -133,12 +133,31 @@ impl Renderer {
         if !(dpi.is_finite() && dpi > 0.0) {
             return Err(Error::Render(format!("cannot render at {dpi} dpi")));
         }
+        self.render_scaled(pdf, index, |width, height| render_scale(width, height, dpi))
+    }
+
+    /// Renders one page as it is displayed, as large as fits in `width` by `height` pixels with its
+    /// shape kept (and within the limits of [`Renderer::render_page`]). The fit is worked out from
+    /// the page size PDFium itself reads, so the image never comes out larger.
+    pub fn render_page_fitting(&self, pdf: &[u8], index: usize, width: u32, height: u32) -> Result<RgbaImage> {
+        if width == 0 || height == 0 {
+            return Err(Error::Render(format!("cannot render a page into {width} x {height} pixels")));
+        }
+        self.render_scaled(pdf, index, |page_width, page_height| {
+            // A little under, so rounding to whole pixels cannot go past the box.
+            let fit = (width as f32 / page_width.max(1.0)).min(height as f32 / page_height.max(1.0)) * 0.999;
+            fit.min(render_scale(page_width, page_height, 72.0 * fit))
+        })
+    }
+
+    /// Renders page `index` at the scale (pixels per point) `scale` gives for its displayed size.
+    fn render_scaled(&self, pdf: &[u8], index: usize, scale: impl FnOnce(f32, f32) -> f32) -> Result<RgbaImage> {
         let document = self.pdfium.load_pdf_from_byte_slice(pdf, None).map_err(render_error)?;
         let page = document
             .pages()
             .get(index as PdfPageIndex)
             .map_err(|_| Error::PageOutOfRange { index, count: document.pages().len() as usize })?;
-        let scale = render_scale(page.width().value, page.height().value, dpi);
+        let scale = scale(page.width().value, page.height().value);
         // PDFium writes RGBA directly, so the image is its buffer copied once, not converted.
         let config = PdfRenderConfig::new()
             .scale_page_by_factor(scale)
