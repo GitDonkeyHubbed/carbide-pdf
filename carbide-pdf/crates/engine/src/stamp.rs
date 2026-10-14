@@ -61,12 +61,26 @@ impl WatermarkOptions {
     }
 }
 
+impl WatermarkOptions {
+    /// Checks that the watermark can be drawn: text, a size larger than 0 and no larger than a page
+    /// can be, an angle, and an opacity and colour between 0 and 1.
+    pub fn validate(&self) -> Result<()> {
+        if self.text.trim().is_empty() {
+            return Err(Error::Other("watermark text is empty".into()));
+        }
+        let fraction = |v: f32| (0.0..=1.0).contains(&v);
+        let sized = self.font_size.is_finite() && self.font_size > 0.0 && self.font_size <= crate::pdf::MAX_PAGE_SIDE;
+        if !(sized && self.rotation_degrees.is_finite() && fraction(self.opacity) && self.color.iter().all(|&c| fraction(c))) {
+            return Err(Error::Other(messages::WATERMARK.into()));
+        }
+        Ok(())
+    }
+}
+
 impl Pdf {
     /// Centers a rotated, semi-transparent text watermark on the selected pages.
     pub fn apply_watermark(&mut self, options: &WatermarkOptions) -> Result<()> {
-        if options.text.trim().is_empty() {
-            return Err(Error::Other("watermark text is empty".into()));
-        }
+        options.validate()?;
         let count = self.page_count();
         // A page listed twice is stamped once.
         let selected: Vec<usize> = match &options.pages {
@@ -84,7 +98,7 @@ impl Pdf {
             let geometry = self.geometry_of(page_id);
             let (w, h) = geometry.display_size();
             let font_name = self.add_standard_font(page_id, options.font)?;
-            let state_name = self.add_alpha_state(page_id, options.opacity.clamp(0.0, 1.0))?;
+            let state_name = self.add_alpha_state(page_id, options.opacity)?;
 
             let mut content: Vec<u8> = Vec::new();
             let header = format!(
@@ -151,6 +165,8 @@ pub mod messages {
     pub const BATES_DIGITS: &str = "Bates numbers can be padded to between 1 and 20 digits.";
     pub const BATES_RANGE: &str = "The Bates numbers would go past 18446744073709551615, the largest that can be stamped.";
     pub const BATES_TEXT: &str = "The Bates text size and margin have to be numbers, and the size larger than 0.";
+    pub const WATERMARK: &str = "The watermark size and angle have to be numbers, the size larger than 0, and the opacity \
+and colour between 0 and 1.";
 }
 
 impl BatesOptions {

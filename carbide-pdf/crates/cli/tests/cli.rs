@@ -418,3 +418,69 @@ fn verify_reads_files_that_need_their_open_password() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("No signatures found."));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn inputs_that_cannot_work_are_refused_with_messages_that_say_why() {
+    let dir = scratch("inputs");
+    let file = dir.join("f.pdf");
+    plain_file(&file, &["ONE", "TWO"]);
+    let (path, out) = (file.to_str().unwrap(), dir.join("out.pdf"));
+    let out_path = out.to_str().unwrap();
+
+    // A watermark that cannot be drawn is refused, and nothing is written.
+    for extra in [&["--size", "nan"][..], &["--size", "inf"], &["--size", "0"], &["--size=-5"], &["--angle", "nan"], &["--opacity", "2"]] {
+        let output = carbide(&[&["watermark", path, out_path, "--text", "HI"][..], extra].concat());
+        assert!(!output.status.success() && stderr(&output).contains("watermark size"), "{extra:?}: {}", stderr(&output));
+        assert!(!out.exists(), "{extra:?}: an output was written");
+    }
+    // A redacted page rasterized at 1 dpi would be unreadable.
+    let output = carbide(&["redact", path, out_path, "--rect", "1:72,700,100,30", "--dpi", "1"]);
+    assert!(!output.status.success() && stderr(&output).contains("72 dpi"), "{}", stderr(&output));
+
+    // Pages are named the way they were given, counted from 1.
+    let output = carbide(&["move", path, "6", "1", out_path]);
+    assert!(stderr(&output).contains("page 6 does not exist (the document has 2 pages)"), "{}", stderr(&output));
+    let output = carbide(&["blank", path, "7", out_path]);
+    assert!(stderr(&output).contains("page 7 does not exist"), "{}", stderr(&output));
+    // A file that cannot be read is named.
+    let missing = dir.join("missing.pdf");
+    let output = carbide(&["verify", missing.to_str().unwrap()]);
+    assert!(!output.status.success() && stderr(&output).contains("missing.pdf"), "{}", stderr(&output));
+
+    // A page tree whose count is too large a number for the file to be read: every viewer shows
+    // its pages, so it is refused rather than read as a document without pages.
+    let damaged = dir.join("damaged.pdf");
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 9223372036854775808 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+    ];
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    std::fs::write(&damaged, bytes).unwrap();
+    for args in [&["info", damaged.to_str().unwrap()][..], &["sanitize", damaged.to_str().unwrap(), out_path]] {
+        let output = carbide(args);
+        assert!(!output.status.success() && stderr(&output).contains("page tree is damaged"), "{args:?}: {}", stderr(&output));
+    }
+    assert!(!out.exists());
+
+    // PDFium that cannot be loaded is said once.
+    let bogus = dir.join("libpdfium.dylib");
+    std::fs::write(&bogus, b"not a library").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carbide")).args(["text", path]).env("CARBIDE_PDFIUM_LIB", &bogus).output().unwrap();
+    if !output.status.success() {
+        assert_eq!(stderr(&output).matches("rendering backend").count(), 1, "{}", stderr(&output));
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

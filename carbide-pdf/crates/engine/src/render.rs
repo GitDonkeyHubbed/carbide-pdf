@@ -95,6 +95,7 @@ impl Renderer {
             if file.is_file() {
                 match Self::with_library(file) {
                     Ok(renderer) => return Ok(renderer),
+                    Err(Error::Render(message)) => failure = Some(format!("{}: {message}", file.display())),
                     Err(e) => failure = Some(format!("{}: {e}", file.display())),
                 }
             }
@@ -110,7 +111,12 @@ impl Renderer {
     pub fn global() -> Result<&'static Renderer> {
         static GLOBAL: OnceLock<std::result::Result<Renderer, String>> = OnceLock::new();
         GLOBAL
-            .get_or_init(|| Renderer::new().map_err(|e| e.to_string()))
+            .get_or_init(|| {
+                Renderer::new().map_err(|e| match e {
+                    Error::Render(message) => message,
+                    other => other.to_string(),
+                })
+            })
             .as_ref()
             .map_err(|message| Error::Render(message.clone()))
     }

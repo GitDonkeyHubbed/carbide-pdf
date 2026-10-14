@@ -24,8 +24,12 @@ pub struct Redaction {
     pub rect: Rect,
 }
 
+/// The lowest resolution a redacted page is rasterized at. Lower ones would make it unreadable.
+pub const MIN_DPI: f32 = 72.0;
+
 pub mod messages {
     pub const BAD_AREA: &str = "A redaction area has to be given in numbers and have a width and a height.";
+    pub const BAD_DPI: &str = "Redacted pages are rasterized at 72 dpi or more.";
 }
 
 impl Pdf {
@@ -35,6 +39,9 @@ impl Pdf {
     pub fn apply_redactions(&mut self, renderer: &Renderer, redactions: &[Redaction], dpi: f32) -> Result<()> {
         if redactions.is_empty() {
             return Ok(());
+        }
+        if !(dpi.is_finite() && dpi >= MIN_DPI) {
+            return Err(Error::Other(messages::BAD_DPI.into()));
         }
         let count = self.page_count();
         if let Some(bad) = redactions.iter().find(|r| r.page >= count) {

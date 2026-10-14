@@ -446,7 +446,7 @@ impl Pdf {
     /// ways are refused (see [`Pdf::shared_protection`]).
     pub fn merge(documents: &[&Pdf]) -> Result<Pdf> {
         if documents.is_empty() {
-            return Err(Error::InvalidRange("there are no documents to merge".into()));
+            return Err(Error::Other("there are no documents to merge".into()));
         }
         let protection = Pdf::shared_protection(documents)?;
         // The new document already owns a few low object ids (catalog, page tree); the inputs

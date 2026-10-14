@@ -3162,7 +3162,34 @@ fn repeated_pages_are_handled_once() {
 
 #[test]
 fn merging_nothing_is_refused() {
-    assert!(matches!(Pdf::merge(&[]), Err(Error::InvalidRange(_))));
+    assert!(matches!(Pdf::merge(&[]), Err(Error::Other(message)) if message == "there are no documents to merge"));
+}
+
+#[test]
+fn watermarks_that_cannot_be_drawn_and_unreadable_redactions_are_refused() {
+    use carbide_engine::stamp::messages::WATERMARK;
+    let mut pdf = text_pdf(&[&["ONE"]]);
+    let before = pdf.document().objects.clone();
+    let mut cases = Vec::new();
+    for size in [f32::NAN, f32::INFINITY, 0.0, -5.0, 1.0e30] {
+        cases.push(WatermarkOptions { font_size: size, ..WatermarkOptions::new("HI") });
+    }
+    cases.push(WatermarkOptions { rotation_degrees: f32::NAN, ..WatermarkOptions::new("HI") });
+    cases.push(WatermarkOptions { opacity: 2.0, ..WatermarkOptions::new("HI") });
+    cases.push(WatermarkOptions { color: [0.5, f32::NAN, 0.5], ..WatermarkOptions::new("HI") });
+    for options in cases {
+        let refused = pdf.apply_watermark(&options).unwrap_err().to_string();
+        assert_eq!(refused, WATERMARK, "{options:?}");
+        assert_eq!(pdf.document().objects, before);
+    }
+    // A redaction rasterized at 1 dpi would leave nothing of the page readable.
+    let area = Redaction { page: 0, rect: Rect::new(0.0, 0.0, 100.0, 100.0) };
+    for dpi in [1.0, 71.0, f32::NAN] {
+        assert!(pdf.apply_redactions(renderer(), &[area], dpi).is_err(), "{dpi} dpi");
+    }
+    assert_eq!(pdf.document().objects, before);
+    // Pages are named the way people count them.
+    assert_eq!(pdf.move_page(5, 0).unwrap_err().to_string(), "page 6 does not exist (the document has 1 pages)");
 }
 
 #[test]

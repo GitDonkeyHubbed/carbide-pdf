@@ -974,7 +974,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 }
                 _ => return Err("give --p12, or --cert and --key".into()),
             };
-            let base = std::fs::read(&a.input)?;
+            let base = std::fs::read(&a.input).map_err(|e| format!("{}: {e}", a.input.display()))?;
             let pdf = open(&a.input, &a.pw)?;
             let authority = a.tsa.as_ref().map(|url| HttpTimestampSource {
                 url: url.clone(),
@@ -1007,7 +1007,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             println!("signed {} as {}", a.output.display(), identity.common_name());
         }
         Command::Timestamp { input, output, tsa, tsa_user, tsa_password } => {
-            let base = std::fs::read(&input)?;
+            let base = std::fs::read(&input).map_err(|e| format!("{}: {e}", input.display()))?;
             let pdf = Pdf::from_bytes(&base)?;
             let authority =
                 HttpTimestampSource { url: tsa, username: tsa_user, password: secret(tsa_password, "CARBIDE_TSA_PASSWORD") };
@@ -1020,10 +1020,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
             println!("wrote {}", output.display());
         }
         Command::Verify { input, trust, pw } => {
-            let bytes = std::fs::read(&input)?;
+            let bytes = std::fs::read(&input).map_err(|e| format!("{}: {e}", input.display()))?;
             let mut store = TrustStore::default();
             for path in trust {
-                let bytes = std::fs::read(&path)?;
+                let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
                 let certificates = carbide_engine::signature::read_certificates(&bytes)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
                 store.certificates.extend(certificates);
@@ -1062,7 +1062,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Command::Revision { action } => match action {
             RevisionAction::Save { file, label } => {
-                let base = std::fs::read(&file)?;
+                let base = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
                 let pdf = Pdf::from_bytes(&base)?;
                 let updated = pdf.save_revision(&base, &label, &pdf_date_now())?;
                 write_replacing(&file, &updated)?;
@@ -1078,7 +1078,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 }
             }
             RevisionAction::Open { file, number, output } => {
-                let bytes = std::fs::read(&file)?;
+                let bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
                 let pdf = Pdf::from_bytes(&bytes)?;
                 let revisions = pdf.revisions();
                 let revision = revisions
