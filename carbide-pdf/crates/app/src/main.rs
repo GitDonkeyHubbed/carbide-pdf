@@ -56,6 +56,9 @@ pub struct OpenDoc {
     pub version: u64,
     pub record: Option<RecordId>,
     pub dirty: bool,
+    /// When this document's Auto Recovery copy was last considered: each document keeps its own
+    /// interval, counted from when it was opened, so opening one never delays another's copy.
+    autosaved_at: Instant,
     /// What a document without a file is called (an earlier revision, say); `None` for Untitled.
     pub name: Option<String>,
     /// Set for a document opened from an Auto Recovery copy, until it is saved.
@@ -99,6 +102,7 @@ impl OpenDoc {
             version: 0,
             record: None,
             dirty: false,
+            autosaved_at: Instant::now(),
             name: None,
             recovered: None,
             geometries,
@@ -274,7 +278,6 @@ pub struct CarbideApp {
     scroll_to: Option<usize>,
     pub autosave: Option<AutoSaveStore>,
     pub settings: AutoSaveSettings,
-    last_autosave: Instant,
     /// A running (or finished, not yet applied) OCR job.
     ocr_job: Option<OcrJob>,
     /// A signature waiting for (or holding, not yet written) its time stamp.
@@ -341,7 +344,6 @@ impl CarbideApp {
             scroll_to: None,
             autosave,
             settings,
-            last_autosave: Instant::now(),
             ocr_job: None,
             sign_job: None,
             notice: None,
@@ -458,7 +460,6 @@ impl CarbideApp {
                 self.pending_redactions.clear();
                 self.current_page = 0;
                 self.scroll_to = Some(0);
-                self.last_autosave = Instant::now();
                 if let Some(path) = path {
                     self.push_recent(&path);
                 }
@@ -1055,15 +1056,20 @@ impl CarbideApp {
 
     // ---- auto save ---------------------------------------------------------------------
 
+    /// Writes the Auto Recovery copy of each document whose own interval has passed.
     fn autosave_tick(&mut self) {
-        if !self.settings.enabled || self.last_autosave.elapsed() < self.settings.interval() {
+        if !self.settings.enabled {
             return;
         }
-        self.last_autosave = Instant::now();
+        let interval = self.settings.interval();
         let Some(store) = self.autosave.as_mut() else { return };
         let mut saved = 0;
         let mut failure = None;
         for doc in self.doc.iter_mut().chain(self.tabs.iter_mut().flatten()) {
+            if doc.autosaved_at.elapsed() < interval {
+                continue;
+            }
+            doc.autosaved_at = Instant::now();
             let Some(id) = doc.record else { continue };
             // Its recovery copy would hold the content unencrypted.
             if doc.is_protected() {

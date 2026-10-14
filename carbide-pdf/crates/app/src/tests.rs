@@ -271,7 +271,7 @@ fn protected_documents_get_no_recovery_copy_and_saving_retires_one() {
     let a = plain(&dir, "a.pdf", &["A"]);
     let mut app = app(&dir);
     let tick = |app: &mut CarbideApp| {
-        app.last_autosave = Instant::now() - Duration::from_secs(24 * 3600);
+        overdue(app);
         app.autosave_tick();
     };
 
@@ -290,6 +290,34 @@ fn protected_documents_get_no_recovery_copy_and_saving_retires_one() {
     app.save_revision("v1").unwrap();
     assert!(!app.doc.as_ref().unwrap().dirty);
     assert_eq!(recovery_copies(&dir), 0);
+}
+
+/// Makes every open document's Auto Recovery interval pass.
+fn overdue(app: &mut CarbideApp) {
+    let long_ago = Instant::now() - Duration::from_secs(24 * 3600);
+    for doc in app.doc.iter_mut().chain(app.tabs.iter_mut().flatten()) {
+        doc.autosaved_at = long_ago;
+    }
+}
+
+#[test]
+fn opening_a_document_never_delays_another_ones_recovery_copy() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["A"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    overdue(&mut app);
+    // Opening other documents while a.pdf's interval passes leaves its own interval alone.
+    for name in ["b.pdf", "c.pdf"] {
+        app.open_path(&plain(&dir, name, &[name]));
+    }
+    app.autosave_tick();
+    assert_eq!(recovery_copies(&dir), 1, "a.pdf got no recovery copy");
+    // The new documents count from when they were opened.
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    app.autosave_tick();
+    assert_eq!(recovery_copies(&dir), 1, "c.pdf was copied before its interval passed");
 }
 
 #[test]
