@@ -122,6 +122,19 @@ impl Pdf {
         }
     }
 
+    /// Fails unless PDFium finds as many pages in `serialized` (this document written out) as the
+    /// engine does. Edits that render page N and then rebuild page N need the two to agree; the page
+    /// tree is repaired when a document is opened, so this only guards against later damage.
+    pub(crate) fn check_pages_agree(&self, renderer: &crate::render::Renderer, serialized: &[u8]) -> Result<()> {
+        let (ours, theirs) = (self.page_count(), renderer.page_count(serialized)?);
+        if ours != theirs {
+            return Err(Error::Other(format!(
+                "the document's page tree is damaged ({ours} pages to the editor, {theirs} to the renderer), so nothing was changed"
+            )));
+        }
+        Ok(())
+    }
+
     /// Looks `key` up on the page, then up the `/Parent` chain, and returns a dereferenced clone.
     pub(crate) fn inherited(&self, page_id: ObjectId, key: &[u8]) -> Option<Object> {
         let mut current = page_id;

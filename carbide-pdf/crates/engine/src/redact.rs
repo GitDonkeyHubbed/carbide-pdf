@@ -46,6 +46,7 @@ impl Pdf {
         let redactions: Vec<Redaction> = redactions.iter().map(|r| Redaction { page: r.page, rect: r.rect.normalized() }).collect();
         let redactions = redactions.as_slice();
         let snapshot = self.to_bytes()?;
+        self.check_pages_agree(renderer, &snapshot)?;
 
         let mut pages: Vec<usize> = redactions.iter().map(|r| r.page).collect();
         pages.sort_unstable();

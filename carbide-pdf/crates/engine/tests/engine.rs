@@ -2343,6 +2343,19 @@ fn redaction_lands_on_the_page_shown_even_when_the_tree_is_damaged() {
 }
 
 #[test]
+fn redaction_refuses_when_the_renderer_counts_other_pages() {
+    // Damage done after loading, which the repair on opening never saw.
+    let mut pdf = text_pdf(&[&["AAA first"], &["BBB SECRET"], &["CCC third"]]);
+    let ids = pdf.page_ids();
+    pdf.document_mut().get_dictionary_mut(ids[1]).unwrap().remove(b"Type");
+    pdf.to_bytes().unwrap();
+    let before = pdf.document().objects.clone();
+    let refused = pdf.apply_redactions(renderer(), &[Redaction { page: 1, rect: Rect::new(60.0, 692.0, 300.0, 28.0) }], 150.0);
+    assert!(refused.unwrap_err().to_string().contains("page tree is damaged"));
+    assert_eq!(pdf.document().objects, before, "a refused redaction changed the document");
+}
+
+#[test]
 fn deleting_pages_finishes_when_parent_chains_loop_after_loading() {
     for (what, damage) in [
         ("root names itself", 0usize),

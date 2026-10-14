@@ -129,6 +129,7 @@ impl Pdf {
         let models = locate_models(options.models_dir.as_deref())?;
         let engine = engine(&models)?;
         let snapshot = self.to_bytes()?;
+        self.check_pages_agree(renderer, &snapshot)?;
         let ids = self.page_ids();
         let count = ids.len();
         // A page listed twice is recognized once, so it gets one text layer.
