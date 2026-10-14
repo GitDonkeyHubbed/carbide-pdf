@@ -11,6 +11,7 @@
 //! unsaved the termination goes ahead, and the documents are let go in `on_exit`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 
 use eframe::egui;
@@ -22,6 +23,7 @@ static CONFIRMED: AtomicBool = AtomicBool::new(false);
 /// Set when the system asked to quit and was told to wait for the quit question.
 static REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Woken up so the next frame puts up the quit question.
+#[cfg(target_os = "macos")]
 static CONTEXT: OnceLock<egui::Context> = OnceLock::new();
 
 /// Whether the app may end now when the system asks it to: when nothing is unsaved, or once the
