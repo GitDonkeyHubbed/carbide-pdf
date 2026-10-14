@@ -690,3 +690,81 @@ fn page_textures_never_exceed_what_the_gpu_takes() {
     // Thumbnails keep their usual size.
     assert_eq!(texture_size((612.0, 792.0), 220.0, 8192), [220, 285]);
 }
+
+#[test]
+fn dialogs_about_a_document_close_when_another_comes_forward() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["A"]);
+    let b = plain(&dir, "b.pdf", &["B"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    let a_id = active_id(&app);
+    app.open_path(&b);
+    let (a_index, b_index) = (app.tab_of(a_id).unwrap(), app.active_tab.unwrap());
+    app.activate(Some(a_index));
+
+    let area = Some((0, carbide_engine::Rect::new(10.0, 10.0, 100.0, 50.0)));
+    let dialogs = vec![
+        Dialog::sign(a_id, area, false),
+        Dialog::timestamp(a_id),
+        Dialog::watermark(a_id),
+        Dialog::bates(a_id),
+        Dialog::protect(a_id),
+        Dialog::impose(a_id),
+        Dialog::reduce(Some(a_id), Some(a.clone())),
+        Dialog::Split { doc: a_id, ranges: "1".into() },
+        Dialog::Note { doc: a_id, page: 0, x: 72.0, y: 72.0, on_page: false, text: "note".into() },
+        Dialog::SaveRevision { doc: a_id, label: String::new(), error: None },
+        Dialog::OpenRevision { doc: a_id, items: Vec::new(), selected: None },
+        Dialog::Signatures { doc: a_id, reports: Vec::new(), notice: String::new() },
+    ];
+    for dialog in dialogs {
+        assert_eq!(dialog.document(), Some(a_id));
+        app.dialog = Some(dialog);
+        app.activate(Some(b_index));
+        assert!(app.dialog.is_none(), "a dialog about a.pdf stayed up over b.pdf");
+        app.activate(Some(a_index));
+    }
+
+    // A dialog still around for a document no longer in front goes without being shown.
+    app.activate(Some(b_index));
+    app.dialog = Some(Dialog::watermark(a_id));
+    crate::dialogs::show(&mut app, &egui::Context::default());
+    assert!(app.dialog.is_none());
+
+    // A signature asked for on one document never signs the one in front.
+    let before = std::fs::read(&b).unwrap();
+    let Dialog::Sign(request) = Dialog::sign(a_id, area, false) else { unreachable!() };
+    app.sign_document(*request);
+    assert_eq!(std::fs::read(&b).unwrap(), before);
+    assert!(app.status.starts_with("Nothing was signed"), "{}", app.status);
+}
+
+#[test]
+fn the_close_question_stays_with_its_document_when_other_tabs_close() {
+    use crate::shell::CloseChoice;
+    let dir = scratch();
+    let mut app = app(&dir);
+    for (name, dirty) in [("clean.pdf", false), ("x.pdf", true), ("y.pdf", true)] {
+        app.open_path(&plain(&dir, name, &[name]));
+        if dirty {
+            app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+        }
+    }
+    let ids: Vec<u64> = (0..3).map(|i| app.doc_at(i).unwrap().id).collect();
+    app.request_close(2);
+    assert_eq!(app.pending_close(), Some(ids[2]));
+    // The clean tab to its left closes while the question is up, so y.pdf moves to tab 1.
+    app.close_tab(0);
+    app.answer_close(CloseChoice::Discard);
+    let open: Vec<u64> = (0..app.tabs.len()).map(|i| app.doc_at(i).unwrap().id).collect();
+    assert_eq!(open, vec![ids[1]], "the wrong document was closed");
+    assert!(app.doc_at(0).unwrap().dirty, "x.pdf lost its changes");
+
+    // Once the document is closed some other way, an answer does nothing.
+    app.request_close(0);
+    app.close_tab(0);
+    app.open_path(&plain(&dir, "z.pdf", &["Z"]));
+    app.answer_close(CloseChoice::Discard);
+    assert_eq!(app.tabs.len(), 1);
+}

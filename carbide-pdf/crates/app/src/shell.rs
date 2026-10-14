@@ -63,7 +63,9 @@ pub struct ShellState {
     folders_tab: bool,
     start_rows: Option<Vec<StartRow>>,
     page_text: String,
-    pending_close: Option<usize>,
+    /// The document whose close question is up. A document, not a tab: closing other tabs while
+    /// the question is up moves the tabs along.
+    pending_close: Option<u64>,
     locations: Vec<PathBuf>,
     comments: Option<((Option<usize>, u64), Vec<AnnotationSummary>)>,
     window_title: String,
@@ -210,6 +212,14 @@ fn comment_kind(subtype: &str) -> &str {
     }
 }
 
+/// An answer to the question whether to save a document that is being closed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CloseChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
 // ---- commands ----------------------------------------------------------------------------
 
 impl CarbideApp {
@@ -281,6 +291,9 @@ impl CarbideApp {
             return;
         }
         let page = self.current_page;
+        // The document the dialogs opened below act on. Commands that need one are only enabled
+        // with one in front.
+        let doc = self.doc.as_ref().map(|d| d.id).unwrap_or_default();
         match cmd {
             Cmd::Open => self.pick_and_open(),
             Cmd::Save => self.save(),
@@ -296,8 +309,8 @@ impl CarbideApp {
             Cmd::PageExtract => self.extract_current(),
             Cmd::PageDelete => self.edit_removing("Delete page", move |p| p.delete_pages(&[page])),
             Cmd::Merge => self.merge_files(),
-            Cmd::Split => self.dialog = Some(Dialog::Split { ranges: "1-2".into() }),
-            Cmd::Imposition => self.dialog = Some(Dialog::impose()),
+            Cmd::Split => self.dialog = Some(Dialog::Split { doc, ranges: "1-2".into() }),
+            Cmd::Imposition => self.dialog = Some(Dialog::impose(doc)),
             Cmd::RotateLeft => self.edit("Rotate left", move |p| p.rotate_pages(&[page], -90)),
             Cmd::RotateRight => self.edit("Rotate right", move |p| p.rotate_pages(&[page], 90)),
             Cmd::MoveUp => {
@@ -312,8 +325,8 @@ impl CarbideApp {
             }
 
             Cmd::Typewriter => self.tool = Tool::TextBox,
-            Cmd::Watermark => self.dialog = Some(Dialog::watermark()),
-            Cmd::Bates => self.dialog = Some(Dialog::bates()),
+            Cmd::Watermark => self.dialog = Some(Dialog::watermark(doc)),
+            Cmd::Bates => self.dialog = Some(Dialog::bates(doc)),
 
             Cmd::ZoomIn => self.set_zoom(self.zoom * 1.2),
             Cmd::ZoomOut => self.set_zoom(self.zoom / 1.2),
@@ -333,16 +346,16 @@ impl CarbideApp {
 
             Cmd::Reduce => {
                 let current = self.doc.as_ref().and_then(|d| d.path.clone());
-                self.dialog = Some(Dialog::reduce(current));
+                self.dialog = Some(Dialog::reduce(self.doc.as_ref().map(|d| d.id), current));
             }
             Cmd::Compare => self.compare_with(),
             Cmd::Ocr => self.start_ocr(),
             Cmd::ExportImages => self.export(Export::Images),
             Cmd::ExportText => self.export(Export::Text),
-            Cmd::SaveRevision => self.dialog = Some(Dialog::SaveRevision { label: String::new(), error: None }),
+            Cmd::SaveRevision => self.dialog = Some(Dialog::SaveRevision { doc, label: String::new(), error: None }),
             Cmd::OpenRevision => {
                 let items = self.doc.as_ref().map(|d| d.pdf.revisions()).unwrap_or_default();
-                self.dialog = Some(Dialog::OpenRevision { items, selected: None });
+                self.dialog = Some(Dialog::OpenRevision { doc, items, selected: None });
             }
 
             Cmd::MarkRedaction => self.tool = Tool::Redact,
@@ -352,16 +365,16 @@ impl CarbideApp {
                 self.tool = Tool::Sign;
                 self.status = "Drag a rectangle on the page to place the signature.".into();
             }
-            Cmd::SignInvisible => self.dialog = Some(Dialog::sign(None, false)),
-            Cmd::Certify => self.dialog = Some(Dialog::sign(None, true)),
-            Cmd::TimeStamp => self.dialog = Some(Dialog::timestamp()),
+            Cmd::SignInvisible => self.dialog = Some(Dialog::sign(doc, None, false)),
+            Cmd::Certify => self.dialog = Some(Dialog::sign(doc, None, true)),
+            Cmd::TimeStamp => self.dialog = Some(Dialog::timestamp(doc)),
             Cmd::Verify => self.validate_signatures(),
             Cmd::Protect => {
                 if self.doc.is_none() {
                     self.pick_and_open();
                 }
-                if self.doc.is_some() {
-                    self.dialog = Some(Dialog::protect());
+                if let Some(doc) = self.doc.as_ref().map(|d| d.id) {
+                    self.dialog = Some(Dialog::protect(doc));
                 }
             }
             Cmd::TrustCertificate => {
@@ -431,25 +444,25 @@ impl CarbideApp {
     /// Closes a tab, asking first when the document has unsaved changes.
     pub fn request_close(&mut self, index: usize) {
         if self.tab_label(index).1 {
-            self.shell.pending_close = Some(index);
+            self.shell.pending_close = self.doc_at(index).map(|d| d.id);
         } else {
             self.close_tab(index);
         }
     }
 
+    /// The document the close question is about, while it is up.
+    pub fn pending_close(&self) -> Option<u64> {
+        self.shell.pending_close
+    }
+
     /// The "save changes?" question shown when a modified document is closed.
     pub fn close_prompt(&mut self, ctx: &egui::Context) {
-        let Some(index) = self.shell.pending_close else { return };
-        if index >= self.tabs.len() {
+        let Some(doc) = self.shell.pending_close else { return };
+        let Some(index) = self.tab_of(doc) else {
             self.shell.pending_close = None;
             return;
-        }
+        };
         let title = self.tab_label(index).0;
-        enum Choice {
-            Save,
-            Discard,
-            Cancel,
-        }
         let mut choice = None;
         egui::Window::new("Carbide PDF").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
             ui.label(format!("Do you want to save the changes you made to \"{title}\"?"));
@@ -457,33 +470,38 @@ impl CarbideApp {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
-                    choice = Some(Choice::Save);
+                    choice = Some(CloseChoice::Save);
                 }
                 if ui.button("Don't Save").clicked() {
-                    choice = Some(Choice::Discard);
+                    choice = Some(CloseChoice::Discard);
                 }
                 if ui.button("Cancel").clicked() {
-                    choice = Some(Choice::Cancel);
+                    choice = Some(CloseChoice::Cancel);
                 }
             });
         });
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            choice = Some(Choice::Cancel);
+            choice = Some(CloseChoice::Cancel);
         }
+        if let Some(choice) = choice {
+            self.answer_close(choice);
+        }
+    }
+
+    /// Carries out the answer to the close question, on the document it is about, wherever its tab
+    /// is now. Nothing happens once that document is no longer open.
+    pub fn answer_close(&mut self, choice: CloseChoice) {
+        let Some(doc) = self.shell.pending_close.take() else { return };
+        let Some(index) = self.tab_of(doc) else { return };
         match choice {
-            Some(Choice::Save) => {
-                self.shell.pending_close = None;
+            CloseChoice::Save => {
                 self.activate(Some(index));
                 // The tab closes once the document is saved, after the answer when saving asks
                 // first. A cancelled Save As leaves it modified and open.
                 self.save_then(AfterSave::CloseTab);
             }
-            Some(Choice::Discard) => {
-                self.shell.pending_close = None;
-                self.close_tab(index);
-            }
-            Some(Choice::Cancel) => self.shell.pending_close = None,
-            None => {}
+            CloseChoice::Discard => self.close_tab(index),
+            CloseChoice::Cancel => {}
         }
     }
 

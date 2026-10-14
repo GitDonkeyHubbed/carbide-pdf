@@ -1206,10 +1206,11 @@ impl CarbideApp {
         }
         self.drag = drag;
 
+        let doc_id = self.doc.as_ref().map(|d| d.id).unwrap_or_default();
         for action in actions {
             match action {
                 Action::SignArea { page, rect } => {
-                    self.dialog = Some(Dialog::sign(Some((page, rect)), false));
+                    self.dialog = Some(Dialog::sign(doc_id, Some((page, rect)), false));
                     self.tool = Tool::Select;
                 }
                 Action::Visible(page) => self.current_page = page,
@@ -1218,7 +1219,7 @@ impl CarbideApp {
                     self.status = "Redaction marked. Security > Apply removes the marked content.".into();
                 }
                 Action::NotePrompt { page, x, y, on_page } => {
-                    self.dialog = Some(Dialog::Note { page, x, y, on_page, text: String::new() });
+                    self.dialog = Some(Dialog::Note { doc: doc_id, page, x, y, on_page, text: String::new() });
                 }
                 Action::Markup { page, rect, style, snap } => {
                     let (bytes, geometry) = match self.doc.as_ref() {
@@ -1309,7 +1310,12 @@ impl CarbideApp {
     // ---- signatures --------------------------------------------------------------------
 
     /// Signs the document file in place. The document is saved first when it has unsaved edits.
+    /// Nothing is signed when the document the request was made for is no longer in front.
     pub fn sign_document(&mut self, request: dialogs::SignRequest) {
+        if self.doc.as_ref().map(|d| d.id) != Some(request.doc) {
+            self.status = "Nothing was signed: the document it was for is no longer in front.".into();
+            return;
+        }
         if self.doc.as_ref().and_then(|d| d.saved.as_ref()).is_some_and(SavedFile::is_protected) {
             return self.alert("Password-protected documents cannot be signed.".into());
         }
@@ -1413,7 +1419,7 @@ impl CarbideApp {
             Ok(reports) => {
                 let notice = carbide_engine::signature::notice_text(&reports).unwrap_or_default().to_string();
                 self.notice = Some(notice.clone());
-                self.dialog = Some(Dialog::Signatures { reports, notice });
+                self.dialog = Some(Dialog::Signatures { doc: doc.id, reports, notice });
             }
             Err(e) => self.alert(format!("Could not read the signatures: {e}")),
         }

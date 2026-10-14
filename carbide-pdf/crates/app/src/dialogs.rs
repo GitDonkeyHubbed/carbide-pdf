@@ -21,6 +21,7 @@ use eframe::egui;
 use crate::CarbideApp;
 
 pub struct WatermarkForm {
+    doc: u64,
     text: String,
     size: f32,
     opacity: f32,
@@ -30,6 +31,7 @@ pub struct WatermarkForm {
 }
 
 pub struct BatesForm {
+    doc: u64,
     prefix: String,
     suffix: String,
     start: u64,
@@ -39,6 +41,7 @@ pub struct BatesForm {
 }
 
 pub struct ProtectForm {
+    doc: u64,
     user: String,
     owner: String,
     print: bool,
@@ -46,6 +49,7 @@ pub struct ProtectForm {
 }
 
 pub struct ImposeForm {
+    doc: u64,
     options: ImpositionOptions,
     custom_media: (f32, f32),
     media_choice: usize,
@@ -53,6 +57,8 @@ pub struct ImposeForm {
 }
 
 pub struct ReduceForm {
+    /// The document "OK" reduces, while the dialog is not working on a list of files.
+    doc: Option<u64>,
     multi: bool,
     files: Vec<PathBuf>,
     slider: u8,
@@ -70,6 +76,8 @@ pub struct ReduceForm {
 /// Everything the Sign / Time Stamp dialogs collect.
 #[derive(Clone)]
 pub struct SignRequest {
+    /// The document it signs; nothing is signed once another one is in front.
+    pub doc: u64,
     pub identity_path: Option<PathBuf>,
     pub password: String,
     pub cades: bool,
@@ -165,9 +173,12 @@ pub enum AfterSave {
     Quit,
 }
 
+/// The dialogs that act on a document, or show one, name it (see [`Dialog::document`]): they close
+/// as soon as another document comes to the front, so that answering one can never act on a
+/// document other than the one it was opened for.
 pub enum Dialog {
     Sign(Box<SignRequest>),
-    Signatures { reports: Vec<SignatureReport>, notice: String },
+    Signatures { doc: u64, reports: Vec<SignatureReport>, notice: String },
     Message(String),
     Password { path: PathBuf, bytes: Vec<u8>, input: String, failed: bool },
     /// Saving document `doc` to `path` has to write the whole file again, which costs its
@@ -198,10 +209,10 @@ pub enum Dialog {
     Watermark(WatermarkForm),
     Bates(BatesForm),
     Protect(ProtectForm),
-    Split { ranges: String },
-    Note { page: usize, x: f32, y: f32, on_page: bool, text: String },
-    SaveRevision { label: String, error: Option<String> },
-    OpenRevision { items: Vec<Revision>, selected: Option<usize> },
+    Split { doc: u64, ranges: String },
+    Note { doc: u64, page: usize, x: f32, y: f32, on_page: bool, text: String },
+    SaveRevision { doc: u64, label: String, error: Option<String> },
+    OpenRevision { doc: u64, items: Vec<Revision>, selected: Option<usize> },
     Impose(Box<ImposeForm>),
     Reduce(Box<ReduceForm>),
     Compare { title: String, diffs: Vec<PageDiff> },
@@ -213,8 +224,8 @@ pub enum Dialog {
 }
 
 impl Dialog {
-    /// The document a question is about, for a question that only makes sense while that document
-    /// is in front.
+    /// The document a dialog acts on or shows, for a dialog that only makes sense while that
+    /// document is in front.
     pub fn document(&self) -> Option<u64> {
         match self {
             Dialog::ConfirmRewrite { doc, .. }
@@ -223,7 +234,19 @@ impl Dialog {
             | Dialog::ConfirmMerge { doc, .. }
             | Dialog::RemoveHidden { doc, .. }
             | Dialog::SuggestRemoveHidden { doc }
-            | Dialog::ReplaceOriginal { doc, .. } => Some(*doc),
+            | Dialog::ReplaceOriginal { doc, .. }
+            | Dialog::Signatures { doc, .. }
+            | Dialog::Split { doc, .. }
+            | Dialog::Note { doc, .. }
+            | Dialog::SaveRevision { doc, .. }
+            | Dialog::OpenRevision { doc, .. } => Some(*doc),
+            Dialog::Sign(request) => Some(request.doc),
+            Dialog::Watermark(form) => Some(form.doc),
+            Dialog::Bates(form) => Some(form.doc),
+            Dialog::Protect(form) => Some(form.doc),
+            Dialog::Impose(form) => Some(form.doc),
+            // Working on a list of files, it no longer acts on the document in front.
+            Dialog::Reduce(form) => form.doc.filter(|_| !form.multi),
             _ => None,
         }
     }
@@ -233,8 +256,9 @@ impl Dialog {
         Dialog::RemoveHidden { doc, chosen: HiddenItem::ALL.into_iter().map(|item| (item, item.chosen_by_default())).collect() }
     }
 
-    pub fn watermark() -> Dialog {
+    pub fn watermark(doc: u64) -> Dialog {
         Dialog::Watermark(WatermarkForm {
+            doc,
             text: "CONFIDENTIAL".into(),
             size: 72.0,
             opacity: 0.3,
@@ -244,8 +268,9 @@ impl Dialog {
         })
     }
 
-    pub fn bates() -> Dialog {
+    pub fn bates(doc: u64) -> Dialog {
         Dialog::Bates(BatesForm {
+            doc,
             prefix: String::new(),
             suffix: String::new(),
             start: 1,
@@ -255,8 +280,9 @@ impl Dialog {
         })
     }
 
-    pub fn sign(appearance: Option<(usize, Rect)>, certify: bool) -> Dialog {
+    pub fn sign(doc: u64, appearance: Option<(usize, Rect)>, certify: bool) -> Dialog {
         Dialog::Sign(Box::new(SignRequest {
+            doc,
             identity_path: None,
             password: String::new(),
             cades: false,
@@ -273,18 +299,19 @@ impl Dialog {
         }))
     }
 
-    pub fn timestamp() -> Dialog {
-        let Dialog::Sign(mut request) = Dialog::sign(None, false) else { unreachable!() };
+    pub fn timestamp(doc: u64) -> Dialog {
+        let Dialog::Sign(mut request) = Dialog::sign(doc, None, false) else { unreachable!() };
         request.document_timestamp = true;
         Dialog::Sign(request)
     }
 
-    pub fn protect() -> Dialog {
-        Dialog::Protect(ProtectForm { user: String::new(), owner: String::new(), print: true, copy: true })
+    pub fn protect(doc: u64) -> Dialog {
+        Dialog::Protect(ProtectForm { doc, user: String::new(), owner: String::new(), print: true, copy: true })
     }
 
-    pub fn impose() -> Dialog {
+    pub fn impose(doc: u64) -> Dialog {
         Dialog::Impose(Box::new(ImposeForm {
+            doc,
             options: ImpositionOptions::default(),
             custom_media: (612.0, 792.0),
             media_choice: PAPER_SIZES.iter().position(|(n, _, _)| *n == "Letter").unwrap_or(0),
@@ -292,8 +319,10 @@ impl Dialog {
         }))
     }
 
-    pub fn reduce(current: Option<PathBuf>) -> Dialog {
+    /// Reduce File Size for document `doc`, the file `current`.
+    pub fn reduce(doc: Option<u64>, current: Option<PathBuf>) -> Dialog {
         Dialog::Reduce(Box::new(ReduceForm {
+            doc,
             multi: false,
             files: current.into_iter().collect(),
             slider: carbide_engine::reduce::DEFAULT_IMAGE_FACTOR,
@@ -337,9 +366,13 @@ fn buttons(ui: &mut egui::Ui, ok: &str, ok_enabled: bool) -> (bool, bool) {
     result
 }
 
-/// Draws the active dialog and carries out its action.
+/// Draws the active dialog and carries out its action. A dialog about a document that is no
+/// longer in front goes without being shown.
 pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
     let Some(mut dialog) = app.dialog.take() else { return };
+    if dialog.document().is_some_and(|doc| app.doc.as_ref().map(|d| d.id) != Some(doc)) {
+        return;
+    }
     let mut open = true;
 
     match &mut dialog {
@@ -438,7 +471,7 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::Signatures { reports, notice } => {
+        Dialog::Signatures { reports, notice, .. } => {
             window("Signatures").show(ctx, |ui| {
                 ui.strong(notice.as_str());
                 egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
@@ -766,7 +799,7 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::Split { ranges } => {
+        Dialog::Split { ranges, .. } => {
             window("Split by Page Ranges").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Ranges, e.g. 1-3, 4-6, 7");
@@ -782,7 +815,7 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::Note { page, x, y, on_page, text } => {
+        Dialog::Note { page, x, y, on_page, text, .. } => {
             window(if *on_page { "Add Text" } else { "Add Note" }).show(ctx, |ui| {
                 ui.add(egui::TextEdit::multiline(text).desired_rows(3).desired_width(320.0));
                 let (ok, cancel) = buttons(ui, "Add", !text.trim().is_empty());
@@ -801,7 +834,7 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::SaveRevision { label, error } => {
+        Dialog::SaveRevision { label, error, .. } => {
             window("Save Revision").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Label:");
@@ -824,7 +857,7 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::OpenRevision { items, selected } => {
+        Dialog::OpenRevision { items, selected, .. } => {
             window("Open Revision").show(ctx, |ui| {
                 egui::Grid::new("revisions").striped(true).show(ui, |ui| {
                     ui.strong("Label");
