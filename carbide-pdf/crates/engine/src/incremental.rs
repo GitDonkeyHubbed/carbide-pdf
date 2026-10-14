@@ -57,7 +57,8 @@ impl Pdf {
 
         let max_id = self.doc.max_id.max(base.max_id);
         let mut update = IncrementalDocument::create_from(base_bytes.to_vec(), base);
-        for (id, object) in changes.objects {
+        for (id, mut object) in changes.objects {
+            crate::pdf::writable(&mut object);
             update.new_document.set_object(id, object);
         }
         for (key, value) in changes.trailer {

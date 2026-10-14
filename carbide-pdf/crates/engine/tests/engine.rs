@@ -2420,6 +2420,384 @@ fn a_sound_page_tree_is_not_rewritten_by_the_repair() {
     assert_ne!(pdf.save_plan(Some(&saved), false).unwrap(), SavePlan::Unchanged);
 }
 
+/// Three pages as `damaged_tree` makes them, the second without a media box, resources or turn of
+/// its own: it inherits them from the root, `levels` page-tree nodes above it.
+fn deep_page(levels: usize) -> Vec<u8> {
+    damaged_tree(|doc, root, ids| {
+        let page = doc.get_dictionary_mut(ids[1]).unwrap();
+        let resources = page.remove(b"Resources").unwrap();
+        page.remove(b"MediaBox");
+        let node = doc.get_dictionary_mut(root).unwrap();
+        node.set("MediaBox", vec![0.into(), 0.into(), 400.into(), 800.into()]);
+        node.set("Rotate", 90);
+        node.set("Resources", resources);
+        let mut child = ids[1];
+        for _ in 0..levels {
+            let parent = doc.add_object(dictionary! { "Type" => "Pages", "Kids" => vec![child.into()], "Count" => 1 });
+            doc.get_dictionary_mut(child).unwrap().set("Parent", parent);
+            child = parent;
+        }
+        doc.get_dictionary_mut(child).unwrap().set("Parent", root);
+        set_kids(doc, root, vec![ids[0].into(), child.into(), ids[2].into()]);
+    })
+}
+
+#[test]
+fn pages_inherit_from_as_far_up_as_a_tree_can_reach() {
+    use carbide_engine::pagetree::MAX_DEPTH;
+    let r = renderer();
+    for levels in [70, MAX_DEPTH - 2] {
+        let mut pdf = Pdf::from_bytes(&deep_page(levels)).unwrap();
+        let bytes = pdf.to_bytes().unwrap();
+        // Turned a quarter, 400 x 800 becomes 800 x 400, to the engine and to PDFium.
+        assert_eq!(pdf.page_geometry(1).unwrap().display_size(), (800.0, 400.0), "{levels} levels");
+        assert_eq!(r.page_size(&bytes, 1).unwrap(), (800.0, 400.0), "{levels} levels");
+        assert_eq!(texts_seen_by_both(&mut pdf)[1], "BBB SECRET", "{levels} levels");
+
+        // Redacting the whole page shown covers it all, not a part of a page of another size.
+        let mut redacted = pdf.clone();
+        redacted.apply_redactions(r, &[Redaction { page: 1, rect: Rect::new(0.0, 0.0, 800.0, 400.0) }], 100.0).unwrap();
+        let image = render(r, &mut redacted, 1);
+        assert_eq!(image.dimensions(), (800, 400), "{levels} levels");
+        assert!(brightness(&image, Rect::new(0.0, 0.0, 800.0, 400.0)) < 5.0, "{levels} levels: the page is not all black");
+        assert!(!contains(&redacted.to_bytes().unwrap(), b"BBB SECRET"));
+
+        // Flattening the tree for an edit keeps what the page inherited.
+        let mut inserted = pdf.clone();
+        inserted.insert_blank_page(0, None).unwrap();
+        assert_eq!(inserted.page_geometry(2).unwrap().display_size(), (800.0, 400.0), "{levels} levels");
+        assert_eq!(texts_seen_by_both(&mut inserted)[2], "BBB SECRET", "{levels} levels");
+    }
+}
+
+/// How many values `doc` holds, nested ones included.
+fn values(doc: &Document) -> usize {
+    fn count(object: &Object) -> usize {
+        1 + match object {
+            Object::Array(items) => items.iter().map(count).sum(),
+            Object::Dictionary(dict) => dict.iter().map(|(_, v)| count(v)).sum(),
+            Object::Stream(stream) => stream.dict.iter().map(|(_, v)| count(v)).sum(),
+            _ => 0,
+        }
+    }
+    doc.objects.values().map(count).sum()
+}
+
+#[test]
+fn repairs_share_what_they_copy_and_stay_linear() {
+    // A page holding a large array directly, listed 300 times: 300 pages that share the array.
+    let junk = || Object::Array(vec![Object::Integer(0); 50_000]);
+    let listed = damaged_tree(|doc, root, ids| {
+        doc.get_dictionary_mut(ids[1]).unwrap().set("Junk", junk());
+        set_kids(doc, root, vec![ids[1].into(); 300]);
+    });
+    let pdf = finishes("listed 300 times", move || Pdf::from_bytes(&listed).unwrap());
+    assert_eq!(pdf.page_count(), 300);
+    assert!(values(pdf.document()) < 2 * 50_000, "the array was copied: {} values", values(pdf.document()));
+
+    // Pages under the root naming, as /Parent, the head of a long chain of nodes outside the tree
+    // that gives them a turn: each page's chain is read once, not once per page and attribute.
+    let chained = damaged_tree(|doc, root, ids| {
+        let template = doc.get_dictionary(ids[0]).unwrap().clone();
+        let mut next = doc.add_object(dictionary! { "Type" => "Pages", "Rotate" => 90 });
+        for _ in 0..8000 {
+            next = doc.add_object(dictionary! { "Type" => "Pages", "Parent" => next });
+        }
+        let pages: Vec<Object> = (0..8000)
+            .map(|_| {
+                let mut page = template.clone();
+                page.set("Parent", next);
+                doc.add_object(page).into()
+            })
+            .collect();
+        set_kids(doc, root, pages);
+    });
+    let pdf = finishes("a long /Parent chain", move || Pdf::from_bytes(&chained).unwrap());
+    assert_eq!(pdf.page_count(), 8000);
+    // The turn is further up than a tree can be deep, so no page takes it.
+    assert_eq!(pdf.page_rotation(0).unwrap(), 0);
+    let near = damaged_tree(|doc, root, ids| {
+        let turn = doc.add_object(dictionary! { "Type" => "Pages", "Rotate" => 90 });
+        let head = doc.add_object(dictionary! { "Type" => "Pages", "Parent" => turn, "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()] });
+        doc.get_dictionary_mut(ids[1]).unwrap().set("Parent", head);
+        doc.get_dictionary_mut(ids[1]).unwrap().remove(b"MediaBox");
+        let _ = root;
+    });
+    let mut near = Pdf::from_bytes(&near).unwrap();
+    assert_eq!(near.page_rotation(1).unwrap(), 90);
+    assert_eq!(texts_seen_by_both(&mut near)[1], "BBB SECRET");
+    assert_eq!(renderer().page_size(&near.to_bytes().unwrap(), 1).unwrap(), (300.0, 300.0));
+
+    // Listing a page more often than copying can afford is refused.
+    let many = damaged_tree(|doc, root, ids| {
+        let page = doc.get_dictionary_mut(ids[1]).unwrap();
+        for n in 0..100 {
+            page.set(format!("Key{n}"), n);
+        }
+        set_kids(doc, root, vec![ids[1].into(); 10_000]);
+    });
+    let refused = finishes("listed 10000 times", move || Pdf::from_bytes(&many).map(|_| ()));
+    assert_eq!(refused.unwrap_err().to_string(), carbide_engine::pagetree::messages::TOO_MANY_COPIES);
+
+    // Flattening the tree shares a large inherited value instead of copying it onto every page.
+    let inherited = damaged_tree(|doc, root, ids| {
+        let mut resources = doc.get_dictionary(ids[0]).unwrap().get(b"Resources").unwrap().as_dict().unwrap().clone();
+        resources.set("Junk", junk());
+        for id in ids {
+            doc.get_dictionary_mut(*id).unwrap().remove(b"Resources");
+        }
+        doc.get_dictionary_mut(root).unwrap().set("Resources", resources);
+    });
+    let mut pdf = Pdf::from_bytes(&inherited).unwrap();
+    pdf.insert_blank_page(0, None).unwrap();
+    assert!(values(pdf.document()) < 2 * 50_000, "the resources were copied: {} values", values(pdf.document()));
+    assert_eq!(texts_seen_by_both(&mut pdf)[1..], ["AAA first", "BBB SECRET", "CCC third"]);
+}
+
+#[test]
+fn kids_that_name_their_page_another_way_name_it_directly() {
+    let bytes = damaged_tree(|doc, root, ids| {
+        // A reference to a reference, and a generation number the object does not have (PDFium
+        // goes by the object number alone).
+        let alias = doc.add_object(Object::Reference(ids[1]));
+        set_kids(doc, root, vec![ids[0].into(), alias.into(), (ids[2].0, 7).into()]);
+    });
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+    assert_eq!(texts_seen_by_both(&mut pdf), ["AAA first", "BBB SECRET", "CCC third"]);
+}
+
+/// A file of `objects` (object 1 first, the catalog), written by hand: values lopdf cannot read
+/// can be written this way, as other programs might.
+fn handwritten(objects: &[&str]) -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1).as_bytes());
+    out
+}
+
+/// Two pages, each showing its number, with `second` as the second page's dictionary and
+/// `count` as the root's /Count.
+fn two_pages(second: &str, count: &str) -> Vec<u8> {
+    let page = |content: u32, extra: &str| {
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {content} 0 R /Resources << /Font << /F1 7 0 R >> >> {extra} >>")
+    };
+    handwritten(&[
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        &format!("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count {count} >>"),
+        &page(5, ""),
+        &page(6, second),
+        "<< /Length 31 >>\nstream\nBT /F1 18 Tf 72 700 Td (ONE) Tj ET\nendstream",
+        "<< /Length 31 >>\nstream\nBT /F1 18 Tf 72 700 Td (TWO) Tj ET\nendstream",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ])
+}
+
+#[test]
+fn pages_that_cannot_be_read_are_refused_instead_of_dropped() {
+    use carbide_engine::pagetree::messages::UNREADABLE;
+    // A sound file opens: the fixture itself is right.
+    let mut sound = Pdf::from_bytes(&two_pages("", "2")).unwrap();
+    assert_eq!(texts_seen_by_both(&mut sound), ["ONE", "TWO"]);
+    for (what, file) in [
+        ("an integer too large in a page box", two_pages("/CropBox [0 0 300000000000000000000000000000000000000 792]", "2")),
+        ("an integer too large for /Rotate", two_pages("/Rotate 100000000000000000000", "2")),
+        ("a dictionary that does not end", two_pages("/Foo <<", "2")),
+        ("an integer too large for the root's /Count", two_pages("", "99999999999999999999999")),
+        ("a /Count of 2 to the 63rd", two_pages("", "9223372036854775808")),
+    ] {
+        // PDFium shows every page of these.
+        assert_eq!(renderer().page_count(&file).unwrap(), 2, "{what}");
+        let refused = Pdf::from_bytes(&file).map(|pdf| pdf.page_count());
+        assert_eq!(refused.unwrap_err().to_string(), UNREADABLE, "{what}");
+    }
+}
+
+#[test]
+fn numbers_too_large_to_write_are_brought_within_range() {
+    use carbide_engine::pagetree::MAX_COORDINATE;
+    use carbide_engine::pdf::MAX_PAGE_SIDE;
+    let file = |media_box: &str| {
+        handwritten(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            &format!("<< /Type /Page /Parent 2 0 R /MediaBox {media_box} /Huge 1000000000000000000000000000000.0 >>"),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ])
+    };
+    for media_box in [
+        "[0 0 1000000000000000000000000000000.0 1000000000000000000000000000000.0]",
+        "[-300000000000000000000000000000000000000.0 -300000000000000000000000000000000000000.0 \
+300000000000000000000000000000000000000.0 300000000000000000000000000000000000000.0]",
+        "[0 0 9000000000000000000 792]",
+    ] {
+        let mut pdf = Pdf::from_bytes(&file(media_box)).unwrap();
+        let (w, h) = pdf.page_geometry(0).unwrap().display_size();
+        assert!(w.is_finite() && h.is_finite() && w <= 2.0 * MAX_COORDINATE && h <= 2.0 * MAX_COORDINATE, "{media_box}: {w} x {h}");
+        // A page made the size of the first (as far as a new page can be), and the numbers of the
+        // file, read back after saving.
+        pdf.insert_blank_page(1, None).unwrap();
+        let bytes = pdf.to_bytes().unwrap();
+        let again = Pdf::from_bytes(&bytes).unwrap();
+        assert_eq!(again.page_count(), 3, "{media_box}");
+        assert_eq!(renderer().page_count(&bytes).unwrap(), 3, "{media_box}");
+        assert_eq!(again.page_geometry(0).unwrap().display_size(), (w, h), "{media_box}");
+        assert_eq!(again.page_geometry(1).unwrap().display_size(), (w.min(MAX_PAGE_SIDE), h.min(MAX_PAGE_SIDE)), "{media_box}");
+    }
+    // Sizes asked for have to be numbers a page can have.
+    for size in [(f32::NAN, 792.0), (f32::INFINITY, 792.0), (0.0, 792.0), (612.0, 1.0e30)] {
+        assert!(Pdf::new().insert_blank_page(0, Some(size)).is_err(), "{size:?}");
+    }
+    // Numbers an edit puts in are brought within range when the document is written.
+    let mut edited = text_pdf(&[&["ONE"], &["TWO"]]);
+    let id = edited.page_ids()[1];
+    edited.document_mut().get_dictionary_mut(id).unwrap().set("Huge", Object::Real(f32::INFINITY));
+    edited.document_mut().get_dictionary_mut(id).unwrap().set("Large", Object::Real(1.0e30));
+    let mut again = Pdf::from_bytes(&edited.to_bytes().unwrap()).unwrap();
+    assert_eq!(texts_seen_by_both(&mut again), ["ONE", "TWO"]);
+}
+
+#[test]
+fn a_media_box_without_an_area_is_a_letter_page() {
+    for media_box in ["[0 0 0 0]", "[5 5 5 100]", "[0 0 100 0]", "[10 10 10 10]", "[0 0 612]"] {
+        let bytes = handwritten(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            &format!("<< /Type /Page /Parent 2 0 R /MediaBox {media_box} >>"),
+        ]);
+        let pdf = Pdf::from_bytes(&bytes).unwrap();
+        assert_eq!(pdf.page_geometry(0).unwrap().display_size(), (612.0, 792.0), "{media_box}");
+        assert_eq!(renderer().page_size(&bytes, 0).unwrap(), (612.0, 792.0), "{media_box}");
+    }
+}
+
+/// `pdf` with `damage` done to the document's catalog (given the catalog and the page ids) and
+/// read back from a file.
+fn with_catalog(pdf: &Pdf, damage: impl FnOnce(&mut Document, lopdf::ObjectId, &[lopdf::ObjectId])) -> Pdf {
+    let mut pdf = pdf.clone();
+    let ids = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let catalog = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+    damage(doc, catalog, &ids);
+    Pdf::from_bytes(&pdf.to_bytes().unwrap()).unwrap()
+}
+
+#[test]
+fn trees_that_list_themselves_do_not_stop_edits() {
+    let base = text_pdf(&[&["ONE"], &["TWO"], &["THREE"]]);
+    // A node that lists itself twice, on and on, and then `last`: 2 to the 64th visits without a
+    // record of the nodes already seen.
+    let self_listing = |doc: &mut Document, last: Option<lopdf::ObjectId>| {
+        let node = doc.new_object_id();
+        let kids: Vec<Object> = [node, node].into_iter().chain(last).map(Object::from).collect();
+        doc.objects.insert(node, Object::Dictionary(dictionary! { "Kids" => kids }));
+        node
+    };
+    // Nodes that each list the next twice, `levels` deep, above `leaf`: no loop, and as many visits.
+    let doubling = |doc: &mut Document, leaf: lopdf::Dictionary, levels: usize| {
+        let mut next = doc.add_object(leaf);
+        for _ in 0..levels {
+            let mut node = dictionary! { "Kids" => vec![next.into(), next.into()] };
+            node.set("T", Object::string_literal("F"));
+            next = doc.add_object(node);
+        }
+        next
+    };
+    let roman = || dictionary! { "Nums" => vec![0.into(), dictionary! { "S" => "r" }.into()] };
+    let names = with_catalog(&base, |doc, catalog, _| {
+        let tree = self_listing(doc, None);
+        let doubled = doubling(doc, dictionary! { "Names" => Vec::<Object>::new() }, 64);
+        doc.get_dictionary_mut(catalog).unwrap().set("Names", dictionary! { "Dests" => tree, "JavaScript" => doubled });
+    });
+    // PDFium reads the page labels for every page it opens, and would run out of stack on these
+    // or never finish.
+    let labels = with_catalog(&base, |doc, catalog, _| {
+        let leaf = doc.add_object(roman());
+        let tree = self_listing(doc, Some(leaf));
+        doc.get_dictionary_mut(catalog).unwrap().set("PageLabels", tree);
+    });
+    let doubled_labels = with_catalog(&base, |doc, catalog, _| {
+        let tree = doubling(doc, roman(), 64);
+        doc.get_dictionary_mut(catalog).unwrap().set("PageLabels", tree);
+    });
+    let deep_labels = with_catalog(&base, |doc, catalog, _| {
+        let mut next = doc.add_object(roman());
+        for _ in 0..100_000 {
+            next = doc.add_object(dictionary! { "Kids" => vec![next.into()] });
+        }
+        doc.get_dictionary_mut(catalog).unwrap().set("PageLabels", next);
+    });
+    let fields = with_catalog(&base, |doc, catalog, ids| {
+        let field = doc.new_object_id();
+        let widget = dictionary! { "Subtype" => "Widget", "P" => ids[0], "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()] };
+        let widget = doc.add_object(widget);
+        doc.objects.insert(field, Object::Dictionary(dictionary! { "T" => Object::string_literal("F"), "Kids" => vec![field.into(), field.into(), widget.into()] }));
+        doc.get_dictionary_mut(ids[0]).unwrap().set("Annots", vec![widget.into()]);
+        doc.get_dictionary_mut(catalog).unwrap().set("AcroForm", dictionary! { "Fields" => vec![field.into()] });
+    });
+    // PDFium reads the field tree to draw a page with forms, 32 levels deep: 2 to the 32nd visits.
+    let doubled_fields = with_catalog(&base, |doc, catalog, ids| {
+        let widget = dictionary! { "Subtype" => "Widget", "P" => ids[1], "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()] };
+        let widget = doc.add_object(widget);
+        let tree = doubling(doc, dictionary! { "T" => Object::string_literal("leaf"), "Kids" => vec![widget.into()] }, 40);
+        doc.get_dictionary_mut(ids[1]).unwrap().set("Annots", vec![widget.into()]);
+        doc.get_dictionary_mut(catalog).unwrap().set("AcroForm", dictionary! { "Fields" => vec![tree.into(), tree.into()] });
+    });
+    let structure = with_catalog(&base, |doc, catalog, ids| {
+        let element = doc.new_object_id();
+        doc.objects.insert(element, Object::Dictionary(dictionary! { "Type" => "StructElem", "Pg" => ids[1], "K" => vec![element.into(), element.into()] }));
+        let parents = doubling(doc, dictionary! { "Nums" => Vec::<Object>::new() }, 64);
+        let root = doc.add_object(dictionary! { "Type" => "StructTreeRoot", "K" => vec![element.into()], "ParentTree" => parents });
+        doc.get_dictionary_mut(catalog).unwrap().set("StructTreeRoot", root);
+    });
+
+    // The page labels are kept, each once, in a tree PDFium reads safely.
+    for pdf in [&labels, &doubled_labels, &deep_labels] {
+        let tree = pdf.document().catalog().unwrap().get(b"PageLabels").unwrap().as_reference().unwrap();
+        assert_eq!(pdf.document().get_dictionary(tree).unwrap(), &roman());
+    }
+    let cases = [
+        ("names", names),
+        ("labels", labels),
+        ("doubled labels", doubled_labels),
+        ("deep labels", deep_labels),
+        ("fields", fields),
+        ("doubled fields", doubled_fields),
+        ("structure", structure),
+    ];
+    for (what, pdf) in cases {
+        let mut shown = pdf.clone();
+        let texts = finishes(what, move || (texts_seen_by_both(&mut shown), render(renderer(), &mut shown, 1).dimensions()));
+        assert_eq!(texts, (vec!["ONE".to_string(), "TWO".into(), "THREE".into()], (612, 792)), "{what}");
+        let mut deleted = pdf.clone();
+        finishes(what, move || deleted.delete_pages(&[1]).unwrap());
+        let extracted = pdf.clone();
+        finishes(what, move || extracted.extract_pages(&[0, 2]).unwrap());
+        let mut redacted = pdf.clone();
+        let area = Redaction { page: 0, rect: Rect::new(0.0, 0.0, 100.0, 100.0) };
+        finishes(what, move || redacted.apply_redactions(renderer(), &[area], 72.0).unwrap());
+        let mut sanitized = pdf.clone();
+        finishes(what, move || sanitized.remove_hidden_information(&HiddenItem::ALL).unwrap());
+    }
+
+    // A sound label tree is left as it is.
+    let sound = with_catalog(&base, |doc, catalog, _| {
+        let leaf = doc.add_object(roman());
+        let tree = doc.add_object(dictionary! { "Kids" => vec![leaf.into()] });
+        doc.get_dictionary_mut(catalog).unwrap().set("PageLabels", tree);
+    });
+    let tree = sound.document().catalog().unwrap().get(b"PageLabels").unwrap().as_reference().unwrap();
+    assert!(sound.document().get_dictionary(tree).unwrap().has(b"Kids"));
+}
+
 // ---- resource limits -----------------------------------------------------------------------
 
 /// A Flate stream of `size` spaces: a few hundred kilobytes in the file, `size` bytes decoded.

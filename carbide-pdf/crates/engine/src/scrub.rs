@@ -52,8 +52,9 @@ impl Pdf {
         };
         let Ok(mut fields) = form.get(b"Fields").cloned() else { return };
         let mut removed = HashSet::new();
+        let mut seen = HashSet::new();
         let left = edit_array(&mut self.doc, &mut fields, |doc, items| {
-            items.retain_mut(|item| !prune_field(doc, item, &widgets, None, &mut removed, 0));
+            items.retain_mut(|item| !prune_field(doc, item, &widgets, None, &mut removed, &mut seen, 0));
             items.len()
         });
         if removed.is_empty() {
@@ -95,7 +96,7 @@ impl Pdf {
         let mut removed = HashSet::new();
         if let Ok(mut kids) = root.get(b"K").cloned() {
             let scope = Scope { pages, annotations: &annotations };
-            if prune_structure(&mut self.doc, &mut kids, None, &scope, &mut removed, 0) {
+            if prune_structure(&mut self.doc, &mut kids, None, &scope, &mut removed, &mut HashSet::new(), 0) {
                 root.remove(b"K");
             } else {
                 root.set("K", kids);
@@ -104,7 +105,7 @@ impl Pdf {
         if !removed.is_empty() {
             for (tree, key) in [(&b"ParentTree"[..], &b"Nums"[..]), (b"IDTree", b"Names")] {
                 if let Ok(mut node) = root.get(tree).cloned() {
-                    prune_tree(&mut self.doc, &mut node, key, &removed, 0);
+                    prune_tree(&mut self.doc, &mut node, key, &removed, &mut HashSet::new(), 0);
                     root.set(tree, node);
                 }
             }
@@ -371,19 +372,22 @@ struct WidgetScope<'a> {
 
 /// Prunes one node of the form's field tree. True when the node goes: a widget on one of the
 /// pages that `goes` gives up, or a field all of whose widgets went. `field_type` is the type
-/// (`/FT`) the node inherits.
+/// (`/FT`) the node inherits. A node met again (in `seen`: the tree loops, or lists a field twice)
+/// is left as it is the second time.
 fn prune_field(
     doc: &mut Document,
     item: &mut Object,
     scope: &WidgetScope<'_>,
     field_type: Option<&[u8]>,
     removed: &mut HashSet<ObjectId>,
+    seen: &mut HashSet<ObjectId>,
     depth: usize,
 ) -> bool {
     if depth > MAX_DEPTH {
         return false;
     }
     let (id, mut dict) = match item {
+        Object::Reference(id) if !seen.insert(*id) => return false,
         Object::Reference(id) => match doc.get_dictionary(*id) {
             Ok(dict) => (Some(*id), dict.clone()),
             Err(_) => return false,
@@ -407,7 +411,7 @@ fn prune_field(
     let Ok(mut kids) = dict.get(b"Kids").cloned() else { return false };
     let counts = edit_array(doc, &mut kids, |doc, items| {
         let before = items.len();
-        items.retain_mut(|kid| !prune_field(doc, kid, scope, field_type.as_deref(), removed, depth + 1));
+        items.retain_mut(|kid| !prune_field(doc, kid, scope, field_type.as_deref(), removed, seen, depth + 1));
         (before, items.len())
     });
     dict.set("Kids", kids);
@@ -430,23 +434,26 @@ struct Scope<'a> {
 }
 
 /// Prunes one structure-tree item (`/K` of an element, or one of its kids). True when the item
-/// goes. `page` is the page the enclosing element is on.
+/// goes. `page` is the page the enclosing element is on. An element met again (in `seen`: the tree
+/// loops, or lists an element twice) is left as it is the second time.
 fn prune_structure(
     doc: &mut Document,
     item: &mut Object,
     page: Option<ObjectId>,
     scope: &Scope<'_>,
     removed: &mut HashSet<ObjectId>,
+    seen: &mut HashSet<ObjectId>,
     depth: usize,
 ) -> bool {
     if depth > MAX_DEPTH {
         return false;
     }
     if let Object::Array(items) = item {
-        items.retain_mut(|kid| !prune_structure(doc, kid, page, scope, removed, depth + 1));
+        items.retain_mut(|kid| !prune_structure(doc, kid, page, scope, removed, seen, depth + 1));
         return false;
     }
     let (id, mut dict) = match item {
+        Object::Reference(id) if !seen.insert(*id) => return false,
         Object::Reference(id) => match doc.get_dictionary(*id) {
             Ok(dict) => (Some(*id), dict.clone()),
             Err(_) => return false,
@@ -474,7 +481,7 @@ fn prune_structure(
                 kids = doc.get_object(kids_id).cloned().unwrap_or(Object::Null);
             }
         }
-        if prune_structure(doc, &mut kids, page, scope, removed, depth + 1) {
+        if prune_structure(doc, &mut kids, page, scope, removed, seen, depth + 1) {
             dict.remove(b"K");
         } else {
             dict.set("K", kids);
@@ -518,12 +525,14 @@ fn collect_elements(doc: &Document, item: &Object, removed: &mut HashSet<ObjectI
 }
 
 /// Drops the entries of a number tree (`key` = `Nums`) or name tree (`Names`) that refer to
-/// removed elements; in arrays of elements those become null.
-fn prune_tree(doc: &mut Document, node: &mut Object, key: &[u8], removed: &HashSet<ObjectId>, depth: usize) {
+/// removed elements; in arrays of elements those become null. A node met again (in `seen`) is
+/// already done.
+fn prune_tree(doc: &mut Document, node: &mut Object, key: &[u8], removed: &HashSet<ObjectId>, seen: &mut HashSet<ObjectId>, depth: usize) {
     if depth > MAX_DEPTH {
         return;
     }
     let (id, mut dict) = match node {
+        Object::Reference(id) if !seen.insert(*id) => return,
         Object::Reference(id) => match doc.get_dictionary(*id) {
             Ok(dict) => (Some(*id), dict.clone()),
             Err(_) => return,
@@ -532,7 +541,7 @@ fn prune_tree(doc: &mut Document, node: &mut Object, key: &[u8], removed: &HashS
         _ => return,
     };
     if let Ok(mut kids) = dict.get(b"Kids").cloned() {
-        edit_array(doc, &mut kids, |doc, items| items.iter_mut().for_each(|kid| prune_tree(doc, kid, key, removed, depth + 1)));
+        edit_array(doc, &mut kids, |doc, items| items.iter_mut().for_each(|kid| prune_tree(doc, kid, key, removed, seen, depth + 1)));
         dict.set("Kids", kids);
     }
     if let Ok(mut pairs) = dict.get(key).cloned() {

@@ -45,12 +45,12 @@ impl Pdf {
         }
         let redactions: Vec<Redaction> = redactions.iter().map(|r| Redaction { page: r.page, rect: r.rect.normalized() }).collect();
         let redactions = redactions.as_slice();
-        let snapshot = self.to_bytes()?;
-        self.check_pages_agree(renderer, &snapshot)?;
-
         let mut pages: Vec<usize> = redactions.iter().map(|r| r.page).collect();
         pages.sort_unstable();
         pages.dedup();
+        let snapshot = self.to_bytes()?;
+        self.check_pages_agree(renderer, &snapshot, &pages)?;
+
         // The rebuilt pages lose their annotations, and with them their form fields: the values
         // and appearances those hold would otherwise stay in the form. A signature field goes
         // only when its signature is drawn inside a redacted area; otherwise it stays (it no

@@ -87,7 +87,7 @@ impl Pdf {
         }
         if let Some(tree) = self.name_tree(b"Dests") {
             let mut pairs = Vec::new();
-            collect_pairs(&self.doc, &tree, b"Names", &mut pairs, 0);
+            collect_pairs(&self.doc, &tree, b"Names", &mut pairs);
             for (name, target) in pairs {
                 if let Object::String(name, _) = name {
                     found.insert(name, target);
@@ -115,7 +115,8 @@ impl Pdf {
             });
         }
         if let Some(mut tree) = self.name_tree(b"Dests") {
-            let held = prune_pairs(&mut self.doc, &mut tree, b"Names", &|name, _| matches!(name, Object::String(n, _) if gone.contains(n)), 0);
+            let goes = |name: &Object, _: &Object| matches!(name, Object::String(n, _) if gone.contains(n));
+            let held = prune_pairs(&mut self.doc, &mut tree, b"Names", &goes, &mut HashSet::new(), 0);
             let names_entry = self.doc.get_dictionary(catalog_id).and_then(|c| c.get(b"Names")).cloned();
             if let Ok(names) = names_entry {
                 edit_dictionary(&mut self.doc, catalog_id, b"Names", names, |dict| match held {
@@ -320,7 +321,7 @@ impl Pdf {
     pub(crate) fn page_labels_without(&self, deleted: &[usize]) -> Option<Object> {
         let tree = self.doc.catalog().ok()?.get(b"PageLabels").ok()?.clone();
         let mut pairs = Vec::new();
-        collect_pairs(&self.doc, &tree, b"Nums", &mut pairs, 0);
+        collect_pairs(&self.doc, &tree, b"Nums", &mut pairs);
         let mut ranges: Vec<(i64, Dictionary)> = pairs
             .into_iter()
             .filter_map(|(start, style)| Some((start.as_i64().ok()?, self.resolve(&style).as_dict().ok()?.clone())))
@@ -398,12 +399,24 @@ fn edit_dictionary(doc: &mut Document, owner: ObjectId, key: &[u8], entry: Objec
 }
 
 /// The key and value pairs of a name tree (`key` = `Names`) or number tree (`Nums`), values as
-/// stored.
-pub(crate) fn collect_pairs(doc: &Document, node: &Object, key: &[u8], out: &mut Vec<(Object, Object)>, depth: usize) {
+/// stored. A node listed again (the tree loops, or lists a node twice) is read only once.
+pub(crate) fn collect_pairs(doc: &Document, node: &Object, key: &[u8], out: &mut Vec<(Object, Object)>) {
+    collect_pairs_below(doc, node, key, out, &mut HashSet::new(), 0);
+}
+
+fn collect_pairs_below(
+    doc: &Document,
+    node: &Object,
+    key: &[u8],
+    out: &mut Vec<(Object, Object)>,
+    seen: &mut HashSet<ObjectId>,
+    depth: usize,
+) {
     if depth > MAX_DEPTH {
         return;
     }
     let dict = match node {
+        Object::Reference(id) if !seen.insert(*id) => return,
         Object::Reference(id) => match doc.get_dictionary(*id) {
             Ok(dict) => dict,
             Err(_) => return,
@@ -424,7 +437,7 @@ pub(crate) fn collect_pairs(doc: &Document, node: &Object, key: &[u8], out: &mut
     }
     if let Object::Array(kids) = dict.get(b"Kids").map(resolved).unwrap_or(Object::Null) {
         for kid in &kids {
-            collect_pairs(doc, kid, key, out, depth + 1);
+            collect_pairs_below(doc, kid, key, out, seen, depth + 1);
         }
     }
 }
@@ -441,12 +454,21 @@ enum Held {
 
 /// Removes the pairs of a name or number tree that `goes` gives up, wherever in the tree they are.
 /// Kids left without a key are taken out, and every node that has /Limits gets them set to the
-/// first and last key it still holds, so no key that went stays there.
-fn prune_pairs(doc: &mut Document, node: &mut Object, key: &[u8], goes: &dyn Fn(&Object, &Object) -> bool, depth: usize) -> Held {
+/// first and last key it still holds, so no key that went stays there. A node met again (in
+/// `seen`: the tree loops, or lists a node twice) is left as it is the second time.
+fn prune_pairs(
+    doc: &mut Document,
+    node: &mut Object,
+    key: &[u8],
+    goes: &dyn Fn(&Object, &Object) -> bool,
+    seen: &mut HashSet<ObjectId>,
+    depth: usize,
+) -> Held {
     if depth > MAX_DEPTH {
         return Held::Unknown;
     }
     let (id, mut dict) = match node {
+        Object::Reference(id) if !seen.insert(*id) => return Held::Unknown,
         Object::Reference(id) => match doc.get_dictionary(*id) {
             Ok(dict) => (Some(*id), dict.clone()),
             Err(_) => return Held::Unknown,
@@ -462,7 +484,7 @@ fn prune_pairs(doc: &mut Document, node: &mut Object, key: &[u8], goes: &dyn Fn(
         if let Object::Array(items) = kids {
             let mut kept = Vec::with_capacity(items.len());
             for mut kid in items {
-                match prune_pairs(doc, &mut kid, key, goes, depth + 1) {
+                match prune_pairs(doc, &mut kid, key, goes, seen, depth + 1) {
                     Held::Nothing => {}
                     other => {
                         held.push(other);

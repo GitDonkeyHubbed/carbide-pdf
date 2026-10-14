@@ -191,7 +191,7 @@ impl Pdf {
     fn remove_name_tree(&mut self, key: &[u8]) -> usize {
         let Some(tree) = self.name_tree(key) else { return 0 };
         let mut pairs = Vec::new();
-        collect_pairs(&self.doc, &tree, b"Names", &mut pairs, 0);
+        collect_pairs(&self.doc, &tree, b"Names", &mut pairs);
         let names = self.doc.catalog().ok().and_then(|c| c.get(b"Names").ok().cloned());
         match names {
             Some(Object::Reference(id)) => {

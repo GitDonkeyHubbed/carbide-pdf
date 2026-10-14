@@ -125,10 +125,21 @@ impl Renderer {
         Ok(document.pages().len() as usize)
     }
 
+    /// The size, in points, at which PDFium shows page `index`: its crop box, turned as the page is.
+    pub fn page_size(&self, pdf: &[u8], index: usize) -> Result<(f32, f32)> {
+        let document = self.pdfium.load_pdf_from_byte_slice(pdf, None).map_err(render_error)?;
+        let page = document
+            .pages()
+            .get(index as PdfPageIndex)
+            .map_err(|_| Error::PageOutOfRange { index, count: document.pages().len() as usize })?;
+        Ok((page.width().value, page.height().value))
+    }
+
     /// Renders one page as it is displayed (crop box and rotation applied) at `dpi`, or at a lower
     /// resolution when the image would be larger than [`MAX_RENDER_PIXELS`] or
     /// [`MAX_RENDER_SIDE`]. The size of the image says which; callers that map between the page
-    /// and the image take the scale from it.
+    /// and the image take the scale from it. PDFium does not limit what drawing a page takes, so
+    /// a page of a document that is not trusted is checked first ([`crate::Pdf::check_drawable`]).
     pub fn render_page(&self, pdf: &[u8], index: usize, dpi: f32) -> Result<RgbaImage> {
         if !(dpi.is_finite() && dpi > 0.0) {
             return Err(Error::Render(format!("cannot render at {dpi} dpi")));

@@ -128,18 +128,18 @@ impl Pdf {
     pub fn make_searchable(&mut self, renderer: &Renderer, options: &OcrOptions) -> Result<OcrReport> {
         let models = locate_models(options.models_dir.as_deref())?;
         let engine = engine(&models)?;
-        let snapshot = self.to_bytes()?;
-        self.check_pages_agree(renderer, &snapshot)?;
         let ids = self.page_ids();
         let count = ids.len();
         // A page listed twice is recognized once, so it gets one text layer.
         let wanted: Vec<usize> = options.pages.as_deref().map(crate::pdf::once_each).unwrap_or_else(|| (0..count).collect());
+        if let Some(&page) = wanted.iter().find(|&&page| page >= count) {
+            return Err(Error::PageOutOfRange { index: page, count });
+        }
+        let snapshot = self.to_bytes()?;
+        self.check_pages_agree(renderer, &snapshot, &wanted)?;
         let mut report = OcrReport::default();
 
         for page in wanted {
-            if page >= count {
-                return Err(Error::PageOutOfRange { index: page, count });
-            }
             let existing = renderer.page_text(&snapshot, page)?;
             if existing.trim().chars().count() > options.skip_pages_with_text_over {
                 report.skipped_pages.push(page);

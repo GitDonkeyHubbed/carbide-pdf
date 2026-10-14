@@ -34,6 +34,7 @@ pub mod security;
 pub mod signature;
 mod sigcrypto;
 pub mod stamp;
+mod trees;
 
 pub use annotate::{AnnotationSummary, MarkupStyle};
 pub use compare::{compare_documents, PageDiff};

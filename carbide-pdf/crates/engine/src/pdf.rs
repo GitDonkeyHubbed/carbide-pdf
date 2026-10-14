@@ -50,15 +50,21 @@ impl Pdf {
     /// restrictions are kept and saving encrypts it again). A damaged page tree is repaired as it
     /// is read (see [`crate::pagetree`]), or refused when that cannot be done safely.
     pub fn from_bytes(bytes: &[u8]) -> Result<Pdf> {
-        let mut doc = Self::load_unrepaired(bytes, None)?;
-        crate::pagetree::repair(&mut doc)?;
-        Ok(Pdf { doc })
+        Self::repaired(Self::load_unrepaired(bytes, None)?)
     }
 
     /// Opens a file with its open password or its owner password, used exactly as given.
     pub fn from_bytes_with_password(bytes: &[u8], password: &str) -> Result<Pdf> {
-        let mut doc = Self::load_unrepaired(bytes, Some(password))?;
+        Self::repaired(Self::load_unrepaired(bytes, Some(password))?)
+    }
+
+    /// `doc` with its page tree, page labels and form field tree repaired (see
+    /// [`crate::pagetree`] and [`crate::trees`]), and every number in it one that can be written
+    /// out and read back (see [`writable_numbers`]).
+    fn repaired(mut doc: Document) -> Result<Pdf> {
+        writable_numbers(&mut doc);
         crate::pagetree::repair(&mut doc)?;
+        crate::trees::repair(&mut doc);
         Ok(Pdf { doc })
     }
 
@@ -76,6 +82,7 @@ impl Pdf {
     /// Serializes the document, dropping objects that are no longer reachable.
     pub fn to_bytes(&mut self) -> Result<Vec<u8>> {
         crate::save::prune(&mut self.doc);
+        writable_numbers(&mut self.doc);
         let mut out = Vec::new();
         self.doc.save_to(&mut out)?;
         Ok(out)
@@ -123,25 +130,48 @@ impl Pdf {
     }
 
     /// Fails unless PDFium finds as many pages in `serialized` (this document written out) as the
-    /// engine does. Edits that render page N and then rebuild page N need the two to agree; the page
-    /// tree is repaired when a document is opened, so this only guards against later damage.
-    pub(crate) fn check_pages_agree(&self, renderer: &crate::render::Renderer, serialized: &[u8]) -> Result<()> {
+    /// engine does, and shows each of `pages` at the size the engine works with. Edits that render
+    /// page N and then rebuild page N need the two to agree; the page tree is repaired when a
+    /// document is opened, so this only guards against later damage.
+    pub(crate) fn check_pages_agree(&self, renderer: &crate::render::Renderer, serialized: &[u8], pages: &[usize]) -> Result<()> {
         let (ours, theirs) = (self.page_count(), renderer.page_count(serialized)?);
         if ours != theirs {
             return Err(Error::Other(format!(
                 "the document's page tree is damaged ({ours} pages to the editor, {theirs} to the renderer), so nothing was changed"
             )));
         }
+        let ids = self.page_ids();
+        for &page in pages {
+            let Some(&id) = ids.get(page) else { continue };
+            let (w, h) = self.geometry_of(id).display_size();
+            let (rw, rh) = renderer.page_size(serialized, page)?;
+            let close = |a: f32, b: f32| (a - b).abs() <= 0.5f32.max(a.abs().max(b.abs()) * 1e-4);
+            if !(close(w, rw) && close(h, rh)) {
+                return Err(Error::Other(format!(
+                    "page {} is {w} x {h} points to the editor but {rw} x {rh} to the renderer, so nothing was changed",
+                    page + 1
+                )));
+            }
+        }
         Ok(())
     }
 
     /// Looks `key` up on the page, then up the `/Parent` chain, and returns a dereferenced clone.
+    /// The chain is followed as far as a page tree can be deep, so a chain that loops ends too.
     pub(crate) fn inherited(&self, page_id: ObjectId, key: &[u8]) -> Option<Object> {
+        let holder = self.inherited_from(page_id, key)?;
+        Some(self.resolve(self.doc.get_dictionary(holder).ok()?.get(key).ok()?))
+    }
+
+    /// The page or page-tree node `key` of the page `page_id` is taken from (see
+    /// [`Pdf::inherited`]).
+    pub(crate) fn inherited_from(&self, page_id: ObjectId, key: &[u8]) -> Option<ObjectId> {
         let mut current = page_id;
-        for _ in 0..64 {
+        // A page sits at most MAX_DEPTH nodes below the root.
+        for _ in 0..crate::pagetree::MAX_DEPTH + 2 {
             let dict = self.doc.get_dictionary(current).ok()?;
-            if let Ok(value) = dict.get(key) {
-                return Some(self.resolve(value));
+            if dict.has(key) {
+                return Some(current);
             }
             current = dict.get(b"Parent").ok()?.as_reference().ok()?;
         }
@@ -163,6 +193,8 @@ impl Pdf {
         Object::Null
     }
 
+    /// A page box the way PDFium reads it: an array of four values, any that is not a number read
+    /// as 0, corners put in order.
     fn rect_from(&self, object: Option<Object>) -> Option<[f32; 4]> {
         let array = object?.as_array().ok()?.clone();
         if array.len() != 4 {
@@ -170,7 +202,7 @@ impl Pdf {
         }
         let mut values = [0f32; 4];
         for (slot, item) in values.iter_mut().zip(array.iter()) {
-            *slot = self.resolve(item).as_float().ok()?;
+            *slot = self.resolve(item).as_float().ok().filter(|v| v.is_finite()).unwrap_or(0.0);
         }
         Some([
             values[0].min(values[2]),
@@ -191,7 +223,11 @@ impl Pdf {
 
     /// The geometry of the page object `id`.
     pub(crate) fn geometry_of(&self, id: ObjectId) -> PageGeometry {
-        let media = self.rect_from(self.inherited(id, b"MediaBox")).unwrap_or([0.0, 0.0, 612.0, 792.0]);
+        // A media box without an area is a US Letter page, as PDFium shows it.
+        let media = self
+            .rect_from(self.inherited(id, b"MediaBox"))
+            .filter(|m| m[2] - m[0] > 0.0 && m[3] - m[1] > 0.0)
+            .unwrap_or([0.0, 0.0, 612.0, 792.0]);
         let crop = self.rect_from(self.inherited(id, b"CropBox"));
         let visible = match crop {
             Some(c) => [
@@ -212,30 +248,22 @@ impl Pdf {
         Ok(self.page_geometry(index)?.rotation)
     }
 
-    /// Makes the page tree a single flat `/Pages` node, copying inherited attributes onto each page.
+    /// Makes the page tree a single flat `/Pages` node, giving each page the attributes it
+    /// inherited. Large ones are shared between the pages rather than copied onto each (see
+    /// [`crate::pagetree::share`]).
     pub fn flatten_page_tree(&mut self) -> Result<()> {
         let ids = self.page_ids();
         let root_id = self.pages_root()?;
-
-        let mut inherited_values: Vec<(ObjectId, Vec<(Vec<u8>, Object)>)> = Vec::new();
-        for id in &ids {
-            let mut values = Vec::new();
+        for &id in &ids {
             for key in INHERITABLE {
-                let own = self.doc.get_dictionary(*id)?.has(key);
-                if !own {
-                    if let Some(value) = self.inherited(*id, key) {
-                        values.push((key.to_vec(), value));
-                    }
-                }
+                let Some(holder) = self.inherited_from(id, key).filter(|&holder| holder != id) else { continue };
+                let value = crate::pagetree::share(&mut self.doc, holder, key)?;
+                self.doc.get_dictionary_mut(id)?.set(key, value);
             }
-            inherited_values.push((*id, values));
         }
-        for (id, values) in inherited_values {
-            let dict = self.doc.get_dictionary_mut(id)?;
-            for (key, value) in values {
-                dict.set(key, value);
-            }
-            dict.set("Parent", root_id);
+        // Only once every page has what it inherited: a page's /Parent can lead through others.
+        for &id in &ids {
+            self.doc.get_dictionary_mut(id)?.set("Parent", root_id);
         }
         let root = self.doc.get_dictionary_mut(root_id)?;
         root.set("Kids", ids.iter().map(|id| Object::Reference(*id)).collect::<Vec<_>>());
@@ -315,8 +343,12 @@ impl Pdf {
             return Err(Error::PageOutOfRange { index, count });
         }
         let (width, height) = match size {
-            Some(s) => s,
-            None if count > 0 => self.page_geometry(index.saturating_sub(1).min(count - 1))?.display_size(),
+            Some((w, h)) if [w, h].iter().all(|v| v.is_finite() && (1.0..=MAX_PAGE_SIDE).contains(v)) => (w, h),
+            Some((w, h)) => return Err(Error::Other(format!("a page can be 1 to {MAX_PAGE_SIDE} points wide and high, not {w} x {h}"))),
+            None if count > 0 => {
+                let (w, h) = self.page_geometry(index.saturating_sub(1).min(count - 1))?.display_size();
+                (w.clamp(1.0, MAX_PAGE_SIDE), h.clamp(1.0, MAX_PAGE_SIDE))
+            }
             None => (612.0, 792.0),
         };
         self.flatten_page_tree()?;
@@ -492,6 +524,37 @@ impl Pdf {
             return Err(Error::InvalidRange(text.to_string()));
         }
         Ok(ranges)
+    }
+}
+
+/// The longest side a new page can have, in points: as far as page boxes reach (see
+/// [`crate::pagetree::MAX_COORDINATE`]).
+pub const MAX_PAGE_SIDE: f32 = crate::pagetree::MAX_COORDINATE;
+
+/// The largest number lopdf writes so that it reads back: it writes a real without an exponent,
+/// so a larger one comes back as an integer too large to read, and the object holding it is lost.
+const MAX_WRITABLE: f32 = 1.0e15;
+
+/// Brings every real number in `doc` within what can be written out and read back (see
+/// [`writable`]). Done when a document is read, and again before it is written, for numbers edits
+/// put in.
+pub(crate) fn writable_numbers(doc: &mut Document) {
+    doc.objects.values_mut().for_each(writable);
+    doc.trailer.iter_mut().for_each(|(_, value)| writable(value));
+}
+
+/// Brings every real number in `object` within what can be written out and read back: one that
+/// is not finite becomes 0, and a larger one becomes the largest that can be written. Numbers that
+/// large mean nothing in a PDF, but written as they are they would take their object, a whole page
+/// say, out of the file when it is read again.
+pub(crate) fn writable(object: &mut Object) {
+    match object {
+        Object::Real(value) if !value.is_finite() => *value = 0.0,
+        Object::Real(value) if value.abs() > MAX_WRITABLE => *value = MAX_WRITABLE.copysign(*value),
+        Object::Array(items) => items.iter_mut().for_each(writable),
+        Object::Dictionary(dict) => dict.iter_mut().for_each(|(_, value)| writable(value)),
+        Object::Stream(stream) => stream.dict.iter_mut().for_each(|(_, value)| writable(value)),
+        _ => {}
     }
 }
 

@@ -282,6 +282,7 @@ impl Pdf {
     /// The whole document, pruned, encrypted again when `protection` is given.
     fn rewrite(&mut self, protection: Option<&Protection>) -> Result<Vec<u8>> {
         prune(&mut self.doc);
+        crate::pdf::writable_numbers(&mut self.doc);
         let mut copy = self.doc.clone();
         // Saved revisions are byte offsets into the old file and mean nothing in the new one.
         if let Ok(catalog) = copy.catalog_mut() {
