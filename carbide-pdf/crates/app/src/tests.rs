@@ -806,3 +806,54 @@ fn a_password_question_is_never_replaced_by_what_comes_after_it() {
     app.next_dialog();
     assert!(app.dialog.is_none(), "a question about a document no longer in front came back");
 }
+
+#[test]
+fn marked_redactions_follow_the_pages_they_were_drawn_on() {
+    use carbide_engine::{PageGeometry, Rect, Redaction};
+    let dir = scratch();
+    let labels = ["P1", "P2", "P3", "P4", "P5", "P6"];
+    let mut app = app(&dir);
+    app.open_path(&plain(&dir, "six.pdf", &labels));
+    let rect = Rect::new(100.0, 600.0, 200.0, 50.0);
+    app.pending_redactions.push(Redaction { page: 4, rect });
+    let marks = |app: &CarbideApp| app.pending_redactions.iter().map(|r| (r.page, r.rect)).collect::<Vec<_>>();
+
+    // Deleting a page before it, and inserting one, move the mark along.
+    app.current_page = 1;
+    app.run(Cmd::PageDelete);
+    assert_eq!(marks(&app), vec![(3, rect)]);
+    app.current_page = 0;
+    app.run(Cmd::PageInsert);
+    assert_eq!(marks(&app), vec![(4, rect)]);
+    // Moving the marked page, or a page past it, keeps the mark on the same content.
+    app.current_page = 4;
+    app.run(Cmd::MoveDown);
+    assert_eq!(marks(&app), vec![(5, rect)]);
+    app.current_page = 4;
+    app.run(Cmd::MoveDown);
+    assert_eq!(marks(&app), vec![(4, rect)]);
+
+    // Turning the page turns the mark with it: on a 612 x 792 page, a quarter turn clockwise
+    // puts (x, y) at (y, 612 - x).
+    app.current_page = 4;
+    app.run(Cmd::RotateRight);
+    assert_eq!(marks(&app), vec![(4, Rect::new(600.0, 312.0, 50.0, 200.0))]);
+    // The same as the engine maps the page: each corner lands on a corner of the turned mark.
+    let (upright, turned) = (PageGeometry::new(0.0, 0.0, 612.0, 792.0, 0), PageGeometry::new(0.0, 0.0, 612.0, 792.0, 90));
+    for (x, y) in [(100.0, 600.0), (300.0, 650.0)] {
+        let (ux, uy) = upright.map_point(x, y);
+        let (tx, ty) = turned.user_to_display(ux, uy);
+        assert!([600.0, 650.0].contains(&tx.round()) && [312.0, 512.0].contains(&ty.round()), "({x}, {y}) -> ({tx}, {ty})");
+    }
+    app.run(Cmd::RotateLeft);
+    assert_eq!(marks(&app), vec![(4, rect)]);
+
+    // Deleting the marked page takes the mark away.
+    app.run(Cmd::PageDelete);
+    assert!(marks(&app).is_empty());
+
+    // Without a renderer nothing is applied, and the marks are kept.
+    app.pending_redactions.push(Redaction { page: 0, rect });
+    app.run(Cmd::ApplyRedactions);
+    assert_eq!(marks(&app), vec![(0, rect)]);
+}

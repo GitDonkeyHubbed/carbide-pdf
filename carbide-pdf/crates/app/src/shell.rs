@@ -15,7 +15,7 @@ use eframe::egui::{
 use crate::dialogs::{AfterSave, Dialog, Export};
 use crate::icons::{self, Glyph};
 use crate::ribbon::{self, Cmd, RibbonTab};
-use crate::{paths, theme, CarbideApp, Tool};
+use crate::{paths, theme, CarbideApp, PageChange, Tool};
 
 const DISABLED: Color32 = Color32::from_gray(105);
 const ZOOM_100_PERCENT: f32 = 96.0 / 72.0;
@@ -241,8 +241,10 @@ impl CarbideApp {
             Cmd::Ocr => doc.is_some() && self.ocr_job.is_none(),
             Cmd::SignVisible | Cmd::SignInvisible | Cmd::TimeStamp => doc.is_some() && self.sign_job.is_none(),
             Cmd::OpenRevision => doc.is_some_and(|d| d.pdf.can_open_revision()),
-            Cmd::FirstPage | Cmd::PrevPage => doc.is_some() && self.current_page > 0,
-            Cmd::NextPage | Cmd::LastPage => doc.is_some_and(|d| self.current_page + 1 < d.pdf.page_count()),
+            Cmd::FirstPage | Cmd::PrevPage | Cmd::MoveUp => doc.is_some() && self.current_page > 0,
+            Cmd::NextPage | Cmd::LastPage | Cmd::MoveDown => doc.is_some_and(|d| self.current_page + 1 < d.pdf.page_count()),
+            // A document keeps at least one page.
+            Cmd::PageDelete => doc.is_some_and(|d| d.pdf.page_count() > 1),
             _ => doc.is_some(),
         }
     }
@@ -305,23 +307,40 @@ impl CarbideApp {
             Cmd::NewBlank => self.new_blank(),
             Cmd::Combine => self.combine_files(),
 
-            Cmd::PageInsert => self.edit("Insert page", move |p| p.insert_blank_page(page + 1, None)),
+            Cmd::PageInsert => {
+                if self.edit("Insert page", move |p| p.insert_blank_page(page + 1, None)) {
+                    self.follow_page_change(PageChange::Inserted(page + 1), &[]);
+                }
+            }
             Cmd::PageExtract => self.extract_current(),
-            Cmd::PageDelete => self.edit_removing("Delete page", move |p| p.delete_pages(&[page])),
+            Cmd::PageDelete => {
+                if self.edit_removing("Delete page", move |p| p.delete_pages(&[page])) {
+                    self.follow_page_change(PageChange::Deleted(page), &[]);
+                }
+            }
             Cmd::Merge => self.merge_files(),
             Cmd::Split => self.open_dialog(Dialog::Split { doc, ranges: "1-2".into() }),
             Cmd::Imposition => self.open_dialog(Dialog::impose(doc)),
-            Cmd::RotateLeft => self.edit("Rotate left", move |p| p.rotate_pages(&[page], -90)),
-            Cmd::RotateRight => self.edit("Rotate right", move |p| p.rotate_pages(&[page], 90)),
+            Cmd::RotateLeft | Cmd::RotateRight => {
+                let clockwise = cmd == Cmd::RotateRight;
+                let before = self.doc.as_ref().map(|d| d.geometries.clone()).unwrap_or_default();
+                let (label, degrees) = if clockwise { ("Rotate right", 90) } else { ("Rotate left", -90) };
+                if self.edit(label, move |p| p.rotate_pages(&[page], degrees)) {
+                    self.follow_page_change(PageChange::Turned { page, clockwise }, &before);
+                }
+            }
             Cmd::MoveUp => {
-                self.edit("Move page up", move |p| if page > 0 { p.move_page(page, page - 1) } else { Ok(()) });
-                if page > 0 {
-                    self.goto_page(page - 1);
+                let to = page.saturating_sub(1);
+                if self.edit("Move page up", move |p| p.move_page(page, to)) {
+                    self.follow_page_change(PageChange::Moved { from: page, to }, &[]);
+                    self.goto_page(to);
                 }
             }
             Cmd::MoveDown => {
-                self.edit("Move page down", move |p| if page + 1 < p.page_count() { p.move_page(page, page + 1) } else { Ok(()) });
-                self.goto_page(page + 1);
+                if self.edit("Move page down", move |p| p.move_page(page, page + 1)) {
+                    self.follow_page_change(PageChange::Moved { from: page, to: page + 1 }, &[]);
+                    self.goto_page(page + 1);
+                }
             }
 
             Cmd::Typewriter => self.tool = Tool::TextBox,

@@ -229,6 +229,18 @@ struct SignJob {
     result: Option<Result<Vec<u8>, String>>,
 }
 
+/// How an edit changed the pages (see [`CarbideApp::follow_page_change`]).
+#[derive(Clone, Copy, Debug)]
+pub enum PageChange {
+    /// A page was inserted so that it is now at this index.
+    Inserted(usize),
+    Deleted(usize),
+    /// A page was taken out at `from` and put back so that it is at `to`.
+    Moved { from: usize, to: usize },
+    /// A page was turned a quarter turn.
+    Turned { page: usize, clockwise: bool },
+}
+
 #[derive(Clone, Copy)]
 struct DragState {
     page: usize,
@@ -653,15 +665,49 @@ impl CarbideApp {
         self.queue_dialog(Dialog::Message(message));
     }
 
-    /// Runs an edit on the open document with undo support.
-    pub fn edit(&mut self, label: &str, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) {
-        self.run_edit(label, false, f);
+    /// Runs an edit on the open document with undo support, and returns whether it was made.
+    pub fn edit(&mut self, label: &str, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) -> bool {
+        self.run_edit(label, false, f)
     }
 
     /// Runs an edit that takes content out of the document, such as applying redactions or
     /// deleting pages. The next Save then writes a clean file instead of appending to the old one.
-    pub fn edit_removing(&mut self, label: &str, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) {
-        self.run_edit(label, true, f);
+    pub fn edit_removing(&mut self, label: &str, f: impl FnOnce(&mut Pdf) -> Result<(), EngineError>) -> bool {
+        self.run_edit(label, true, f)
+    }
+
+    /// Moves the marked redactions along with an edit that changed the pages, so that each still
+    /// covers what it was drawn over: a mark on a deleted page goes, one on a moved page moves, one
+    /// on a turned page turns with it. `before` is the page geometry from before the edit.
+    pub fn follow_page_change(&mut self, change: PageChange, before: &[PageGeometry]) {
+        let marks = std::mem::take(&mut self.pending_redactions);
+        self.pending_redactions = marks
+            .into_iter()
+            .filter_map(|mark| {
+                let Redaction { page, rect } = mark;
+                let page = match change {
+                    PageChange::Inserted(at) if page >= at => page + 1,
+                    PageChange::Deleted(gone) if page == gone => return None,
+                    PageChange::Deleted(gone) if page > gone => page - 1,
+                    PageChange::Moved { from, to } if page == from => to,
+                    PageChange::Moved { from, to } if from < to && (from + 1..=to).contains(&page) => page - 1,
+                    PageChange::Moved { from, to } if to < from && (to..from).contains(&page) => page + 1,
+                    _ => page,
+                };
+                let rect = match change {
+                    PageChange::Turned { page: turned, clockwise } if turned == page => {
+                        let (w, h) = before.get(page)?.display_size();
+                        if clockwise {
+                            Rect::new(rect.y, w - rect.max_x(), rect.height, rect.width)
+                        } else {
+                            Rect::new(h - rect.max_y(), rect.x, rect.height, rect.width)
+                        }
+                    }
+                    _ => rect,
+                };
+                Some(Redaction { page, rect })
+            })
+            .collect();
     }
 
     /// Runs an edit, and returns whether it was made.
@@ -1653,11 +1699,14 @@ impl CarbideApp {
     }
 
     fn apply_redactions(&mut self) {
-        let (Some(renderer), redactions) = (self.renderer, std::mem::take(&mut self.pending_redactions)) else { return };
-        if redactions.is_empty() {
+        let Some(renderer) = self.renderer else { return };
+        if self.pending_redactions.is_empty() {
             return;
         }
+        // The marks stay until the redaction is made, so a failed one loses none of them.
+        let redactions = self.pending_redactions.clone();
         if self.run_edit("Apply redactions", true, move |pdf| pdf.apply_redactions(renderer, &redactions, 200.0)) {
+            self.pending_redactions.clear();
             // The same text may still be elsewhere in the document, so offer to look.
             if let Some(doc) = self.doc.as_ref() {
                 self.open_dialog(Dialog::SuggestRemoveHidden { doc: doc.id });
