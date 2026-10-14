@@ -954,3 +954,73 @@ fn ending_without_the_quit_question_keeps_unsaved_work_recoverable() {
     assert!(app.tabs.is_empty() && app.doc.is_none());
     assert_eq!(recovery_copies(&dir), 1, "the unsaved document has no recovery copy");
 }
+
+#[test]
+fn pages_of_any_size_are_laid_out_and_drawn_within_limits() {
+    use crate::{layout_size, texture_size, thumbnail_size, thumbnails_fit, MAX_LAYOUT_SIDE, THUMBNAIL_CACHE_PIXELS, THUMBNAIL_WIDTH};
+    // Sizes a file can give, and some it cannot once it is read, are laid out as numbers.
+    for page in [(f32::INFINITY, f32::INFINITY), (f32::NAN, 792.0), (0.0, 0.0), (-5.0, 792.0), (1.2e38, 792.0), (612.0, 14_400.0)] {
+        let (w, h) = layout_size(page);
+        assert!((1.0..=MAX_LAYOUT_SIDE).contains(&w) && (1.0..=MAX_LAYOUT_SIDE).contains(&h), "{page:?}: {w} x {h}");
+        let thumbnail = thumbnail_size(page);
+        assert!(thumbnail.x.is_finite() && thumbnail.y.is_finite(), "{page:?}: {thumbnail:?}");
+        assert!(thumbnail.x <= THUMBNAIL_WIDTH && thumbnail.y <= 4.0 * THUMBNAIL_WIDTH, "{page:?}: {thumbnail:?}");
+        let [tw, th] = texture_size((w, h), thumbnail.x * 2.0, 8192);
+        assert!(tw * th <= 4 * 1_000_000, "{page:?}: a thumbnail of {tw} x {th}");
+    }
+    let letter = thumbnail_size((612.0, 792.0));
+    assert!(letter.x == THUMBNAIL_WIDTH && (letter.y - THUMBNAIL_WIDTH * 792.0 / 612.0).abs() < 0.01, "{letter:?}");
+    // Thumbnails kept for redrawing hold no more than their share of memory.
+    assert!(thumbnails_fit(std::iter::repeat_n([220, 285], 200)));
+    assert!(!thumbnails_fit(std::iter::repeat_n([220, 285], THUMBNAIL_CACHE_PIXELS / (220 * 285) + 1)));
+
+    // A document of such pages, and one whose page draws itself, shown at every zoom.
+    let Ok(renderer) = carbide_engine::Renderer::global() else { return };
+    let dir = scratch();
+    let mut pdf = document(&["LETTER"]);
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    pdf.insert_blank_page(2, Some((612.0, 14_400.0))).unwrap();
+    pdf.insert_blank_page(3, Some((1_000_000.0, 1_000_000.0))).unwrap();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let form = doc.new_object_id();
+    let dict = lopdf::dictionary! { "Subtype" => "Form", "Resources" => lopdf::dictionary! { "XObject" => lopdf::dictionary! { "X" => form } } };
+    doc.objects.insert(form, lopdf::Object::Stream(lopdf::Stream::new(dict, b"/X Do /X Do".to_vec())));
+    let draw = doc.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), b"/X Do".to_vec()));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", lopdf::dictionary! { "XObject" => lopdf::dictionary! { "X" => form } });
+    page.set("Contents", draw);
+    let path = dir.join("sizes.pdf");
+    std::fs::write(&path, pdf.to_bytes().unwrap()).unwrap();
+    let mut app = app(&dir);
+    app.renderer = Some(renderer);
+    app.open_path(&path);
+    let ctx = egui::Context::default();
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+        max_texture_side: Some(4096),
+        ..Default::default()
+    };
+    for zoom in [None, Some(crate::shell::MIN_ZOOM), Some(crate::shell::MAX_ZOOM)] {
+        if let Some(zoom) = zoom {
+            app.zoom = zoom;
+            app.shell.fit = crate::shell::Fit::Manual;
+        }
+        for page in 0..4 {
+            app.current_page = page;
+            app.scroll_to = Some(page);
+            // Laying out and scrolling take a few frames.
+            for _ in 0..3 {
+                ctx.run_ui(input(), |ui| app.draw_shell(ui)).drop_without_applying_deltas();
+            }
+        }
+    }
+    let largest = app.textures.values().chain(app.thumbs.values()).map(|t| t.size()).max_by_key(|[w, h]| w * h).unwrap();
+    assert!(largest[0] <= 4096 && largest[1] <= 4096 && largest[0] * largest[1] <= 16 << 20, "{largest:?}");
+    // The page that draws itself is not rendered: PDFium would never finish it. The others are.
+    let version = app.doc.as_ref().unwrap().version;
+    assert_eq!(app.drawable.get(&(version, 0)), Some(&false));
+    assert_eq!(app.drawable.get(&(version, 1)), Some(&true));
+    let pages: Vec<usize> = app.thumbs.keys().map(|&(_, page)| page).chain(app.textures.keys().map(|&(_, page, _)| page)).collect();
+    assert!(!pages.contains(&0) && pages.contains(&1), "{pages:?}");
+}

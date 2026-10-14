@@ -19,6 +19,9 @@ use crate::{paths, theme, CarbideApp, PageChange, Tool};
 
 const DISABLED: Color32 = Color32::from_gray(105);
 const ZOOM_100_PERCENT: f32 = 96.0 / 72.0;
+/// The zoom range, as a scale of points to screen points.
+pub const MIN_ZOOM: f32 = 0.25;
+pub const MAX_ZOOM: f32 = 6.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Fit {
@@ -285,7 +288,7 @@ impl CarbideApp {
     }
 
     fn set_zoom(&mut self, zoom: f32) {
-        self.zoom = zoom.clamp(0.25, 6.0);
+        self.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
         self.shell.fit = Fit::Manual;
     }
 

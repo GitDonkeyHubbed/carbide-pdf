@@ -273,6 +273,9 @@ pub struct CarbideApp {
     queued_dialogs: VecDeque<Dialog>,
     textures: HashMap<(u64, usize, u32), egui::TextureHandle>,
     thumbs: HashMap<(u64, usize), egui::TextureHandle>,
+    /// Whether each page of the active document, by version, can be rendered safely (see
+    /// [`Pdf::check_drawable`]).
+    drawable: HashMap<(u64, usize), bool>,
     drag: Option<DragState>,
     pub pending_redactions: Vec<Redaction>,
     pub current_page: usize,
@@ -339,6 +342,7 @@ impl CarbideApp {
             queued_dialogs: VecDeque::new(),
             textures: HashMap::new(),
             thumbs: HashMap::new(),
+            drawable: HashMap::new(),
             drag: None,
             pending_redactions: Vec::new(),
             current_page: 0,
@@ -470,10 +474,16 @@ impl CarbideApp {
     }
 
     fn reset_view_caches(&mut self) {
-        self.textures.clear();
-        self.thumbs.clear();
+        self.forget_page_images();
         self.drag = None;
         self.shell.forget_caches();
+    }
+
+    /// Drops the page images and what is known about drawing the pages, after the document changed.
+    fn forget_page_images(&mut self) {
+        self.textures.clear();
+        self.thumbs.clear();
+        self.drawable.clear();
     }
 
     /// The document in tab `index`, whether it is the active one or parked.
@@ -736,8 +746,7 @@ impl CarbideApp {
                 doc.content_removed = doc.content_removed || doc.removes_content(removes);
                 doc.dirty = true;
                 self.status = format!("{label} done.");
-                self.textures.clear();
-                self.thumbs.clear();
+                self.forget_page_images();
                 true
             }
             Err(e) => {
@@ -886,8 +895,7 @@ impl CarbideApp {
                 let _ = store.remove_record(recovered.record);
             }
         }
-        self.textures.clear();
-        self.thumbs.clear();
+        self.forget_page_images();
         self.shell.forget_caches();
         self.notice = signature_notice(self.doc.as_ref().expect("checked above"));
     }
@@ -1131,18 +1139,21 @@ impl CarbideApp {
         let count = doc.pdf.page_count();
         let bytes = &doc.bytes;
         let geometries = &doc.geometries;
+        let drawable = &mut self.drawable;
         let mut goto: Option<usize> = None;
+        let mut shown = std::collections::HashSet::new();
         let max_side = max_texture_side(ui.ctx().input(|i| i.max_texture_side));
         egui::ScrollArea::vertical().show(ui, |ui| {
             for page in 0..count {
-                let (w, h) = geometries.get(page).map(|g| g.display_size()).unwrap_or((612.0, 792.0));
-                let width = 110.0f32;
-                let size = egui::vec2(width, width * h / w.max(1.0));
-                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+                let (w, h) = layout_size(geometries.get(page).map(|g| g.display_size()).unwrap_or((612.0, 792.0)));
+                let size = thumbnail_size((w, h));
+                let (column, response) = ui.allocate_exact_size(egui::vec2(THUMBNAIL_WIDTH, size.y), egui::Sense::click());
+                let rect = egui::Rect::from_center_size(column.center(), size);
                 if ui.is_rect_visible(rect) {
                     let key = (version, page);
-                    if !self.thumbs.contains_key(&key) {
-                        let [tw, th] = texture_size((w, h), width * ui.ctx().pixels_per_point(), max_side);
+                    shown.insert(key);
+                    if !self.thumbs.contains_key(&key) && page_drawable(drawable, doc, page) {
+                        let [tw, th] = texture_size((w, h), size.x * ui.ctx().pixels_per_point(), max_side);
                         let texture = renderer
                             .render_page_fitting(bytes, page, tw, th)
                             .ok()
@@ -1158,6 +1169,8 @@ impl CarbideApp {
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
                         );
+                    } else {
+                        ui.painter().rect_filled(rect, 0.0, egui::Color32::WHITE);
                     }
                     let outline = if page == self.current_page { theme::ACCENT } else { egui::Color32::GRAY };
                     ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.5, outline), egui::StrokeKind::Outside);
@@ -1168,6 +1181,10 @@ impl CarbideApp {
                 }
             }
         });
+        // Thumbnails scrolled out of view go once they hold more than their share of memory.
+        if !thumbnails_fit(self.thumbs.values().map(|texture| texture.size())) {
+            self.thumbs.retain(|key, _| shown.contains(key));
+        }
         if let Some(page) = goto {
             self.scroll_to = Some(page);
             self.current_page = page;
@@ -1188,17 +1205,17 @@ impl CarbideApp {
         // Fit modes and pinch / ctrl-scroll zoom adjust the zoom before the pages are laid out.
         let pinch = ui.ctx().input(|i| i.zoom_delta());
         if (pinch - 1.0).abs() > 1e-3 && ui.rect_contains_pointer(ui.max_rect()) {
-            self.zoom = (self.zoom * pinch).clamp(0.25, 6.0);
+            self.zoom = (self.zoom * pinch).clamp(shell::MIN_ZOOM, shell::MAX_ZOOM);
             self.shell.fit = shell::Fit::Manual;
         }
         if self.shell.fit != shell::Fit::Manual {
             if let Some(g) = self.doc.as_ref().and_then(|d| d.geometries.get(self.current_page)) {
-                let (w, h) = g.display_size();
+                let (w, h) = layout_size(g.display_size());
                 let avail = ui.available_size();
                 let by_width = (avail.x - 48.0) / w.max(1.0);
                 let by_height = (avail.y - 24.0) / h.max(1.0);
                 let fitted = if self.shell.fit == shell::Fit::Width { by_width } else { by_width.min(by_height) };
-                self.zoom = fitted.clamp(0.25, 6.0);
+                self.zoom = fitted.clamp(shell::MIN_ZOOM, shell::MAX_ZOOM);
             }
         }
 
@@ -1214,6 +1231,7 @@ impl CarbideApp {
             let geometries = &doc.geometries;
             let pending = &self.pending_redactions;
             let textures = &mut self.textures;
+            let drawable = &mut self.drawable;
             let pixels_per_point = ui.ctx().pixels_per_point();
             let max_side = max_texture_side(ui.ctx().input(|i| i.max_texture_side));
             let viewport_top = ui.clip_rect().min.y;
@@ -1221,7 +1239,7 @@ impl CarbideApp {
             egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     for page in 0..count {
-                        let (w, h) = geometries.get(page).map(|g| g.display_size()).unwrap_or((612.0, 792.0));
+                        let (w, h) = layout_size(geometries.get(page).map(|g| g.display_size()).unwrap_or((612.0, 792.0)));
                         let size = egui::vec2(w * zoom, h * zoom);
                         let sense = if tool == Tool::Select { egui::Sense::hover() } else { egui::Sense::click_and_drag() };
                         let (rect, response) = ui.allocate_exact_size(size, sense);
@@ -1236,7 +1254,15 @@ impl CarbideApp {
                         ui.painter().rect_filled(rect.translate(egui::vec2(3.0, 3.0)), 0.0, egui::Color32::from_black_alpha(40));
                         ui.painter().rect_filled(rect, 0.0, egui::Color32::WHITE);
 
-                        if ui.is_rect_visible(rect) {
+                        if ui.is_rect_visible(rect) && !page_drawable(drawable, doc, page) {
+                            ui.painter().text(
+                                rect.center_top() + egui::vec2(0.0, 40.0),
+                                egui::Align2::CENTER_CENTER,
+                                "This page is too complex to show safely.",
+                                egui::FontId::proportional(14.0),
+                                egui::Color32::DARK_GRAY,
+                            );
+                        } else if ui.is_rect_visible(rect) {
                             let [tw, th] = texture_size((w, h), size.x * pixels_per_point, max_side);
                             let key = (version, page, tw);
                             if !textures.contains_key(&key) {
@@ -1346,10 +1372,12 @@ impl CarbideApp {
                     self.open_dialog(Dialog::Note { doc: doc_id, page, x, y, on_page, text: String::new() });
                 }
                 Action::Markup { page, rect, style, snap } => {
-                    let (bytes, geometry) = match self.doc.as_ref() {
-                        Some(d) => (d.bytes.clone(), d.geometries.get(page).copied()),
+                    let (bytes, geometry, readable) = match self.doc.as_ref() {
+                        Some(d) => (d.bytes.clone(), d.geometries.get(page).copied(), page_drawable(&mut self.drawable, d, page)),
                         None => continue,
                     };
+                    // Reading the text of a page that cannot be rendered safely is no safer.
+                    let snap = snap && readable;
                     // Snap to the text lines inside the dragged area; fall back to the area itself.
                     let lines = match (snap, geometry) {
                         (true, Some(g)) => match renderer.text_line_rects(&bytes, page, &g, rect) {
@@ -1831,6 +1859,43 @@ fn signature_notice(doc: &OpenDoc) -> Option<String> {
     let trust = paths::load_trust_store();
     let reports = Pdf::verify_signatures_with_password(bytes, password, &trust, chrono::Utc::now()).ok()?;
     carbide_engine::signature::notice_text(&reports).map(str::to_string)
+}
+
+/// Whether page `page` of `doc` can be rendered safely (see [`Pdf::check_drawable`]), worked out
+/// once for each version of the document.
+fn page_drawable(drawable: &mut HashMap<(u64, usize), bool>, doc: &OpenDoc, page: usize) -> bool {
+    *drawable.entry((doc.version, page)).or_insert_with(|| doc.pdf.check_drawable(page).is_ok())
+}
+
+/// The longest side a page is laid out with, in points: as far as page boxes reach.
+const MAX_LAYOUT_SIDE: f32 = 2.0 * carbide_engine::pagetree::MAX_COORDINATE;
+
+/// The size a page displayed `page` (width, height) points large is laid out at: each side a
+/// number from 1 to [`MAX_LAYOUT_SIDE`], whatever the file says, so that layout never meets a
+/// size that is not a number.
+pub fn layout_size(page: (f32, f32)) -> (f32, f32) {
+    let side = |v: f32| if v.is_nan() { 1.0 } else { v.clamp(1.0, MAX_LAYOUT_SIDE) };
+    (side(page.0), side(page.1))
+}
+
+/// How wide the thumbnail column is, in points.
+const THUMBNAIL_WIDTH: f32 = 110.0;
+
+/// The size a thumbnail of a page laid out `page` (width, height) points large is shown at: the
+/// width of the column, or less for a page more than four times as tall as it is wide, so that a
+/// strip of a page does not take the whole panel.
+pub fn thumbnail_size(page: (f32, f32)) -> egui::Vec2 {
+    let (w, h) = layout_size(page);
+    let scale = (THUMBNAIL_WIDTH / w).min(4.0 * THUMBNAIL_WIDTH / h);
+    egui::vec2((w * scale).clamp(2.0, THUMBNAIL_WIDTH), (h * scale).clamp(2.0, 4.0 * THUMBNAIL_WIDTH))
+}
+
+/// The most pixels the thumbnail images kept for redrawing hold together: 64 MB.
+const THUMBNAIL_CACHE_PIXELS: usize = 16 << 20;
+
+/// True while thumbnail images of `sizes` hold no more than [`THUMBNAIL_CACHE_PIXELS`].
+pub fn thumbnails_fit(sizes: impl Iterator<Item = [usize; 2]>) -> bool {
+    sizes.map(|[w, h]| w * h).sum::<usize>() <= THUMBNAIL_CACHE_PIXELS
 }
 
 /// The texture side assumed when egui does not say what the GPU takes; every GPU egui runs on
