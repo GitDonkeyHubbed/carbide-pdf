@@ -45,6 +45,12 @@ type Uses = HashSet<(&'static [u8], Vec<u8>)>;
 /// Deeper nesting than this is treated as damaged and left alone.
 const MAX_DEPTH: usize = 64;
 
+/// The most different names one page's content, with the forms, patterns, glyphs and
+/// appearances it draws, may give the operators that look a resource up. Real pages give a few
+/// hundred; each name is kept while the page is read, so without a limit millions of names in
+/// content within the limit for one page in [`crate::limits`] could take gigabytes.
+const MAX_NAMES: usize = 100_000;
+
 impl Pdf {
     /// The annotations placed on `pages`, with the page each is on.
     fn annotations_on(&self, pages: &HashSet<ObjectId>) -> HashMap<ObjectId, ObjectId> {
@@ -281,9 +287,9 @@ impl Pdf {
     /// one resource dictionary. A page whose content cannot be read keeps all of its resources.
     ///
     /// Each page's content, with the forms it draws, is decoded within the limit for one page in
-    /// [`crate::limits`]; past it, or with forms nested deeper than a page may draw them, this
-    /// fails with [`Error::TooLarge`] rather than keep resources that may be what removed content
-    /// alone used.
+    /// [`crate::limits`]; past it, with forms nested deeper than a page may draw them, or with
+    /// more different resource names than [`MAX_NAMES`], this fails with [`Error::TooLarge`]
+    /// rather than keep resources that may be what removed content alone used.
     pub(crate) fn trim_resources(&mut self) -> Result<()> {
         let pages = self.page_ids();
         let mut shared = HashSet::new();
@@ -303,6 +309,7 @@ impl Pdf {
         let mut changes = Vec::new();
         let mut scan = NameScan {
             budget: DecodeBudget::for_page(),
+            names_left: MAX_NAMES,
             names: HashMap::new(),
             joined: HashMap::new(),
             trimmed: HashSet::new(),
@@ -321,6 +328,7 @@ impl Pdf {
                 .ok()
                 .cloned();
             scan.budget = DecodeBudget::for_page();
+            scan.names_left = MAX_NAMES;
             let mut kept = match self.names_used_by_page(*page, &resources, &mut scan)? {
                 Some(uses) => self.keep_named(&resources, &uses),
                 None => resources.clone(),
@@ -701,6 +709,8 @@ impl Pdf {
 /// each page's streams decoded within the budget of one page.
 struct NameScan {
     budget: DecodeBudget,
+    /// How many more different names the page being read may use (see [`MAX_NAMES`]).
+    names_left: usize,
     names: HashMap<ObjectId, Option<Uses>>,
     /// What the content of pages split over several streams uses, by the streams, in order.
     joined: HashMap<Vec<ObjectId>, Option<Uses>>,
@@ -721,7 +731,9 @@ impl NameScan {
             return self.uses_in(Some(id), content);
         }
         if let Some(found) = self.joined.get(&streams) {
-            return Ok(found.clone());
+            let found = found.clone();
+            self.count(&found)?;
+            return Ok(found);
         }
         let mut joined = Vec::new();
         let mut readable = true;
@@ -742,7 +754,11 @@ impl NameScan {
                 }
             }
         }
-        let found = readable.then(|| uses_in(&joined));
+        let found = if readable {
+            Some(uses_in(&joined, &mut self.names_left)?)
+        } else {
+            None
+        };
         self.joined.insert(streams, found.clone());
         Ok(found)
     }
@@ -751,10 +767,12 @@ impl NameScan {
     /// cannot be decoded, and an error when decoding it would go past the budget.
     fn uses_in(&mut self, id: Option<ObjectId>, stream: &lopdf::Stream) -> Result<Option<Uses>> {
         if let Some(found) = id.and_then(|id| self.names.get(&id)) {
-            return Ok(found.clone());
+            let found = found.clone();
+            self.count(&found)?;
+            return Ok(found);
         }
         let found = match self.budget.stream(stream) {
-            Ok(plain) => Some(uses_in(&plain)),
+            Ok(plain) => Some(uses_in(&plain, &mut self.names_left)?),
             Err(error @ Error::TooLarge(_)) => return Err(error),
             Err(_) => None,
         };
@@ -762,6 +780,17 @@ impl NameScan {
             self.names.insert(id, found.clone());
         }
         Ok(found)
+    }
+
+    /// Counts the names in `found`, found before, against those the page being read may use: the
+    /// copy of them it is given takes as much memory as reading them did.
+    fn count(&mut self, found: &Option<Uses>) -> Result<()> {
+        let used = found.as_ref().map_or(0, HashSet::len);
+        self.names_left = self
+            .names_left
+            .checked_sub(used)
+            .ok_or_else(|| Error::TooLarge(messages::TOO_COMPLEX.into()))?;
+        Ok(())
     }
 }
 
@@ -779,14 +808,20 @@ pub(crate) fn widget_area(widget: &Dictionary) -> Option<[f32; 4]> {
 /// The resources `content` uses: the names given to the operators that look a resource up, each
 /// in the category that operator looks in. Names inside an inline image's dictionary count as
 /// colour spaces, and every name given to a marked-content operator as properties.
-fn uses_in(content: &[u8]) -> Uses {
+///
+/// `left` is how many more different names may be kept, and goes down by those this content
+/// uses; past it, or with more different names before one operator than [`MAX_NAMES`], this
+/// fails with [`Error::TooLarge`].
+fn uses_in(content: &[u8], left: &mut usize) -> Result<Uses> {
     let mut uses = HashSet::new();
     // Which operand a name is, or how often it is given, does not matter: each is kept once, so
     // a name given millions of times before an operator takes no more memory than one.
     let mut operands: HashSet<&[u8]> = HashSet::new();
+    let mut over = false;
     tokens(content, |token| match token {
+        _ if over => {}
         Token::Name(written) => {
-            operands.insert(written);
+            over = operands.insert(written) && operands.len() > MAX_NAMES;
         }
         Token::Operator(operator) => {
             let category = match operator {
@@ -800,17 +835,26 @@ fn uses_in(content: &[u8]) -> Uses {
                 _ => None,
             };
             if let Some(category) = category {
-                uses.extend(
-                    operands
-                        .iter()
-                        .map(|written| (category, name(written).into_owned())),
-                );
+                for written in &operands {
+                    if uses.insert((category, name(written).into_owned())) {
+                        match left.checked_sub(1) {
+                            Some(fewer) => *left = fewer,
+                            None => {
+                                over = true;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             operands.clear();
         }
         _ => {}
     });
-    uses
+    if over {
+        return Err(Error::TooLarge(messages::TOO_COMPLEX.into()));
+    }
+    Ok(uses)
 }
 
 /// Whether `dict` is that of a stream that holds content: a form or a tiling pattern.

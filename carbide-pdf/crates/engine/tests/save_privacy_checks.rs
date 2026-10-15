@@ -464,6 +464,45 @@ fn deleted_page_image_does_not_survive_in_the_appearance_of_a_kept_annotation() 
     );
 }
 
+/// A document whose first page draws `names` different forms, none of them there, and whose
+/// second page draws the secret image.
+fn many_names_pdf(names: usize) -> Pdf {
+    let content: String = (0..names).map(|i| format!("/N{i} Do ")).collect();
+    shared_resources_pdf(
+        |doc| {
+            let image = secret_image(doc);
+            dictionary! { "XObject" => dictionary! { "Im1" => image } }
+        },
+        &[&content, "q 100 0 0 100 0 0 cm /Im1 Do Q"],
+    )
+}
+
+#[test]
+fn a_page_naming_too_many_different_resources_is_refused() {
+    // Each name is kept while the page is read: 200,000 different ones are refused rather than
+    // held, however small the content that names them.
+    let mut pdf = many_names_pdf(200_000);
+    LARGEST.with(|largest| largest.set(0));
+    assert!(matches!(
+        pdf.delete_pages(&[1]),
+        Err(carbide_engine::Error::TooLarge(_))
+    ));
+    let largest = LARGEST.with(std::cell::Cell::get);
+    assert!(
+        largest < 8 << 20,
+        "reading the page's names took a block of {largest} bytes"
+    );
+
+    // A page naming a few thousand is read as before.
+    let mut pdf = many_names_pdf(5_000);
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+}
+
 // ---- legacy passwords ----------------------------------------------------------------------
 
 const PADDING: [u8; 32] = [
