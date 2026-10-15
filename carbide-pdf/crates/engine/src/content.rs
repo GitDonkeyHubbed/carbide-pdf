@@ -109,7 +109,7 @@ pub(crate) enum Token<'a> {
 
 /// Goes through the content stream `data` token by token, without building a list of its
 /// operations: lopdf's parser makes a few hundred bytes of objects for every operator, so a
-/// stream of a few megabytes of `q` would take gigabytes. The data of inline images is skipped.
+/// stream of a few megabytes of `q` would take gigabytes. The data of inline images, from the `ID` that follows a `BI`, is skipped.
 pub(crate) fn tokens<'a>(data: &'a [u8], mut visit: impl FnMut(Token<'a>)) {
     let is_space = |b: u8| matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ');
     let is_delimiter = |b: u8| {
@@ -119,6 +119,9 @@ pub(crate) fn tokens<'a>(data: &'a [u8], mut visit: impl FnMut(Token<'a>)) {
         )
     };
     let mut at = 0;
+    // Whether a `BI` has begun an inline image whose data has not started: an `ID` stands for the
+    // start of data only after one.
+    let mut in_image_header = false;
     while at < data.len() {
         let byte = data[at];
         if is_space(byte) {
@@ -201,7 +204,9 @@ pub(crate) fn tokens<'a>(data: &'a [u8], mut visit: impl FnMut(Token<'a>)) {
                     visit(Token::Other);
                 } else {
                     visit(Token::Operator(word));
-                    if word == b"ID" {
+                    if word == b"BI" {
+                        in_image_header = true;
+                    } else if word == b"ID" && std::mem::take(&mut in_image_header) {
                         // Inline image data runs from the byte after ID up to EI standing alone.
                         let image = at + 1;
                         let end = (image..data.len().saturating_sub(1)).find(|&i| {

@@ -194,3 +194,37 @@ fn a_form_found_again_is_as_deep_as_it_was_where_it_was_first_drawn() {
     assert!(matches!(pdf.check_drawable(0), Err(Error::TooLarge(_))));
 }
 
+// ---- inline images -------------------------------------------------------------------------
+
+#[test]
+fn a_stray_id_does_not_hide_the_forms_drawn_after_it() {
+    let mut pdf = blank_page_pdf();
+    let f = self_drawing_form(&mut pdf);
+    page_drawing(&mut pdf, b"ID /F Do", f);
+    assert!(
+        matches!(pdf.check_drawable(0), Err(Error::TooLarge(_))),
+        "a form drawing itself went unnoticed after a stray ID"
+    );
+}
+
+#[test]
+fn what_follows_a_real_inline_image_is_still_read() {
+    let mut pdf = blank_page_pdf();
+    let f = self_drawing_form(&mut pdf);
+    page_drawing(
+        &mut pdf,
+        b"q BI /W 1 /H 1 /CS /G /BPC 8 ID \x00 EI Q /F Do",
+        f,
+    );
+    assert!(matches!(pdf.check_drawable(0), Err(Error::TooLarge(_))));
+    // Drawing something that looks like a form inside the image data is not drawing it.
+    let mut pdf = blank_page_pdf();
+    let f = self_drawing_form(&mut pdf);
+    page_drawing(
+        &mut pdf,
+        b"BI /W 2 /H 1 /CS /G /BPC 8 ID /F Do EI",
+        f,
+    );
+    pdf.check_drawable(0).unwrap();
+}
+
