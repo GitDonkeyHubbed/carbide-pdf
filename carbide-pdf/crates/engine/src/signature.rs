@@ -1530,31 +1530,36 @@ fn can_issue(
         && valid_at(cert, at)
 }
 
-/// The extensions path validation here takes into account: basic constraints, key usage, extended
-/// key usage, and the subject and authority key identifiers and subject alternative names, which
-/// only describe the certificate.
-const UNDERSTOOD_EXTENSIONS: [&str; 6] = [
-    "2.5.29.19",
-    "2.5.29.15",
-    "2.5.29.37",
-    "2.5.29.14",
-    "2.5.29.35",
-    "2.5.29.17",
-];
-
-/// True when every extension `cert` marks critical is one this verifier processes. RFC 5280 (4.2)
-/// says a certificate with a critical extension the verifier does not recognise must be rejected:
-/// the extension may restrict what the certificate is good for.
+/// True when every extension `cert` marks critical is one this verifier processes, and its value
+/// decodes. RFC 5280 (4.2) says a certificate with a critical extension the verifier does not
+/// recognise must be rejected: the extension may restrict what the certificate is good for. One it
+/// recognises but cannot read is no better.
 fn critical_extensions_understood(cert: &Certificate) -> bool {
     cert.tbs_certificate
         .extensions
         .as_ref()
         .is_none_or(|extensions| {
-            extensions.iter().all(|extension| {
-                !extension.critical
-                    || UNDERSTOOD_EXTENSIONS.contains(&extension.extn_id.to_string().as_str())
-            })
+            extensions
+                .iter()
+                .all(|extension| !extension.critical || critical_extension_decodes(extension))
         })
+}
+
+/// True when `extension` is one path validation here takes into account and its value is well
+/// formed: basic constraints, key usage, extended key usage, and the subject and authority key
+/// identifiers and subject alternative names, which only describe the certificate.
+fn critical_extension_decodes(extension: &x509_cert::ext::Extension) -> bool {
+    use x509_cert::ext::pkix;
+    let value = extension.extn_value.as_bytes();
+    match extension.extn_id.to_string().as_str() {
+        "2.5.29.19" => pkix::BasicConstraints::from_der(value).is_ok(),
+        "2.5.29.15" => pkix::KeyUsage::from_der(value).is_ok(),
+        "2.5.29.37" => pkix::ExtendedKeyUsage::from_der(value).is_ok(),
+        "2.5.29.14" => pkix::SubjectKeyIdentifier::from_der(value).is_ok(),
+        "2.5.29.35" => pkix::AuthorityKeyIdentifier::from_der(value).is_ok(),
+        "2.5.29.17" => pkix::SubjectAltName::from_der(value).is_ok(),
+        _ => false,
+    }
 }
 
 /// True when `cert` carries an extension `oid`.

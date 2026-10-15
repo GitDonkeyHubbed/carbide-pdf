@@ -420,6 +420,41 @@ fn a_critical_extension_nothing_checks_leaves_the_identity_unconfirmed() {
     assert_eq!(chain_outcome(&identity, &root), VIA_CHAIN);
 }
 
+/// A critical extension under a standard `oid` whose value is a NULL, which none of them allow.
+fn malformed_critical_extension(oid: &[u64]) -> rcgen::CustomExtension {
+    let mut extension = rcgen::CustomExtension::from_oid_content(oid, null());
+    extension.set_criticality(true);
+    extension
+}
+
+#[test]
+fn a_critical_extension_that_does_not_decode_leaves_the_identity_unconfirmed() {
+    let (root, root_issuer) = ca("Root CA", None, |_| {});
+    // subjectAltName, subjectKeyIdentifier, authorityKeyIdentifier: extensions that only describe
+    // the certificate, which are accepted by their identifier alone if they are not decoded.
+    for oid in [&[2, 5, 29, 17][..], &[2, 5, 29, 14], &[2, 5, 29, 35]] {
+        let identity = leaf(&root_issuer, &[], |p| {
+            p.custom_extensions.push(malformed_critical_extension(oid))
+        });
+        assert_eq!(chain_outcome(&identity, &root), REJECTED, "signer, {oid:?}");
+
+        let (intermediate, intermediate_issuer) = ca("Intermediate CA", Some(&root_issuer), |p| {
+            p.custom_extensions.push(malformed_critical_extension(oid))
+        });
+        let identity = leaf(&intermediate_issuer, &[intermediate], |_| {});
+        assert_eq!(chain_outcome(&identity, &root), REJECTED, "CA, {oid:?}");
+    }
+
+    // The same malformed extension, not marked critical, may be ignored.
+    let (intermediate, intermediate_issuer) = ca("Intermediate CA", Some(&root_issuer), |p| {
+        let mut extension = malformed_critical_extension(&[2, 5, 29, 17]);
+        extension.set_criticality(false);
+        p.custom_extensions.push(extension)
+    });
+    let identity = leaf(&intermediate_issuer, &[intermediate], |_| {});
+    assert_eq!(chain_outcome(&identity, &root), VIA_CHAIN);
+}
+
 #[test]
 fn name_constraints_on_a_ca_leave_the_identity_unconfirmed() {
     let (root, root_issuer) = ca("Constrained Root CA", None, |p| {
