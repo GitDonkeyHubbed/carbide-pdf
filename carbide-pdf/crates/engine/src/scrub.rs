@@ -15,16 +15,28 @@ use crate::error::{Error, Result};
 use crate::limits::DecodeBudget;
 use crate::pdf::Pdf;
 
+const FONT: &[u8] = b"Font";
+const XOBJECT: &[u8] = b"XObject";
+const EXT_G_STATE: &[u8] = b"ExtGState";
+const COLOR_SPACE: &[u8] = b"ColorSpace";
+const PATTERN: &[u8] = b"Pattern";
+const SHADING: &[u8] = b"Shading";
+const PROPERTIES: &[u8] = b"Properties";
+
 /// Resource categories whose entries content refers to by name.
 const NAMED_RESOURCES: [&[u8]; 7] = [
-    b"Font",
-    b"XObject",
-    b"ExtGState",
-    b"ColorSpace",
-    b"Pattern",
-    b"Shading",
-    b"Properties",
+    FONT,
+    XOBJECT,
+    EXT_G_STATE,
+    COLOR_SPACE,
+    PATTERN,
+    SHADING,
+    PROPERTIES,
 ];
+
+/// The resources content uses: each name with the category it is looked up in. A font `/R1`
+/// does not keep an image that is also called `/R1`.
+type Uses = HashSet<(&'static [u8], Vec<u8>)>;
 
 /// Deeper nesting than this is treated as damaged and left alone.
 const MAX_DEPTH: usize = 64;
@@ -300,7 +312,7 @@ impl Pdf {
                 .cloned();
             scan.budget = DecodeBudget::for_page();
             let kept = match self.names_used_by_page(*page, &resources, &mut scan)? {
-                Some(names) => self.keep_named(&resources, &names),
+                Some(uses) => self.keep_named(&resources, &uses),
                 None => resources.clone(),
             };
             let independent = match &own {
@@ -337,26 +349,37 @@ impl Pdf {
         Ok(())
     }
 
-    /// The resource names the page's content refers to, following forms, patterns and Type 3
-    /// fonts that use the page's resources instead of their own. `None` when some content cannot
-    /// be read; an error when decoding it would go past the limits in [`crate::limits`].
+    /// The resources the page's content uses, following forms, patterns and Type 3 fonts that use
+    /// the page's resources instead of their own. `None` when some content cannot be read; an
+    /// error when decoding it would go past the limits in [`crate::limits`].
     fn names_used_by_page(
         &self,
         page: ObjectId,
         resources: &Dictionary,
         scan: &mut NameScan,
-    ) -> Result<Option<HashSet<Vec<u8>>>> {
-        let mut names = HashSet::new();
+    ) -> Result<Option<Uses>> {
+        let mut uses = HashSet::new();
         for stream in self.doc.get_page_contents(page) {
             let Ok(content) = self.doc.get_object(stream).and_then(Object::as_stream) else {
                 return Ok(None);
             };
-            let Some(found) = scan.names_in(Some(stream), content)? else {
+            let Some(found) = scan.uses_in(Some(stream), content)? else {
                 return Ok(None);
             };
-            names.extend(found);
+            uses.extend(found);
         }
-        // Resources that are drawn without resources of their own use the page's.
+        self.scope_uses(uses, resources, scan)
+    }
+
+    /// `uses`, the resources some content uses directly, together with what the forms, patterns
+    /// and Type 3 fonts among them that have no resources of their own use from `resources`.
+    fn scope_uses(
+        &self,
+        mut uses: Uses,
+        resources: &Dictionary,
+        scan: &mut NameScan,
+    ) -> Result<Option<Uses>> {
+        // Resources that are drawn without resources of their own use the enclosing ones.
         let mut followed = HashSet::new();
         loop {
             let mut more = Vec::new();
@@ -369,26 +392,38 @@ impl Pdf {
                     continue;
                 };
                 for (name, value) in entries.iter() {
-                    if !names.contains(name) || !followed.insert((category, name.clone())) {
+                    let key = (category, name.clone());
+                    if !uses.contains(&key) || !followed.insert(key) {
                         continue;
                     }
                     let Some(resolved) = self.resolved(value) else {
                         continue;
                     };
-                    // Names in the resource's own dictionary: an image's colour space, say.
-                    if let Some(dict) = resolved
-                        .as_dict()
-                        .ok()
-                        .or_else(|| resolved.as_stream().ok().map(|s| &s.dict))
-                    {
+                    // Names in the resource's own dictionary or array can only stand for colour
+                    // spaces: an image's, or the base of an indexed colour space.
+                    let values: Vec<&Object> = match resolved {
+                        Object::Dictionary(dict) => dict.iter().map(|(_, v)| v).collect(),
+                        Object::Stream(stream) => stream.dict.iter().map(|(_, v)| v).collect(),
+                        Object::Array(items) => items.iter().collect(),
+                        _ => Vec::new(),
+                    };
+                    for value in values {
+                        let items = match value {
+                            Object::Array(items) => items.iter().collect(),
+                            other => vec![other],
+                        };
                         more.extend(
-                            dict.iter()
-                                .filter_map(|(_, v)| v.as_name().ok().map(<[u8]>::to_vec)),
+                            items
+                                .into_iter()
+                                .filter_map(|v| v.as_name().ok())
+                                .map(|n| (COLOR_SPACE, n.to_vec())),
                         );
                     }
                     match resolved {
-                        Object::Stream(stream) if !stream.dict.has(b"Resources") => {
-                            let Some(found) = scan.names_in(value.as_reference().ok(), stream)?
+                        Object::Stream(stream)
+                            if !stream.dict.has(b"Resources") && is_content(&stream.dict) =>
+                        {
+                            let Some(found) = scan.uses_in(value.as_reference().ok(), stream)?
                             else {
                                 return Ok(None);
                             };
@@ -411,7 +446,7 @@ impl Pdf {
                             for (_, glyph) in procs.iter() {
                                 if let Some(Object::Stream(stream)) = self.resolved(glyph) {
                                     let Some(found) =
-                                        scan.names_in(glyph.as_reference().ok(), stream)?
+                                        scan.uses_in(glyph.as_reference().ok(), stream)?
                                     else {
                                         return Ok(None);
                                     };
@@ -423,29 +458,29 @@ impl Pdf {
                     }
                 }
             }
-            let before = names.len();
-            names.extend(more);
-            if names.len() == before {
-                return Ok(Some(names));
+            let before = uses.len();
+            uses.extend(more);
+            if uses.len() == before {
+                return Ok(Some(uses));
             }
         }
     }
 
-    /// `resources` with only the named entries in `names`, as a direct dictionary.
-    fn keep_named(&self, resources: &Dictionary, names: &HashSet<Vec<u8>>) -> Dictionary {
+    /// `resources` with only the named entries in `uses`, as a direct dictionary.
+    fn keep_named(&self, resources: &Dictionary, uses: &Uses) -> Dictionary {
         let mut kept = Dictionary::new();
         for (key, value) in resources.iter() {
-            if !NAMED_RESOURCES.contains(&key.as_slice()) {
+            let Some(category) = NAMED_RESOURCES.into_iter().find(|c| *c == key.as_slice()) else {
                 kept.set(key.clone(), value.clone());
                 continue;
-            }
+            };
             let Object::Dictionary(entries) = self.resolve(value) else {
                 kept.set(key.clone(), value.clone());
                 continue;
             };
             let used: Dictionary = entries
                 .iter()
-                .filter(|(name, _)| names.contains(*name))
+                .filter(|(name, _)| uses.contains(&(category, name.to_vec())))
                 .map(|(n, v)| (n.clone(), v.clone()))
                 .collect();
             if !used.is_empty() {
@@ -470,26 +505,22 @@ impl Pdf {
     }
 }
 
-/// The names each content stream uses, found once per stream however many pages draw it, each
-/// page's streams decoded within the budget of one page.
+/// The resources each content stream uses, found once per stream however many pages draw it,
+/// each page's streams decoded within the budget of one page.
 struct NameScan {
     budget: DecodeBudget,
-    names: HashMap<ObjectId, Option<HashSet<Vec<u8>>>>,
+    names: HashMap<ObjectId, Option<Uses>>,
 }
 
 impl NameScan {
-    /// The names `stream` (object `id`, when it is one of its own) uses as operands; `None` when
-    /// it cannot be decoded, and an error when decoding it would go past the budget.
-    fn names_in(
-        &mut self,
-        id: Option<ObjectId>,
-        stream: &lopdf::Stream,
-    ) -> Result<Option<HashSet<Vec<u8>>>> {
+    /// The resources `stream` (object `id`, when it is one of its own) uses; `None` when it
+    /// cannot be decoded, and an error when decoding it would go past the budget.
+    fn uses_in(&mut self, id: Option<ObjectId>, stream: &lopdf::Stream) -> Result<Option<Uses>> {
         if let Some(found) = id.and_then(|id| self.names.get(&id)) {
             return Ok(found.clone());
         }
         let found = match self.budget.stream(stream) {
-            Ok(plain) => Some(names_in(&plain)),
+            Ok(plain) => Some(uses_in(&plain)),
             Err(error @ Error::TooLarge(_)) => return Err(error),
             Err(_) => None,
         };
@@ -511,19 +542,46 @@ pub(crate) fn widget_area(widget: &Dictionary) -> Option<[f32; 4]> {
     (area[2] > area[0] && area[3] > area[1]).then_some(area)
 }
 
-/// Every name `content` uses as an operand, including inside dictionaries (marked-content
-/// properties, inline images).
-fn names_in(content: &[u8]) -> HashSet<Vec<u8>> {
-    let mut names = HashSet::new();
-    tokens(content, |token| {
-        if let Token::Name(written) = token {
-            let name = name(written);
-            if !names.contains(name.as_ref()) {
-                names.insert(name.into_owned());
+/// The resources `content` uses: the names given to the operators that look a resource up, each
+/// in the category that operator looks in. Names inside an inline image's dictionary count as
+/// colour spaces, and every name given to a marked-content operator as properties.
+fn uses_in(content: &[u8]) -> Uses {
+    let mut uses = HashSet::new();
+    let mut operands: Vec<&[u8]> = Vec::new();
+    tokens(content, |token| match token {
+        Token::Name(written) => operands.push(written),
+        Token::Operator(operator) => {
+            let category = match operator {
+                b"Tf" => Some(FONT),
+                b"Do" => Some(XOBJECT),
+                b"gs" => Some(EXT_G_STATE),
+                b"cs" | b"CS" | b"ID" => Some(COLOR_SPACE),
+                b"scn" | b"SCN" => Some(PATTERN),
+                b"sh" => Some(SHADING),
+                b"BDC" | b"DP" => Some(PROPERTIES),
+                _ => None,
+            };
+            if let Some(category) = category {
+                uses.extend(
+                    operands
+                        .iter()
+                        .map(|written| (category, name(written).into_owned())),
+                );
             }
+            operands.clear();
         }
+        _ => {}
     });
-    names
+    uses
+}
+
+/// Whether `dict` is that of a stream that holds content: a form or a tiling pattern.
+fn is_content(dict: &Dictionary) -> bool {
+    dict.has(b"PatternType")
+        || dict
+            .get(b"Subtype")
+            .and_then(Object::as_name)
+            .is_ok_and(|s| s == b"Form")
 }
 
 /// Runs `edit` on the array `holder` is, or refers to, and stores the result where it came from.
