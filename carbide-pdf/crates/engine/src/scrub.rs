@@ -723,9 +723,13 @@ pub(crate) fn widget_area(widget: &Dictionary) -> Option<[f32; 4]> {
 /// colour spaces, and every name given to a marked-content operator as properties.
 fn uses_in(content: &[u8]) -> Uses {
     let mut uses = HashSet::new();
-    let mut operands: Vec<&[u8]> = Vec::new();
+    // Which operand a name is, or how often it is given, does not matter: each is kept once, so
+    // a name given millions of times before an operator takes no more memory than one.
+    let mut operands: HashSet<&[u8]> = HashSet::new();
     tokens(content, |token| match token {
-        Token::Name(written) => operands.push(written),
+        Token::Name(written) => {
+            operands.insert(written);
+        }
         Token::Operator(operator) => {
             let category = match operator {
                 b"Tf" => Some(FONT),

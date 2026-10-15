@@ -357,6 +357,56 @@ fn default_colour_spaces_stay_with_content_that_paints_in_device_colours() {
     );
 }
 
+/// The allocator, noting the largest block each thread asks for.
+struct Largest;
+
+thread_local! {
+    static LARGEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn note(size: usize) {
+    let _ = LARGEST.try_with(|largest| largest.set(largest.get().max(size)));
+}
+
+unsafe impl std::alloc::GlobalAlloc for Largest {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        note(layout.size());
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        note(new_size);
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Largest = Largest;
+
+#[test]
+fn names_repeated_before_an_operator_take_no_memory_each() {
+    // Four million names before one operator: 8 MB of content.
+    let content = format!("{} Do", "/A".repeat(4 << 20));
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let image = secret_image(doc);
+            dictionary! { "XObject" => dictionary! { "Im1" => image } }
+        },
+        &[&content, "q 100 0 0 100 0 0 cm /Im1 Do Q"],
+    );
+    LARGEST.with(|largest| largest.set(0));
+    pdf.delete_pages(&[1]).unwrap();
+    let largest = LARGEST.with(std::cell::Cell::get);
+    assert!(
+        largest < 4 * content.len(),
+        "reading the page's names took a block of {largest} bytes"
+    );
+}
+
 // ---- legacy passwords ----------------------------------------------------------------------
 
 const PADDING: [u8; 32] = [
