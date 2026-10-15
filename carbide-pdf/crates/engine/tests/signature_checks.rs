@@ -321,6 +321,31 @@ fn signed_with(sub_filter: SubFilter, cms: impl Fn(&[u8]) -> Vec<u8>) -> Vec<u8>
 // ---- signed attributes ---------------------------------------------------------------------
 
 #[test]
+fn signed_attributes_must_name_the_content_type() {
+    let with = |attributes: &dyn Fn(&[u8]) -> Vec<Vec<u8>>| {
+        let file = signed_with(SubFilter::Pkcs7Detached, |covered| {
+            signer_cms(covered, Some(&attributes(covered)), None)
+        });
+        outcome(&verify(&file, &trust_signer())[0])
+    };
+    assert_eq!(
+        with(&|covered| vec![content_type(DATA_OID), message_digest(&sha256(covered))]),
+        (Validity::Valid, Detail::TrustedDirectly)
+    );
+    assert_eq!(
+        with(&|covered| vec![message_digest(&sha256(covered))]),
+        (Validity::Invalid, Detail::Corrupt)
+    );
+    assert_eq!(
+        with(&|covered| vec![
+            content_type(SIGNED_DATA_OID),
+            message_digest(&sha256(covered))
+        ]),
+        (Validity::Invalid, Detail::Corrupt)
+    );
+}
+
+#[test]
 fn a_signer_identifier_that_names_no_embedded_certificate_is_not_valid() {
     let file = signed_with(SubFilter::Pkcs7Detached, |covered| {
         signer_cms(

@@ -1975,6 +1975,12 @@ fn verify_one(
     let covered: [&[u8]; 2] = [&file[..b], &file[c..c + d]];
     let inputs: Vec<Vec<u8>> = match &signer_info.signed_attributes {
         Some(_) => {
+            // Signed attributes must say what kind of content they sign (RFC 5652, 11.1), and it
+            // must be the encapsulated type: id-data for a detached PDF signature.
+            if signer_info.content_type.as_deref() != Some(cms.content_type.as_str()) {
+                invalid(&mut report, Detail::Corrupt);
+                return report;
+            }
             let Some(content_digest) = sigcrypto::digest(digest_oid, &covered) else {
                 unknown(&mut report, Detail::UnsupportedAlgorithm);
                 return report;
