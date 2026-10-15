@@ -270,6 +270,12 @@ fn keep_access(target: &Path, existing: &fs::Metadata, staged: &File) -> io::Res
     // Before the permission bits: a new owner or group takes the set-user and set-group bits off.
     if owner.is_some() || group.is_some() {
         if let Err(e) = fchown(staged, owner, group) {
+            if owner.is_some() {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("the new file could not be given to the owner of {} ({e}), so it was left as it is", target.display()),
+                ));
+            }
             if group_allows_more(existing.mode()) {
                 return Err(io::Error::new(
                     e.kind(),
