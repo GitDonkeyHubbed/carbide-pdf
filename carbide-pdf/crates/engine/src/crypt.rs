@@ -27,7 +27,9 @@ pub(crate) fn load(bytes: &[u8], password: Option<&str>) -> Result<Document> {
         let doc = load_bounded(bytes)?;
         if doc.is_encrypted() || doc.was_encrypted() {
             // The encryption dictionary is named in a way the loader above did not find.
-            return Err(Error::Unsupported("this file's encryption could not be read".into()));
+            return Err(Error::Unsupported(
+                "this file's encryption could not be read".into(),
+            ));
         }
         return Ok(doc);
     };
@@ -50,9 +52,17 @@ pub(crate) fn load(bytes: &[u8], password: Option<&str>) -> Result<Document> {
     }
     for candidate in candidates {
         let open = match candidate {
-            Candidate::Raw(bytes) if revision <= 4 => open_password_r4(&doc, &bytes).map(Candidate::Raw),
-            Candidate::Raw(bytes) => doc.authenticate_raw_password(&bytes).is_ok().then_some(Candidate::Raw(bytes)),
-            Candidate::Text(text) => doc.authenticate_password(&text).is_ok().then_some(Candidate::Text(text)),
+            Candidate::Raw(bytes) if revision <= 4 => {
+                open_password_r4(&doc, &bytes).map(Candidate::Raw)
+            }
+            Candidate::Raw(bytes) => doc
+                .authenticate_raw_password(&bytes)
+                .is_ok()
+                .then_some(Candidate::Raw(bytes)),
+            Candidate::Text(text) => doc
+                .authenticate_password(&text)
+                .is_ok()
+                .then_some(Candidate::Text(text)),
         };
         if let Some(open) = open {
             decrypt(&mut doc, &open)?;
@@ -60,7 +70,11 @@ pub(crate) fn load(bytes: &[u8], password: Option<&str>) -> Result<Document> {
             return Ok(doc);
         }
     }
-    Err(if password.is_some() { Error::WrongPassword } else { Error::PasswordRequired })
+    Err(if password.is_some() {
+        Error::WrongPassword
+    } else {
+        Error::PasswordRequired
+    })
 }
 
 enum Candidate {
@@ -74,7 +88,9 @@ enum Candidate {
 /// stored, still encrypted, and with object streams left packed (their content is encrypted too).
 /// `None` when the file is not encrypted.
 fn load_still_encrypted(bytes: &[u8]) -> Result<Option<Document>> {
-    let Some((hidden, renamed)) = rename_key(bytes, ENCRYPT, HIDDEN_ENCRYPT) else { return Ok(None) };
+    let Some((hidden, renamed)) = rename_key(bytes, ENCRYPT, HIDDEN_ENCRYPT) else {
+        return Ok(None);
+    };
     let doc = load_packed(&hidden, renamed)?;
     Ok(doc.trailer.has(b"Encrypt").then_some(doc))
 }
@@ -133,7 +149,25 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn ends_name(byte: u8) -> bool {
-    matches!(byte, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ' | b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%')
+    matches!(
+        byte,
+        b'\0'
+            | b'\t'
+            | b'\n'
+            | b'\x0c'
+            | b'\r'
+            | b' '
+            | b'('
+            | b')'
+            | b'<'
+            | b'>'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'/'
+            | b'%'
+    )
 }
 
 /// Undoes the renaming of `renamed` names in `doc`. Names and dictionary keys come first; strings
@@ -187,7 +221,10 @@ fn restore_data(object: &mut Object) {
         Object::Array(items) => items.iter_mut().for_each(restore_data),
         Object::Dictionary(dict) => dict.iter_mut().for_each(|(_, value)| restore_data(value)),
         Object::Stream(stream) => {
-            stream.dict.iter_mut().for_each(|(_, value)| restore_data(value));
+            stream
+                .dict
+                .iter_mut()
+                .for_each(|(_, value)| restore_data(value));
             restore_bytes(&mut stream.content);
         }
         _ => {}
@@ -195,7 +232,10 @@ fn restore_data(object: &mut Object) {
 }
 
 fn restore_bytes(bytes: &mut Vec<u8>) {
-    for (hidden, key) in [(HIDDEN_ENCRYPT, ENCRYPT), (HIDDEN_OBJECT_STREAM, OBJECT_STREAM)] {
+    for (hidden, key) in [
+        (HIDDEN_ENCRYPT, ENCRYPT),
+        (HIDDEN_OBJECT_STREAM, OBJECT_STREAM),
+    ] {
         if let Some((restored, _)) = rename_key(bytes, hidden, key) {
             *bytes = restored;
         }
@@ -210,7 +250,9 @@ fn open_password_r4(doc: &Document, password: &[u8]) -> Option<Vec<u8>> {
     }
     doc.authenticate_raw_owner_password(password).ok()?;
     let user = recover_open_password(doc, password)?;
-    doc.authenticate_raw_user_password(&user).is_ok().then_some(user)
+    doc.authenticate_raw_user_password(&user)
+        .is_ok()
+        .then_some(user)
 }
 
 /// Algorithm 7 of ISO 32000-2: the open password, as stored in `/O`, decrypted with a key derived
@@ -225,13 +267,21 @@ fn recover_open_password(doc: &Document, owner: &[u8]) -> Option<Vec<u8>> {
         None if version == 4 => 128,
         None => 40,
     };
-    let n = if revision >= 3 { usize::try_from(length / 8).ok()? } else { 5 };
+    let n = if revision >= 3 {
+        usize::try_from(length / 8).ok()?
+    } else {
+        5
+    };
     if !(5..=16).contains(&n) {
         return None;
     }
     let stored = dict.get(b"O").ok()?.as_str().ok()?;
     let used = owner.len().min(32);
-    let mut hash: [u8; 16] = Md5::new().chain_update(&owner[..used]).chain_update(&PADDING[..32 - used]).finalize().into();
+    let mut hash: [u8; 16] = Md5::new()
+        .chain_update(&owner[..used])
+        .chain_update(&PADDING[..32 - used])
+        .finalize()
+        .into();
     if revision >= 3 {
         for _ in 0..50 {
             hash = Md5::digest(hash).into();
@@ -251,8 +301,8 @@ fn recover_open_password(doc: &Document, owner: &[u8]) -> Option<Vec<u8>> {
 }
 
 const PADDING: [u8; 32] = [
-    0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08, 0x2e, 0x2e, 0x00,
-    0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,
+    0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
+    0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,
 ];
 
 fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -281,19 +331,55 @@ fn pdf_doc_encoding(password: &str) -> Option<Vec<u8>> {
         return None;
     }
     const SPECIAL: [(u16, u8); 40] = [
-        (0x02d8, 0x18), (0x02c7, 0x19), (0x02c6, 0x1a), (0x02d9, 0x1b), (0x02dd, 0x1c), (0x02db, 0x1d),
-        (0x02da, 0x1e), (0x02dc, 0x1f), (0x2022, 0x80), (0x2020, 0x81), (0x2021, 0x82), (0x2026, 0x83),
-        (0x2014, 0x84), (0x2013, 0x85), (0x0192, 0x86), (0x2044, 0x87), (0x2039, 0x88), (0x203a, 0x89),
-        (0x2212, 0x8a), (0x2030, 0x8b), (0x201e, 0x8c), (0x201c, 0x8d), (0x201d, 0x8e), (0x2018, 0x8f),
-        (0x2019, 0x90), (0x201a, 0x91), (0x2122, 0x92), (0xfb01, 0x93), (0xfb02, 0x94), (0x0141, 0x95),
-        (0x0152, 0x96), (0x0160, 0x97), (0x0178, 0x98), (0x017d, 0x99), (0x0131, 0x9a), (0x0142, 0x9b),
-        (0x0153, 0x9c), (0x0161, 0x9d), (0x017e, 0x9e), (0x20ac, 0xa0),
+        (0x02d8, 0x18),
+        (0x02c7, 0x19),
+        (0x02c6, 0x1a),
+        (0x02d9, 0x1b),
+        (0x02dd, 0x1c),
+        (0x02db, 0x1d),
+        (0x02da, 0x1e),
+        (0x02dc, 0x1f),
+        (0x2022, 0x80),
+        (0x2020, 0x81),
+        (0x2021, 0x82),
+        (0x2026, 0x83),
+        (0x2014, 0x84),
+        (0x2013, 0x85),
+        (0x0192, 0x86),
+        (0x2044, 0x87),
+        (0x2039, 0x88),
+        (0x203a, 0x89),
+        (0x2212, 0x8a),
+        (0x2030, 0x8b),
+        (0x201e, 0x8c),
+        (0x201c, 0x8d),
+        (0x201d, 0x8e),
+        (0x2018, 0x8f),
+        (0x2019, 0x90),
+        (0x201a, 0x91),
+        (0x2122, 0x92),
+        (0xfb01, 0x93),
+        (0xfb02, 0x94),
+        (0x0141, 0x95),
+        (0x0152, 0x96),
+        (0x0160, 0x97),
+        (0x0178, 0x98),
+        (0x017d, 0x99),
+        (0x0131, 0x9a),
+        (0x0142, 0x9b),
+        (0x0153, 0x9c),
+        (0x0161, 0x9d),
+        (0x017e, 0x9e),
+        (0x20ac, 0xa0),
     ];
     let encoded = password
         .encode_utf16()
         .filter_map(|unit| match unit {
             0x20..=0x7e | 0xa1..=0xac | 0xae..=0xff => Some(unit as u8),
-            _ => SPECIAL.iter().find(|(code, _)| *code == unit).map(|(_, byte)| *byte),
+            _ => SPECIAL
+                .iter()
+                .find(|(code, _)| *code == unit)
+                .map(|(_, byte)| *byte),
         })
         .collect();
     Some(encoded)
@@ -308,12 +394,17 @@ fn decrypt(doc: &mut Document, password: &Candidate) -> Result<()> {
     // dictionary gives the state alone.
     let mut shell = Document::new();
     shell.trailer = doc.trailer.clone();
-    shell.objects.insert(encrypt_id, doc.get_object(encrypt_id)?.clone());
+    shell
+        .objects
+        .insert(encrypt_id, doc.get_object(encrypt_id)?.clone());
     match password {
         Candidate::Raw(bytes) => shell.decrypt_raw(bytes)?,
         Candidate::Text(text) => shell.decrypt(text)?,
     }
-    let state = shell.encryption_state.take().ok_or_else(|| Error::Unsupported("the file could not be decrypted".into()))?;
+    let state = shell
+        .encryption_state
+        .take()
+        .ok_or_else(|| Error::Unsupported("the file could not be decrypted".into()))?;
 
     for (&id, object) in doc.objects.iter_mut() {
         if id != encrypt_id {
@@ -337,32 +428,51 @@ fn unpack_object_streams(doc: &mut Document, budget: usize) -> Result<()> {
     let containers: Vec<ObjectId> = doc
         .objects
         .iter()
-        .filter(|(_, object)| object.as_stream().is_ok_and(|stream| stream.dict.has_type(b"ObjStm")))
+        .filter(|(_, object)| {
+            object
+                .as_stream()
+                .is_ok_and(|stream| stream.dict.has_type(b"ObjStm"))
+        })
         .map(|(id, _)| *id)
         .collect();
     let mut left = budget;
     let mut unpacked = Vec::new();
     for container in containers {
-        let Ok(stream) = doc.objects[&container].as_stream() else { continue };
+        let Ok(stream) = doc.objects[&container].as_stream() else {
+            continue;
+        };
         let data = match stream.get_plain_content_with_limit(MAX_STREAM_ON_LOAD) {
             Ok(data) => data,
-            Err(lopdf::Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => return Err(too_large()),
+            Err(lopdf::Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+                return Err(too_large())
+            }
             // lopdf leaves out the objects of a stream it cannot decode, too.
             Err(_) => continue,
         };
         let mut count = 0usize;
         crate::content::tokens(&data, |_| count += 1);
-        let cost = count.saturating_mul(std::mem::size_of::<Object>()).saturating_add(data.len());
+        let cost = count
+            .saturating_mul(std::mem::size_of::<Object>())
+            .saturating_add(data.len());
         left = left.checked_sub(cost).ok_or_else(too_large)?;
         let mut dict = stream.dict.clone();
         dict.remove(b"Filter");
         dict.remove(b"DecodeParms");
-        let Ok(parsed) = ObjectStream::new(&Stream::new(dict, data)) else { continue };
+        let Ok(parsed) = ObjectStream::new(&Stream::new(dict, data)) else {
+            continue;
+        };
         let entries = &doc.reference_table.entries;
-        unpacked.extend(parsed.objects.into_iter().filter(|(id, _)| match entries.get(&id.0) {
-            Some(XrefEntry::Compressed { container: placed, .. }) => *placed == container.0,
-            _ => true,
-        }));
+        unpacked.extend(
+            parsed
+                .objects
+                .into_iter()
+                .filter(|(id, _)| match entries.get(&id.0) {
+                    Some(XrefEntry::Compressed {
+                        container: placed, ..
+                    }) => *placed == container.0,
+                    _ => true,
+                }),
+        );
     }
     for (id, object) in unpacked {
         doc.max_id = doc.max_id.max(id.0);
@@ -376,7 +486,13 @@ mod tests {
     use super::*;
     use crate::pdf::Pdf;
 
-    fn write_object(out: &mut Vec<u8>, offsets: &mut [usize], number: usize, dict: &str, stream: Option<&[u8]>) {
+    fn write_object(
+        out: &mut Vec<u8>,
+        offsets: &mut [usize],
+        number: usize,
+        dict: &str,
+        stream: Option<&[u8]>,
+    ) {
         offsets[number] = out.len();
         out.extend_from_slice(format!("{number} 0 obj\n{dict}\n").as_bytes());
         if let Some(data) = stream {
@@ -400,13 +516,22 @@ mod tests {
         };
         let owner_key: [u8; 16] = Md5::digest(pad(b"owner")).into();
         let o = rc4(&owner_key[..5], &pad(b""));
-        let file_key: [u8; 16] =
-            Md5::new().chain_update(pad(b"")).chain_update(&o).chain_update(permissions.to_le_bytes()).chain_update(id).finalize().into();
+        let file_key: [u8; 16] = Md5::new()
+            .chain_update(pad(b""))
+            .chain_update(&o)
+            .chain_update(permissions.to_le_bytes())
+            .chain_update(id)
+            .finalize()
+            .into();
         let key = &file_key[..5];
         let u = rc4(key, &PADDING);
         let encrypt = |number: u32, data: &[u8]| {
-            let object_key: [u8; 16] =
-                Md5::new().chain_update(key).chain_update(&number.to_le_bytes()[..3]).chain_update([0u8, 0]).finalize().into();
+            let object_key: [u8; 16] = Md5::new()
+                .chain_update(key)
+                .chain_update(&number.to_le_bytes()[..3])
+                .chain_update([0u8, 0])
+                .finalize()
+                .into();
             rc4(&object_key[..10], data)
         };
         let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02X}")).collect::<String>();
@@ -420,14 +545,34 @@ mod tests {
         let mut out = b"%PDF-1.5\n".to_vec();
         let mut offsets = [0usize; 9];
         let sealed = encrypt(1, packed.as_bytes());
-        let dict = format!("<< /Type /ObjStm /N 2 /First {} /Length {} >>", header.len(), sealed.len());
+        let dict = format!(
+            "<< /Type /ObjStm /N 2 /First {} /Length {} >>",
+            header.len(),
+            sealed.len()
+        );
         write_object(&mut out, &mut offsets, 1, &dict, Some(&sealed));
         let page = "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 6 0 R >> >> >>";
         write_object(&mut out, &mut offsets, 4, page, None);
         let sealed = encrypt(5, content.as_bytes());
-        write_object(&mut out, &mut offsets, 5, &format!("<< /Length {} >>", sealed.len()), Some(&sealed));
-        write_object(&mut out, &mut offsets, 6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>", None);
-        let dict = format!("<< /Filter /Standard /V 1 /R 2 /O <{}> /U <{}> /P {permissions} >>", hex(&o), hex(&u));
+        write_object(
+            &mut out,
+            &mut offsets,
+            5,
+            &format!("<< /Length {} >>", sealed.len()),
+            Some(&sealed),
+        );
+        write_object(
+            &mut out,
+            &mut offsets,
+            6,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            None,
+        );
+        let dict = format!(
+            "<< /Filter /Standard /V 1 /R 2 /O <{}> /U <{}> /P {permissions} >>",
+            hex(&o),
+            hex(&u)
+        );
         write_object(&mut out, &mut offsets, 7, &dict, None);
         offsets[8] = out.len();
         let mut entries = Vec::new();
@@ -456,14 +601,22 @@ mod tests {
     fn object_streams_of_encrypted_files_are_unpacked_after_decrypting() {
         let file = packed_rc4_file("PACKED SECRET");
         // The fixture is a valid file: lopdf reads it on its own (its key is right here).
-        let reference = Pdf { doc: Document::load_mem(&file).unwrap() };
+        let reference = Pdf {
+            doc: Document::load_mem(&file).unwrap(),
+        };
         assert_eq!(reference.page_count(), 1);
 
-        let pdf = Pdf { doc: load(&file, None).unwrap() };
+        let pdf = Pdf {
+            doc: load(&file, None).unwrap(),
+        };
         assert!(pdf.doc.encryption_state.is_some());
         assert_eq!(pdf.page_count(), 1);
         let content = pdf.doc.get_page_content(pdf.page_id(0).unwrap());
-        assert!(content.windows(13).any(|w| w == b"PACKED SECRET"), "{}", String::from_utf8_lossy(&content));
+        assert!(
+            content.windows(13).any(|w| w == b"PACKED SECRET"),
+            "{}",
+            String::from_utf8_lossy(&content)
+        );
         assert!(!pdf.doc.trailer.has(b"Encrypt"));
     }
 
@@ -471,7 +624,10 @@ mod tests {
     fn names_that_only_start_like_the_key_are_left_alone() {
         let bytes = b"<< /EncryptMetadata false /Encrypt 7 0 R /Encrypt<< >> /Encrypted 1 >>";
         let (renamed, count) = rename_key(bytes, ENCRYPT, HIDDEN_ENCRYPT).unwrap();
-        assert_eq!(renamed.as_slice(), &b"<< /EncryptMetadata false /Cb-Encr 7 0 R /Cb-Encr<< >> /Encrypted 1 >>"[..]);
+        assert_eq!(
+            renamed.as_slice(),
+            &b"<< /EncryptMetadata false /Cb-Encr 7 0 R /Cb-Encr<< >> /Encrypted 1 >>"[..]
+        );
         assert_eq!(count, 2);
         assert!(rename_key(b"<< /Root 1 0 R >>", ENCRYPT, HIDDEN_ENCRYPT).is_none());
     }

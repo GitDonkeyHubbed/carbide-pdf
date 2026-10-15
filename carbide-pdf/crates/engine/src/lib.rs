@@ -31,8 +31,8 @@ pub mod sanitize;
 pub mod save;
 mod scrub;
 pub mod security;
-pub mod signature;
 mod sigcrypto;
+pub mod signature;
 pub mod stamp;
 mod trees;
 
@@ -45,8 +45,10 @@ pub use geometry::{PageGeometry, Rect};
 pub use pdf::Pdf;
 pub use redact::Redaction;
 pub use render::Renderer;
+pub use revisions::{
+    open_revision_bytes, pdf_date_now, revision_display_name, validate_label, Revision,
+};
 pub use sanitize::{HiddenItem, HiddenReport};
-pub use revisions::{open_revision_bytes, pdf_date_now, revision_display_name, validate_label, Revision};
 pub use save::{Protection, SavePlan, SavedFile};
 pub use security::ProtectionOptions;
 pub use stamp::{BatesOptions, PageAnchor, WatermarkOptions};

@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use carbide_engine::AnnotationSummary;
 use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, FontId, Frame, Key, Margin, Modifiers, Rect, Sense, Stroke, StrokeKind, Ui,
+    self, pos2, vec2, Align, Align2, Color32, FontId, Frame, Key, Margin, Modifiers, Rect, Sense,
+    Stroke, StrokeKind, Ui,
 };
 
 use crate::dialogs::{AfterSave, Dialog, Export};
@@ -54,6 +55,9 @@ struct StartRow {
     size: Option<u64>,
 }
 
+/// The comment list for one document version, keyed by (active tab, document version).
+type CommentsCache = ((Option<usize>, u64), Vec<AnnotationSummary>);
+
 /// View state that belongs to the shell rather than to a document.
 pub struct ShellState {
     ribbon_tab: RibbonTab,
@@ -70,7 +74,7 @@ pub struct ShellState {
     /// the question is up moves the tabs along.
     pending_close: Option<u64>,
     locations: Vec<PathBuf>,
-    comments: Option<((Option<usize>, u64), Vec<AnnotationSummary>)>,
+    comments: Option<CommentsCache>,
     window_title: String,
     /// Asking what to do with unsaved documents before the window closes.
     quit_prompt: bool,
@@ -125,7 +129,10 @@ impl ShellState {
 // ---- small drawing helpers ---------------------------------------------------------------
 
 fn text_width(ui: &Ui, text: &str, font: &FontId) -> f32 {
-    ui.painter().layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE).size().x
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE)
+        .size()
+        .x
 }
 
 fn elide(text: &str, max_chars: usize) -> String {
@@ -138,17 +145,36 @@ fn elide(text: &str, max_chars: usize) -> String {
 }
 
 /// A square icon button drawn into `rect`. Returns whether it was clicked.
-fn icon_button(ui: &mut Ui, rect: Rect, glyph: Glyph, id: impl std::hash::Hash + std::fmt::Debug, enabled: bool, selected: bool, tip: &str) -> bool {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+fn icon_button(
+    ui: &mut Ui,
+    rect: Rect,
+    glyph: Glyph,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    enabled: bool,
+    selected: bool,
+    tip: &str,
+) -> bool {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let response = ui.interact(rect, ui.id().with(id), sense);
     let hovered = enabled && response.hovered();
     if selected {
-        ui.painter().rect_filled(rect.shrink(2.0), 4.0, theme::SIDEBAR_SELECTED);
+        ui.painter()
+            .rect_filled(rect.shrink(2.0), 4.0, theme::SIDEBAR_SELECTED);
     } else if hovered {
-        ui.painter().rect_filled(rect.shrink(2.0), 4.0, Color32::from_gray(84));
+        ui.painter()
+            .rect_filled(rect.shrink(2.0), 4.0, Color32::from_gray(84));
     }
     let color = if enabled { theme::TEXT } else { DISABLED };
-    icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(18.0, 18.0)), glyph, color);
+    icons::paint(
+        ui.painter(),
+        Rect::from_center_size(rect.center(), vec2(18.0, 18.0)),
+        glyph,
+        color,
+    );
     let clicked = enabled && response.clicked();
     if !tip.is_empty() {
         response.on_hover_text(tip);
@@ -157,8 +183,19 @@ fn icon_button(ui: &mut Ui, rect: Rect, glyph: Glyph, id: impl std::hash::Hash +
 }
 
 /// A large ribbon button: icon over label. Returns whether it was clicked.
-fn command_button(ui: &mut Ui, rect: Rect, cmd: Cmd, index: usize, enabled: bool, selected: bool) -> bool {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+fn command_button(
+    ui: &mut Ui,
+    rect: Rect,
+    cmd: Cmd,
+    index: usize,
+    enabled: bool,
+    selected: bool,
+) -> bool {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let response = ui.interact(rect, ui.id().with(("cmd", index)), sense);
     let hovered = enabled && response.hovered();
     if selected {
@@ -167,8 +204,19 @@ fn command_button(ui: &mut Ui, rect: Rect, cmd: Cmd, index: usize, enabled: bool
         ui.painter().rect_filled(rect, 5.0, Color32::from_gray(70));
     }
     let color = if enabled { theme::TEXT } else { DISABLED };
-    icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.center().x, rect.min.y + 20.0), vec2(26.0, 26.0)), cmd.glyph(), color);
-    ui.painter().text(pos2(rect.center().x, rect.max.y - 11.0), Align2::CENTER_CENTER, cmd.label(), FontId::proportional(11.5), color);
+    icons::paint(
+        ui.painter(),
+        Rect::from_center_size(pos2(rect.center().x, rect.min.y + 20.0), vec2(26.0, 26.0)),
+        cmd.glyph(),
+        color,
+    );
+    ui.painter().text(
+        pos2(rect.center().x, rect.max.y - 11.0),
+        Align2::CENTER_CENTER,
+        cmd.label(),
+        FontId::proportional(11.5),
+        color,
+    );
     let clicked = enabled && response.clicked();
     let tip = cmd.tooltip();
     if !tip.is_empty() {
@@ -193,7 +241,9 @@ fn format_size(bytes: u64) -> String {
 
 fn format_time(secs: i64) -> String {
     use chrono::{DateTime, Local, Utc};
-    let Some(utc) = DateTime::<Utc>::from_timestamp(secs, 0) else { return String::new() };
+    let Some(utc) = DateTime::<Utc>::from_timestamp(secs, 0) else {
+        return String::new();
+    };
     let local = utc.with_timezone(&Local);
     if local.date_naive() == Local::now().date_naive() {
         local.format("%-I:%M %p").to_string()
@@ -203,7 +253,9 @@ fn format_time(secs: i64) -> String {
 }
 
 fn file_name(path: &Path) -> String {
-    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn comment_kind(subtype: &str) -> &str {
@@ -241,9 +293,13 @@ impl CarbideApp {
             Cmd::Undo => doc.is_some_and(|d| !d.undo.is_empty()),
             Cmd::Redo => doc.is_some_and(|d| !d.redo.is_empty()),
             // These need PDFium, and do nothing without it.
-            Cmd::ApplyRedactions => doc.is_some() && !self.pending_redactions.is_empty() && self.renderer.is_some(),
+            Cmd::ApplyRedactions => {
+                doc.is_some() && !self.pending_redactions.is_empty() && self.renderer.is_some()
+            }
             Cmd::Ocr => doc.is_some() && self.ocr_job.is_none() && self.renderer.is_some(),
-            Cmd::Compare | Cmd::ExportImages | Cmd::ExportText => doc.is_some() && self.renderer.is_some(),
+            Cmd::Compare | Cmd::ExportImages | Cmd::ExportText => {
+                doc.is_some() && self.renderer.is_some()
+            }
             // Signing and saving revisions refuse password-protected documents (see
             // `sign_document` and `save_revision`), and a signature waiting for its time stamp
             // would be dropped by another one written first.
@@ -255,7 +311,9 @@ impl CarbideApp {
             Cmd::ZoomOut => doc.is_some() && self.zoom > MIN_ZOOM,
             Cmd::OpenRevision => doc.is_some_and(|d| d.pdf.can_open_revision()),
             Cmd::FirstPage | Cmd::PrevPage | Cmd::MoveUp => doc.is_some() && self.current_page > 0,
-            Cmd::NextPage | Cmd::LastPage | Cmd::MoveDown => doc.is_some_and(|d| self.current_page + 1 < d.pdf.page_count()),
+            Cmd::NextPage | Cmd::LastPage | Cmd::MoveDown => {
+                doc.is_some_and(|d| self.current_page + 1 < d.pdf.page_count())
+            }
             // A document keeps at least one page.
             Cmd::PageDelete => doc.is_some_and(|d| d.pdf.page_count() > 1),
             _ => doc.is_some(),
@@ -281,7 +339,10 @@ impl CarbideApp {
     }
 
     fn pick_and_open(&mut self) {
-        if let Some(files) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).pick_files() {
+        if let Some(files) = rfd::FileDialog::new()
+            .add_filter("PDF Files", &["pdf"])
+            .pick_files()
+        {
             for file in files {
                 self.open_path(&file);
             }
@@ -332,12 +393,23 @@ impl CarbideApp {
                 }
             }
             Cmd::Merge => self.merge_files(),
-            Cmd::Split => self.open_dialog(Dialog::Split { doc, ranges: "1-2".into() }),
+            Cmd::Split => self.open_dialog(Dialog::Split {
+                doc,
+                ranges: "1-2".into(),
+            }),
             Cmd::Imposition => self.open_dialog(Dialog::impose(doc)),
             Cmd::RotateLeft | Cmd::RotateRight => {
                 let clockwise = cmd == Cmd::RotateRight;
-                let before = self.doc.as_ref().map(|d| d.geometries.clone()).unwrap_or_default();
-                let (label, degrees) = if clockwise { ("Rotate right", 90) } else { ("Rotate left", -90) };
+                let before = self
+                    .doc
+                    .as_ref()
+                    .map(|d| d.geometries.clone())
+                    .unwrap_or_default();
+                let (label, degrees) = if clockwise {
+                    ("Rotate right", 90)
+                } else {
+                    ("Rotate left", -90)
+                };
                 if self.edit(label, move |p| p.rotate_pages(&[page], degrees)) {
                     self.follow_page_change(PageChange::Turned { page, clockwise }, &before);
                 }
@@ -351,7 +423,13 @@ impl CarbideApp {
             }
             Cmd::MoveDown => {
                 if self.edit("Move page down", move |p| p.move_page(page, page + 1)) {
-                    self.follow_page_change(PageChange::Moved { from: page, to: page + 1 }, &[]);
+                    self.follow_page_change(
+                        PageChange::Moved {
+                            from: page,
+                            to: page + 1,
+                        },
+                        &[],
+                    );
                     self.goto_page(page + 1);
                 }
             }
@@ -384,10 +462,22 @@ impl CarbideApp {
             Cmd::Ocr => self.start_ocr(),
             Cmd::ExportImages => self.export(Export::Images),
             Cmd::ExportText => self.export(Export::Text),
-            Cmd::SaveRevision => self.open_dialog(Dialog::SaveRevision { doc, label: String::new(), error: None }),
+            Cmd::SaveRevision => self.open_dialog(Dialog::SaveRevision {
+                doc,
+                label: String::new(),
+                error: None,
+            }),
             Cmd::OpenRevision => {
-                let items = self.doc.as_ref().map(|d| d.pdf.revisions()).unwrap_or_default();
-                self.open_dialog(Dialog::OpenRevision { doc, items, selected: None });
+                let items = self
+                    .doc
+                    .as_ref()
+                    .map(|d| d.pdf.revisions())
+                    .unwrap_or_default();
+                self.open_dialog(Dialog::OpenRevision {
+                    doc,
+                    items,
+                    selected: None,
+                });
             }
 
             Cmd::MarkRedaction => self.tool = Tool::Redact,
@@ -410,7 +500,10 @@ impl CarbideApp {
                 }
             }
             Cmd::TrustCertificate => {
-                if let Some(path) = rfd::FileDialog::new().add_filter("Certificates", &["pem", "crt", "cer", "der"]).pick_file() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Certificates", &["pem", "crt", "cer", "der"])
+                    .pick_file()
+                {
                     match paths::trust_certificate_file(&path) {
                         Ok(n) => self.status = format!("Added {n} trusted certificate(s)."),
                         Err(e) => self.alert(format!("Could not add the certificate: {e}")),
@@ -470,7 +563,9 @@ impl CarbideApp {
     // ---- tabs ------------------------------------------------------------------------------
 
     fn tab_label(&self, index: usize) -> (String, bool) {
-        self.doc_at(index).map(|d| (d.title(), d.dirty)).unwrap_or_else(|| ("Untitled".into(), false))
+        self.doc_at(index)
+            .map(|d| (d.title(), d.dirty))
+            .unwrap_or_else(|| ("Untitled".into(), false))
     }
 
     /// Closes a tab, asking first when the document has unsaved changes.
@@ -489,29 +584,37 @@ impl CarbideApp {
 
     /// The "save changes?" question shown when a modified document is closed.
     pub fn close_prompt(&mut self, ctx: &egui::Context) {
-        let Some(doc) = self.shell.pending_close else { return };
+        let Some(doc) = self.shell.pending_close else {
+            return;
+        };
         let Some(index) = self.tab_of(doc) else {
             self.shell.pending_close = None;
             return;
         };
         let title = self.tab_label(index).0;
         let mut choice = None;
-        egui::Window::new("Carbide PDF").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-            ui.label(format!("Do you want to save the changes you made to \"{title}\"?"));
-            ui.weak("Your changes will be lost if you don't save them.");
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    choice = Some(CloseChoice::Save);
-                }
-                if ui.button("Don't Save").clicked() {
-                    choice = Some(CloseChoice::Discard);
-                }
-                if ui.button("Cancel").clicked() {
-                    choice = Some(CloseChoice::Cancel);
-                }
+        egui::Window::new("Carbide PDF")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Do you want to save the changes you made to \"{title}\"?"
+                ));
+                ui.weak("Your changes will be lost if you don't save them.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        choice = Some(CloseChoice::Save);
+                    }
+                    if ui.button("Don't Save").clicked() {
+                        choice = Some(CloseChoice::Discard);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(CloseChoice::Cancel);
+                    }
+                });
             });
-        });
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             choice = Some(CloseChoice::Cancel);
         }
@@ -523,8 +626,12 @@ impl CarbideApp {
     /// Carries out the answer to the close question, on the document it is about, wherever its tab
     /// is now. Nothing happens once that document is no longer open.
     pub fn answer_close(&mut self, choice: CloseChoice) {
-        let Some(doc) = self.shell.pending_close.take() else { return };
-        let Some(index) = self.tab_of(doc) else { return };
+        let Some(doc) = self.shell.pending_close.take() else {
+            return;
+        };
+        let Some(index) = self.tab_of(doc) else {
+            return;
+        };
         match choice {
             CloseChoice::Save => {
                 self.activate(Some(index));
@@ -616,29 +723,38 @@ impl CarbideApp {
             Cancel,
         }
         let mut choice = None;
-        egui::Window::new("Carbide PDF").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-            if let [only] = dirty.as_slice() {
-                ui.label(format!("Do you want to save the changes you made to \"{only}\"?"));
-            } else {
-                ui.label(format!("{} documents have unsaved changes:", dirty.len()));
-                for title in &dirty {
-                    ui.label(format!("  {title}"));
+        egui::Window::new("Carbide PDF")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if let [only] = dirty.as_slice() {
+                    ui.label(format!(
+                        "Do you want to save the changes you made to \"{only}\"?"
+                    ));
+                } else {
+                    ui.label(format!("{} documents have unsaved changes:", dirty.len()));
+                    for title in &dirty {
+                        ui.label(format!("  {title}"));
+                    }
                 }
-            }
-            ui.weak("Your changes will be lost if you don't save them.");
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button(if dirty.len() == 1 { "Save" } else { "Save All" }).clicked() {
-                    choice = Some(Choice::SaveAll);
-                }
-                if ui.button("Don't Save").clicked() {
-                    choice = Some(Choice::Discard);
-                }
-                if ui.button("Cancel").clicked() {
-                    choice = Some(Choice::Cancel);
-                }
+                ui.weak("Your changes will be lost if you don't save them.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(if dirty.len() == 1 { "Save" } else { "Save All" })
+                        .clicked()
+                    {
+                        choice = Some(Choice::SaveAll);
+                    }
+                    if ui.button("Don't Save").clicked() {
+                        choice = Some(Choice::Discard);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(Choice::Cancel);
+                    }
+                });
             });
-        });
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             choice = Some(Choice::Cancel);
         }
@@ -654,19 +770,26 @@ impl CarbideApp {
     /// first; then the first one that has to ask does, and quitting carries on once it is answered.
     pub(crate) fn save_all_and_quit(&mut self, ctx: &egui::Context) {
         // Followed by document, not by tab: a save can close another tab on the same file.
-        let modified: Vec<u64> =
-            (0..self.tabs.len()).filter(|&i| self.tab_label(i).1).filter_map(|i| self.doc_at(i).map(|d| d.id)).collect();
+        let modified: Vec<u64> = (0..self.tabs.len())
+            .filter(|&i| self.tab_label(i).1)
+            .filter_map(|i| self.doc_at(i).map(|d| d.id))
+            .collect();
         let mut asks = None;
         let mut failed = false;
         for id in modified {
-            let Some(index) = self.tab_of(id) else { continue };
+            let Some(index) = self.tab_of(id) else {
+                continue;
+            };
             self.activate(Some(index));
             if self.save_needs_question() {
                 asks.get_or_insert(id);
             } else {
                 self.save();
                 // Still modified: the save failed, and has said why, or Save As was cancelled.
-                failed |= self.tab_of(id).and_then(|i| self.doc_at(i)).is_some_and(|d| d.dirty);
+                failed |= self
+                    .tab_of(id)
+                    .and_then(|i| self.doc_at(i))
+                    .is_some_and(|d| d.dirty);
             }
         }
         // The quit prompt stays up for another try.
@@ -693,7 +816,9 @@ impl CarbideApp {
     }
 
     fn add_location_window(&mut self, ctx: &egui::Context) {
-        let Some(found) = self.shell.add_location.clone() else { return };
+        let Some(found) = self.shell.add_location.clone() else {
+            return;
+        };
         let mut add: Option<PathBuf> = None;
         let mut browse = false;
         let mut close = false;
@@ -739,7 +864,9 @@ impl CarbideApp {
             close = true;
         }
         if browse {
-            add = rfd::FileDialog::new().set_title("Add Location").pick_folder();
+            add = rfd::FileDialog::new()
+                .set_title("Add Location")
+                .pick_folder();
             close = add.is_some() || close;
         }
         if let Some(dir) = add {
@@ -781,10 +908,16 @@ impl CarbideApp {
             if let Some(text) = self.shown_notice() {
                 egui::Panel::top("notice")
                     .show_separator_line(false)
-                    .frame(Frame::new().fill(theme::NOTICE).inner_margin(Margin::symmetric(12, 5)))
+                    .frame(
+                        Frame::new()
+                            .fill(theme::NOTICE)
+                            .inner_margin(Margin::symmetric(12, 5)),
+                    )
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(text).color(Color32::from_rgb(190, 210, 255)));
+                            ui.label(
+                                egui::RichText::new(text).color(Color32::from_rgb(190, 210, 255)),
+                            );
                             if ui.small_button("Signatures").clicked() {
                                 self.validate_signatures();
                             }
@@ -805,25 +938,43 @@ impl CarbideApp {
                     .size_range(150.0..=360.0)
                     .resizable(true)
                     .show_separator_line(false)
-                    .frame(Frame::new().fill(theme::SIDEBAR).inner_margin(Margin::symmetric(8, 6)))
+                    .frame(
+                        Frame::new()
+                            .fill(theme::SIDEBAR)
+                            .inner_margin(Margin::symmetric(8, 6)),
+                    )
                     .show(ui, |ui| self.sidebar(ui));
             }
-            egui::CentralPanel::default().frame(Frame::new().fill(theme::CONTENT)).show(ui, |ui| self.page_view(ui));
+            egui::CentralPanel::default()
+                .frame(Frame::new().fill(theme::CONTENT))
+                .show(ui, |ui| self.page_view(ui));
         } else {
             egui::Panel::left("start-sidebar")
                 .exact_size(260.0)
                 .show_separator_line(false)
-                .frame(Frame::new().fill(theme::SIDEBAR).inner_margin(Margin::symmetric(14, 26)))
+                .frame(
+                    Frame::new()
+                        .fill(theme::SIDEBAR)
+                        .inner_margin(Margin::symmetric(14, 26)),
+                )
                 .show(ui, |ui| self.start_sidebar(ui));
             egui::CentralPanel::default()
-                .frame(Frame::new().fill(theme::CONTENT).inner_margin(Margin::symmetric(20, 14)))
+                .frame(
+                    Frame::new()
+                        .fill(theme::CONTENT)
+                        .inner_margin(Margin::symmetric(20, 14)),
+                )
                 .show(ui, |ui| self.start_main(ui));
         }
     }
 
     fn sync_window_title(&mut self, ctx: &egui::Context) {
         let title = match self.doc.as_ref() {
-            Some(d) => format!("{}{} - Carbide PDF", d.title(), if d.dirty { " *" } else { "" }),
+            Some(d) => format!(
+                "{}{} - Carbide PDF",
+                d.title(),
+                if d.dirty { " *" } else { "" }
+            ),
             None => "Start - Carbide PDF".to_string(),
         };
         if title != self.shell.window_title {
@@ -847,33 +998,65 @@ impl CarbideApp {
             (Glyph::Undo, Cmd::Undo),
             (Glyph::Redo, Cmd::Redo),
         ];
-        let strip = Rect::from_min_size(pos2(rect.min.x + 8.0, rect.min.y + 6.0), vec2(quick.len() as f32 * 30.0 + 6.0, 28.0));
-        ui.painter().rect_filled(strip, 5.0, Color32::from_rgb(70, 70, 70));
+        let strip = Rect::from_min_size(
+            pos2(rect.min.x + 8.0, rect.min.y + 6.0),
+            vec2(quick.len() as f32 * 30.0 + 6.0, 28.0),
+        );
+        ui.painter()
+            .rect_filled(strip, 5.0, Color32::from_rgb(70, 70, 70));
         for (i, (glyph, cmd)) in quick.iter().enumerate() {
-            let r = Rect::from_min_size(pos2(strip.min.x + 3.0 + i as f32 * 30.0, strip.min.y + 1.0), vec2(30.0, 26.0));
-            if icon_button(ui, r, *glyph, ("quick", i), self.cmd_enabled(*cmd), self.cmd_selected(*cmd), cmd.label()) {
+            let r = Rect::from_min_size(
+                pos2(strip.min.x + 3.0 + i as f32 * 30.0, strip.min.y + 1.0),
+                vec2(30.0, 26.0),
+            );
+            if icon_button(
+                ui,
+                r,
+                *glyph,
+                ("quick", i),
+                self.cmd_enabled(*cmd),
+                self.cmd_selected(*cmd),
+                cmd.label(),
+            ) {
                 fired = Some(*cmd);
             }
         }
 
         // The tab menu, centred in the window.
         let font = FontId::proportional(13.5);
-        let widths: Vec<f32> = RibbonTab::ALL.iter().map(|t| text_width(ui, t.label(), &font) + 22.0).collect();
+        let widths: Vec<f32> = RibbonTab::ALL
+            .iter()
+            .map(|t| text_width(ui, t.label(), &font) + 22.0)
+            .collect();
         let total: f32 = widths.iter().sum();
         let left = (rect.center().x - total / 2.0).max(strip.max.x + 14.0);
         let cluster = Rect::from_min_size(pos2(left, rect.min.y + 6.0), vec2(total, 28.0));
-        ui.painter().rect_filled(cluster, 5.0, Color32::from_rgb(52, 52, 52));
-        ui.painter().rect_stroke(cluster, 5.0, Stroke::new(1.0, theme::HAIRLINE), StrokeKind::Inside);
+        ui.painter()
+            .rect_filled(cluster, 5.0, Color32::from_rgb(52, 52, 52));
+        ui.painter().rect_stroke(
+            cluster,
+            5.0,
+            Stroke::new(1.0, theme::HAIRLINE),
+            StrokeKind::Inside,
+        );
         let mut x = cluster.min.x;
         for (i, tab) in RibbonTab::ALL.iter().enumerate() {
             let r = Rect::from_min_size(pos2(x, cluster.min.y), vec2(widths[i], cluster.height()));
             let response = ui.interact(r, ui.id().with(("ribbon-tab", i)), Sense::click());
             if self.shell.ribbon_tab == *tab {
-                ui.painter().rect_filled(r.shrink(2.0), 4.0, theme::TAB_ACTIVE);
+                ui.painter()
+                    .rect_filled(r.shrink(2.0), 4.0, theme::TAB_ACTIVE);
             } else if response.hovered() {
-                ui.painter().rect_filled(r.shrink(2.0), 4.0, Color32::from_gray(68));
+                ui.painter()
+                    .rect_filled(r.shrink(2.0), 4.0, Color32::from_gray(68));
             }
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, tab.label(), font.clone(), theme::TEXT);
+            ui.painter().text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                tab.label(),
+                font.clone(),
+                theme::TEXT,
+            );
             if i + 1 < RibbonTab::ALL.len() {
                 ui.painter().line_segment(
                     [pos2(r.max.x, r.min.y + 8.0), pos2(r.max.x, r.max.y - 8.0)],
@@ -888,16 +1071,31 @@ impl CarbideApp {
 
         // Find a Tool.
         let find_width = ((rect.max.x - 12.0) - (cluster.max.x + 14.0)).clamp(110.0, 280.0);
-        let find = Rect::from_min_max(pos2(rect.max.x - 12.0 - find_width, rect.min.y + 6.0), pos2(rect.max.x - 12.0, rect.max.y - 6.0));
-        ui.painter().rect_filled(find, 5.0, Color32::from_rgb(30, 30, 30));
-        ui.painter().rect_stroke(find, 5.0, Stroke::new(1.0, theme::HAIRLINE), StrokeKind::Inside);
+        let find = Rect::from_min_max(
+            pos2(rect.max.x - 12.0 - find_width, rect.min.y + 6.0),
+            pos2(rect.max.x - 12.0, rect.max.y - 6.0),
+        );
+        ui.painter()
+            .rect_filled(find, 5.0, Color32::from_rgb(30, 30, 30));
+        ui.painter().rect_stroke(
+            find,
+            5.0,
+            Stroke::new(1.0, theme::HAIRLINE),
+            StrokeKind::Inside,
+        );
         icons::paint(
             ui.painter(),
             Rect::from_center_size(pos2(find.min.x + 15.0, find.center().y), vec2(14.0, 14.0)),
             Glyph::Search,
             theme::TEXT_DIM,
         );
-        let edit_rect = Rect::from_center_size(pos2((find.min.x + 28.0 + find.max.x - 6.0) / 2.0, find.center().y), vec2(find.width() - 34.0, 20.0));
+        let edit_rect = Rect::from_center_size(
+            pos2(
+                (find.min.x + 28.0 + find.max.x - 6.0) / 2.0,
+                find.center().y,
+            ),
+            vec2(find.width() - 34.0, 20.0),
+        );
         let edit = egui::TextEdit::singleline(&mut self.shell.find)
             .hint_text("Find a Tool")
             .frame(Frame::NONE)
@@ -921,7 +1119,11 @@ impl CarbideApp {
             self.shell.find_hover = false;
             return None;
         }
-        let matches: Vec<Cmd> = ribbon::all_commands().into_iter().filter(|c| c.label().to_lowercase().contains(&query)).take(8).collect();
+        let matches: Vec<Cmd> = ribbon::all_commands()
+            .into_iter()
+            .filter(|c| c.label().to_lowercase().contains(&query))
+            .take(8)
+            .collect();
         let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
         let mut chosen: Option<Cmd> = None;
         if enter {
@@ -938,7 +1140,9 @@ impl CarbideApp {
                     }
                     for cmd in &matches {
                         let enabled = self.cmd_enabled(*cmd);
-                        let button = egui::Button::new(cmd.label()).frame(false).min_size(vec2(ui.available_width(), 22.0));
+                        let button = egui::Button::new(cmd.label())
+                            .frame(false)
+                            .min_size(vec2(ui.available_width(), 22.0));
                         if ui.add_enabled(enabled, button).clicked() {
                             chosen = Some(*cmd);
                         }
@@ -972,9 +1176,16 @@ impl CarbideApp {
         if self.active_tab.is_none() {
             ui.painter().rect_filled(start, 0.0, theme::TAB_ACTIVE);
         } else if response.hovered() {
-            ui.painter().rect_filled(start, 0.0, Color32::from_gray(100));
+            ui.painter()
+                .rect_filled(start, 0.0, Color32::from_gray(100));
         }
-        ui.painter().text(pos2(start.min.x + 12.0, start.center().y), Align2::LEFT_CENTER, "Start", font.clone(), theme::TEXT);
+        ui.painter().text(
+            pos2(start.min.x + 12.0, start.center().y),
+            Align2::LEFT_CENTER,
+            "Start",
+            font.clone(),
+            theme::TEXT,
+        );
         if response.clicked() {
             action = Some(TabAction::Show(None));
         }
@@ -992,14 +1203,32 @@ impl CarbideApp {
             } else if response.hovered() {
                 ui.painter().rect_filled(tab, 0.0, Color32::from_gray(100));
             }
-            ui.painter().text(pos2(tab.min.x + 12.0, tab.center().y), Align2::LEFT_CENTER, label, font.clone(), theme::TEXT);
-            let close = Rect::from_center_size(pos2(tab.max.x - 16.0, tab.center().y), vec2(20.0, 20.0));
-            let close_response = ui.interact(close, ui.id().with(("doc-tab-close", index)), Sense::click());
+            ui.painter().text(
+                pos2(tab.min.x + 12.0, tab.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                font.clone(),
+                theme::TEXT,
+            );
+            let close =
+                Rect::from_center_size(pos2(tab.max.x - 16.0, tab.center().y), vec2(20.0, 20.0));
+            let close_response = ui.interact(
+                close,
+                ui.id().with(("doc-tab-close", index)),
+                Sense::click(),
+            );
             if close_response.hovered() {
-                ui.painter().rect_filled(close, 4.0, Color32::from_gray(140));
+                ui.painter()
+                    .rect_filled(close, 4.0, Color32::from_gray(140));
             }
-            icons::paint(ui.painter(), Rect::from_center_size(close.center(), vec2(10.0, 10.0)), Glyph::Close, theme::TEXT);
-            if close_response.clicked() || (response.middle_clicked() && !close_response.hovered()) {
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(close.center(), vec2(10.0, 10.0)),
+                Glyph::Close,
+                theme::TEXT,
+            );
+            if close_response.clicked() || (response.middle_clicked() && !close_response.hovered())
+            {
                 action = Some(TabAction::Close(index));
             } else if response.clicked() {
                 action = Some(TabAction::Show(Some(index)));
@@ -1009,7 +1238,15 @@ impl CarbideApp {
 
         // New tab.
         let plus = Rect::from_min_size(pos2(x + 2.0, rect.min.y), vec2(32.0, rect.height()));
-        if icon_button(ui, plus, Glyph::Plus, "new-tab", true, false, "Open a document") {
+        if icon_button(
+            ui,
+            plus,
+            Glyph::Plus,
+            "new-tab",
+            true,
+            false,
+            "Open a document",
+        ) {
             action = Some(TabAction::New);
         }
 
@@ -1025,7 +1262,13 @@ impl CarbideApp {
 
     fn ribbon_strip(&mut self, ui: &mut Ui) {
         let rect = ui.max_rect();
-        ui.painter().line_segment([pos2(rect.min.x, rect.max.y - 0.5), pos2(rect.max.x, rect.max.y - 0.5)], Stroke::new(1.0, theme::HAIRLINE));
+        ui.painter().line_segment(
+            [
+                pos2(rect.min.x, rect.max.y - 0.5),
+                pos2(rect.max.x, rect.max.y - 0.5),
+            ],
+            Stroke::new(1.0, theme::HAIRLINE),
+        );
         let groups = ribbon::groups(self.shell.ribbon_tab);
         if groups.is_empty() {
             ui.painter().text(
@@ -1045,9 +1288,17 @@ impl CarbideApp {
             let start = x;
             let mut buttons_width = 0.0;
             for cmd in group.commands {
-                let width = (text_width(ui, cmd.label(), &FontId::proportional(11.5)) + 16.0).max(54.0);
+                let width =
+                    (text_width(ui, cmd.label(), &FontId::proportional(11.5)) + 16.0).max(54.0);
                 let r = Rect::from_min_size(pos2(x, rect.min.y + 5.0), vec2(width, 58.0));
-                if command_button(ui, r, *cmd, index, self.cmd_enabled(*cmd), self.cmd_selected(*cmd)) {
+                if command_button(
+                    ui,
+                    r,
+                    *cmd,
+                    index,
+                    self.cmd_enabled(*cmd),
+                    self.cmd_selected(*cmd),
+                ) {
                     fired = Some(*cmd);
                 }
                 index += 1;
@@ -1066,7 +1317,10 @@ impl CarbideApp {
                 theme::TEXT_DIM,
             );
             x += 6.0;
-            ui.painter().line_segment([pos2(x, rect.min.y + 8.0), pos2(x, rect.max.y - 8.0)], Stroke::new(1.0, theme::HAIRLINE));
+            ui.painter().line_segment(
+                [pos2(x, rect.min.y + 8.0), pos2(x, rect.max.y - 8.0)],
+                Stroke::new(1.0, theme::HAIRLINE),
+            );
             x += 10.0;
         }
         if let Some(cmd) = fired {
@@ -1089,7 +1343,15 @@ impl CarbideApp {
         let mut button = |ui: &mut Ui, x: &mut f32, glyph: Glyph, cmd: Cmd, tip: &str| {
             let r = Rect::from_min_size(pos2(*x, top), vec2(26.0, 26.0));
             *x += 26.0;
-            if icon_button(ui, r, glyph, ("bottom", cmd), self.cmd_enabled(cmd), self.cmd_selected(cmd), tip) {
+            if icon_button(
+                ui,
+                r,
+                glyph,
+                ("bottom", cmd),
+                self.cmd_enabled(cmd),
+                self.cmd_selected(cmd),
+                tip,
+            ) {
                 fired = Some(cmd);
             }
         };
@@ -1103,7 +1365,11 @@ impl CarbideApp {
         let field_id = ui.id().with("page-field");
         let editing = ui.ctx().memory(|m| m.has_focus(field_id));
         if !editing {
-            self.shell.page_text = if has_doc { format!("{} / {}", self.current_page + 1, page_count) } else { String::new() };
+            self.shell.page_text = if has_doc {
+                format!("{} / {}", self.current_page + 1, page_count)
+            } else {
+                String::new()
+            };
         }
         let edit = egui::TextEdit::singleline(&mut self.shell.page_text)
             .id(field_id)
@@ -1122,7 +1388,15 @@ impl CarbideApp {
         let mut button = |ui: &mut Ui, x: &mut f32, glyph: Glyph, cmd: Cmd, tip: &str| {
             let r = Rect::from_min_size(pos2(*x, top), vec2(26.0, 26.0));
             *x += 26.0;
-            if icon_button(ui, r, glyph, ("bottom", cmd), self.cmd_enabled(cmd), self.cmd_selected(cmd), tip) {
+            if icon_button(
+                ui,
+                r,
+                glyph,
+                ("bottom", cmd),
+                self.cmd_enabled(cmd),
+                self.cmd_selected(cmd),
+                tip,
+            ) {
                 fired = Some(cmd);
             }
         };
@@ -1131,17 +1405,36 @@ impl CarbideApp {
         x += 10.0;
         button(ui, &mut x, Glyph::FitPage, Cmd::FitPage, "Fit page");
         button(ui, &mut x, Glyph::FitWidth, Cmd::FitWidth, "Fit width");
-        button(ui, &mut x, Glyph::ActualSize, Cmd::ActualSize, "Actual size");
+        button(
+            ui,
+            &mut x,
+            Glyph::ActualSize,
+            Cmd::ActualSize,
+            "Actual size",
+        );
         x += 10.0;
         button(ui, &mut x, Glyph::ZoomOut, Cmd::ZoomOut, "Zoom out");
         let percent = Rect::from_min_size(pos2(x, rect.min.y), vec2(56.0, rect.height()));
         x += 56.0;
-        let text = if has_doc { format!("{:.0}%", self.zoom * 100.0 / ZOOM_100_PERCENT) } else { String::new() };
-        ui.painter().text(percent.center(), Align2::CENTER_CENTER, text, FontId::proportional(13.0), theme::TEXT);
+        let text = if has_doc {
+            format!("{:.0}%", self.zoom * 100.0 / ZOOM_100_PERCENT)
+        } else {
+            String::new()
+        };
+        ui.painter().text(
+            percent.center(),
+            Align2::CENTER_CENTER,
+            text,
+            FontId::proportional(13.0),
+            theme::TEXT,
+        );
         button(ui, &mut x, Glyph::ZoomIn, Cmd::ZoomIn, "Zoom in");
 
         // Status text on the left, clipped so it never runs under the controls.
-        let status_clip = Rect::from_min_max(rect.min, pos2((cluster_start - 8.0).max(rect.min.x), rect.max.y));
+        let status_clip = Rect::from_min_max(
+            rect.min,
+            pos2((cluster_start - 8.0).max(rect.min.x), rect.max.y),
+        );
         ui.painter().with_clip_rect(status_clip).text(
             pos2(rect.min.x + 12.0, rect.center().y),
             Align2::LEFT_CENTER,
@@ -1195,30 +1488,37 @@ impl CarbideApp {
         if self.shell.comments.as_ref().map(|(k, _)| *k) != Some(key) {
             self.shell.comments = Some((key, doc.pdf.annotation_summaries()));
         }
-        let items: Vec<AnnotationSummary> = self.shell.comments.as_ref().map(|(_, v)| v.clone()).unwrap_or_default();
+        let items: Vec<AnnotationSummary> = self
+            .shell
+            .comments
+            .as_ref()
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
         if items.is_empty() {
             ui.weak("No comments in this document.");
             return;
         }
         let mut goto = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for item in &items {
-                let header = format!("Page {} - {}", item.page + 1, comment_kind(&item.kind));
-                let response = ui
-                    .scope(|ui| {
-                        ui.label(egui::RichText::new(header).strong());
-                        if !item.contents.is_empty() {
-                            ui.label(&item.contents);
-                        }
-                    })
-                    .response
-                    .interact(Sense::click());
-                if response.clicked() {
-                    goto = Some(item.page);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for item in &items {
+                    let header = format!("Page {} - {}", item.page + 1, comment_kind(&item.kind));
+                    let response = ui
+                        .scope(|ui| {
+                            ui.label(egui::RichText::new(header).strong());
+                            if !item.contents.is_empty() {
+                                ui.label(&item.contents);
+                            }
+                        })
+                        .response
+                        .interact(Sense::click());
+                    if response.clicked() {
+                        goto = Some(item.page);
+                    }
+                    ui.separator();
                 }
-                ui.separator();
-            }
-        });
+            });
         if let Some(page) = goto {
             self.goto_page(page);
         }
@@ -1253,14 +1553,21 @@ impl CarbideApp {
         let mut pick: Option<Pick> = None;
         let font = FontId::proportional(14.0);
         let row = |ui: &mut Ui, label: &str, selected: bool, id: usize| -> egui::Response {
-            let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+            let (rect, response) =
+                ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
             if selected {
                 ui.painter().rect_filled(rect, 3.0, theme::SIDEBAR_SELECTED);
             } else if response.hovered() {
                 ui.painter().rect_filled(rect, 3.0, Color32::from_gray(58));
             }
             let _ = id;
-            ui.painter().text(pos2(rect.min.x + 26.0, rect.center().y), Align2::LEFT_CENTER, label, font.clone(), theme::TEXT);
+            ui.painter().text(
+                pos2(rect.min.x + 26.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                font.clone(),
+                theme::TEXT,
+            );
             response
         };
 
@@ -1351,7 +1658,11 @@ impl CarbideApp {
                     .into_iter()
                     .flatten()
                     .flatten()
-                    .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("pdf")))
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .is_some_and(|x| x.eq_ignore_ascii_case("pdf"))
+                    })
                     .filter_map(|e| {
                         let meta = e.metadata().ok()?;
                         let time = meta
@@ -1401,8 +1712,19 @@ impl CarbideApp {
             if response.hovered() {
                 ui.painter().rect_filled(r, 6.0, Color32::from_gray(46));
             }
-            icons::paint(ui.painter(), Rect::from_center_size(pos2(r.min.x + 29.0, r.center().y), vec2(34.0, 34.0)), *glyph, theme::TEXT);
-            ui.painter().text(pos2(r.min.x + 62.0, r.center().y), Align2::LEFT_CENTER, *label, font.clone(), theme::TEXT);
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(pos2(r.min.x + 29.0, r.center().y), vec2(34.0, 34.0)),
+                *glyph,
+                theme::TEXT,
+            );
+            ui.painter().text(
+                pos2(r.min.x + 62.0, r.center().y),
+                Align2::LEFT_CENTER,
+                *label,
+                font.clone(),
+                theme::TEXT,
+            );
             if response.clicked() {
                 fired = Some(*cmd);
             }
@@ -1420,17 +1742,42 @@ impl CarbideApp {
             StartView::Folder(dir) => Some(file_name(dir)),
         };
         if let Some(name) = heading {
-            ui.painter().text(pos2(tab_x, bar.center().y), Align2::LEFT_CENTER, name, tab_font.clone(), theme::TEXT);
+            ui.painter().text(
+                pos2(tab_x, bar.center().y),
+                Align2::LEFT_CENTER,
+                name,
+                tab_font.clone(),
+                theme::TEXT,
+            );
         } else {
-            for (i, (label, folders)) in [("Recent File", false), ("Recent Folder", true)].iter().enumerate() {
+            for (i, (label, folders)) in [("Recent File", false), ("Recent Folder", true)]
+                .iter()
+                .enumerate()
+            {
                 let width = text_width(ui, label, &tab_font) + 8.0;
                 let r = Rect::from_min_size(pos2(tab_x, bar.min.y), vec2(width, bar.height()));
                 let response = ui.interact(r, ui.id().with(("recent-tab", i)), Sense::click());
                 let selected = self.shell.folders_tab == *folders;
-                let color = if selected { theme::TEXT } else { theme::TEXT_DIM };
-                ui.painter().text(pos2(r.min.x + 4.0, r.center().y - 2.0), Align2::LEFT_CENTER, *label, tab_font.clone(), color);
+                let color = if selected {
+                    theme::TEXT
+                } else {
+                    theme::TEXT_DIM
+                };
+                ui.painter().text(
+                    pos2(r.min.x + 4.0, r.center().y - 2.0),
+                    Align2::LEFT_CENTER,
+                    *label,
+                    tab_font.clone(),
+                    color,
+                );
                 if selected {
-                    ui.painter().line_segment([pos2(r.min.x + 2.0, r.max.y - 3.0), pos2(r.max.x - 2.0, r.max.y - 3.0)], Stroke::new(2.0, theme::TEXT));
+                    ui.painter().line_segment(
+                        [
+                            pos2(r.min.x + 2.0, r.max.y - 3.0),
+                            pos2(r.max.x - 2.0, r.max.y - 3.0),
+                        ],
+                        Stroke::new(2.0, theme::TEXT),
+                    );
                 }
                 if response.clicked() && !selected {
                     self.shell.folders_tab = *folders;
@@ -1440,11 +1787,22 @@ impl CarbideApp {
             }
         }
         if in_recent && !self.recent.is_empty() {
-            let clear = Rect::from_min_size(pos2(bar.max.x - 84.0, bar.min.y + 2.0), vec2(80.0, 26.0));
+            let clear =
+                Rect::from_min_size(pos2(bar.max.x - 84.0, bar.min.y + 2.0), vec2(80.0, 26.0));
             let response = ui.interact(clear, ui.id().with("clear-all"), Sense::click());
-            let fill = if response.hovered() { Color32::from_gray(96) } else { Color32::from_gray(72) };
+            let fill = if response.hovered() {
+                Color32::from_gray(96)
+            } else {
+                Color32::from_gray(72)
+            };
             ui.painter().rect_filled(clear, 4.0, fill);
-            ui.painter().text(clear.center(), Align2::CENTER_CENTER, "Clear All", FontId::proportional(13.0), theme::TEXT);
+            ui.painter().text(
+                clear.center(),
+                Align2::CENTER_CENTER,
+                "Clear All",
+                FontId::proportional(13.0),
+                theme::TEXT,
+            );
             if response.clicked() {
                 self.recent.clear();
                 paths::save_recent(&self.recent);
@@ -1455,14 +1813,24 @@ impl CarbideApp {
 
         // Table header.
         let rows = self.start_rows();
-        let time_title = if matches!(self.shell.start_view, StartView::Folder(_)) { "MODIFIED" } else { "OPENED" };
+        let time_title = if matches!(self.shell.start_view, StartView::Folder(_)) {
+            "MODIFIED"
+        } else {
+            "OPENED"
+        };
         let (header, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
         let head_font = FontId::proportional(12.0);
         let name_x = header.min.x + 128.0;
         let time_x = header.max.x - 330.0;
         let size_x = header.max.x - 170.0;
         for (x, title) in [(name_x, "NAME"), (time_x, time_title), (size_x, "SIZE")] {
-            ui.painter().text(pos2(x, header.center().y), Align2::LEFT_CENTER, title, head_font.clone(), theme::TEXT_DIM);
+            ui.painter().text(
+                pos2(x, header.center().y),
+                Align2::LEFT_CENTER,
+                title,
+                head_font.clone(),
+                theme::TEXT_DIM,
+            );
         }
 
         if rows.is_empty() {
@@ -1475,29 +1843,68 @@ impl CarbideApp {
         }
 
         let mut open: Option<StartRow> = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (i, row) in rows.iter().enumerate() {
-                let (r, response) = ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::click());
-                if response.hovered() {
-                    ui.painter().rect_filled(r, 4.0, Color32::from_gray(40));
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, row) in rows.iter().enumerate() {
+                    let (r, response) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::click());
+                    if response.hovered() {
+                        ui.painter().rect_filled(r, 4.0, Color32::from_gray(40));
+                    }
+                    let glyph = if row.is_folder {
+                        Glyph::Folder
+                    } else {
+                        Glyph::Document
+                    };
+                    icons::paint(
+                        ui.painter(),
+                        Rect::from_center_size(
+                            pos2(r.min.x + 74.0, r.center().y),
+                            vec2(30.0, 30.0),
+                        ),
+                        glyph,
+                        theme::TEXT,
+                    );
+                    let name = elide(&row.name, 70);
+                    ui.painter().text(
+                        pos2(name_x, r.center().y - 9.0),
+                        Align2::LEFT_CENTER,
+                        name,
+                        FontId::proportional(15.0),
+                        theme::TEXT,
+                    );
+                    let subtitle = elide(&row.subtitle, 90);
+                    ui.painter().text(
+                        pos2(name_x, r.center().y + 11.0),
+                        Align2::LEFT_CENTER,
+                        subtitle,
+                        FontId::proportional(12.0),
+                        theme::TEXT_DIM,
+                    );
+                    ui.painter().text(
+                        pos2(time_x, r.center().y),
+                        Align2::LEFT_CENTER,
+                        format_time(row.time),
+                        FontId::proportional(13.5),
+                        theme::TEXT,
+                    );
+                    if let Some(size) = row.size {
+                        ui.painter().text(
+                            pos2(size_x, r.center().y),
+                            Align2::LEFT_CENTER,
+                            format_size(size),
+                            FontId::proportional(13.5),
+                            theme::TEXT,
+                        );
+                    }
+                    let response = response.on_hover_text(row.path.display().to_string());
+                    if response.clicked() {
+                        open = Some(row.clone());
+                    }
+                    let _ = i;
                 }
-                let glyph = if row.is_folder { Glyph::Folder } else { Glyph::Document };
-                icons::paint(ui.painter(), Rect::from_center_size(pos2(r.min.x + 74.0, r.center().y), vec2(30.0, 30.0)), glyph, theme::TEXT);
-                let name = elide(&row.name, 70);
-                ui.painter().text(pos2(name_x, r.center().y - 9.0), Align2::LEFT_CENTER, name, FontId::proportional(15.0), theme::TEXT);
-                let subtitle = elide(&row.subtitle, 90);
-                ui.painter().text(pos2(name_x, r.center().y + 11.0), Align2::LEFT_CENTER, subtitle, FontId::proportional(12.0), theme::TEXT_DIM);
-                ui.painter().text(pos2(time_x, r.center().y), Align2::LEFT_CENTER, format_time(row.time), FontId::proportional(13.5), theme::TEXT);
-                if let Some(size) = row.size {
-                    ui.painter().text(pos2(size_x, r.center().y), Align2::LEFT_CENTER, format_size(size), FontId::proportional(13.5), theme::TEXT);
-                }
-                let response = response.on_hover_text(row.path.display().to_string());
-                if response.clicked() {
-                    open = Some(row.clone());
-                }
-                let _ = i;
-            }
-        });
+            });
 
         if let Some(row) = open {
             if row.is_folder {

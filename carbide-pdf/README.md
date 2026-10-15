@@ -12,7 +12,7 @@ Carbide PDF is a free, open-source PDF editor written in Rust. Its window layout
 
 ## Requirements and setup
 
-**Rust toolchain.** Cargo workspace, edition 2021. The repository does not pin a minimum Rust version.
+**Rust toolchain.** Cargo workspace, edition 2021. Rust 1.95 or newer is required (`rust-version` in `Cargo.toml`; the GUI dependencies need it).
 
 **PDFium (runtime, for rendering and text).** Needed by `images`, `text`, `compare`, `redact`, `ocr`, and the GUI page view. Other commands do not need it. Download a prebuilt library from https://github.com/bblanchon/pdfium-binaries and set `CARBIDE_PDFIUM_LIB` to the path of the library file (or to the folder containing it). The engine looks for `libpdfium.dylib` (`libpdfium.so`, `pdfium.dll`) in this order and loads the first it finds:
 
@@ -39,6 +39,8 @@ target/release/carbide-gui [file.pdf]
 ```
 
 `cargo build --release` writes `target/release/carbide` and `target/release/carbide-gui`. `carbide-gui` opens the PDF named on the command line, if one is given.
+
+Most tests need PDFium. Set `CARBIDE_PDFIUM_LIB` (see Requirements and setup) before `cargo test`, otherwise the tests that render pages or extract text fail or skip. The OCR tests need the models as well: set `CARBIDE_OCR_MODELS` to the folder that holds them.
 
 ## Features
 

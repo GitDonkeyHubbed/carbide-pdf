@@ -59,9 +59,13 @@ pub fn install(ctx: &egui::Context) -> bool {
     type ShouldTerminate = extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize;
 
     let _ = CONTEXT.set(ctx.clone());
-    let Some(mtm) = MainThreadMarker::new() else { return false };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
     let app = NSApplication::sharedApplication(mtm);
-    let Some(delegate) = app.delegate() else { return false };
+    let Some(delegate) = app.delegate() else {
+        return false;
+    };
     let object: &AnyObject = (*delegate).as_ref();
     let class: *const AnyClass = object.class();
     // SAFETY: the function has the signature the selector's type encoding names ("Q@:@": an
@@ -69,7 +73,12 @@ pub fn install(ctx: &egui::Context) -> bool {
     // class_addMethod adds nothing when the class already has the method.
     let added = unsafe {
         let imp: Imp = std::mem::transmute::<ShouldTerminate, Imp>(should_terminate);
-        objc2::ffi::class_addMethod(class as *mut AnyClass, sel!(applicationShouldTerminate:), imp, c"Q@:@".as_ptr())
+        objc2::ffi::class_addMethod(
+            class as *mut AnyClass,
+            sel!(applicationShouldTerminate:),
+            imp,
+            c"Q@:@".as_ptr(),
+        )
     };
     if !added.as_bool() {
         return false;
@@ -86,10 +95,17 @@ pub fn install(_ctx: &egui::Context) -> bool {
 
 /// `-[NSApplicationDelegate applicationShouldTerminate:]`.
 #[cfg(target_os = "macos")]
-extern "C-unwind" fn should_terminate(_this: *mut objc2::runtime::AnyObject, _cmd: objc2::runtime::Sel, _sender: *mut objc2::runtime::AnyObject) -> usize {
+extern "C-unwind" fn should_terminate(
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _sender: *mut objc2::runtime::AnyObject,
+) -> usize {
     const TERMINATE_CANCEL: usize = 0;
     const TERMINATE_NOW: usize = 1;
-    if may_terminate(UNSAVED.load(Ordering::SeqCst), CONFIRMED.load(Ordering::SeqCst)) {
+    if may_terminate(
+        UNSAVED.load(Ordering::SeqCst),
+        CONFIRMED.load(Ordering::SeqCst),
+    ) {
         return TERMINATE_NOW;
     }
     REQUESTED.store(true, Ordering::SeqCst);
@@ -107,13 +123,19 @@ fn show_windows() {
     use objc2::{msg_send, MainThreadMarker};
     use objc2_app_kit::NSApplication;
 
-    let Some(mtm) = MainThreadMarker::new() else { return };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
     let app = NSApplication::sharedApplication(mtm);
     // SAFETY: standard NSApplication, NSArray and NSWindow messages, sent on the main thread with
     // the argument and return types they are declared with.
     unsafe {
         let windows: *mut AnyObject = msg_send![&*app, windows];
-        let count: usize = if windows.is_null() { 0 } else { msg_send![windows, count] };
+        let count: usize = if windows.is_null() {
+            0
+        } else {
+            msg_send![windows, count]
+        };
         for index in 0..count {
             let window: *mut AnyObject = msg_send![windows, objectAtIndex: index];
             let minimized: Bool = msg_send![window, isMiniaturized];

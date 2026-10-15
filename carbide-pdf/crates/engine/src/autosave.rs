@@ -53,7 +53,8 @@ pub mod messages {
     pub const TOOLTIP_RECOVERED: &str = "A copy kept automatically by Auto Recovery.";
     pub const LAST_SAVED_BY_USER: &str = "Saved by you";
     pub const LAST_SAVED_AUTO: &str = "Saved automatically";
-    pub const APP_CLOSE: &str = "Some recovered documents have not been opened yet. Choose Yes to keep them for later, \
+    pub const APP_CLOSE: &str =
+        "Some recovered documents have not been opened yet. Choose Yes to keep them for later, \
 or No to discard them if your work is already saved.";
 
     pub fn cannot_open_recovered(reason: &str) -> String {
@@ -80,7 +81,10 @@ pub struct AutoSaveSettings {
 
 impl Default for AutoSaveSettings {
     fn default() -> Self {
-        Self { enabled: true, interval_minutes: DEFAULT_INTERVAL_MINUTES }
+        Self {
+            enabled: true,
+            interval_minutes: DEFAULT_INTERVAL_MINUTES,
+        }
     }
 }
 
@@ -103,7 +107,11 @@ impl AutoSaveSettings {
 
     /// Applies the preference page. With the checkbox off the interval is not validated and the
     /// stored value is left unchanged; with it on, the typed value must be valid.
-    pub fn apply_page(&mut self, enabled: bool, interval_text: &str) -> std::result::Result<(), &'static str> {
+    pub fn apply_page(
+        &mut self,
+        enabled: bool,
+        interval_text: &str,
+    ) -> std::result::Result<(), &'static str> {
         if enabled {
             self.interval_minutes = Self::parse_interval(interval_text)?;
         }
@@ -222,7 +230,11 @@ impl AutoSaveStore {
         let _folder = lock_folder(&dir);
         remove_stale_staging(&dir);
         let (owner, owner_lock) = create_owner(&dir)?;
-        let token = owner.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+        let token = owner
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
         let mut store = AutoSaveStore {
             index: dir.join(format!("{token}.xml")),
             dir,
@@ -288,7 +300,10 @@ impl AutoSaveStore {
         self.next_id += 1;
         let original_slot = original.map(|p| OriginalSlot {
             path: p.to_path_buf(),
-            file_name: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            file_name: p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             save_time: now,
         });
         self.records.push(Record {
@@ -308,24 +323,38 @@ impl AutoSaveStore {
             return Err(Error::Other(PROTECTED.into()));
         }
         let bytes = pdf.to_bytes()?;
-        let existing = self.record(id).ok_or_else(|| Error::Other("unknown auto-save record".into()))?;
+        let existing = self
+            .record(id)
+            .ok_or_else(|| Error::Other("unknown auto-save record".into()))?;
         let path = match &existing.recovered {
             Some(slot) => slot.path.clone(),
             None => self.reserve_file()?,
         };
         replace_private(&path, &bytes)?;
 
-        let record = self.records.iter_mut().find(|r| r.id == id).expect("record exists");
+        let record = self
+            .records
+            .iter_mut()
+            .find(|r| r.id == id)
+            .expect("record exists");
         match &mut record.recovered {
             Some(slot) => slot.save_time = now,
-            None => record.recovered = Some(RecoveredSlot { path, save_time: now, flags: 0 }),
+            None => {
+                record.recovered = Some(RecoveredSlot {
+                    path,
+                    save_time: now,
+                    flags: 0,
+                })
+            }
         }
         self.write_index()
     }
 
     /// The user saved the document normally.
     pub fn document_saved(&mut self, id: RecordId) -> Result<()> {
-        let Some(position) = self.records.iter().position(|r| r.id == id) else { return Ok(()) };
+        let Some(position) = self.records.iter().position(|r| r.id == id) else {
+            return Ok(());
+        };
         if self.records[position].loaded {
             // A recovered document was saved: drop the recovery copy, keep tracking the original.
             let slot = self.records[position].recovered.take();
@@ -346,7 +375,9 @@ impl AutoSaveStore {
     /// The document was closed. Session records lose their recovery copy; recovered ones stay in
     /// the list so the user can decide later.
     pub fn document_closed(&mut self, id: RecordId) -> Result<()> {
-        let Some(position) = self.records.iter().position(|r| r.id == id) else { return Ok(()) };
+        let Some(position) = self.records.iter().position(|r| r.id == id) else {
+            return Ok(());
+        };
         if !self.records[position].loaded {
             self.remove_record_files(position);
             self.records.remove(position);
@@ -359,7 +390,9 @@ impl AutoSaveStore {
 
     /// Removes the original row. If a recovered copy exists only the original slot is cleared.
     pub fn remove_original(&mut self, id: RecordId) -> Result<()> {
-        let Some(position) = self.records.iter().position(|r| r.id == id) else { return Ok(()) };
+        let Some(position) = self.records.iter().position(|r| r.id == id) else {
+            return Ok(());
+        };
         if self.records[position].recovered.is_some() {
             self.records[position].original = None;
         } else {
@@ -371,7 +404,9 @@ impl AutoSaveStore {
 
     /// Removes the recovered row. If an original exists only the recovered files are deleted.
     pub fn remove_recovered(&mut self, id: RecordId) -> Result<()> {
-        let Some(position) = self.records.iter().position(|r| r.id == id) else { return Ok(()) };
+        let Some(position) = self.records.iter().position(|r| r.id == id) else {
+            return Ok(());
+        };
         if self.records[position].original.is_some() {
             if let Some(slot) = self.records[position].recovered.take() {
                 self.delete_file(&slot.path);
@@ -411,12 +446,18 @@ impl AutoSaveStore {
 
     /// Loads the recovered copy. The title shown for it is `<name> (recovered)`.
     pub fn open_recovered(&self, id: RecordId, password: Option<&str>) -> Result<(Pdf, String)> {
-        let record = self.record(id).ok_or_else(|| Error::Other("unknown auto-save record".into()))?;
+        let record = self
+            .record(id)
+            .ok_or_else(|| Error::Other("unknown auto-save record".into()))?;
         let slot = record
             .recovered
             .as_ref()
             .filter(|s| s.path.exists())
-            .ok_or_else(|| Error::Other(messages::cannot_open_recovered("the recovery file is missing")))?;
+            .ok_or_else(|| {
+                Error::Other(messages::cannot_open_recovered(
+                    "the recovery file is missing",
+                ))
+            })?;
         let bytes = fs::read(&slot.path)?;
         let pdf = match password {
             Some(p) => Pdf::from_bytes_with_password(&bytes, p),
@@ -433,8 +474,12 @@ impl AutoSaveStore {
         const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
         for _ in 0..32 {
             let mut random = [0u8; 6];
-            getrandom::fill(&mut random).map_err(|e| Error::Other(format!("no randomness available: {e}")))?;
-            let suffix: String = random.iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect();
+            getrandom::fill(&mut random)
+                .map_err(|e| Error::Other(format!("no randomness available: {e}")))?;
+            let suffix: String = random
+                .iter()
+                .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+                .collect();
             let path = self.dir.join(format!("ZAS{suffix}.asd"));
             let mut options = fs::OpenOptions::new();
             options.write(true).create_new(true);
@@ -469,7 +514,9 @@ impl AutoSaveStore {
                 _ => return Ok(()),
             }
         }
-        let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<AutoSave version=\"1.0\">\n");
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<AutoSave version=\"1.0\">\n",
+        );
         for record in &self.records {
             xml.push_str("  <AutoSaveItem");
             if let Some(o) = &record.original {
@@ -482,7 +529,11 @@ impl AutoSaveStore {
                 attribute(&mut xml, "RecoveredSaveTime", &r.save_time.to_string());
                 attribute(&mut xml, "RecoveredFlags", &r.flags.to_string());
             }
-            attribute(&mut xml, "IsNewDoc", if record.is_new_doc { "1" } else { "0" });
+            attribute(
+                &mut xml,
+                "IsNewDoc",
+                if record.is_new_doc { "1" } else { "0" },
+            );
             xml.push_str("/>\n");
         }
         xml.push_str("</AutoSave>\n");
@@ -496,7 +547,9 @@ impl AutoSaveStore {
     /// store's index holds them. Indexes of running windows are left alone. The caller holds the
     /// folder lock, so no other store takes over the same records meanwhile.
     fn take_over_ended_windows(&mut self) {
-        let Ok(entries) = fs::read_dir(&self.dir) else { return };
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return;
+        };
         let mut taken: Vec<PathBuf> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
@@ -506,9 +559,14 @@ impl AutoSaveStore {
             }
             let (index, lock) = match (name.strip_suffix(".xml"), name.strip_suffix(".lock")) {
                 (Some(_), _) if name == INDEX_FILE_NAME => (path, None),
-                (Some(token), _) if token.starts_with(OWN_PREFIX) => (path, Some(self.dir.join(format!("{token}.lock")))),
+                (Some(token), _) if token.starts_with(OWN_PREFIX) => {
+                    (path, Some(self.dir.join(format!("{token}.lock"))))
+                }
                 // The lock of a window that ended without records, or before writing any.
-                (_, Some(token)) if token.starts_with(OWN_PREFIX) && !self.dir.join(format!("{token}.xml")).exists() => {
+                (_, Some(token))
+                    if token.starts_with(OWN_PREFIX)
+                        && !self.dir.join(format!("{token}.xml")).exists() =>
+                {
                     if !is_running(&path) {
                         let _ = fs::remove_file(&path);
                     }
@@ -519,22 +577,37 @@ impl AutoSaveStore {
             if lock.as_deref().is_some_and(is_running) {
                 continue;
             }
-            let Ok(text) = fs::read_to_string(&index) else { continue };
-            let Some(items) = parse_index(&text) else { continue };
+            let Ok(text) = fs::read_to_string(&index) else {
+                continue;
+            };
+            let Some(items) = parse_index(&text) else {
+                continue;
+            };
             // A window of an earlier version that still runs keeps writing its index and copies.
             if lock.is_none() && !quiet(&index, &items) {
                 continue;
             }
             for (original, recovered, is_new_doc) in items {
                 let duplicate = recovered.as_ref().is_some_and(|r| {
-                    self.records.iter().any(|existing| existing.recovered.as_ref().is_some_and(|e| e.path == r.path))
+                    self.records.iter().any(|existing| {
+                        existing
+                            .recovered
+                            .as_ref()
+                            .is_some_and(|e| e.path == r.path)
+                    })
                 });
                 if duplicate {
                     continue;
                 }
                 let id = self.next_id;
                 self.next_id += 1;
-                self.records.push(Record { id, original, recovered, is_new_doc, loaded: true });
+                self.records.push(Record {
+                    id,
+                    original,
+                    recovered,
+                    is_new_doc,
+                    loaded: true,
+                });
             }
             taken.push(index);
             taken.extend(lock);
@@ -589,7 +662,8 @@ fn lock_folder(dir: &Path) -> Option<fs::File> {
 fn create_owner(dir: &Path) -> Result<(PathBuf, Option<fs::File>)> {
     for _ in 0..32 {
         let mut random = [0u8; 8];
-        getrandom::fill(&mut random).map_err(|e| Error::Other(format!("no randomness available: {e}")))?;
+        getrandom::fill(&mut random)
+            .map_err(|e| Error::Other(format!("no randomness available: {e}")))?;
         let token: String = random.iter().map(|b| format!("{b:02x}")).collect();
         let path = dir.join(format!("{OWN_PREFIX}{token}.lock"));
         let mut options = fs::OpenOptions::new();
@@ -605,13 +679,17 @@ fn create_owner(dir: &Path) -> Result<(PathBuf, Option<fs::File>)> {
             Err(e) => return Err(e.into()),
         }
     }
-    Err(Error::Other("could not create an auto-save lock file".into()))
+    Err(Error::Other(
+        "could not create an auto-save lock file".into(),
+    ))
 }
 
 /// True when neither `index` nor any recovery copy it lists has changed for [`EARLIER_INDEX_QUIET`].
 /// A time that cannot be read counts as recent.
 fn quiet(index: &Path, items: &[IndexItem]) -> bool {
-    let copies = items.iter().filter_map(|(_, recovered, _)| recovered.as_ref().map(|r| r.path.as_path()));
+    let copies = items
+        .iter()
+        .filter_map(|(_, recovered, _)| recovered.as_ref().map(|r| r.path.as_path()));
     std::iter::once(index).chain(copies).all(|path| {
         fs::metadata(path)
             .and_then(|m| m.modified())
@@ -638,7 +716,9 @@ fn parse_index(text: &str) -> Option<Vec<IndexItem>> {
         let original = attr("OriginalFile").map(|path| OriginalSlot {
             path: PathBuf::from(path),
             file_name: attr("OriginalFileName").unwrap_or_default().to_string(),
-            save_time: attr("OriginalSaveTime").and_then(|v| v.parse().ok()).unwrap_or(0),
+            save_time: attr("OriginalSaveTime")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
         });
         // A recovery file that no longer exists cannot be opened, so the slot is dropped.
         let recovered = attr("RecoveredFile")
@@ -646,8 +726,12 @@ fn parse_index(text: &str) -> Option<Vec<IndexItem>> {
             .filter(|p| p.exists())
             .map(|path| RecoveredSlot {
                 path,
-                save_time: attr("RecoveredSaveTime").and_then(|v| v.parse().ok()).unwrap_or(0),
-                flags: attr("RecoveredFlags").and_then(|v| v.parse().ok()).unwrap_or(0),
+                save_time: attr("RecoveredSaveTime")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
+                flags: attr("RecoveredFlags")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
             });
         if original.is_none() && recovered.is_none() {
             continue;
@@ -663,7 +747,9 @@ fn parse_index(text: &str) -> Option<Vec<IndexItem>> {
 /// all of `bytes`, never an empty or torn file.
 fn replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let dir = path.parent().ok_or_else(|| Error::Other(format!("{} has no folder", path.display())))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::Other(format!("{} has no folder", path.display())))?;
     let (temp, mut file) = crate::fs::create_temp(dir, 0o600)?;
     let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
@@ -681,13 +767,19 @@ fn replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Removes the staging files of writes that never finished (the app ended halfway), once they
 /// are [`STALE_STAGING`] old. They hold what a recovery copy or an index would have held.
 fn remove_stale_staging(dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !(name.starts_with(".carbide-") && name.ends_with(".tmp")) {
             continue;
         }
-        let age = entry.metadata().and_then(|m| m.modified()).ok().and_then(|modified| modified.elapsed().ok());
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok());
         if age.is_some_and(|age| age >= STALE_STAGING) {
             let _ = fs::remove_file(entry.path());
         }
@@ -750,7 +842,11 @@ mod tests {
         assert_eq!(AutoSaveSettings::parse_interval("1"), Ok(1));
         assert_eq!(AutoSaveSettings::parse_interval("120"), Ok(120));
         for bad in ["0", "121", "", "abc", "-5", "1.5", "10 min"] {
-            assert_eq!(AutoSaveSettings::parse_interval(bad), Err(messages::INTERVAL_RANGE), "{bad:?}");
+            assert_eq!(
+                AutoSaveSettings::parse_interval(bad),
+                Err(messages::INTERVAL_RANGE),
+                "{bad:?}"
+            );
         }
     }
 
@@ -772,12 +868,21 @@ mod tests {
     #[test]
     fn timer_start_conditions() {
         let on = AutoSaveSettings::default();
-        let off = AutoSaveSettings { enabled: false, ..on };
+        let off = AutoSaveSettings {
+            enabled: false,
+            ..on
+        };
         assert!(should_start_timer(&on, false, true, false));
         assert!(!should_start_timer(&off, false, true, false));
-        assert!(!should_start_timer(&on, true, true, false), "already running");
+        assert!(
+            !should_start_timer(&on, true, true, false),
+            "already running"
+        );
         assert!(!should_start_timer(&on, false, false, false), "not dirty");
-        assert!(!should_start_timer(&on, false, true, true), "recovery copy pending");
+        assert!(
+            !should_start_timer(&on, false, true, true),
+            "recovery copy pending"
+        );
         assert!(can_do_autosave(true, false));
         assert!(!can_do_autosave(true, true));
         assert!(!can_do_autosave(false, false));

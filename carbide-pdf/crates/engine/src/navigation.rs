@@ -27,21 +27,41 @@ impl Pdf {
     pub(crate) fn drop_navigation_to(&mut self, doomed: &HashSet<ObjectId>) {
         let named = self.named_destinations();
         let leads_away = |pdf: &Pdf, target: Option<&Object>| {
-            target.and_then(|t| pdf.destination_page(t, &named, 0)).is_some_and(|page| doomed.contains(&page))
+            target
+                .and_then(|t| pdf.destination_page(t, &named, 0))
+                .is_some_and(|page| doomed.contains(&page))
         };
 
-        if let Ok(root) = self.doc.catalog().and_then(|c| c.get(b"Outlines")).and_then(Object::as_reference) {
+        if let Ok(root) = self
+            .doc
+            .catalog()
+            .and_then(|c| c.get(b"Outlines"))
+            .and_then(Object::as_reference)
+        {
             let mut visited = HashSet::new();
-            self.prune_outline(root, true, &|pdf, item| leads_away(pdf, item_target(item)), &mut visited, 0);
+            self.prune_outline(
+                root,
+                true,
+                &|pdf, item| leads_away(pdf, item_target(item)),
+                &mut visited,
+                0,
+            );
         }
 
-        let gone: HashSet<Vec<u8>> =
-            named.iter().filter(|(_, target)| leads_away(self, Some(target))).map(|(name, _)| name.clone()).collect();
+        let gone: HashSet<Vec<u8>> = named
+            .iter()
+            .filter(|(_, target)| leads_away(self, Some(target)))
+            .map(|(name, _)| name.clone())
+            .collect();
         if !gone.is_empty() {
             self.drop_named_destinations(&gone);
         }
 
-        let open_action = self.doc.catalog().ok().and_then(|c| c.get(b"OpenAction").ok().cloned());
+        let open_action = self
+            .doc
+            .catalog()
+            .ok()
+            .and_then(|c| c.get(b"OpenAction").ok().cloned());
         if leads_away(self, open_action.as_ref()) {
             if let Ok(catalog) = self.doc.catalog_mut() {
                 catalog.remove(b"OpenAction");
@@ -49,10 +69,18 @@ impl Pdf {
         }
 
         // Links on the pages that stay lose a destination that is going.
-        let staying: Vec<ObjectId> = self.page_ids().into_iter().filter(|page| !doomed.contains(page)).collect();
+        let staying: Vec<ObjectId> = self
+            .page_ids()
+            .into_iter()
+            .filter(|page| !doomed.contains(page))
+            .collect();
         for page in staying {
             self.clear_links_to(page, &|pdf, annotation| {
-                annotation.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Link") && leads_away(pdf, item_target(annotation))
+                annotation
+                    .get(b"Subtype")
+                    .and_then(Object::as_name)
+                    .is_ok_and(|s| s == b"Link")
+                    && leads_away(pdf, item_target(annotation))
             });
         }
 
@@ -60,7 +88,12 @@ impl Pdf {
     }
 
     /// The page a destination, a named destination or a go-to action leads to in this document.
-    fn destination_page(&self, target: &Object, named: &HashMap<Vec<u8>, Object>, depth: usize) -> Option<ObjectId> {
+    fn destination_page(
+        &self,
+        target: &Object,
+        named: &HashMap<Vec<u8>, Object>,
+        depth: usize,
+    ) -> Option<ObjectId> {
         if depth > 8 {
             return None;
         }
@@ -68,12 +101,18 @@ impl Pdf {
             Object::Array(items) => items.first()?.as_reference().ok(),
             // A go-to action, or a named destination in its dictionary form.
             Object::Dictionary(dict) => {
-                if dict.get(b"S").and_then(Object::as_name).is_ok_and(|s| s != b"GoTo") {
+                if dict
+                    .get(b"S")
+                    .and_then(Object::as_name)
+                    .is_ok_and(|s| s != b"GoTo")
+                {
                     return None;
                 }
                 self.destination_page(dict.get(b"D").ok()?, named, depth + 1)
             }
-            Object::Name(name) | Object::String(name, _) => self.destination_page(named.get(&name)?, named, depth + 1),
+            Object::Name(name) | Object::String(name, _) => {
+                self.destination_page(named.get(&name)?, named, depth + 1)
+            }
             _ => None,
         }
     }
@@ -81,9 +120,15 @@ impl Pdf {
     /// Every named destination: the catalog's /Dests dictionary and the /Dests name tree.
     fn named_destinations(&self) -> HashMap<Vec<u8>, Object> {
         let mut found = HashMap::new();
-        let Ok(catalog) = self.doc.catalog() else { return found };
+        let Ok(catalog) = self.doc.catalog() else {
+            return found;
+        };
         if let Ok(Object::Dictionary(dests)) = catalog.get(b"Dests").map(|d| self.resolve(d)) {
-            found.extend(dests.iter().map(|(name, target)| (name.clone(), target.clone())));
+            found.extend(
+                dests
+                    .iter()
+                    .map(|(name, target)| (name.clone(), target.clone())),
+            );
         }
         if let Some(tree) = self.name_tree(b"Dests") {
             let mut pairs = Vec::new();
@@ -105,10 +150,21 @@ impl Pdf {
 
     /// Removes the named destinations called `gone` from the catalog's /Dests and the name tree.
     fn drop_named_destinations(&mut self, gone: &HashSet<Vec<u8>>) {
-        let Ok(catalog_id) = self.doc.trailer.get(b"Root").and_then(Object::as_reference) else { return };
-        if let Ok(dests) = self.doc.get_dictionary(catalog_id).and_then(|c| c.get(b"Dests")).cloned() {
+        let Ok(catalog_id) = self.doc.trailer.get(b"Root").and_then(Object::as_reference) else {
+            return;
+        };
+        if let Ok(dests) = self
+            .doc
+            .get_dictionary(catalog_id)
+            .and_then(|c| c.get(b"Dests"))
+            .cloned()
+        {
             edit_dictionary(&mut self.doc, catalog_id, b"Dests", dests, |dict| {
-                let names: Vec<Vec<u8>> = dict.iter().map(|(k, _)| k.clone()).filter(|k| gone.contains(k)).collect();
+                let names: Vec<Vec<u8>> = dict
+                    .iter()
+                    .map(|(k, _)| k.clone())
+                    .filter(|k| gone.contains(k))
+                    .collect();
                 for name in names {
                     dict.remove(&name);
                 }
@@ -116,16 +172,33 @@ impl Pdf {
         }
         if let Some(mut tree) = self.name_tree(b"Dests") {
             let goes = |name: &Object, _: &Object| matches!(name, Object::String(n, _) if gone.contains(n));
-            let held = prune_pairs(&mut self.doc, &mut tree, b"Names", &goes, &mut HashSet::new(), 0);
-            let names_entry = self.doc.get_dictionary(catalog_id).and_then(|c| c.get(b"Names")).cloned();
+            let held = prune_pairs(
+                &mut self.doc,
+                &mut tree,
+                b"Names",
+                &goes,
+                &mut HashSet::new(),
+                0,
+            );
+            let names_entry = self
+                .doc
+                .get_dictionary(catalog_id)
+                .and_then(|c| c.get(b"Names"))
+                .cloned();
             if let Ok(names) = names_entry {
-                edit_dictionary(&mut self.doc, catalog_id, b"Names", names, |dict| match held {
-                    // A tree left without a name goes altogether.
-                    Held::Nothing => {
-                        dict.remove(b"Dests");
-                    }
-                    _ => dict.set("Dests", tree),
-                });
+                edit_dictionary(
+                    &mut self.doc,
+                    catalog_id,
+                    b"Names",
+                    names,
+                    |dict| match held {
+                        // A tree left without a name goes altogether.
+                        Held::Nothing => {
+                            dict.remove(b"Dests");
+                        }
+                        _ => dict.set("Dests", tree),
+                    },
+                );
             }
         }
     }
@@ -141,9 +214,15 @@ impl Pdf {
         visited: &mut HashSet<ObjectId>,
         depth: usize,
     ) -> i64 {
-        let Ok(dict) = self.doc.get_dictionary(parent) else { return 0 };
+        let Ok(dict) = self.doc.get_dictionary(parent) else {
+            return 0;
+        };
         if depth > MAX_DEPTH {
-            return dict.get(b"Count").and_then(Object::as_i64).map(i64::abs).unwrap_or(0);
+            return dict
+                .get(b"Count")
+                .and_then(Object::as_i64)
+                .map(i64::abs)
+                .unwrap_or(0);
         }
         let mut children = Vec::new();
         let mut next = dict.get(b"First").and_then(Object::as_reference).ok();
@@ -152,16 +231,26 @@ impl Pdf {
                 break;
             }
             children.push(id);
-            next = self.doc.get_dictionary(id).and_then(|d| d.get(b"Next")).and_then(Object::as_reference).ok();
+            next = self
+                .doc
+                .get_dictionary(id)
+                .and_then(|d| d.get(b"Next"))
+                .and_then(Object::as_reference)
+                .ok();
         }
 
         let mut kept = Vec::new();
         let mut shown = 0;
         for child in children {
             let below = self.prune_outline(child, false, goes, visited, depth + 1);
-            let Ok(item) = self.doc.get_dictionary(child) else { continue };
+            let Ok(item) = self.doc.get_dictionary(child) else {
+                continue;
+            };
             let has_children = item.has(b"First");
-            let open = item.get(b"Count").and_then(Object::as_i64).is_ok_and(|c| c > 0);
+            let open = item
+                .get(b"Count")
+                .and_then(Object::as_i64)
+                .is_ok_and(|c| c > 0);
             if goes(self, item) {
                 if !has_children {
                     continue;
@@ -176,7 +265,9 @@ impl Pdf {
         }
 
         for (i, &id) in kept.iter().enumerate() {
-            let Ok(item) = self.doc.get_dictionary_mut(id) else { continue };
+            let Ok(item) = self.doc.get_dictionary_mut(id) else {
+                continue;
+            };
             item.set("Parent", parent);
             match i.checked_sub(1).map(|p| kept[p]) {
                 Some(previous) => item.set("Prev", previous),
@@ -191,7 +282,9 @@ impl Pdf {
                 }
             }
         }
-        let Ok(dict) = self.doc.get_dictionary_mut(parent) else { return shown };
+        let Ok(dict) = self.doc.get_dictionary_mut(parent) else {
+            return shown;
+        };
         match (kept.first(), kept.last()) {
             (Some(&first), Some(&last)) => {
                 dict.set("First", first);
@@ -203,7 +296,11 @@ impl Pdf {
             }
         }
         // An open item counts the items it shows; a closed one, negated, those it would show.
-        let closed = !is_root && dict.get(b"Count").and_then(Object::as_i64).is_ok_and(|c| c < 0);
+        let closed = !is_root
+            && dict
+                .get(b"Count")
+                .and_then(Object::as_i64)
+                .is_ok_and(|c| c < 0);
         if shown == 0 && !is_root {
             dict.remove(b"Count");
         } else {
@@ -214,7 +311,12 @@ impl Pdf {
 
     /// Removes the destination of every link on `page` that `goes` gives up.
     fn clear_links_to(&mut self, page: ObjectId, goes: &dyn Fn(&Pdf, &Dictionary) -> bool) {
-        let annotations = match self.doc.get_dictionary(page).and_then(|d| d.get(b"Annots")).map(|a| self.resolve(a)) {
+        let annotations = match self
+            .doc
+            .get_dictionary(page)
+            .and_then(|d| d.get(b"Annots"))
+            .map(|a| self.resolve(a))
+        {
             Ok(Object::Array(items)) => items,
             _ => return,
         };
@@ -222,7 +324,9 @@ impl Pdf {
         for (i, annotation) in annotations.iter().enumerate() {
             match annotation {
                 Object::Reference(id) => {
-                    let Ok(dict) = self.doc.get_dictionary(*id) else { continue };
+                    let Ok(dict) = self.doc.get_dictionary(*id) else {
+                        continue;
+                    };
                     if goes(self, dict) {
                         if let Ok(dict) = self.doc.get_dictionary_mut(*id) {
                             dict.remove(b"Dest");
@@ -244,7 +348,12 @@ impl Pdf {
                 dict.remove(b"A");
             }
         }
-        if let Ok(Object::Reference(id)) = self.doc.get_dictionary(page).and_then(|d| d.get(b"Annots")).cloned() {
+        if let Ok(Object::Reference(id)) = self
+            .doc
+            .get_dictionary(page)
+            .and_then(|d| d.get(b"Annots"))
+            .cloned()
+        {
             self.doc.objects.insert(id, Object::Array(annotations));
         } else if let Ok(dict) = self.doc.get_dictionary_mut(page) {
             dict.set("Annots", annotations);
@@ -254,9 +363,20 @@ impl Pdf {
     /// Takes the article beads on `doomed` pages out of their threads, and threads left without a
     /// bead out of the document.
     pub(crate) fn prune_threads(&mut self, doomed: &HashSet<ObjectId>) {
-        let Ok(catalog_id) = self.doc.trailer.get(b"Root").and_then(Object::as_reference) else { return };
-        let Ok(threads) = self.doc.get_dictionary(catalog_id).and_then(|c| c.get(b"Threads")).cloned() else { return };
-        let Object::Array(list) = self.resolve(&threads) else { return };
+        let Ok(catalog_id) = self.doc.trailer.get(b"Root").and_then(Object::as_reference) else {
+            return;
+        };
+        let Ok(threads) = self
+            .doc
+            .get_dictionary(catalog_id)
+            .and_then(|c| c.get(b"Threads"))
+            .cloned()
+        else {
+            return;
+        };
+        let Object::Array(list) = self.resolve(&threads) else {
+            return;
+        };
         let mut kept_threads = Vec::new();
         let mut changed = false;
         for thread in list {
@@ -265,22 +385,41 @@ impl Pdf {
                 continue;
             };
             let mut beads = Vec::new();
-            let mut next = self.doc.get_dictionary(thread_id).and_then(|t| t.get(b"F")).and_then(Object::as_reference).ok();
+            let mut next = self
+                .doc
+                .get_dictionary(thread_id)
+                .and_then(|t| t.get(b"F"))
+                .and_then(Object::as_reference)
+                .ok();
             while let Some(bead) = next {
                 if beads.contains(&bead) || beads.len() >= MAX_CHAIN {
                     break;
                 }
                 beads.push(bead);
-                next = self.doc.get_dictionary(bead).and_then(|b| b.get(b"N")).and_then(Object::as_reference).ok();
+                next = self
+                    .doc
+                    .get_dictionary(bead)
+                    .and_then(|b| b.get(b"N"))
+                    .and_then(Object::as_reference)
+                    .ok();
             }
-            let on_doomed =
-                |pdf: &Pdf, bead: ObjectId| pdf.doc.get_dictionary(bead).and_then(|b| b.get(b"P")).and_then(Object::as_reference).is_ok_and(|p| doomed.contains(&p));
+            let on_doomed = |pdf: &Pdf, bead: ObjectId| {
+                pdf.doc
+                    .get_dictionary(bead)
+                    .and_then(|b| b.get(b"P"))
+                    .and_then(Object::as_reference)
+                    .is_ok_and(|p| doomed.contains(&p))
+            };
             if !beads.iter().any(|&b| on_doomed(self, b)) {
                 kept_threads.push(thread);
                 continue;
             }
             changed = true;
-            let kept: Vec<ObjectId> = beads.iter().copied().filter(|&b| !on_doomed(self, b)).collect();
+            let kept: Vec<ObjectId> = beads
+                .iter()
+                .copied()
+                .filter(|&b| !on_doomed(self, b))
+                .collect();
             if kept.is_empty() {
                 continue;
             }
@@ -324,7 +463,12 @@ impl Pdf {
         collect_pairs(&self.doc, &tree, b"Nums", &mut pairs);
         let mut ranges: Vec<(i64, Dictionary)> = pairs
             .into_iter()
-            .filter_map(|(start, style)| Some((start.as_i64().ok()?, self.resolve(&style).as_dict().ok()?.clone())))
+            .filter_map(|(start, style)| {
+                Some((
+                    start.as_i64().ok()?,
+                    self.resolve(&style).as_dict().ok()?.clone(),
+                ))
+            })
             .collect();
         if ranges.is_empty() {
             // Nothing readable to carry over: the tree is left as it is.
@@ -335,9 +479,19 @@ impl Pdf {
             let index = index as i64;
             match ranges.iter().rev().find(|(start, _)| *start <= index) {
                 Some((start, style)) => {
-                    let name = style.get(b"S").ok().and_then(|s| self.resolve(s).as_name().ok().map(<[u8]>::to_vec));
-                    let prefix = style.get(b"P").ok().and_then(|p| self.resolve(p).as_str().ok().map(<[u8]>::to_vec));
-                    let first = style.get(b"St").ok().and_then(|n| self.resolve(n).as_i64().ok()).unwrap_or(1);
+                    let name = style
+                        .get(b"S")
+                        .ok()
+                        .and_then(|s| self.resolve(s).as_name().ok().map(<[u8]>::to_vec));
+                    let prefix = style
+                        .get(b"P")
+                        .ok()
+                        .and_then(|p| self.resolve(p).as_str().ok().map(<[u8]>::to_vec));
+                    let first = style
+                        .get(b"St")
+                        .ok()
+                        .and_then(|n| self.resolve(n).as_i64().ok())
+                        .unwrap_or(1);
                     (name, prefix, first + index - start)
                 }
                 None => (None, None, index + 1),
@@ -349,9 +503,9 @@ impl Pdf {
         let kept = (0..self.page_count()).filter(|page| deleted.binary_search(page).is_err());
         for (new_index, old_index) in kept.enumerate() {
             let (name, prefix, number) = label(old_index);
-            let continues = previous
-                .as_ref()
-                .is_some_and(|(n, p, last)| *n == name && *p == prefix && (name.is_none() || *last + 1 == number));
+            let continues = previous.as_ref().is_some_and(|(n, p, last)| {
+                *n == name && *p == prefix && (name.is_none() || *last + 1 == number)
+            });
             if !continues {
                 let mut style = Dictionary::new();
                 if let Some(name) = &name {
@@ -381,7 +535,13 @@ fn item_target(item: &Dictionary) -> Option<&Object> {
 
 /// Runs `edit` on the dictionary `entry` (the value of `key` in the dictionary `owner`) is or
 /// refers to, and stores it where it came from.
-fn edit_dictionary(doc: &mut Document, owner: ObjectId, key: &[u8], entry: Object, edit: impl FnOnce(&mut Dictionary)) {
+fn edit_dictionary(
+    doc: &mut Document,
+    owner: ObjectId,
+    key: &[u8],
+    entry: Object,
+    edit: impl FnOnce(&mut Dictionary),
+) {
     match entry {
         Object::Reference(id) => {
             if let Ok(dict) = doc.get_dictionary_mut(id) {
@@ -400,7 +560,12 @@ fn edit_dictionary(doc: &mut Document, owner: ObjectId, key: &[u8], entry: Objec
 
 /// The key and value pairs of a name tree (`key` = `Names`) or number tree (`Nums`), values as
 /// stored. A node listed again (the tree loops, or lists a node twice) is read only once.
-pub(crate) fn collect_pairs(doc: &Document, node: &Object, key: &[u8], out: &mut Vec<(Object, Object)>) {
+pub(crate) fn collect_pairs(
+    doc: &Document,
+    node: &Object,
+    key: &[u8],
+    out: &mut Vec<(Object, Object)>,
+) {
     collect_pairs_below(doc, node, key, out, &mut HashSet::new(), 0);
 }
 
@@ -514,7 +679,10 @@ fn prune_pairs(
                     kept.push(value.clone());
                 }
             }
-            if let (Some(first), Some(last)) = (kept.first(), kept.len().checked_sub(2).and_then(|i| kept.get(i))) {
+            if let (Some(first), Some(last)) = (
+                kept.first(),
+                kept.len().checked_sub(2).and_then(|i| kept.get(i)),
+            ) {
                 held.push(Held::Keys(Box::new((first.clone(), last.clone()))));
             }
             dict.set(key.to_vec(), kept);
@@ -524,11 +692,15 @@ fn prune_pairs(
     }
     let held = match (held.first(), held.last()) {
         _ if held.iter().any(|h| matches!(h, Held::Unknown)) => Held::Unknown,
-        (Some(Held::Keys(first)), Some(Held::Keys(last))) => Held::Keys(Box::new((first.0.clone(), last.1.clone()))),
+        (Some(Held::Keys(first)), Some(Held::Keys(last))) => {
+            Held::Keys(Box::new((first.0.clone(), last.1.clone())))
+        }
         _ => Held::Nothing,
     };
     match &held {
-        Held::Keys(keys) if dict.has(b"Limits") => dict.set("Limits", vec![keys.0.clone(), keys.1.clone()]),
+        Held::Keys(keys) if dict.has(b"Limits") => {
+            dict.set("Limits", vec![keys.0.clone(), keys.1.clone()])
+        }
         Held::Nothing => {
             dict.remove(b"Limits");
         }

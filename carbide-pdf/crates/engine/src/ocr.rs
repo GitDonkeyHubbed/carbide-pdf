@@ -34,7 +34,12 @@ pub struct OcrOptions {
 
 impl Default for OcrOptions {
     fn default() -> Self {
-        Self { dpi: 300.0, models_dir: None, skip_pages_with_text_over: 10, pages: None }
+        Self {
+            dpi: 300.0,
+            models_dir: None,
+            skip_pages_with_text_over: 10,
+            pages: None,
+        }
     }
 }
 
@@ -94,14 +99,23 @@ struct Line {
 /// The render may have been made at a lower resolution than asked for (see
 /// [`Renderer::render_page`]), so the scale comes from its size.
 fn recognize(engine: &OcrEngine, image: image::RgbaImage, page: (f32, f32)) -> Result<Vec<Line>> {
-    let (sx, sy) = (page.0 / image.width().max(1) as f32, page.1 / image.height().max(1) as f32);
+    let (sx, sy) = (
+        page.0 / image.width().max(1) as f32,
+        page.1 / image.height().max(1) as f32,
+    );
     let rgb = image::DynamicImage::ImageRgba8(image).into_rgb8();
     let source = ImageSource::from_bytes(rgb.as_raw(), rgb.dimensions())
         .map_err(|e| Error::Other(format!("OCR input error: {e}")))?;
-    let input = engine.prepare_input(source).map_err(|e| Error::Other(format!("OCR error: {e}")))?;
-    let words = engine.detect_words(&input).map_err(|e| Error::Other(format!("OCR error: {e}")))?;
+    let input = engine
+        .prepare_input(source)
+        .map_err(|e| Error::Other(format!("OCR error: {e}")))?;
+    let words = engine
+        .detect_words(&input)
+        .map_err(|e| Error::Other(format!("OCR error: {e}")))?;
     let line_rects = engine.find_text_lines(&input, &words);
-    let lines = engine.recognize_text(&input, &line_rects).map_err(|e| Error::Other(format!("OCR error: {e}")))?;
+    let lines = engine
+        .recognize_text(&input, &line_rects)
+        .map_err(|e| Error::Other(format!("OCR error: {e}")))?;
 
     let mut out = Vec::new();
     for line in lines.into_iter().flatten() {
@@ -125,13 +139,21 @@ fn recognize(engine: &OcrEngine, image: image::RgbaImage, page: (f32, f32)) -> R
 
 impl Pdf {
     /// Adds an invisible, selectable text layer to pages that have no text of their own.
-    pub fn make_searchable(&mut self, renderer: &Renderer, options: &OcrOptions) -> Result<OcrReport> {
+    pub fn make_searchable(
+        &mut self,
+        renderer: &Renderer,
+        options: &OcrOptions,
+    ) -> Result<OcrReport> {
         let models = locate_models(options.models_dir.as_deref())?;
         let engine = engine(&models)?;
         let ids = self.page_ids();
         let count = ids.len();
         // A page listed twice is recognized once, so it gets one text layer.
-        let wanted: Vec<usize> = options.pages.as_deref().map(crate::pdf::once_each).unwrap_or_else(|| (0..count).collect());
+        let wanted: Vec<usize> = options
+            .pages
+            .as_deref()
+            .map(crate::pdf::once_each)
+            .unwrap_or_else(|| (0..count).collect());
         if let Some(&page) = wanted.iter().find(|&&page| page >= count) {
             return Err(Error::PageOutOfRange { index: page, count });
         }
@@ -158,13 +180,19 @@ impl Pdf {
             }
 
             let font_name = self.add_standard_font(page_id, StandardFont::Helvetica)?;
-            let mut content: Vec<u8> = format!("q\n{}\nBT\n3 Tr\n", matrix_string(geometry.display_to_user())).into_bytes();
+            let mut content: Vec<u8> = format!(
+                "q\n{}\nBT\n3 Tr\n",
+                matrix_string(geometry.display_to_user())
+            )
+            .into_bytes();
             for line in &lines {
                 let encoded = win_ansi(&line.text);
                 // Font size from the line height; horizontal scale stretches the text so that
                 // selection boxes match the width of the printed line.
                 let size = (line.height * 0.85).max(2.0);
-                let natural = StandardFont::Helvetica.text_width(&line.text, size).max(0.01);
+                let natural = StandardFont::Helvetica
+                    .text_width(&line.text, size)
+                    .max(0.01);
                 let scale = (line.width / natural * 100.0).clamp(10.0, 400.0);
                 content.extend_from_slice(
                     format!(

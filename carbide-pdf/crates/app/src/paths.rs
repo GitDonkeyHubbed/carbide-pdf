@@ -15,11 +15,18 @@ pub fn data_dir() -> PathBuf {
     if cfg!(test) {
         return std::env::temp_dir().join(format!("carbide-app-tests-{}", std::process::id()));
     }
-    let home = || std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let home = || {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+    };
     if cfg!(target_os = "macos") {
         home().join("Library/Application Support/Carbide PDF")
     } else if cfg!(target_os = "windows") {
-        std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(home).join("Carbide PDF")
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(home)
+            .join("Carbide PDF")
     } else {
         std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -39,12 +46,18 @@ fn settings_file() -> PathBuf {
 /// Keys `EnableAutoSave` and `AutoSaveInterval`.
 pub fn load_autosave_settings() -> AutoSaveSettings {
     let mut settings = AutoSaveSettings::default();
-    let Ok(text) = std::fs::read_to_string(settings_file()) else { return settings };
+    let Ok(text) = std::fs::read_to_string(settings_file()) else {
+        return settings;
+    };
     for line in text.lines() {
         match line.split_once('=') {
             Some(("EnableAutoSave", v)) => settings.enabled = v.trim() != "0",
             Some(("AutoSaveInterval", v)) => {
-                if let Ok(Ok(minutes)) = v.trim().parse::<u32>().map(|m| AutoSaveSettings::parse_interval(&m.to_string())) {
+                if let Ok(Ok(minutes)) = v
+                    .trim()
+                    .parse::<u32>()
+                    .map(|m| AutoSaveSettings::parse_interval(&m.to_string()))
+                {
                     settings.interval_minutes = minutes;
                 }
             }
@@ -94,7 +107,12 @@ pub fn trust_certificate_file(path: &std::path::Path) -> std::io::Result<usize> 
     std::fs::create_dir_all(trusted_dir())?;
     let count = ders.len();
     for der in ders {
-        let name = format!("{:016x}.der", der.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)));
+        let name = format!(
+            "{:016x}.der",
+            der.iter()
+                .fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64)
+                    .wrapping_mul(0x100000001b3))
+        );
         write_replacing(&trusted_dir().join(name), &der)?;
     }
     Ok(count)
@@ -129,11 +147,16 @@ pub fn now_secs() -> i64 {
 
 /// Most recent first. One `seconds<TAB>path` pair per line.
 pub fn load_recent() -> Vec<RecentFile> {
-    let Ok(text) = std::fs::read_to_string(recent_file()) else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(recent_file()) else {
+        return Vec::new();
+    };
     text.lines()
         .filter_map(|line| {
             let (secs, path) = line.split_once('\t')?;
-            Some(RecentFile { path: PathBuf::from(path), opened: secs.trim().parse().ok()? })
+            Some(RecentFile {
+                path: PathBuf::from(path),
+                opened: secs.trim().parse().ok()?,
+            })
         })
         .take(MAX_RECENT)
         .collect()
@@ -141,14 +164,22 @@ pub fn load_recent() -> Vec<RecentFile> {
 
 pub fn save_recent(list: &[RecentFile]) {
     let _ = std::fs::create_dir_all(data_dir());
-    let text: String = list.iter().map(|r| format!("{}\t{}\n", r.opened, r.path.display())).collect();
+    let text: String = list
+        .iter()
+        .map(|r| format!("{}\t{}\n", r.opened, r.path.display()))
+        .collect();
     let _ = write_replacing(&recent_file(), text.as_bytes());
 }
 
 /// Folders pinned in the start screen's sidebar.
 pub fn load_locations() -> Vec<PathBuf> {
     std::fs::read_to_string(locations_file())
-        .map(|t| t.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+        .map(|t| {
+            t.lines()
+                .filter(|l| !l.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -161,7 +192,9 @@ pub fn save_locations(list: &[PathBuf]) {
 // ---- cloud-synced folders -------------------------------------------------------------------
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 /// "GoogleDrive-me@example.com" becomes "Google Drive (me@example.com)", and the "-folder" suffix
@@ -193,7 +226,9 @@ fn cloud_storage_label(folder_name: &str) -> String {
 /// Folders that a cloud service's desktop app keeps in sync on this computer, with display names.
 /// These are ordinary folders as far as Carbide PDF is concerned: it does not sign in to any service.
 pub fn cloud_locations() -> Vec<(String, PathBuf)> {
-    let Some(home) = home_dir() else { return Vec::new() };
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
     let mut found: Vec<(String, PathBuf)> = Vec::new();
     let mut add = |label: String, path: PathBuf| {
         if path.is_dir() && !found.iter().any(|(_, p)| *p == path) {
@@ -211,7 +246,10 @@ pub fn cloud_locations() -> Vec<(String, PathBuf)> {
             }
         }
     }
-    add("iCloud Drive".into(), home.join("Library/Mobile Documents/com~apple~CloudDocs"));
+    add(
+        "iCloud Drive".into(),
+        home.join("Library/Mobile Documents/com~apple~CloudDocs"),
+    );
     for name in ["Dropbox", "OneDrive", "Google Drive", "Box", "Nextcloud"] {
         add(name.to_string(), home.join(name));
     }
@@ -220,8 +258,14 @@ pub fn cloud_locations() -> Vec<(String, PathBuf)> {
 
 /// How a pinned location is named in the start screen's sidebar.
 pub fn location_label(path: &std::path::Path) -> String {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-    if path.parent().is_some_and(|p| p.ends_with("Library/CloudStorage")) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    if path
+        .parent()
+        .is_some_and(|p| p.ends_with("Library/CloudStorage"))
+    {
         cloud_storage_label(&name)
     } else if path.ends_with("Library/Mobile Documents/com~apple~CloudDocs") {
         "iCloud Drive".into()
@@ -236,10 +280,18 @@ mod tests {
 
     #[test]
     fn cloud_folder_names_become_readable_labels() {
-        assert_eq!(cloud_storage_label("GoogleDrive-me@example.com"), "Google Drive (me@example.com)");
-        assert_eq!(cloud_storage_label("OneDrive-Personal"), "OneDrive (Personal)");
-        assert_eq!(cloud_storage_label("ProtonDrive-me@proton.me-folder"), "Proton Drive (me@proton.me)");
+        assert_eq!(
+            cloud_storage_label("GoogleDrive-me@example.com"),
+            "Google Drive (me@example.com)"
+        );
+        assert_eq!(
+            cloud_storage_label("OneDrive-Personal"),
+            "OneDrive (Personal)"
+        );
+        assert_eq!(
+            cloud_storage_label("ProtonDrive-me@proton.me-folder"),
+            "Proton Drive (me@proton.me)"
+        );
         assert_eq!(cloud_storage_label("Dropbox"), "Dropbox");
     }
 }
-

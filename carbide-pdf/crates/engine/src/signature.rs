@@ -21,12 +21,12 @@ use x509_cert::Certificate;
 
 use crate::cms;
 use crate::der;
-use crate::sigcrypto::{self, Verified};
 use crate::error::{Error, Result};
 use crate::fonts::{literal_string, win_ansi};
 use crate::geometry::{fmt, Rect};
 use crate::pdf::Pdf;
 use crate::revisions::{decode_text, encode_text, parse_pdf_date, pdf_date_now};
+use crate::sigcrypto::{self, Verified};
 
 /// User-facing messages.
 pub mod messages {
@@ -44,34 +44,43 @@ pub mod messages {
     pub const IDENTITY_UNKNOWN: &str = "The signer's identity is not confirmed: neither the certificate nor any certificate above it is in your trusted list";
     pub const IDENTITY_EXPIRED: &str = "The signer's certificate has expired or is not valid yet, and no trusted time stamp shows it was valid when the document was signed";
     pub const CHAIN_REJECTED: &str = "The signer's certificate leads to your trusted list, but through a certificate that may not issue it or was not valid at the time";
-    pub const SIGNER_NOT_PERMITTED: &str = "The signer's certificate is not allowed to sign documents";
+    pub const SIGNER_NOT_PERMITTED: &str =
+        "The signer's certificate is not allowed to sign documents";
     pub const TIMESTAMP_AUTHORITY_UNKNOWN: &str = "The time stamp authority is not confirmed: neither its certificate nor any certificate above it is in your trusted list";
     pub const TIMESTAMP_AUTHORITY_EXPIRED: &str = "The time stamp authority's certificate was not valid at the time it gives, or is no longer valid, so nothing shows its key was not misused";
     pub const TIMESTAMP_CHAIN_REJECTED: &str = "The time stamp authority's certificate leads to your trusted list, but through a certificate that may not issue it, or that was not valid at the time it gives or is no longer valid";
-    pub const TIMESTAMP_AUTHORITY_NOT_PERMITTED: &str = "The time stamp authority's certificate is not for time stamping";
+    pub const TIMESTAMP_AUTHORITY_NOT_PERMITTED: &str =
+        "The time stamp authority's certificate is not for time stamping";
     pub const DOCUMENT_TIME_STAMPED: &str = "A trusted time stamp authority confirms this version of the document existed at the time given.";
     pub const DOCUMENT_ALTERED: &str = "The document is damaged or was changed after signing.";
-    pub const UNSUPPORTED_ALGORITHM: &str = "This signature uses an algorithm this version cannot check.";
-    pub const WEAK_ALGORITHM: &str = "This signature uses SHA-1, which is no longer considered secure.";
+    pub const UNSUPPORTED_ALGORITHM: &str =
+        "This signature uses an algorithm this version cannot check.";
+    pub const WEAK_ALGORITHM: &str =
+        "This signature uses SHA-1, which is no longer considered secure.";
     pub const BAD_BYTE_RANGE: &str = "Invalid signature: the signed byte range is wrong.";
     pub const CORRUPTED: &str = "Invalid signature: the signature data is damaged.";
-    pub const FILTER_NOT_SUPPORTED: &str = "Invalid signature: this signature handler is not supported.";
+    pub const FILTER_NOT_SUPPORTED: &str =
+        "Invalid signature: this signature handler is not supported.";
     pub const SIGNED_IN_FUTURE: &str = "The signing time is in the future.";
     pub const TIME_STAMP_IN_FUTURE: &str = "The time stamp's time is in the future.";
     pub const NOTICE_NOT_VERIFIED: &str = "Some signatures still need to be validated.";
-    pub const NOTICE_PROBLEMS: &str = "This document is signed, but at least one signature has a problem.";
+    pub const NOTICE_PROBLEMS: &str =
+        "This document is signed, but at least one signature has a problem.";
     pub const NOTICE_NOT_CONFIRMED: &str =
         "This document is signed, but at least one signature's identity is not confirmed.";
-    pub const NOTICE_NOT_CHECKED: &str = "This document is signed, but at least one signature could not be checked.";
+    pub const NOTICE_NOT_CHECKED: &str =
+        "This document is signed, but at least one signature could not be checked.";
     pub const NOTICE_TIMESTAMP_NOT_CONFIRMED: &str =
         "This document is signed, but at least one time stamp's authority is not confirmed.";
     pub const NOTICE_CHANGED_AFTER_LAST: &str =
         "Signed with valid signatures, but the document changed after the last signature.";
-    pub const NOTICE_UPDATED: &str = "Signed with valid signatures; the document was updated after signing.";
+    pub const NOTICE_UPDATED: &str =
+        "Signed with valid signatures; the document was updated after signing.";
     pub const NOTICE_ALL_VALID: &str = "This document is signed and every signature is valid.";
     pub const FIELD_ALREADY_SIGNED: &str = "This field has already been signed.";
     pub const TIME_STAMPED: &str = "The signature carries a time stamp.";
-    pub const TIME_STAMP_UNCONFIRMED: &str = "The signature carries a time stamp, but its authority is not confirmed.";
+    pub const TIME_STAMP_UNCONFIRMED: &str =
+        "The signature carries a time stamp, but its authority is not confirmed.";
     pub const TIME_STAMP_NOT_VERIFIED: &str =
         "The signature carries a time stamp that could not be verified, so its time was not used.";
 }
@@ -90,7 +99,8 @@ impl Identity {
             return Err(Error::Other("the identity has no certificate".into()));
         }
         for der in &chain_der {
-            Certificate::from_der(der).map_err(|e| Error::Other(format!("invalid certificate: {e}")))?;
+            Certificate::from_der(der)
+                .map_err(|e| Error::Other(format!("invalid certificate: {e}")))?;
         }
         // The signer certificate is the one whose public key matches the private key. Some files
         // (a CA-first PEM bundle, say) list it after its issuer; move it to the front, and refuse
@@ -106,18 +116,30 @@ impl Identity {
         let signer = chain_der
             .iter()
             .position(|der| matches(der))
-            .ok_or_else(|| Error::Other("the private key does not match any of the identity's certificates".into()))?;
+            .ok_or_else(|| {
+                Error::Other(
+                    "the private key does not match any of the identity's certificates".into(),
+                )
+            })?;
         chain_der.swap(0, signer);
-        Ok(Identity { chain: chain_der, key })
+        Ok(Identity {
+            chain: chain_der,
+            key,
+        })
     }
 
     /// PEM certificate(s) (signer first) and a PKCS#8 or PKCS#1 RSA private key.
     pub fn from_pem(certificates: &str, private_key: &str) -> Result<Identity> {
         let chain = pem_blocks(certificates, "CERTIFICATE");
         let key = if let Some(der) = pem_blocks(private_key, "PRIVATE KEY").into_iter().next() {
-            RsaPrivateKey::from_pkcs8_der(&der).map_err(|e| Error::Other(format!("invalid private key: {e}")))?
-        } else if let Some(der) = pem_blocks(private_key, "RSA PRIVATE KEY").into_iter().next() {
-            RsaPrivateKey::from_pkcs1_der(&der).map_err(|e| Error::Other(format!("invalid private key: {e}")))?
+            RsaPrivateKey::from_pkcs8_der(&der)
+                .map_err(|e| Error::Other(format!("invalid private key: {e}")))?
+        } else if let Some(der) = pem_blocks(private_key, "RSA PRIVATE KEY")
+            .into_iter()
+            .next()
+        {
+            RsaPrivateKey::from_pkcs1_der(&der)
+                .map_err(|e| Error::Other(format!("invalid private key: {e}")))?
         } else {
             return Err(Error::Other("no RSA private key found".into()));
         };
@@ -126,8 +148,12 @@ impl Identity {
 
     /// A PKCS#12 (.p12 / .pfx) file protected by `password`.
     pub fn from_pkcs12(bytes: &[u8], password: &str) -> Result<Identity> {
-        let store = p12_keystore::KeyStore::from_pkcs12(bytes, password, p12_keystore::Pkcs12ImportPolicy::Strict)
-            .map_err(|e| Error::Other(format!("could not read the PKCS#12 file: {e}")))?;
+        let store = p12_keystore::KeyStore::from_pkcs12(
+            bytes,
+            password,
+            p12_keystore::Pkcs12ImportPolicy::Strict,
+        )
+        .map_err(|e| Error::Other(format!("could not read the PKCS#12 file: {e}")))?;
         for (_, entry) in store.entries() {
             if let p12_keystore::KeyStoreEntry::PrivateKeyChain(chain) = entry {
                 let key = RsaPrivateKey::from_pkcs8_der(chain.key().as_der())
@@ -136,7 +162,9 @@ impl Identity {
                 return Identity::new(certificates, key);
             }
         }
-        Err(Error::Other("the PKCS#12 file contains no private key".into()))
+        Err(Error::Other(
+            "the PKCS#12 file contains no private key".into(),
+        ))
     }
 
     pub fn certificate_der(&self) -> &[u8] {
@@ -146,14 +174,18 @@ impl Identity {
     /// The signer's name as the certificate gives it, used for the signature's `/Name`: the
     /// common name, else the email address, else the whole subject.
     pub fn common_name(&self) -> String {
-        Certificate::from_der(&self.chain[0]).map(|c| subject_name(&c)).unwrap_or_default()
+        Certificate::from_der(&self.chain[0])
+            .map(|c| subject_name(&c))
+            .unwrap_or_default()
     }
 }
 
 fn base64_decode(text: &str) -> Option<Vec<u8>> {
     use base64::Engine;
     let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    base64::engine::general_purpose::STANDARD.decode(cleaned).ok()
+    base64::engine::general_purpose::STANDARD
+        .decode(cleaned)
+        .ok()
 }
 
 fn pem_blocks(text: &str, label: &str) -> Vec<Vec<u8>> {
@@ -206,7 +238,10 @@ fn directory_string(value: &x509_cert::der::Any) -> Option<String> {
         // T.61 in theory; Latin-1 in practice.
         Tag::TeletexString => Some(bytes.iter().map(|b| char::from(*b)).collect()),
         Tag::BmpString if bytes.len().is_multiple_of(2) => {
-            let units: Vec<u16> = bytes.chunks(2).map(|pair| u16::from_be_bytes([pair[0], pair[1]])).collect();
+            let units: Vec<u16> = bytes
+                .chunks(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                .collect();
             Some(String::from_utf16_lossy(&units))
         }
         _ => None,
@@ -216,7 +251,9 @@ fn directory_string(value: &x509_cert::der::Any) -> Option<String> {
 /// The certificate's subjectKeyIdentifier extension value, if it has one.
 fn subject_key_id(certificate: &Certificate) -> Option<Vec<u8>> {
     let extensions = certificate.tbs_certificate.extensions.as_ref()?;
-    let extension = extensions.iter().find(|e| e.extn_id.to_string() == "2.5.29.14")?;
+    let extension = extensions
+        .iter()
+        .find(|e| e.extn_id.to_string() == "2.5.29.14")?;
     // The extension value is an OCTET STRING wrapping the key identifier OCTET STRING.
     der::read(extension.extn_value.as_bytes()).map(|(inner, _)| inner.content.to_vec())
 }
@@ -247,14 +284,22 @@ fn timestamp_request(digest: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
     getrandom::fill(&mut nonce).expect("system randomness");
     nonce[0] &= 0x7F; // a positive INTEGER
     let nonce = der::integer_unsigned(&nonce);
-    let request = der::sequence(&[&der::integer_small(1), &imprint, &nonce, &der::boolean(true)]);
-    let content = der::read(&nonce).map(|(e, _)| e.content.to_vec()).unwrap_or_default();
+    let request = der::sequence(&[
+        &der::integer_small(1),
+        &imprint,
+        &nonce,
+        &der::boolean(true),
+    ]);
+    let content = der::read(&nonce)
+        .map(|(e, _)| e.content.to_vec())
+        .unwrap_or_default();
     (request, content)
 }
 
 /// Extracts the token from a `TimeStampResp`; status 0 and 1 are "granted".
 fn timestamp_token_from_response(bytes: &[u8]) -> Result<Vec<u8>> {
-    let (response, _) = der::read_ber(bytes).ok_or_else(|| Error::Other("malformed time stamp response".into()))?;
+    let (response, _) =
+        der::read_ber(bytes).ok_or_else(|| Error::Other("malformed time stamp response".into()))?;
     let parts = der::children_ber(response.content);
     let status = parts
         .first()
@@ -262,7 +307,9 @@ fn timestamp_token_from_response(bytes: &[u8]) -> Result<Vec<u8>> {
         .and_then(|i| i.content.last().copied())
         .ok_or_else(|| Error::Other("malformed time stamp status".into()))?;
     if status > 1 {
-        return Err(Error::Other(format!("the time stamp authority refused the request (status {status})")));
+        return Err(Error::Other(format!(
+            "the time stamp authority refused the request (status {status})"
+        )));
     }
     parts
         .get(1)
@@ -275,15 +322,25 @@ fn timestamp_token_from_response(bytes: &[u8]) -> Result<Vec<u8>> {
 fn check_timestamp_response(token: &[u8], digest: &[u8; 32], nonce: &[u8]) -> Result<()> {
     let cms = cms::parse_signed_data(token)
         .filter(|cms| cms.content_type == cms::OID_TST_INFO)
-        .ok_or_else(|| Error::Other("the time stamp authority returned a malformed token".into()))?;
-    let info = cms.content.clone().ok_or_else(|| Error::Other("the time stamp token has no content".into()))?;
-    let tst = cms::parse_tst_info(&info).ok_or_else(|| Error::Other("the time stamp token is malformed".into()))?;
+        .ok_or_else(|| {
+            Error::Other("the time stamp authority returned a malformed token".into())
+        })?;
+    let info = cms
+        .content
+        .clone()
+        .ok_or_else(|| Error::Other("the time stamp token has no content".into()))?;
+    let tst = cms::parse_tst_info(&info)
+        .ok_or_else(|| Error::Other("the time stamp token is malformed".into()))?;
     if tst.hash_algorithm != "2.16.840.1.101.3.4.2.1" || tst.hashed_message != digest {
-        return Err(Error::Other("the time stamp token covers the wrong digest".into()));
+        return Err(Error::Other(
+            "the time stamp token covers the wrong digest".into(),
+        ));
     }
     // The token must echo the nonce we sent (RFC 3161 requires it when the request carried one).
     if tst.nonce.as_deref() != Some(nonce) {
-        return Err(Error::Other("the time stamp authority returned a mismatched nonce".into()));
+        return Err(Error::Other(
+            "the time stamp authority returned a mismatched nonce".into(),
+        ));
     }
     if timestamp_signature(&cms, &info) != Verified::Ok {
         return Err(Error::Other("the time stamp token did not verify".into()));
@@ -297,19 +354,30 @@ fn check_timestamp_response(token: &[u8], digest: &[u8; 32], nonce: &[u8]) -> Re
 /// attributes holds.
 fn timestamp_signature(cms: &cms::SignedData, econtent: &[u8]) -> Verified {
     let signer_info = &cms.signer;
-    let certificates: Vec<Certificate> = cms.certificates.iter().filter_map(|c| Certificate::from_der(c).ok()).collect();
-    let Some(signer) = find_signer(&certificates, &signer_info.id) else { return Verified::Bad };
-    if signer_info.signed_attributes.is_none() || signer_info.content_type.as_deref() != Some(cms::OID_TST_INFO) {
+    let certificates: Vec<Certificate> = cms
+        .certificates
+        .iter()
+        .filter_map(|c| Certificate::from_der(c).ok())
+        .collect();
+    let Some(signer) = find_signer(&certificates, &signer_info.id) else {
+        return Verified::Bad;
+    };
+    if signer_info.signed_attributes.is_none()
+        || signer_info.content_type.as_deref() != Some(cms::OID_TST_INFO)
+    {
         return Verified::Bad;
     }
     let digest_oid = &signer_info.digest_algorithm;
     match sigcrypto::digest(digest_oid, &[econtent]) {
-        Some(content_digest) if signer_info.message_digest.as_deref() == Some(content_digest.as_slice()) => {}
+        Some(content_digest)
+            if signer_info.message_digest.as_deref() == Some(content_digest.as_slice()) => {}
         Some(_) => return Verified::Bad,
         None => return Verified::Unsupported,
     }
     if let Some((hash_oid, hash)) = &signer_info.signing_certificate {
-        let Ok(der) = signer.to_der() else { return Verified::Bad };
+        let Ok(der) = signer.to_der() else {
+            return Verified::Bad;
+        };
         match sigcrypto::digest(hash_oid, &[&der]) {
             Some(expected) if &expected == hash => {}
             Some(_) => return Verified::Bad,
@@ -336,7 +404,11 @@ fn timestamp_signature(cms: &cms::SignedData, econtent: &[u8]) -> Verified {
 impl TimestampSource for HttpTimestampSource {
     fn token_for_digest(&self, digest: &[u8; 32]) -> Result<Vec<u8>> {
         use base64::Engine;
-        let secure = self.url.trim_start().to_ascii_lowercase().starts_with("https://");
+        let secure = self
+            .url
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("https://");
         let authenticating = self.username.as_ref().is_some_and(|u| !u.is_empty())
             || self.password.is_some()
             || url_has_credentials(&self.url);
@@ -347,15 +419,18 @@ impl TimestampSource for HttpTimestampSource {
         }
         let (body, nonce) = timestamp_request(digest);
         // An authority that accepts the connection and never answers must not hang the caller.
-        let agent: ureq::Agent =
-            ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(30))).build().into();
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .build()
+            .into();
         let mut request = agent
             .post(&self.url)
             .header("Content-Type", "application/timestamp-query")
             .header("Character-Encoding", "binary")
             .header("User-Agent", "Carbide PDF");
         if let (Some(user), Some(password)) = (&self.username, &self.password) {
-            let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+            let credentials =
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
             request = request.header("Authorization", format!("Basic {credentials}"));
         }
         let mut response = request
@@ -375,7 +450,9 @@ impl TimestampSource for HttpTimestampSource {
 /// (`http://user:password@host/`): the HTTP client sends those as basic authentication.
 fn url_has_credentials(url: &str) -> bool {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    rest.split(['/', '?', '#']).next().is_some_and(|authority| authority.contains('@'))
+    rest.split(['/', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
 }
 
 // ---- CMS -----------------------------------------------------------------------------------
@@ -403,9 +480,18 @@ fn build_cms(
     cades: bool,
     timestamps: Option<&dyn TimestampSource>,
 ) -> Result<Vec<u8>> {
-    let certificate = Certificate::from_der(identity.certificate_der()).map_err(|e| Error::Other(e.to_string()))?;
-    let issuer = certificate.tbs_certificate.issuer.to_der().map_err(|e| Error::Other(e.to_string()))?;
-    let serial = certificate.tbs_certificate.serial_number.to_der().map_err(|e| Error::Other(e.to_string()))?;
+    let certificate = Certificate::from_der(identity.certificate_der())
+        .map_err(|e| Error::Other(e.to_string()))?;
+    let issuer = certificate
+        .tbs_certificate
+        .issuer
+        .to_der()
+        .map_err(|e| Error::Other(e.to_string()))?;
+    let serial = certificate
+        .tbs_certificate
+        .serial_number
+        .to_der()
+        .map_err(|e| Error::Other(e.to_string()))?;
     let issuer_and_serial = der::sequence(&[&issuer, &serial]);
 
     let sha256_alg = der::sequence(&[&der::oid(OID_SHA256), &der::null()]);
@@ -413,8 +499,11 @@ fn build_cms(
 
     let (signed_attributes, to_sign): (Option<Vec<u8>>, [u8; 32]) = if cades {
         let cert_hash = Sha256::digest(identity.certificate_der());
-        let signing_cert = der::sequence(&[&der::sequence(&[&der::sequence(&[&der::octet_string(&cert_hash)])])]);
-        let mut attributes = vec![
+        let signing_cert =
+            der::sequence(&[&der::sequence(&[&der::sequence(&[&der::octet_string(
+                &cert_hash,
+            )])])]);
+        let mut attributes = [
             attribute(OID_CONTENT_TYPE, &der::oid(OID_DATA)),
             attribute(OID_MESSAGE_DIGEST, &der::octet_string(content_digest)),
             attribute(OID_SIGNING_CERT_V2, &signing_cert),
@@ -433,7 +522,8 @@ fn build_cms(
         .sign(Pkcs1v15Sign::new::<Sha256>(), &to_sign)
         .map_err(|e| Error::Other(format!("signing failed: {e}")))?;
 
-    let mut signer_info_parts: Vec<Vec<u8>> = vec![der::integer_small(1), issuer_and_serial, sha256_alg.clone()];
+    let mut signer_info_parts: Vec<Vec<u8>> =
+        vec![der::integer_small(1), issuer_and_serial, sha256_alg.clone()];
     if let Some(body) = &signed_attributes {
         signer_info_parts.push(der::context(0, true, body));
     }
@@ -456,7 +546,10 @@ fn build_cms(
         &der::context(0, true, &certificates),
         &der::set(&[&signer_info]),
     ]);
-    Ok(der::sequence(&[&der::oid(OID_SIGNED_DATA), &der::context(0, true, &signed_data)]))
+    Ok(der::sequence(&[
+        &der::oid(OID_SIGNED_DATA),
+        &der::context(0, true, &signed_data),
+    ]))
 }
 
 // ---- signing -------------------------------------------------------------------------------
@@ -536,7 +629,9 @@ impl Pdf {
     /// that file plus one incremental update containing any pending edits and the signature.
     pub fn sign(&self, base_bytes: &[u8], options: &SignOptions<'_>) -> Result<Vec<u8>> {
         if self.doc.is_encrypted() {
-            return Err(Error::Unsupported("signing encrypted documents is not supported".into()));
+            return Err(Error::Unsupported(
+                "signing encrypted documents is not supported".into(),
+            ));
         }
         let identity = options.identity;
         let doc_timestamp = options.sub_filter == SubFilter::DocumentTimeStamp;
@@ -555,7 +650,10 @@ impl Pdf {
         // How much room the signature needs: measure with a dummy digest, as the original does.
         let measure = [0u8; 32];
         let reserved = if doc_timestamp {
-            let token = options.timestamp.expect("checked").token_for_digest(&measure)?;
+            let token = options
+                .timestamp
+                .expect("checked")
+                .token_for_digest(&measure)?;
             token.len() + 100
         } else {
             let identity = identity.expect("checked");
@@ -588,12 +686,19 @@ impl Pdf {
             if let Some(name) = &sig_name {
                 v.set("Name", pdf_text(name));
             }
-            for (key, value) in [("Reason", &options.reason), ("Location", &options.location), ("ContactInfo", &options.contact)] {
+            for (key, value) in [
+                ("Reason", &options.reason),
+                ("Location", &options.location),
+                ("ContactInfo", &options.contact),
+            ] {
                 if let Some(text) = value.as_ref().filter(|t| !t.is_empty()) {
                     v.set(key, pdf_text(text));
                 }
             }
-            v.set("Prop_Build", dictionary! { "App" => dictionary! { "Name" => "Carbide PDF" } });
+            v.set(
+                "Prop_Build",
+                dictionary! { "App" => dictionary! { "Name" => "Carbide PDF" } },
+            );
         }
         let mut references: Vec<Object> = Vec::new();
         if let Some(level) = options.certify {
@@ -630,9 +735,14 @@ impl Pdf {
 
         // Locate the placeholders in the appended part.
         let appended_from = base_bytes.len();
-        let hex_marker = marker.iter().map(|b| format!("{b:02X}")).collect::<String>();
+        let hex_marker = marker
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<String>();
         let hex_marker_lower = hex_marker.to_lowercase();
-        let needle_at = |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).position(|w| w == needle);
+        let needle_at = |haystack: &[u8], needle: &[u8]| {
+            haystack.windows(needle.len()).position(|w| w == needle)
+        };
         let appended = &file[appended_from..];
         let marker_at = needle_at(appended, hex_marker.as_bytes())
             .or_else(|| needle_at(appended, hex_marker_lower.as_bytes()))
@@ -641,7 +751,9 @@ impl Pdf {
         let contents_len = 2 * contents.len() + 2;
         let contents_end = contents_start + contents_len;
         if file.get(contents_start) != Some(&b'<') || file.get(contents_end - 1) != Some(&b'>') {
-            return Err(Error::Other("unexpected signature placeholder layout".into()));
+            return Err(Error::Other(
+                "unexpected signature placeholder layout".into(),
+            ));
         }
         let range_at = needle_at(&file[appended_from..], BYTE_RANGE_PLACEHOLDER.as_bytes())
             .map(|p| appended_from + p)
@@ -649,7 +761,10 @@ impl Pdf {
 
         let total = file.len();
         let ranges = [0usize, contents_start, contents_end, total - contents_end];
-        let text = format!("{:010} {:010} {:010} {:010}", ranges[0], ranges[1], ranges[2], ranges[3]);
+        let text = format!(
+            "{:010} {:010} {:010} {:010}",
+            ranges[0], ranges[1], ranges[2], ranges[3]
+        );
         debug_assert_eq!(text.len(), BYTE_RANGE_PLACEHOLDER.len());
         file[range_at..range_at + text.len()].copy_from_slice(text.as_bytes());
 
@@ -660,13 +775,23 @@ impl Pdf {
         let digest: [u8; 32] = hasher.finalize().into();
 
         let signature = if doc_timestamp {
-            options.timestamp.expect("checked").token_for_digest(&digest)?
+            options
+                .timestamp
+                .expect("checked")
+                .token_for_digest(&digest)?
         } else {
             let cades = options.sub_filter == SubFilter::CadesDetached;
-            build_cms(identity.expect("checked"), &digest, cades, options.timestamp)?
+            build_cms(
+                identity.expect("checked"),
+                &digest,
+                cades,
+                options.timestamp,
+            )?
         };
         if signature.len() > contents.len() {
-            return Err(Error::Other("the signature does not fit the space reserved for it".into()));
+            return Err(Error::Other(
+                "the signature does not fit the space reserved for it".into(),
+            ));
         }
         let hex: String = signature.iter().map(|b| format!("{b:02X}")).collect();
         let slot = &mut file[contents_start + 1..contents_end - 1];
@@ -679,12 +804,19 @@ impl Pdf {
     /// value (even one that no longer reads as a signature).
     pub fn has_signatures(&self) -> bool {
         self.doc.objects.values().any(|o| match o {
-            Object::Dictionary(d) => is_signature_dictionary(d) || signature_field_value(d).is_some(),
+            Object::Dictionary(d) => {
+                is_signature_dictionary(d) || signature_field_value(d).is_some()
+            }
             _ => false,
         })
     }
 
-    fn add_signature_field(&mut self, v_id: ObjectId, options: &SignOptions<'_>, signing_time: &str) -> Result<()> {
+    fn add_signature_field(
+        &mut self,
+        v_id: ObjectId,
+        options: &SignOptions<'_>,
+        signing_time: &str,
+    ) -> Result<()> {
         let page_index = options.appearance.map(|(p, _)| p).unwrap_or(0);
         let page_id = self.page_id(page_index)?;
         let geometry = self.page_geometry(page_index)?;
@@ -715,7 +847,10 @@ impl Pdf {
             "Rect" => rect.iter().map(|v| Object::Real(*v)).collect::<Vec<_>>(),
         };
         if options.lock_document {
-            widget.set("Lock", dictionary! { "Type" => "SigFieldLock", "Action" => "All", "P" => 1 });
+            widget.set(
+                "Lock",
+                dictionary! { "Type" => "SigFieldLock", "Action" => "All", "P" => 1 },
+            );
         }
         if visible {
             let (w, h) = (rect[2] - rect[0], rect[3] - rect[1]);
@@ -729,8 +864,15 @@ impl Pdf {
             };
             let lines = appearance_lines(self_name(options), signing_time, options);
             let size = (dh / (lines.len().max(1) as f32 + 1.0)).clamp(6.0, 11.0);
-            let mut content = format!("q 0.2 w 0 0 {} {} re S Q\nBT /F1 {} Tf 0 g 3 {} Td {} TL\n", fmt(dw), fmt(dh), fmt(size), fmt(dh - size - 2.0), fmt(size * 1.15))
-                .into_bytes();
+            let mut content = format!(
+                "q 0.2 w 0 0 {} {} re S Q\nBT /F1 {} Tf 0 g 3 {} Td {} TL\n",
+                fmt(dw),
+                fmt(dh),
+                fmt(size),
+                fmt(dh - size - 2.0),
+                fmt(size * 1.15)
+            )
+            .into_bytes();
             for (i, line) in lines.iter().enumerate() {
                 if i > 0 {
                     content.extend_from_slice(b"T*\n");
@@ -784,7 +926,9 @@ impl Pdf {
                     _ => form.set("Fields", Object::Array(vec![Object::Reference(widget_id)])),
                 }
                 form.set("SigFlags", 3);
-                self.doc.catalog_mut()?.set("AcroForm", Object::Dictionary(form));
+                self.doc
+                    .catalog_mut()?
+                    .set("AcroForm", Object::Dictionary(form));
             }
         }
         Ok(())
@@ -795,7 +939,9 @@ impl Pdf {
             .objects
             .values()
             .filter_map(|o| match o {
-                Object::Dictionary(d) if d.has(b"FT") => d.get(b"T").ok()?.as_str().ok().map(decode_text),
+                Object::Dictionary(d) if d.has(b"FT") => {
+                    d.get(b"T").ok()?.as_str().ok().map(decode_text)
+                }
                 _ => None,
             })
             .collect()
@@ -803,12 +949,18 @@ impl Pdf {
 }
 
 fn self_name(options: &SignOptions<'_>) -> String {
-    options.identity.map(|i| i.common_name()).unwrap_or_default()
+    options
+        .identity
+        .map(|i| i.common_name())
+        .unwrap_or_default()
 }
 
 fn appearance_lines(name: String, signing_time: &str, options: &SignOptions<'_>) -> Vec<String> {
     let mut lines = vec![format!("Digitally signed by {name}")];
-    lines.push(format!("Date: {}", crate::revisions::pdf_date_to_local(signing_time)));
+    lines.push(format!(
+        "Date: {}",
+        crate::revisions::pdf_date_to_local(signing_time)
+    ));
     if let Some(reason) = options.reason.as_ref().filter(|r| !r.is_empty()) {
         lines.push(format!("Reason: {reason}"));
     }
@@ -874,7 +1026,9 @@ pub fn read_certificates(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
         ders.push(bytes.to_vec());
     }
     if ders.is_empty() {
-        return Err(Error::Other("this file does not contain an X.509 certificate".into()));
+        return Err(Error::Other(
+            "this file does not contain an X.509 certificate".into(),
+        ));
     }
     Ok(ders)
 }
@@ -957,13 +1111,22 @@ impl SignatureReport {
     /// signer's claims (name, reason, location, time). A document time stamp's time is the one in
     /// its token, and only once that verifies: a `/M` beside it is not taken.
     fn describe(&mut self, v: &Dictionary) {
-        self.sub_filter = v.get(b"SubFilter").ok().and_then(|o| o.as_name().ok()).map(|n| String::from_utf8_lossy(n).into_owned());
+        self.sub_filter = v
+            .get(b"SubFilter")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .map(|n| String::from_utf8_lossy(n).into_owned());
         self.claimed_name = text_of(v, b"Name");
         self.reason = text_of(v, b"Reason");
         self.location = text_of(v, b"Location");
-        self.document_time_stamp = v.get(b"Type").ok().and_then(|o| o.as_name().ok()) == Some(b"DocTimeStamp".as_slice())
+        self.document_time_stamp = v.get(b"Type").ok().and_then(|o| o.as_name().ok())
+            == Some(b"DocTimeStamp".as_slice())
             || self.sub_filter.as_deref() == Some("ETSI.RFC3161");
-        self.signing_time = if self.document_time_stamp { None } else { text_of(v, b"M") };
+        self.signing_time = if self.document_time_stamp {
+            None
+        } else {
+            text_of(v, b"M")
+        };
     }
 
     /// True when the time stamp that gives `time_stamp_time` comes from a trusted authority whose
@@ -979,9 +1142,17 @@ impl SignatureReport {
     /// The panel's status line.
     pub fn status_line(&self) -> &'static str {
         let (valid, unknown, invalid) = if self.document_time_stamp {
-            (messages::TIMESTAMP_VALID, messages::TIMESTAMP_VALIDITY_UNKNOWN, messages::TIMESTAMP_INVALID)
+            (
+                messages::TIMESTAMP_VALID,
+                messages::TIMESTAMP_VALIDITY_UNKNOWN,
+                messages::TIMESTAMP_INVALID,
+            )
         } else {
-            (messages::VALID, messages::VALIDITY_UNKNOWN, messages::INVALID)
+            (
+                messages::VALID,
+                messages::VALIDITY_UNKNOWN,
+                messages::INVALID,
+            )
         };
         match (self.validity, self.detail) {
             (Validity::Blank, _) => messages::UNSIGNED_FIELD,
@@ -998,7 +1169,9 @@ impl SignatureReport {
         match self.validity {
             Validity::Valid => self.integrity_lines(&mut lines),
             // Nothing was checked, so nothing is said about the signed version being unchanged.
-            Validity::ValidityUnknown | Validity::Unknown if self.detail == Detail::UnsupportedAlgorithm => {
+            Validity::ValidityUnknown | Validity::Unknown
+                if self.detail == Detail::UnsupportedAlgorithm =>
+            {
                 if self.modified_after_signing {
                     lines.push(messages::SUBSEQUENT_CHANGES);
                 }
@@ -1024,7 +1197,11 @@ impl SignatureReport {
                 lines.push(messages::DOCUMENT_TIME_STAMPED);
             }
         } else if self.has_embedded_timestamp {
-            lines.push(if self.embedded_timestamp_trusted { messages::TIME_STAMPED } else { messages::TIME_STAMP_UNCONFIRMED });
+            lines.push(if self.embedded_timestamp_trusted {
+                messages::TIME_STAMPED
+            } else {
+                messages::TIME_STAMP_UNCONFIRMED
+            });
         } else if self.embedded_timestamp_failed {
             lines.push(messages::TIME_STAMP_NOT_VERIFIED);
         }
@@ -1061,28 +1238,46 @@ impl SignatureReport {
 
 /// The notice bar text for a set of reports: the most serious condition wins.
 pub fn notice_text(reports: &[SignatureReport]) -> Option<&'static str> {
-    let mut signed: Vec<&SignatureReport> = reports.iter().filter(|r| r.validity != Validity::Blank).collect();
+    let mut signed: Vec<&SignatureReport> = reports
+        .iter()
+        .filter(|r| r.validity != Validity::Blank)
+        .collect();
     if signed.is_empty() {
         return None;
     }
     signed.sort_by_key(|r| r.revision_end);
-    if signed.iter().any(|r| r.validity == Validity::Unknown && r.detail == Detail::NotVerified) {
+    if signed
+        .iter()
+        .any(|r| r.validity == Validity::Unknown && r.detail == Detail::NotVerified)
+    {
         return Some(messages::NOTICE_NOT_VERIFIED);
     }
     // Anything that is neither cleanly valid nor merely identity-unknown (a bad digest, a damaged
     // signature) is a problem.
-    if signed.iter().any(|r| !matches!(r.validity, Validity::Valid | Validity::ValidityUnknown)) {
+    if signed
+        .iter()
+        .any(|r| !matches!(r.validity, Validity::Valid | Validity::ValidityUnknown))
+    {
         return Some(messages::NOTICE_PROBLEMS);
     }
-    if signed.iter().any(|r| r.detail == Detail::UnsupportedAlgorithm) {
+    if signed
+        .iter()
+        .any(|r| r.detail == Detail::UnsupportedAlgorithm)
+    {
         return Some(messages::NOTICE_NOT_CHECKED);
     }
     // A signature whose digest holds but whose signer is not confirmed must not be called valid,
     // and neither may a time stamp from an authority anyone could have made.
-    if signed.iter().any(|r| r.validity == Validity::ValidityUnknown && !r.document_time_stamp) {
+    if signed
+        .iter()
+        .any(|r| r.validity == Validity::ValidityUnknown && !r.document_time_stamp)
+    {
         return Some(messages::NOTICE_NOT_CONFIRMED);
     }
-    if signed.iter().any(|r| r.validity == Validity::ValidityUnknown) {
+    if signed
+        .iter()
+        .any(|r| r.validity == Validity::ValidityUnknown)
+    {
         return Some(messages::NOTICE_TIMESTAMP_NOT_CONFIRMED);
     }
     if signed.last().is_some_and(|r| r.modified_after_signing) {
@@ -1099,9 +1294,17 @@ fn issued_by(child: &Certificate, issuer: &Certificate) -> bool {
     if child.tbs_certificate.issuer != issuer.tbs_certificate.subject {
         return false;
     }
-    let Ok(tbs) = child.tbs_certificate.to_der() else { return false };
-    let Some(signature) = child.signature.as_bytes() else { return false };
-    let parameters = child.signature_algorithm.parameters.as_ref().and_then(|p| p.to_der().ok());
+    let Ok(tbs) = child.tbs_certificate.to_der() else {
+        return false;
+    };
+    let Some(signature) = child.signature.as_bytes() else {
+        return false;
+    };
+    let parameters = child
+        .signature_algorithm
+        .parameters
+        .as_ref()
+        .and_then(|p| p.to_der().ok());
     sigcrypto::verify(
         issuer,
         &child.signature_algorithm.oid.to_string(),
@@ -1127,13 +1330,21 @@ fn trust_level(
     store: &TrustStore,
     at: DateTime<Utc>,
 ) -> std::result::Result<Detail, Detail> {
-    let in_store = |cert: &Certificate| cert.to_der().ok().is_some_and(|der| store.certificates.contains(&der));
+    let in_store = |cert: &Certificate| {
+        cert.to_der()
+            .ok()
+            .is_some_and(|der| store.certificates.contains(&der))
+    };
     // A certificate the user trusts outright needs nothing further: this is the "trust one
     // person's certificate" flow, where that certificate may be an ordinary end-entity one.
     if in_store(signer) {
         return Ok(Detail::TrustedDirectly);
     }
-    let trusted: Vec<Certificate> = store.certificates.iter().filter_map(|d| Certificate::from_der(d).ok()).collect();
+    let trusted: Vec<Certificate> = store
+        .certificates
+        .iter()
+        .filter_map(|d| Certificate::from_der(d).ok())
+        .collect();
     let mut search = ChainSearch::new(signer, trusted.iter().chain(embedded), &in_store);
     if search.reaches_store(Some(at)) {
         Ok(Detail::TrustedViaChain)
@@ -1171,7 +1382,12 @@ impl<'a> ChainSearch<'a> {
             }
         }
         let stored = certificates.iter().map(|c| in_store(c)).collect();
-        ChainSearch { certificates, stored, issued: HashMap::new(), dead_ends: HashSet::new() }
+        ChainSearch {
+            certificates,
+            stored,
+            issued: HashMap::new(),
+            dead_ends: HashSet::new(),
+        }
     }
 
     /// With `rules` (the time to check validity at), every issuer must also be allowed to issue at
@@ -1181,18 +1397,29 @@ impl<'a> ChainSearch<'a> {
         self.search(0, &mut vec![0], rules)
     }
 
-    fn search(&mut self, child: usize, path: &mut Vec<usize>, rules: Option<DateTime<Utc>>) -> bool {
+    fn search(
+        &mut self,
+        child: usize,
+        path: &mut Vec<usize>,
+        rules: Option<DateTime<Utc>>,
+    ) -> bool {
         // The number of CA certificates between the leaf and the issuer considered.
         let intermediates = path.len() - 1;
         if intermediates >= MAX_CHAIN || self.dead_ends.contains(&(child, intermediates)) {
             return false;
         }
         for issuer in 0..self.certificates.len() {
-            if path.contains(&issuer) || rules.is_some_and(|at| !can_issue(self.certificates[issuer], intermediates, at)) {
+            if path.contains(&issuer)
+                || rules.is_some_and(|at| !can_issue(self.certificates[issuer], intermediates, at))
+            {
                 continue;
             }
             let certificates = &self.certificates;
-            if !*self.issued.entry((child, issuer)).or_insert_with(|| issued_by(certificates[child], certificates[issuer])) {
+            if !*self
+                .issued
+                .entry((child, issuer))
+                .or_insert_with(|| issued_by(certificates[child], certificates[issuer]))
+            {
                 continue;
             }
             if self.stored[issuer] {
@@ -1214,7 +1441,9 @@ impl<'a> ChainSearch<'a> {
 /// valid at `at`: it must be a CA (pathLen permitting), allow key-certificate signing, and be in
 /// its validity period.
 fn can_issue(cert: &Certificate, intermediates: usize, at: DateTime<Utc>) -> bool {
-    let Some(path_len) = basic_constraints_ca(cert) else { return false };
+    let Some(path_len) = basic_constraints_ca(cert) else {
+        return false;
+    };
     if path_len.is_some_and(|limit| (limit as usize) < intermediates) {
         return false;
     }
@@ -1224,15 +1453,30 @@ fn can_issue(cert: &Certificate, intermediates: usize, at: DateTime<Utc>) -> boo
 /// `Some(pathLenConstraint)` when `cert` has basicConstraints with cA=true, else `None`.
 fn basic_constraints_ca(cert: &Certificate) -> Option<Option<u32>> {
     let extensions = cert.tbs_certificate.extensions.as_ref()?;
-    let extension = extensions.iter().find(|e| e.extn_id.to_string() == "2.5.29.19")?;
-    let constraints = x509_cert::ext::pkix::BasicConstraints::from_der(extension.extn_value.as_bytes()).ok()?;
-    constraints.ca.then(|| constraints.path_len_constraint.map(u32::from))
+    let extension = extensions
+        .iter()
+        .find(|e| e.extn_id.to_string() == "2.5.29.19")?;
+    let constraints =
+        x509_cert::ext::pkix::BasicConstraints::from_der(extension.extn_value.as_bytes()).ok()?;
+    constraints
+        .ca
+        .then(|| constraints.path_len_constraint.map(u32::from))
 }
 
 /// True when `cert` has no keyUsage extension, or one for which `permitted` holds.
-fn key_usage_allows(cert: &Certificate, permitted: impl Fn(&x509_cert::ext::pkix::KeyUsage) -> bool) -> bool {
-    let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else { return true };
-    let Some(extension) = extensions.iter().find(|e| e.extn_id.to_string() == "2.5.29.15") else { return true };
+fn key_usage_allows(
+    cert: &Certificate,
+    permitted: impl Fn(&x509_cert::ext::pkix::KeyUsage) -> bool,
+) -> bool {
+    let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else {
+        return true;
+    };
+    let Some(extension) = extensions
+        .iter()
+        .find(|e| e.extn_id.to_string() == "2.5.29.15")
+    else {
+        return true;
+    };
     match x509_cert::ext::pkix::KeyUsage::from_der(extension.extn_value.as_bytes()) {
         Ok(usage) => permitted(&usage),
         Err(_) => false,
@@ -1242,7 +1486,10 @@ fn key_usage_allows(cert: &Certificate, permitted: impl Fn(&x509_cert::ext::pkix
 /// True when `at` falls within `cert`'s validity period.
 fn valid_at(cert: &Certificate, at: DateTime<Utc>) -> bool {
     let validity = &cert.tbs_certificate.validity;
-    let seconds = |t: x509_cert::time::Time| Utc.timestamp_opt(t.to_unix_duration().as_secs() as i64, 0).single();
+    let seconds = |t: x509_cert::time::Time| {
+        Utc.timestamp_opt(t.to_unix_duration().as_secs() as i64, 0)
+            .single()
+    };
     match (seconds(validity.not_before), seconds(validity.not_after)) {
         (Some(nb), Some(na)) => at >= nb && at <= na,
         _ => true,
@@ -1263,12 +1510,21 @@ fn signed_range(v: &Dictionary, file: &[u8]) -> Option<(usize, usize, usize)> {
 /// Where the value of `/Contents` lies in the dictionary object `id` as stored in `file`, read
 /// from the bytes at the offset the cross-reference table gives for it.
 fn signature_value_span(pdf: &Pdf, id: ObjectId, file: &[u8]) -> Option<(usize, usize)> {
-    let XrefEntry::Normal { offset, generation } = pdf.doc.reference_table.get(id.0)? else { return None };
+    let XrefEntry::Normal { offset, generation } = pdf.doc.reference_table.get(id.0)? else {
+        return None;
+    };
     if u32::from(*generation) != u32::from(id.1) {
         return None;
     }
-    let mut lexer = RawLexer { file, at: *offset as usize };
-    for expected in [id.0.to_string().as_bytes(), id.1.to_string().as_bytes(), b"obj"] {
+    let mut lexer = RawLexer {
+        file,
+        at: *offset as usize,
+    };
+    for expected in [
+        id.0.to_string().as_bytes(),
+        id.1.to_string().as_bytes(),
+        b"obj",
+    ] {
         lexer.skip_space();
         if lexer.token()? != expected {
             return None;
@@ -1307,17 +1563,26 @@ fn hex_value(text: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let digit = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
-    text.chunks(2).map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?)).collect()
+    text.chunks(2)
+        .map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?))
+        .collect()
 }
 
 /// True when the revision ending at `end` names cross-reference data of its own in the signed
 /// part: its last `startxref` lies after the gap and points outside it.
 fn revision_is_self_contained(file: &[u8], b: usize, c: usize, end: usize) -> bool {
     let tail = &file[c..end];
-    let Some(at) = tail.windows(9).rposition(|w| w == b"startxref") else { return false };
-    let mut lexer = RawLexer { file: tail, at: at + 9 };
+    let Some(at) = tail.windows(9).rposition(|w| w == b"startxref") else {
+        return false;
+    };
+    let mut lexer = RawLexer {
+        file: tail,
+        at: at + 9,
+    };
     lexer.skip_space();
-    let offset = lexer.token().and_then(|t| std::str::from_utf8(t).ok()?.parse::<usize>().ok());
+    let offset = lexer
+        .token()
+        .and_then(|t| std::str::from_utf8(t).ok()?.parse::<usize>().ok());
     offset.is_some_and(|x| x < b || (c..end).contains(&x))
 }
 
@@ -1352,7 +1617,10 @@ impl<'a> RawLexer<'a> {
         if self.peek() == Some(b'/') {
             self.at += 1;
         }
-        while self.peek().is_some_and(|b| !b"\0\t\n\x0c\r ()<>[]{}/%".contains(&b)) {
+        while self
+            .peek()
+            .is_some_and(|b| !b"\0\t\n\x0c\r ()<>[]{}/%".contains(&b))
+        {
             self.at += 1;
         }
         (self.at > start).then(|| &self.file[start..self.at])
@@ -1394,7 +1662,9 @@ impl<'a> RawLexer<'a> {
                     let generation = self.token();
                     self.skip_space();
                     let keyword = self.token();
-                    if !(generation.is_some_and(|g| g.iter().all(u8::is_ascii_digit)) && keyword == Some(b"R".as_slice())) {
+                    if !(generation.is_some_and(|g| g.iter().all(u8::is_ascii_digit))
+                        && keyword == Some(b"R".as_slice()))
+                    {
                         self.at = back;
                     }
                 }
@@ -1432,7 +1702,11 @@ impl Pdf {
     /// Validates every signature in `file_bytes` (the file this document was loaded from).
     /// Certificates are checked at `now`, or at the time of a time stamp from a trusted authority;
     /// never at the signing time a signature claims for itself.
-    pub fn verify_signatures(file_bytes: &[u8], trust: &TrustStore, now: DateTime<Utc>) -> Result<Vec<SignatureReport>> {
+    pub fn verify_signatures(
+        file_bytes: &[u8],
+        trust: &TrustStore,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<SignatureReport>> {
         Self::verify_signatures_with_password(file_bytes, None, trust, now)
     }
 
@@ -1448,7 +1722,11 @@ impl Pdf {
             Some(password) => Pdf::from_bytes_with_password(file_bytes, password)?,
             None => Pdf::from_bytes(file_bytes)?,
         };
-        let file_end = file_bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map(|p| p + 1).unwrap_or(0);
+        let file_end = file_bytes
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map(|p| p + 1)
+            .unwrap_or(0);
 
         // Field name per signature dictionary id.
         let mut names: HashMap<ObjectId, String> = HashMap::new();
@@ -1462,24 +1740,52 @@ impl Pdf {
 
         let mut reports = Vec::new();
         for (id, object) in &pdf.doc.objects {
-            let Object::Dictionary(v) = object else { continue };
+            let Object::Dictionary(v) = object else {
+                continue;
+            };
             if !is_signature_dictionary(v) {
                 continue;
             }
-            reports.push(verify_one(&pdf, *id, v, names.get(id).cloned(), file_bytes, password, file_end, trust, now));
+            reports.push(verify_one(
+                &pdf,
+                *id,
+                v,
+                names.get(id).cloned(),
+                file_bytes,
+                password,
+                file_end,
+                trust,
+                now,
+            ));
         }
         // A signature field whose value is gone or no longer reads as a signature (bytes written
         // into the gap broke its dictionary, say) is still a signature, and a damaged one.
         for field in pdf.doc.objects.values() {
-            let Object::Dictionary(field) = field else { continue };
-            let Some(value) = signature_field_value(field) else { continue };
+            let Object::Dictionary(field) = field else {
+                continue;
+            };
+            let Some(value) = signature_field_value(field) else {
+                continue;
+            };
             match pdf.doc.objects.get(&value) {
                 Some(Object::Dictionary(v)) if is_signature_dictionary(v) => {}
                 Some(Object::Dictionary(v)) if v.has(b"ByteRange") => {
-                    reports.push(verify_one(&pdf, value, v, names.get(&value).cloned(), file_bytes, password, file_end, trust, now));
+                    reports.push(verify_one(
+                        &pdf,
+                        value,
+                        v,
+                        names.get(&value).cloned(),
+                        file_bytes,
+                        password,
+                        file_end,
+                        trust,
+                        now,
+                    ));
                 }
                 _ => {
-                    let mut report = SignatureReport::new(text_of(field, b"T").unwrap_or_else(|| format!("object {}", value.0)));
+                    let mut report = SignatureReport::new(
+                        text_of(field, b"T").unwrap_or_else(|| format!("object {}", value.0)),
+                    );
                     report.validity = Validity::Invalid;
                     report.detail = Detail::Corrupt;
                     report.revision_end = file_end;
@@ -1497,15 +1803,32 @@ impl Pdf {
     /// rewritten since), is already broken. One that cannot be checked here (an unsupported
     /// algorithm, say) counts as intact.
     pub(crate) fn has_intact_signatures(&self, file_bytes: &[u8], password: Option<&str>) -> bool {
-        let file_end = file_bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map(|p| p + 1).unwrap_or(0);
+        let file_end = file_bytes
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map(|p| p + 1)
+            .unwrap_or(0);
         let trust = TrustStore::default();
         self.doc.objects.iter().any(|(id, object)| {
-            let Object::Dictionary(v) = object else { return false };
+            let Object::Dictionary(v) = object else {
+                return false;
+            };
             if !is_signature_dictionary(v) {
                 return false;
             }
-            let report = verify_one(self, *id, v, None, file_bytes, password, file_end, &trust, Utc::now());
-            !(report.validity == Validity::Invalid && matches!(report.detail, Detail::BadByteRange | Detail::DigestMismatch))
+            let report = verify_one(
+                self,
+                *id,
+                v,
+                None,
+                file_bytes,
+                password,
+                file_end,
+                &trust,
+                Utc::now(),
+            );
+            !(report.validity == Validity::Invalid
+                && matches!(report.detail, Detail::BadByteRange | Detail::DigestMismatch))
         })
     }
 }
@@ -1533,7 +1856,12 @@ fn verify_one(
 
     // 1. Sub-filter.
     const SUPPORTED: [&str; 3] = ["adbe.pkcs7.detached", "ETSI.CAdES.detached", "ETSI.RFC3161"];
-    let supported = |report: &SignatureReport| report.sub_filter.as_deref().is_some_and(|f| SUPPORTED.contains(&f));
+    let supported = |report: &SignatureReport| {
+        report
+            .sub_filter
+            .as_deref()
+            .is_some_and(|f| SUPPORTED.contains(&f))
+    };
     if !supported(&report) {
         invalid(&mut report, Detail::UnsupportedFilter);
         return report;
@@ -1558,7 +1886,10 @@ fn verify_one(
     let reloaded;
     let revision = if report.modified_after_signing {
         let signed_part = &file[..c + d];
-        match password.map_or_else(|| Pdf::from_bytes(signed_part), |p| Pdf::from_bytes_with_password(signed_part, p)) {
+        match password.map_or_else(
+            || Pdf::from_bytes(signed_part),
+            |p| Pdf::from_bytes_with_password(signed_part, p),
+        ) {
             Ok(pdf) => {
                 reloaded = pdf;
                 &reloaded
@@ -1617,7 +1948,11 @@ fn verify_one(
 
     // Signer certificate: match issuer and serial, or subject key identifier, else the first
     // embedded certificate.
-    let certificates: Vec<Certificate> = cms.certificates.iter().filter_map(|d| Certificate::from_der(d).ok()).collect();
+    let certificates: Vec<Certificate> = cms
+        .certificates
+        .iter()
+        .filter_map(|d| Certificate::from_der(d).ok())
+        .collect();
     let Some(signer) = find_signer(&certificates, &signer_info.id) else {
         invalid(&mut report, Detail::Corrupt);
         return report;
@@ -1629,7 +1964,11 @@ fn verify_one(
 
     let digest_oid = &signer_info.digest_algorithm;
     report.weak_algorithm = sigcrypto::is_weak_digest(digest_oid)
-        || sigcrypto::uses_sha1(&signer_info.signature_algorithm, signer_info.signature_parameters.as_deref(), digest_oid);
+        || sigcrypto::uses_sha1(
+            &signer_info.signature_algorithm,
+            signer_info.signature_parameters.as_deref(),
+            digest_oid,
+        );
 
     // 4. Integrity: message digest and signature value. The signed input is the DER SET OF signed
     //    attributes, or, when there are none, the covered bytes directly.
@@ -1714,7 +2053,10 @@ fn verify_one(
         return report;
     }
     // The signer certificate, when it declares a key usage or purposes, must allow signing.
-    if !key_usage_allows(signer, |usage| usage.digital_signature() || usage.non_repudiation()) || !purposes_allow_signing(signer) {
+    if !key_usage_allows(signer, |usage| {
+        usage.digital_signature() || usage.non_repudiation()
+    }) || !purposes_allow_signing(signer)
+    {
         unknown(&mut report, Detail::NotPermitted);
         return report;
     }
@@ -1744,10 +2086,21 @@ fn verify_document_timestamp(
         TokenResult::NotAToken | TokenResult::BadSignature => (Validity::Invalid, Detail::Corrupt),
         TokenResult::ImprintMismatch => (Validity::Invalid, Detail::DigestMismatch),
         TokenResult::Unsupported => (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm),
-        TokenResult::Verified { time, signer, standing } => {
+        TokenResult::Verified {
+            time,
+            signer,
+            standing,
+        } => {
             report.signer = signer;
             report.time_stamp_time = Some(pdf_date(time));
-            (if is_trusted(standing) { Validity::Valid } else { Validity::ValidityUnknown }, standing)
+            (
+                if is_trusted(standing) {
+                    Validity::Valid
+                } else {
+                    Validity::ValidityUnknown
+                },
+                standing,
+            )
         }
     };
     report.validity = validity;
@@ -1777,7 +2130,11 @@ enum TokenResult {
     Unsupported,
     /// The token verifies. `standing` is its authority's: `TrustedDirectly` or `TrustedViaChain`
     /// when trusted, else why not.
-    Verified { time: DateTime<Utc>, signer: Option<String>, standing: Detail },
+    Verified {
+        time: DateTime<Utc>,
+        signer: Option<String>,
+        standing: Detail,
+    },
 }
 
 /// Verifies an RFC 3161 time-stamp token: its message imprint must cover `imprint` and its own
@@ -1786,14 +2143,27 @@ enum TokenResult {
 /// may not be in the future) and now. Without long-term validation data nothing in the file shows
 /// that an authority whose certificate has since expired still kept its key: whoever holds it now
 /// could make a token with any earlier time.
-fn check_timestamp_token(token: &[u8], imprint: &[&[u8]], trust: &TrustStore, now: DateTime<Utc>) -> TokenResult {
-    let Some(cms) = cms::parse_signed_data(token) else { return TokenResult::NotAToken };
+fn check_timestamp_token(
+    token: &[u8],
+    imprint: &[&[u8]],
+    trust: &TrustStore,
+    now: DateTime<Utc>,
+) -> TokenResult {
+    let Some(cms) = cms::parse_signed_data(token) else {
+        return TokenResult::NotAToken;
+    };
     if cms.content_type != cms::OID_TST_INFO {
         return TokenResult::NotAToken;
     }
-    let Some(econtent) = cms.content.as_deref() else { return TokenResult::NotAToken };
-    let Some(info) = cms::parse_tst_info(econtent) else { return TokenResult::NotAToken };
-    let Some(time) = gentime_to_utc(&info.gen_time) else { return TokenResult::NotAToken };
+    let Some(econtent) = cms.content.as_deref() else {
+        return TokenResult::NotAToken;
+    };
+    let Some(info) = cms::parse_tst_info(econtent) else {
+        return TokenResult::NotAToken;
+    };
+    let Some(time) = gentime_to_utc(&info.gen_time) else {
+        return TokenResult::NotAToken;
+    };
 
     // The message imprint must hash exactly the data this token is supposed to cover.
     match sigcrypto::digest(&info.hash_algorithm, imprint) {
@@ -1809,20 +2179,32 @@ fn check_timestamp_token(token: &[u8], imprint: &[&[u8]], trust: &TrustStore, no
         Verified::Unsupported => return TokenResult::Unsupported,
     }
 
-    let certificates: Vec<Certificate> = cms.certificates.iter().filter_map(|c| Certificate::from_der(c).ok()).collect();
-    let Some(signer) = find_signer(&certificates, &cms.signer.id) else { return TokenResult::BadSignature };
+    let certificates: Vec<Certificate> = cms
+        .certificates
+        .iter()
+        .filter_map(|c| Certificate::from_der(c).ok())
+        .collect();
+    let Some(signer) = find_signer(&certificates, &cms.signer.id) else {
+        return TokenResult::BadSignature;
+    };
     let standing = if time > now + chrono::Duration::minutes(5) {
         Detail::SignedInFuture
     } else if !valid_at(signer, time) || !valid_at(signer, now) {
         Detail::Expired
-    } else if !(has_timestamping_eku(signer) && key_usage_allows(signer, |u| u.digital_signature() || u.non_repudiation())) {
+    } else if !(has_timestamping_eku(signer)
+        && key_usage_allows(signer, |u| u.digital_signature() || u.non_repudiation()))
+    {
         Detail::NotPermitted
     } else {
         trust_level(signer, &certificates, trust, time)
             .and_then(|_| trust_level(signer, &certificates, trust, now))
             .unwrap_or_else(|detail| detail)
     };
-    TokenResult::Verified { time, signer: Some(subject_name(signer)), standing }
+    TokenResult::Verified {
+        time,
+        signer: Some(subject_name(signer)),
+        standing,
+    }
 }
 
 /// Finds the certificate a SignerInfo names, by issuer and serial or by subject key identifier.
@@ -1842,9 +2224,18 @@ fn find_signer<'a>(certificates: &'a [Certificate], id: &cms::SignerId) -> Optio
 /// True when `certificate` is for time stamping as RFC 3161 asks: a critical extended key usage
 /// whose only purpose is id-kp-timeStamping.
 fn has_timestamping_eku(certificate: &Certificate) -> bool {
-    let Some(extensions) = certificate.tbs_certificate.extensions.as_ref() else { return false };
-    let Some(extension) = extensions.iter().find(|e| e.extn_id.to_string() == "2.5.29.37") else { return false };
-    let Ok(usage) = x509_cert::ext::pkix::ExtendedKeyUsage::from_der(extension.extn_value.as_bytes()) else {
+    let Some(extensions) = certificate.tbs_certificate.extensions.as_ref() else {
+        return false;
+    };
+    let Some(extension) = extensions
+        .iter()
+        .find(|e| e.extn_id.to_string() == "2.5.29.37")
+    else {
+        return false;
+    };
+    let Ok(usage) =
+        x509_cert::ext::pkix::ExtendedKeyUsage::from_der(extension.extn_value.as_bytes())
+    else {
         return false;
     };
     extension.critical && usage.0.len() == 1 && usage.0[0].to_string() == "1.3.6.1.5.5.7.3.8"
@@ -1852,19 +2243,36 @@ fn has_timestamping_eku(certificate: &Certificate) -> bool {
 
 /// The extended key usages that allow signing documents: any purpose, e-mail protection, document
 /// signing (RFC 9336), Adobe Authentic Documents Trust and Microsoft Document Signing.
-const SIGNING_PURPOSES: [&str; 5] =
-    ["2.5.29.37.0", "1.3.6.1.5.5.7.3.4", "1.3.6.1.5.5.7.3.36", "1.2.840.113583.1.1.5", "1.3.6.1.4.1.311.10.3.12"];
+const SIGNING_PURPOSES: [&str; 5] = [
+    "2.5.29.37.0",
+    "1.3.6.1.5.5.7.3.4",
+    "1.3.6.1.5.5.7.3.36",
+    "1.2.840.113583.1.1.5",
+    "1.3.6.1.4.1.311.10.3.12",
+];
 
 /// True when `certificate` names no extended key usage, or names one that allows signing
 /// documents. A certificate restricted to other purposes (time stamping, or a TLS server, say) is
 /// not a signer's, whoever trusts it.
 fn purposes_allow_signing(certificate: &Certificate) -> bool {
-    let Some(extensions) = certificate.tbs_certificate.extensions.as_ref() else { return true };
-    let Some(extension) = extensions.iter().find(|e| e.extn_id.to_string() == "2.5.29.37") else { return true };
-    let Ok(usage) = x509_cert::ext::pkix::ExtendedKeyUsage::from_der(extension.extn_value.as_bytes()) else {
+    let Some(extensions) = certificate.tbs_certificate.extensions.as_ref() else {
+        return true;
+    };
+    let Some(extension) = extensions
+        .iter()
+        .find(|e| e.extn_id.to_string() == "2.5.29.37")
+    else {
+        return true;
+    };
+    let Ok(usage) =
+        x509_cert::ext::pkix::ExtendedKeyUsage::from_der(extension.extn_value.as_bytes())
+    else {
         return false;
     };
-    usage.0.iter().any(|purpose| SIGNING_PURPOSES.contains(&purpose.to_string().as_str()))
+    usage
+        .0
+        .iter()
+        .any(|purpose| SIGNING_PURPOSES.contains(&purpose.to_string().as_str()))
 }
 
 /// A GeneralizedTime (`YYYYMMDDHHMMSS[.fff]Z`) as a UTC instant.
@@ -1877,7 +2285,8 @@ fn gentime_to_utc(text: &str) -> Option<DateTime<Utc>> {
     let year = field(0, 4)? as i32;
     let (month, day) = (field(4, 2)?, field(6, 2)?);
     let (hour, minute, second) = (field(8, 2)?, field(10, 2)?, field(12, 2)?);
-    Utc.with_ymd_and_hms(year, month, day, hour, minute, second).single()
+    Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
+        .single()
 }
 
 impl Pdf {
@@ -1887,7 +2296,11 @@ impl Pdf {
             .ok()
             .and_then(|c| c.get(b"Perms").ok())
             .map(|p| self.resolve(p))
-            .and_then(|p| p.as_dict().ok().and_then(|d| d.get(b"DocMDP").ok().cloned()))
+            .and_then(|p| {
+                p.as_dict()
+                    .ok()
+                    .and_then(|d| d.get(b"DocMDP").ok().cloned())
+            })
             .is_some_and(|o| matches!(o, Object::Reference(r) if r == id))
     }
 }

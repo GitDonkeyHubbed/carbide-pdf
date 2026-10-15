@@ -21,11 +21,18 @@ impl PageDiff {
 }
 
 fn lines(text: &str) -> Vec<String> {
-    text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+    text.lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 /// Compares the extracted text of `original` and `revised`.
-pub fn compare_documents(renderer: &Renderer, original: &mut Pdf, revised: &mut Pdf) -> Result<Vec<PageDiff>> {
+pub fn compare_documents(
+    renderer: &Renderer,
+    original: &mut Pdf,
+    revised: &mut Pdf,
+) -> Result<Vec<PageDiff>> {
     for pdf in [&*original, &*revised] {
         for index in 0..pdf.page_count() {
             pdf.check_drawable(index)?;
@@ -37,26 +44,47 @@ pub fn compare_documents(renderer: &Renderer, original: &mut Pdf, revised: &mut 
 
     (0..old_count.max(new_count))
         .map(|index| {
-            let old = if index < old_count { lines(&renderer.page_text(&old_bytes, index)?) } else { Vec::new() };
-            let new = if index < new_count { lines(&renderer.page_text(&new_bytes, index)?) } else { Vec::new() };
+            let old = if index < old_count {
+                lines(&renderer.page_text(&old_bytes, index)?)
+            } else {
+                Vec::new()
+            };
+            let new = if index < new_count {
+                lines(&renderer.page_text(&new_bytes, index)?)
+            } else {
+                Vec::new()
+            };
             let mut removed = Vec::new();
             let mut added = Vec::new();
             for op in capture_diff_slices(Algorithm::Myers, &old, &new) {
                 match op {
                     DiffOp::Equal { .. } => {}
-                    DiffOp::Delete { old_index, old_len, .. } => {
+                    DiffOp::Delete {
+                        old_index, old_len, ..
+                    } => {
                         removed.extend_from_slice(&old[old_index..old_index + old_len]);
                     }
-                    DiffOp::Insert { new_index, new_len, .. } => {
+                    DiffOp::Insert {
+                        new_index, new_len, ..
+                    } => {
                         added.extend_from_slice(&new[new_index..new_index + new_len]);
                     }
-                    DiffOp::Replace { old_index, old_len, new_index, new_len } => {
+                    DiffOp::Replace {
+                        old_index,
+                        old_len,
+                        new_index,
+                        new_len,
+                    } => {
                         removed.extend_from_slice(&old[old_index..old_index + old_len]);
                         added.extend_from_slice(&new[new_index..new_index + new_len]);
                     }
                 }
             }
-            Ok(PageDiff { page_number: index + 1, removed, added })
+            Ok(PageDiff {
+                page_number: index + 1,
+                removed,
+                added,
+            })
         })
         .collect()
 }

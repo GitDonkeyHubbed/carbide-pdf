@@ -69,7 +69,11 @@ pub fn integer_small(value: u32) -> Vec<u8> {
 /// Positive big-endian integer (nonce, serial numbers).
 pub fn integer_unsigned(bytes: &[u8]) -> Vec<u8> {
     let trimmed: &[u8] = {
-        let skip = bytes.iter().take_while(|b| **b == 0).count().min(bytes.len().saturating_sub(1));
+        let skip = bytes
+            .iter()
+            .take_while(|b| **b == 0)
+            .count()
+            .min(bytes.len().saturating_sub(1));
         &bytes[skip..]
     };
     let mut content = trimmed.to_vec();
@@ -136,7 +140,14 @@ fn read_with(data: &[u8], ber_depth: Option<usize>) -> Option<(Element<'_>, &[u8
             rest = read_with(rest, Some(depth + 1))?.1;
         }
         let content_end = data.len() - rest.len();
-        return Some((Element { tag, content: &data[2..content_end], raw: &data[..content_end + 2] }, &rest[2..]));
+        return Some((
+            Element {
+                tag,
+                content: &data[2..content_end],
+                raw: &data[..content_end + 2],
+            },
+            &rest[2..],
+        ));
     }
     let (len, header) = if first < 0x80 {
         (first as usize, 2)
@@ -155,7 +166,14 @@ fn read_with(data: &[u8], ber_depth: Option<usize>) -> Option<(Element<'_>, &[u8
     if data.len() < end {
         return None;
     }
-    Some((Element { tag, content: &data[header..end], raw: &data[..end] }, &data[end..]))
+    Some((
+        Element {
+            tag,
+            content: &data[header..end],
+            raw: &data[..end],
+        },
+        &data[end..],
+    ))
 }
 
 /// All elements directly inside `content`, which may be BER.
@@ -179,11 +197,19 @@ pub fn small_unsigned(content: &[u8]) -> Option<u64> {
     if content.is_empty() || content[0] & 0x80 != 0 || content.len() > 9 {
         return None;
     }
-    let digits = if content.len() == 9 && content[0] == 0 { &content[1..] } else { content };
+    let digits = if content.len() == 9 && content[0] == 0 {
+        &content[1..]
+    } else {
+        content
+    };
     if digits.len() > 8 {
         return None;
     }
-    Some(digits.iter().fold(0u64, |value, b| (value << 8) | *b as u64))
+    Some(
+        digits
+            .iter()
+            .fold(0u64, |value, b| (value << 8) | *b as u64),
+    )
 }
 
 /// The DER encoding of a (possibly BER) element: definite lengths throughout, and a string sent
@@ -273,7 +299,10 @@ mod tests {
     fn oid_round_trip() {
         // sha256: 2.16.840.1.101.3.4.2.1
         let encoded = oid(&[2, 16, 840, 1, 101, 3, 4, 2, 1]);
-        assert_eq!(encoded, vec![0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01]);
+        assert_eq!(
+            encoded,
+            vec![0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01]
+        );
         let (element, _) = read(&encoded).unwrap();
         assert_eq!(oid_to_string(element.content), "2.16.840.1.101.3.4.2.1");
         let rsa = oid(&[1, 2, 840, 113549, 1, 1, 11]);
@@ -289,16 +318,25 @@ mod tests {
         assert_eq!(element.content, &[0x02, 0x01, 0x07]);
         assert_eq!(element.raw, &ber[..7]);
         assert_eq!(rest, &[0xAA]);
-        assert_eq!(normalize(&element).unwrap(), vec![0x30, 0x03, 0x02, 0x01, 0x07]);
+        assert_eq!(
+            normalize(&element).unwrap(),
+            vec![0x30, 0x03, 0x02, 0x01, 0x07]
+        );
 
         // Nested indefinite lengths, a constructed OCTET STRING sent in two pieces.
-        let nested = [0xA0, 0x80, 0x24, 0x80, 0x04, 0x01, b'a', 0x04, 0x02, b'b', b'c', 0x00, 0x00, 0x00, 0x00];
+        let nested = [
+            0xA0, 0x80, 0x24, 0x80, 0x04, 0x01, b'a', 0x04, 0x02, b'b', b'c', 0x00, 0x00, 0x00,
+            0x00,
+        ];
         let (outer, rest) = read_ber(&nested).unwrap();
         assert!(rest.is_empty());
         let inner = children_ber(outer.content);
         assert_eq!(inner.len(), 1);
         assert_eq!(string_value(&inner[0]).unwrap(), b"abc");
-        assert_eq!(normalize(&outer).unwrap(), vec![0xA0, 0x05, 0x04, 0x03, b'a', b'b', b'c']);
+        assert_eq!(
+            normalize(&outer).unwrap(),
+            vec![0xA0, 0x05, 0x04, 0x03, b'a', b'b', b'c']
+        );
 
         // Primitive elements cannot be indefinite, and nesting is bounded.
         assert!(read_ber(&[0x04, 0x80, 0x00, 0x00]).is_none());

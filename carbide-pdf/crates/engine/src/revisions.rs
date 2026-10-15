@@ -52,12 +52,23 @@ pub fn pdf_date_now() -> String {
     let offset = now.offset().local_minus_utc();
     let sign = if offset < 0 { '-' } else { '+' };
     let minutes = offset.abs() / 60;
-    format!("D:{}{}'{:02}'", now.format("%Y%m%d%H%M%S"), format_args!("{sign}{:02}", minutes / 60), minutes % 60)
+    format!(
+        "D:{}{}'{:02}'",
+        now.format("%Y%m%d%H%M%S"),
+        format_args!("{sign}{:02}", minutes / 60),
+        minutes % 60
+    )
 }
 
 /// Converts `D:YYYYMMDDHHmmSS[Z|+HH'mm']` to local `yyyy-MM-dd HH:mm:ss`. Invalid input gives "".
 pub fn pdf_date_to_local(text: &str) -> String {
-    parse_pdf_date(text).map(|utc| utc.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default()
+    parse_pdf_date(text)
+        .map(|utc| {
+            utc.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn parse_pdf_date(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -79,45 +90,65 @@ pub(crate) fn parse_pdf_date(text: &str) -> Option<chrono::DateTime<chrono::Utc>
     if !(1971..=3000).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
-    if hour > 24 || minute > 60 || second > 60 {
+    // PDF allows 00-23, 00-59 and 00-59; there is no hour 24 and no leap second.
+    if hour > 23 || minute > 59 || second > 59 {
         return None;
     }
 
     let mut offset_seconds = 0i32;
     let mut chars = tail.chars();
-    match chars.next() {
-        Some(sign @ ('+' | '-')) => {
-            let numbers: Vec<u32> = chars
-                .as_str()
-                .split(|c: char| !c.is_ascii_digit())
-                .filter(|s| !s.is_empty())
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            let (h, m) = (numbers.first().copied().unwrap_or(0), numbers.get(1).copied().unwrap_or(0));
-            let total = (h * 3600 + m * 60) as i32;
-            offset_seconds = if sign == '-' { -total } else { total };
+    if let Some(sign @ ('+' | '-')) = chars.next() {
+        let numbers: Vec<u32> = chars
+            .as_str()
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let (h, m) = (
+            numbers.first().copied().unwrap_or(0),
+            numbers.get(1).copied().unwrap_or(0),
+        );
+        if h > 23 || m > 59 {
+            return None;
         }
-        _ => {}
+        let total = (h * 3600 + m * 60) as i32;
+        offset_seconds = if sign == '-' { -total } else { total };
     }
 
-    let naive = NaiveDate::from_ymd_opt(year, month, day)?
-        .and_hms_opt(hour.min(23), minute.min(59), second.min(59))?;
+    let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, second)?;
     let zone = FixedOffset::east_opt(offset_seconds)?;
-    Some(zone.from_local_datetime(&naive).single()?.with_timezone(&chrono::Utc))
+    Some(
+        zone.from_local_datetime(&naive)
+            .single()?
+            .with_timezone(&chrono::Utc),
+    )
 }
 
 impl Pdf {
     /// Revisions with a non-empty date, in the order they were saved.
     pub fn revisions(&self) -> Vec<Revision> {
-        let Ok(catalog) = self.doc.catalog() else { return Vec::new() };
-        let Ok(entry) = catalog.get(CATALOG_KEY) else { return Vec::new() };
-        let Object::Array(items) = self.resolve(entry) else { return Vec::new() };
+        let Ok(catalog) = self.doc.catalog() else {
+            return Vec::new();
+        };
+        let Ok(entry) = catalog.get(CATALOG_KEY) else {
+            return Vec::new();
+        };
+        let Object::Array(items) = self.resolve(entry) else {
+            return Vec::new();
+        };
         items
             .iter()
             .filter_map(|item| {
-                let Object::Dictionary(record) = self.resolve(item) else { return None };
+                let Object::Dictionary(record) = self.resolve(item) else {
+                    return None;
+                };
                 let text = |key: &[u8]| -> String {
-                    record.get(key).ok().and_then(|o| o.as_str().ok()).map(decode_text).unwrap_or_default()
+                    record
+                        .get(key)
+                        .ok()
+                        .and_then(|o| o.as_str().ok())
+                        .map(decode_text)
+                        .unwrap_or_default()
                 };
                 let date = text(b"Date");
                 if date.is_empty() {
@@ -144,7 +175,9 @@ impl Pdf {
     pub fn save_revision(&self, base_bytes: &[u8], label: &str, date: &str) -> Result<Vec<u8>> {
         validate_label(label).map_err(|m| Error::Other(m.to_string()))?;
         if self.doc.is_encrypted() {
-            return Err(Error::Unsupported("revisions are not supported for encrypted documents".into()));
+            return Err(Error::Unsupported(
+                "revisions are not supported for encrypted documents".into(),
+            ));
         }
         // The record's Length is the size of the file it ends, which is only known once the update
         // is written: it starts as a fixed-width placeholder and is patched afterwards. The update is
@@ -153,20 +186,29 @@ impl Pdf {
         // instead could hit page text that happens to hold the same characters.
         let mut bytes = self.update_with_record(base_bytes, label, date, b'0')?;
         let other = self.update_with_record(base_bytes, label, date, b'1')?;
-        let differing: Vec<usize> = (0..bytes.len().min(other.len())).filter(|&i| bytes[i] != other[i]).collect();
+        let differing: Vec<usize> = (0..bytes.len().min(other.len()))
+            .filter(|&i| bytes[i] != other[i])
+            .collect();
         let at = match differing[..] {
-            [first, .., last] if other.len() == bytes.len()
-                && last - first + 1 == LENGTH_DIGITS
-                && differing.len() == LENGTH_DIGITS
-                && first >= base_bytes.len() =>
+            [first, .., last]
+                if other.len() == bytes.len()
+                    && last - first + 1 == LENGTH_DIGITS
+                    && differing.len() == LENGTH_DIGITS
+                    && first >= base_bytes.len() =>
             {
                 first
             }
-            _ => return Err(Error::Other("could not locate the revision length field".into())),
+            _ => {
+                return Err(Error::Other(
+                    "could not locate the revision length field".into(),
+                ))
+            }
         };
         let digits = format!("{:0width$}", bytes.len(), width = LENGTH_DIGITS);
         if digits.len() != LENGTH_DIGITS {
-            return Err(Error::Other("the file is too large for a revision record".into()));
+            return Err(Error::Other(
+                "the file is too large for a revision record".into(),
+            ));
         }
         bytes[at..at + LENGTH_DIGITS].copy_from_slice(digits.as_bytes());
         Ok(bytes)
@@ -174,7 +216,13 @@ impl Pdf {
 
     /// `base_bytes` plus an update holding this document's pending edits and a new revision record
     /// whose Length is `digit` repeated.
-    fn update_with_record(&self, base_bytes: &[u8], label: &str, date: &str, digit: u8) -> Result<Vec<u8>> {
+    fn update_with_record(
+        &self,
+        base_bytes: &[u8],
+        label: &str,
+        date: &str,
+        digit: u8,
+    ) -> Result<Vec<u8>> {
         let mut next = self.clone();
         let mut records: Vec<Object> = match next.doc.catalog()?.get(CATALOG_KEY) {
             Ok(entry) => match next.resolve(entry) {
@@ -188,7 +236,9 @@ impl Pdf {
             "Date" => Object::String(date.as_bytes().to_vec(), StringFormat::Literal),
             "Length" => Object::String(vec![digit; LENGTH_DIGITS], StringFormat::Literal),
         }));
-        next.doc.catalog_mut()?.set(CATALOG_KEY.to_vec(), Object::Array(records));
+        next.doc
+            .catalog_mut()?
+            .set(CATALOG_KEY.to_vec(), Object::Array(records));
         next.incremental_update(base_bytes)
     }
 }
@@ -201,7 +251,9 @@ pub fn open_revision_bytes(file_bytes: &[u8], revision: &Revision) -> Result<Vec
     }
     let end = revision.file_offset as usize;
     if end > file_bytes.len() {
-        return Err(Error::Other("the file is shorter than the revision's recorded size".into()));
+        return Err(Error::Other(
+            "the file is shorter than the revision's recorded size".into(),
+        ));
     }
     let prefix = file_bytes[..end].to_vec();
     Pdf::from_bytes(&prefix)?; // must be a complete, loadable document
@@ -222,7 +274,12 @@ pub fn revision_display_name(source_name: &str, revision: &Revision) -> String {
 /// PDF text string (PDFDocEncoding subset or UTF-16BE) to `String`.
 pub(crate) fn decode_text(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xFE, 0xFF]) {
-        let units: Vec<u16> = bytes[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
         String::from_utf16_lossy(&units)
     } else if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         String::from_utf8_lossy(&bytes[3..]).into_owned()
@@ -258,11 +315,21 @@ mod tests {
     fn pdf_dates_convert_and_validate() {
         // UTC input converts to the machine's local zone, so compare through the same conversion.
         let utc = chrono::Utc.with_ymd_and_hms(2026, 3, 4, 5, 6, 7).unwrap();
-        let expected = utc.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string();
+        let expected = utc
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
         assert_eq!(pdf_date_to_local("D:20260304050607Z"), expected);
         assert_eq!(pdf_date_to_local("D:20260304070607+02'00'"), expected);
         assert_eq!(pdf_date_to_local("D:20260303210607-08'00'"), expected);
-        for bad in ["", "20260304050607", "D:19700101000000Z", "D:20261301000000Z", "D:20260132000000Z", "D:2026030425"] {
+        for bad in [
+            "",
+            "20260304050607",
+            "D:19700101000000Z",
+            "D:20261301000000Z",
+            "D:20260132000000Z",
+            "D:2026030425",
+        ] {
             assert_eq!(pdf_date_to_local(bad), "", "{bad:?}");
         }
         let now = pdf_date_now();
@@ -270,6 +337,46 @@ mod tests {
         let local = Local::now();
         assert!(pdf_date_to_local(&now).starts_with(&format!("{}-", local.year())));
         let _ = local.hour();
+    }
+
+    #[test]
+    fn pdf_date_time_fields_are_range_checked() {
+        let utc = |text: &str| parse_pdf_date(text).map(|d| d.to_rfc3339());
+        // The last valid moment of a day is accepted as written.
+        assert_eq!(
+            utc("D:20260304235959Z").as_deref(),
+            Some("2026-03-04T23:59:59+00:00")
+        );
+        assert_eq!(
+            utc("D:20260101000000Z").as_deref(),
+            Some("2026-01-01T00:00:00+00:00")
+        );
+        // Shorter dates fall back to the start of the period.
+        assert_eq!(utc("D:2026").as_deref(), Some("2026-01-01T00:00:00+00:00"));
+        for bad in [
+            "D:20260304240000Z", // hour 24
+            "D:20260304246000Z", // hour 24 with minute 60
+            "D:20260304006000Z", // minute 60
+            "D:20260304000060Z", // second 60: no leap seconds
+            "D:20260304000061Z", // second 61
+            "D:20260304000099Z",
+            "D:20261301000000Z", // month 13
+            "D:20260001000000Z", // month 0
+            "D:20260300000000Z", // day 0
+            "D:20260332000000Z", // day 32
+            "D:20260230000000Z", // no 30th of February
+            "D:20260304050607+24'00'",
+            "D:20260304050607+05'60'",
+            "D:20260304050607-99'00'",
+        ] {
+            assert_eq!(parse_pdf_date(bad), None, "{bad:?}");
+            assert_eq!(pdf_date_to_local(bad), "", "{bad:?}");
+        }
+        // Edge offsets still work.
+        assert_eq!(
+            utc("D:20260304120000+23'59'").as_deref(),
+            Some("2026-03-03T12:01:00+00:00")
+        );
     }
 
     #[test]

@@ -5,7 +5,13 @@ members = ["crates/engine", "crates/cli", "crates/app"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.95"
 license = "MIT"
+repository = "https://github.com/GitDonkeyHubbed/carbide-pdf"
+homepage = "https://github.com/GitDonkeyHubbed/carbide-pdf"
+authors = ["GitDonkeyHubbed"]
+keywords = ["pdf", "editor", "macos", "redaction", "signature"]
+categories = ["text-processing", "command-line-utilities", "gui"]
 
 [workspace.dependencies]
 lopdf = "0.45"

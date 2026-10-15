@@ -2,7 +2,15 @@
 name = "carbide-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Command-line tool for Carbide PDF (the carbide binary)."
+readme = "../../README.md"
 
 [[bin]]
 name = "carbide"

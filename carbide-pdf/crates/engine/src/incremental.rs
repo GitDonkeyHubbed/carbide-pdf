@@ -42,7 +42,9 @@ impl Pdf {
     pub fn incremental_update(&self, base_bytes: &[u8]) -> Result<Vec<u8>> {
         let base = crate::crypt::load_bounded(base_bytes)?;
         if base.is_encrypted() || base.was_encrypted() || self.doc.is_encrypted() {
-            return Err(Error::Unsupported("incremental updates of encrypted files are not supported".into()));
+            return Err(Error::Unsupported(
+                "incremental updates of encrypted files are not supported".into(),
+            ));
         }
         self.append_update(base_bytes, base)
     }
@@ -85,7 +87,9 @@ impl Pdf {
             .objects
             .iter()
             .filter(|(id, object)| {
-                reachable.contains(id) && !is_file_structure(object) && base.objects.get(id) != Some(*object)
+                reachable.contains(id)
+                    && !is_file_structure(object)
+                    && base.objects.get(id) != Some(*object)
             })
             .map(|(id, object)| (*id, object.clone()))
             .collect();
@@ -103,7 +107,9 @@ impl Pdf {
 /// Cross-reference and object streams, and a linearization dictionary, belong to how a file was
 /// written, not to the document: every save builds its own and an update never carries them.
 pub(crate) fn is_file_structure(object: &Object) -> bool {
-    object.type_name().is_ok_and(|name| name == b"XRef" || name == b"ObjStm")
+    object
+        .type_name()
+        .is_ok_and(|name| name == b"XRef" || name == b"ObjStm")
         || object.as_dict().is_ok_and(|dict| dict.has(b"Linearized"))
 }
 
@@ -118,13 +124,29 @@ pub(crate) fn file_structure(doc: &Document) -> HashSet<ObjectId> {
         .values()
         .filter_map(|object| object.as_dict().ok().filter(|dict| dict.has(b"Linearized")))
         .filter_map(|dict| dict.get(b"H").and_then(Object::as_array).ok())
-        .flat_map(|hints| hints.iter().step_by(2).filter_map(|offset| u32::try_from(offset.as_i64().ok()?).ok()))
+        .flat_map(|hints| {
+            hints
+                .iter()
+                .step_by(2)
+                .filter_map(|offset| u32::try_from(offset.as_i64().ok()?).ok())
+        })
         .collect();
-    let hints = doc.reference_table.entries.iter().filter_map(|(&number, entry)| match *entry {
-        XrefEntry::Normal { offset, generation } if hint_offsets.contains(&offset) => Some((number, generation)),
-        _ => None,
-    });
-    let lone = |object: &Object| matches!(object, Object::Integer(_) | Object::Real(_) | Object::Boolean(_) | Object::Null);
+    let hints = doc
+        .reference_table
+        .entries
+        .iter()
+        .filter_map(|(&number, entry)| match *entry {
+            XrefEntry::Normal { offset, generation } if hint_offsets.contains(&offset) => {
+                Some((number, generation))
+            }
+            _ => None,
+        });
+    let lone = |object: &Object| {
+        matches!(
+            object,
+            Object::Integer(_) | Object::Real(_) | Object::Boolean(_) | Object::Null
+        )
+    };
     doc.objects
         .iter()
         .filter(|(_, object)| is_file_structure(object) || lone(object))

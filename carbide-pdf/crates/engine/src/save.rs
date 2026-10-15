@@ -27,7 +27,10 @@ pub enum SavePlan {
     Incremental,
     /// The whole document is written again and nothing removed or replaced survives. The flags say
     /// what that costs compared with appending.
-    FullRewrite { breaks_signatures: bool, drops_revisions: bool },
+    FullRewrite {
+        breaks_signatures: bool,
+        drops_revisions: bool,
+    },
 }
 
 impl SavePlan {
@@ -69,19 +72,24 @@ impl Protection {
     /// and permissions, so the same passwords open both and allow the same.
     pub fn same_as(&self, other: &Protection) -> bool {
         let (a, b) = (&self.state, &other.state);
-        let first_id = |p: &Protection| p.id.as_ref().and_then(|id| id.as_array().ok()?.first().cloned());
+        let first_id = |p: &Protection| {
+            p.id.as_ref()
+                .and_then(|id| id.as_array().ok()?.first().cloned())
+        };
         a.file_encryption_key() == b.file_encryption_key()
             && (a.version(), a.revision()) == (b.version(), b.revision())
             && a.permissions() == b.permissions()
             && (a.owner_value(), a.user_value()) == (b.owner_value(), b.user_value())
-            && (a.owner_encrypted(), a.user_encrypted()) == (b.owner_encrypted(), b.user_encrypted())
+            && (a.owner_encrypted(), a.user_encrypted())
+                == (b.owner_encrypted(), b.user_encrypted())
             && a.permission_encrypted() == b.permission_encrypted()
             && (a.revision() >= 5 || first_id(self) == first_id(other))
     }
 }
 
 /// Refusal to merge documents that are protected in different ways.
-pub const DIFFERENT_PROTECTION: &str = "The documents are protected with different passwords or permissions, \
+pub const DIFFERENT_PROTECTION: &str =
+    "The documents are protected with different passwords or permissions, \
 so one file cannot keep the protection of all of them.";
 
 impl SavedFile {
@@ -92,12 +100,27 @@ impl SavedFile {
             id: pdf.doc.trailer.get(b"ID").ok().cloned(),
         });
         let reachable = reachable(&pdf.doc);
-        let content = reachable.iter().filter_map(|&id| Some((id, Fingerprint::of(pdf.doc.objects.get(&id)?)?))).collect();
+        let content = reachable
+            .iter()
+            .filter_map(|&id| Some((id, Fingerprint::of(pdf.doc.objects.get(&id)?)?)))
+            .collect();
         let structure = file_structure(&pdf.doc);
-        let unused =
-            pdf.doc.objects.keys().filter(|id| !reachable.contains(id) && !structure.contains(id)).copied().collect();
+        let unused = pdf
+            .doc
+            .objects
+            .keys()
+            .filter(|id| !reachable.contains(id) && !structure.contains(id))
+            .copied()
+            .collect();
         let updates = appended_updates(&bytes, pdf.doc.xref_start);
-        SavedFile { bytes, password, protection, content, unused, updates }
+        SavedFile {
+            bytes,
+            password,
+            protection,
+            content,
+            unused,
+            updates,
+        }
     }
 
     /// Opens `bytes` as a document and records them as its file. The password is used exactly as
@@ -147,10 +170,12 @@ impl SavedFile {
     /// that hold neither (page-tree nodes, resource dictionaries) are not content and do not count.
     pub fn removed_from(&self, pdf: &Pdf) -> bool {
         let reachable = reachable(&pdf.doc);
-        self.content.iter().any(|(id, held)| match pdf.doc.objects.get(id) {
-            Some(object) if reachable.contains(id) => !held.kept_by(object),
-            _ => true,
-        })
+        self.content
+            .iter()
+            .any(|(id, held)| match pdf.doc.objects.get(id) {
+                Some(object) if reachable.contains(id) => !held.kept_by(object),
+                _ => true,
+            })
     }
 
     /// The file as a document again, decrypted with the same password. Its page tree is left as
@@ -166,7 +191,10 @@ impl Pdf {
     /// made from it (extracted pages, split parts, imposed sheets, a merge) carry it along, and
     /// [`Pdf::to_file_bytes`] writes them protected the same way.
     pub fn protection(&self) -> Option<Protection> {
-        Some(Protection { state: self.doc.encryption_state.clone()?, id: self.doc.trailer.get(b"ID").ok().cloned() })
+        Some(Protection {
+            state: self.doc.encryption_state.clone()?,
+            id: self.doc.trailer.get(b"ID").ok().cloned(),
+        })
     }
 
     /// Gives the document the protection it is written with. `None` takes it away: writing a
@@ -230,7 +258,10 @@ impl Pdf {
     /// by the file (an object nothing refers to, an earlier version an update left behind).
     pub fn save_plan(&self, saved: Option<&SavedFile>, content_removed: bool) -> Result<SavePlan> {
         let Some(saved) = saved else {
-            return Ok(SavePlan::FullRewrite { breaks_signatures: false, drops_revisions: false });
+            return Ok(SavePlan::FullRewrite {
+                breaks_signatures: false,
+                drops_revisions: false,
+            });
         };
         let base = Pdf { doc: saved.load()? };
         if !content_removed && self.changes_since(&base.doc).is_empty() {
@@ -247,7 +278,10 @@ impl Pdf {
         if (signed || revisions) && !removed && appendable {
             Ok(SavePlan::Incremental)
         } else {
-            Ok(SavePlan::FullRewrite { breaks_signatures: signed, drops_revisions: revisions })
+            Ok(SavePlan::FullRewrite {
+                breaks_signatures: signed,
+                drops_revisions: revisions,
+            })
         }
     }
 
@@ -301,9 +335,13 @@ impl Pdf {
                         copy.trailer.remove(b"ID");
                     }
                 }
-                copy.encrypt(&protection.state).map_err(|e| Error::Other(format!("{NOT_ENCRYPTED} ({e})")))?;
+                copy.encrypt(&protection.state)
+                    .map_err(|e| Error::Other(format!("{NOT_ENCRYPTED} ({e})")))?;
                 // As for new protected files: no object streams, which lopdf cannot encrypt.
-                let options = SaveOptions::builder().use_object_streams(false).use_xref_streams(false).build();
+                let options = SaveOptions::builder()
+                    .use_object_streams(false)
+                    .use_xref_streams(false)
+                    .build();
                 copy.save_with_options(&mut out, options)?;
             }
         }
@@ -325,7 +363,9 @@ fn check_encryption(bytes: &[u8], password: Option<&str>, protection: &Protectio
     let state = match written {
         Ok(pdf) => pdf.doc.encryption_state,
         Err(Error::PasswordRequired) => {
-            return Err(Error::Other(format!("{NOT_ENCRYPTED} (the password it was opened with is needed)")));
+            return Err(Error::Other(format!(
+                "{NOT_ENCRYPTED} (the password it was opened with is needed)"
+            )));
         }
         Err(_) => None,
     };
@@ -336,8 +376,10 @@ fn check_encryption(bytes: &[u8], password: Option<&str>, protection: &Protectio
     let same = state.file_encryption_key() == original.file_encryption_key()
         && (state.version(), state.revision()) == (original.version(), original.revision())
         && state.permissions() == original.permissions()
-        && (state.owner_value(), state.user_value()) == (original.owner_value(), original.user_value())
-        && (state.owner_encrypted(), state.user_encrypted()) == (original.owner_encrypted(), original.user_encrypted());
+        && (state.owner_value(), state.user_value())
+            == (original.owner_value(), original.user_value())
+        && (state.owner_encrypted(), state.user_encrypted())
+            == (original.owner_encrypted(), original.user_encrypted());
     if same {
         Ok(())
     } else {
@@ -352,12 +394,17 @@ pub(crate) fn reachable(doc: &Document) -> HashSet<ObjectId> {
             Object::Reference(id) => out.push(*id),
             Object::Array(items) => items.iter().for_each(|item| references(item, out)),
             Object::Dictionary(dict) => dict.iter().for_each(|(_, value)| references(value, out)),
-            Object::Stream(stream) => stream.dict.iter().for_each(|(_, value)| references(value, out)),
+            Object::Stream(stream) => stream
+                .dict
+                .iter()
+                .for_each(|(_, value)| references(value, out)),
             _ => {}
         }
     }
     let mut pending = Vec::new();
-    doc.trailer.iter().for_each(|(_, value)| references(value, &mut pending));
+    doc.trailer
+        .iter()
+        .for_each(|(_, value)| references(value, &mut pending));
     let mut seen = HashSet::new();
     while let Some(id) = pending.pop() {
         if seen.insert(id) {
@@ -374,7 +421,12 @@ pub(crate) fn reachable(doc: &Document) -> HashSet<ObjectId> {
 /// time in proportion to the square of the number of objects.
 pub(crate) fn prune(doc: &mut Document) -> Vec<ObjectId> {
     let keep = reachable(doc);
-    let gone: Vec<ObjectId> = doc.objects.keys().filter(|id| !keep.contains(id)).copied().collect();
+    let gone: Vec<ObjectId> = doc
+        .objects
+        .keys()
+        .filter(|id| !keep.contains(id))
+        .copied()
+        .collect();
     for id in &gone {
         doc.objects.remove(id);
     }
@@ -406,11 +458,19 @@ fn appended_updates(bytes: &[u8], xref_start: usize) -> usize {
 /// in the dictionary of a cross-reference stream.
 fn previous_section(bytes: &[u8], at: usize) -> Option<usize> {
     let section = bytes.get(at..)?;
-    let end: &[u8] = if section.trim_ascii_start().starts_with(b"xref") { b"startxref" } else { b"stream" };
+    let end: &[u8] = if section.trim_ascii_start().starts_with(b"xref") {
+        b"startxref"
+    } else {
+        b"stream"
+    };
     let dictionary = &section[..find(section, end)?];
     let after = &dictionary[find(dictionary, b"/Prev")? + b"/Prev".len()..];
-    let digits: Vec<u8> =
-        after.iter().skip_while(|b| b.is_ascii_whitespace()).take_while(|b| b.is_ascii_digit()).copied().collect();
+    let digits: Vec<u8> = after
+        .iter()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .take_while(|b| b.is_ascii_digit())
+        .copied()
+        .collect();
     std::str::from_utf8(&digits).ok()?.parse().ok()
 }
 
@@ -433,7 +493,10 @@ impl Fingerprint {
                 Object::String(bytes, _) => out.push(hash(bytes)),
                 Object::Array(items) => items.iter().for_each(|item| strings(item, out)),
                 Object::Dictionary(dict) => dict.iter().for_each(|(_, value)| strings(value, out)),
-                Object::Stream(stream) => stream.dict.iter().for_each(|(_, value)| strings(value, out)),
+                Object::Stream(stream) => stream
+                    .dict
+                    .iter()
+                    .for_each(|(_, value)| strings(value, out)),
                 _ => {}
             }
         }
@@ -441,20 +504,32 @@ impl Fingerprint {
         strings(object, &mut found);
         found.sort_unstable();
         let stream = object.as_stream().ok().map(|s| hash(&s.content));
-        (stream.is_some() || !found.is_empty() || is_annotation(object)).then_some(Fingerprint { strings: found, stream })
+        (stream.is_some() || !found.is_empty() || is_annotation(object)).then_some(Fingerprint {
+            strings: found,
+            stream,
+        })
     }
 
     /// True when `object` still carries all of this content; added strings do not matter.
     fn kept_by(&self, object: &Object) -> bool {
-        let Some(now) = Fingerprint::of(object) else { return false };
-        self.stream == now.stream && self.strings.iter().all(|s| now.strings.binary_search(s).is_ok())
+        let Some(now) = Fingerprint::of(object) else {
+            return false;
+        };
+        self.stream == now.stream
+            && self
+                .strings
+                .iter()
+                .all(|s| now.strings.binary_search(s).is_ok())
     }
 }
 
 /// An annotation dictionary. Ink, shapes and stamps can hold nothing but numbers and names.
 fn is_annotation(object: &Object) -> bool {
-    let Object::Dictionary(dict) = object else { return false };
-    dict.has_type(b"Annot") || (dict.get(b"Subtype").is_ok_and(|s| s.as_name().is_ok()) && dict.has(b"Rect"))
+    let Object::Dictionary(dict) = object else {
+        return false;
+    };
+    dict.has_type(b"Annot")
+        || (dict.get(b"Subtype").is_ok_and(|s| s.as_name().is_ok()) && dict.has(b"Rect"))
 }
 
 fn hash(bytes: &[u8]) -> u64 {

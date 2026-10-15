@@ -12,12 +12,22 @@ pub struct Rect {
 
 impl Rect {
     pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     /// Builds a normalized rect from two opposite corners.
     pub fn from_corners(a: (f32, f32), b: (f32, f32)) -> Self {
-        Self::new(a.0.min(b.0), a.1.min(b.1), (a.0 - b.0).abs(), (a.1 - b.1).abs())
+        Self::new(
+            a.0.min(b.0),
+            a.1.min(b.1),
+            (a.0 - b.0).abs(),
+            (a.1 - b.1).abs(),
+        )
     }
 
     pub fn max_x(&self) -> f32 {
@@ -34,18 +44,28 @@ impl Rect {
 
     /// True when every coordinate is a finite number.
     pub fn is_finite(&self) -> bool {
-        [self.x, self.y, self.width, self.height].iter().all(|v| v.is_finite())
+        [self.x, self.y, self.width, self.height]
+            .iter()
+            .all(|v| v.is_finite())
     }
 
     /// The same area with a non-negative width and height: a rect given with a negative width
     /// (dragged or typed from right to left) starts at its other corner.
     pub fn normalized(&self) -> Rect {
-        Rect::from_corners((self.x, self.y), (self.x + self.width, self.y + self.height))
+        Rect::from_corners(
+            (self.x, self.y),
+            (self.x + self.width, self.y + self.height),
+        )
     }
 
     /// Shrinks the rect by `amount` on every side (grows it when negative).
     pub fn inset(&self, amount: f32) -> Rect {
-        Rect::new(self.x + amount, self.y + amount, self.width - 2.0 * amount, self.height - 2.0 * amount)
+        Rect::new(
+            self.x + amount,
+            self.y + amount,
+            self.width - 2.0 * amount,
+            self.height - 2.0 * amount,
+        )
     }
 }
 
@@ -83,7 +103,13 @@ pub fn rotation_value(value: &lopdf::Object) -> i32 {
 
 impl PageGeometry {
     pub fn new(x0: f32, y0: f32, box_width: f32, box_height: f32, rotation: i32) -> Self {
-        Self { x0, y0, box_width, box_height, rotation: normalize_rotation(rotation as i64) }
+        Self {
+            x0,
+            y0,
+            box_width,
+            box_height,
+            rotation: normalize_rotation(rotation as i64),
+        }
     }
 
     /// Displayed size (width, height): swapped for 90/270 degree rotations.
@@ -133,15 +159,29 @@ impl PageGeometry {
             self.map_point(rect.max_x(), rect.max_y()),
         ];
         let min_x = corners.iter().map(|c| c.0).fold(f32::INFINITY, f32::min);
-        let max_x = corners.iter().map(|c| c.0).fold(f32::NEG_INFINITY, f32::max);
+        let max_x = corners
+            .iter()
+            .map(|c| c.0)
+            .fold(f32::NEG_INFINITY, f32::max);
         let min_y = corners.iter().map(|c| c.1).fold(f32::INFINITY, f32::min);
-        let max_y = corners.iter().map(|c| c.1).fold(f32::NEG_INFINITY, f32::max);
+        let max_y = corners
+            .iter()
+            .map(|c| c.1)
+            .fold(f32::NEG_INFINITY, f32::max);
         Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
     }
 }
 
 pub(crate) fn matrix_string(m: [f32; 6]) -> String {
-    format!("{} {} {} {} {} {} cm", fmt(m[0]), fmt(m[1]), fmt(m[2]), fmt(m[3]), fmt(m[4]), fmt(m[5]))
+    format!(
+        "{} {} {} {} {} {} cm",
+        fmt(m[0]),
+        fmt(m[1]),
+        fmt(m[2]),
+        fmt(m[3]),
+        fmt(m[4]),
+        fmt(m[5])
+    )
 }
 
 /// Compact, locale-independent number formatting for content streams.
@@ -185,7 +225,10 @@ mod tests {
             let g = PageGeometry::new(10.0, 20.0, 100.0, 200.0, rotation);
             let (ux, uy) = g.map_point(33.0, 44.0);
             let (dx, dy) = g.user_to_display(ux, uy);
-            assert!((dx - 33.0).abs() < 1e-3 && (dy - 44.0).abs() < 1e-3, "rotation {rotation}");
+            assert!(
+                (dx - 33.0).abs() < 1e-3 && (dy - 44.0).abs() < 1e-3,
+                "rotation {rotation}"
+            );
         }
     }
 
@@ -224,8 +267,14 @@ mod tests {
 
     #[test]
     fn rects_given_from_the_other_corner_are_normalized() {
-        assert_eq!(Rect::new(500.0, 700.0, -200.0, -50.0).normalized(), Rect::new(300.0, 650.0, 200.0, 50.0));
-        assert_eq!(Rect::new(1.0, 2.0, 3.0, 4.0).normalized(), Rect::new(1.0, 2.0, 3.0, 4.0));
+        assert_eq!(
+            Rect::new(500.0, 700.0, -200.0, -50.0).normalized(),
+            Rect::new(300.0, 650.0, 200.0, 50.0)
+        );
+        assert_eq!(
+            Rect::new(1.0, 2.0, 3.0, 4.0).normalized(),
+            Rect::new(1.0, 2.0, 3.0, 4.0)
+        );
         assert!(!Rect::new(f32::NAN, 0.0, 1.0, 1.0).is_finite());
     }
 

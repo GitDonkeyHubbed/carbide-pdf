@@ -96,7 +96,11 @@ impl HiddenReport {
     /// How much of `item` was taken out: entries, streams, files, scripts, fields, comments or
     /// objects, whichever it holds.
     pub fn count(&self, item: HiddenItem) -> usize {
-        self.removed.iter().filter(|(i, _)| *i == item).map(|(_, n)| n).sum()
+        self.removed
+            .iter()
+            .filter(|(i, _)| *i == item)
+            .map(|(_, n)| n)
+            .sum()
     }
 
     /// How many earlier versions (appended updates) and unused objects the file holds besides the
@@ -113,8 +117,12 @@ impl HiddenReport {
     /// One line per item that was found, such as "Attachments and embedded files: 2", and one for
     /// what only the file holds.
     pub fn lines(&self) -> Vec<String> {
-        let mut lines: Vec<String> =
-            self.removed.iter().filter(|(_, n)| *n > 0).map(|(item, n)| format!("{}: {n}", item.label())).collect();
+        let mut lines: Vec<String> = self
+            .removed
+            .iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(item, n)| format!("{}: {n}", item.label()))
+            .collect();
         if self.in_file > 0 {
             lines.push(format!("{IN_FILE_LABEL}: {}", self.in_file));
         }
@@ -134,7 +142,11 @@ impl Pdf {
     /// over. What only that file holds is reported too: the earlier versions appended updates kept
     /// in it and the objects nothing refers to, which the full rewrite that has to follow leaves
     /// out. They are reported even when nothing else is found, since saving still removes them.
-    pub fn remove_hidden_information_from(&mut self, items: &[HiddenItem], file: Option<&SavedFile>) -> Result<HiddenReport> {
+    pub fn remove_hidden_information_from(
+        &mut self,
+        items: &[HiddenItem],
+        file: Option<&SavedFile>,
+    ) -> Result<HiddenReport> {
         let mut report = HiddenReport::default();
         let chosen = |item| items.contains(&item);
         let empty = HashSet::new();
@@ -146,21 +158,37 @@ impl Pdf {
         if chosen(HiddenItem::UnusedObjects) {
             let structure = file_structure(&self.doc);
             self.trim_resources()?;
-            let removed = crate::save::prune(&mut self.doc).into_iter().filter(|id| !structure.contains(id) && !in_file.contains(id)).count();
+            let removed = crate::save::prune(&mut self.doc)
+                .into_iter()
+                .filter(|id| !structure.contains(id) && !in_file.contains(id))
+                .count();
             report.removed.push((HiddenItem::UnusedObjects, removed));
         }
-        for item in HiddenItem::ALL.into_iter().filter(|&i| chosen(i) && i != HiddenItem::UnusedObjects) {
+        for item in HiddenItem::ALL
+            .into_iter()
+            .filter(|&i| chosen(i) && i != HiddenItem::UnusedObjects)
+        {
             let count = match item {
                 HiddenItem::Metadata => self.remove_info(),
                 HiddenItem::Xmp => remove_key_everywhere(&mut self.doc, b"Metadata"),
                 HiddenItem::Attachments => self.remove_attachments(),
                 HiddenItem::Scripts => self.remove_scripts(),
                 HiddenItem::FormData => self.remove_form_data(),
-                HiddenItem::Comments => self.remove_annotations(&|subtype| !matches!(subtype, b"Link" | b"Widget")),
-                HiddenItem::Thumbnails => self.page_ids().into_iter().filter(|&page| self.remove_from(page, b"Thumb")).count(),
+                HiddenItem::Comments => {
+                    self.remove_annotations(&|subtype| !matches!(subtype, b"Link" | b"Widget"))
+                }
+                HiddenItem::Thumbnails => self
+                    .page_ids()
+                    .into_iter()
+                    .filter(|&page| self.remove_from(page, b"Thumb"))
+                    .count(),
                 HiddenItem::PrivateData => {
                     remove_key_everywhere(&mut self.doc, b"LastModified");
-                    let spider = self.doc.catalog_mut().map(|c| c.remove(b"SpiderInfo").is_some()).unwrap_or(false);
+                    let spider = self
+                        .doc
+                        .catalog_mut()
+                        .map(|c| c.remove(b"SpiderInfo").is_some())
+                        .unwrap_or(false);
                     remove_key_everywhere(&mut self.doc, b"PieceInfo") + usize::from(spider)
                 }
                 HiddenItem::Bookmarks => self.remove_bookmarks(),
@@ -175,12 +203,17 @@ impl Pdf {
 
     /// Removes `key` from the dictionary `id`; true when it was there.
     fn remove_from(&mut self, id: ObjectId, key: &[u8]) -> bool {
-        self.doc.get_dictionary_mut(id).map(|d| d.remove(key).is_some()).unwrap_or(false)
+        self.doc
+            .get_dictionary_mut(id)
+            .map(|d| d.remove(key).is_some())
+            .unwrap_or(false)
     }
 
     /// The document information dictionary; the count is how many entries it had.
     fn remove_info(&mut self) -> usize {
-        let Some(info) = self.doc.trailer.remove(b"Info") else { return 0 };
+        let Some(info) = self.doc.trailer.remove(b"Info") else {
+            return 0;
+        };
         match self.resolve(&info) {
             Object::Dictionary(dict) => dict.len().max(1),
             _ => 1,
@@ -189,10 +222,16 @@ impl Pdf {
 
     /// Removes the name tree `key` from the catalog's /Names and returns how many entries it had.
     fn remove_name_tree(&mut self, key: &[u8]) -> usize {
-        let Some(tree) = self.name_tree(key) else { return 0 };
+        let Some(tree) = self.name_tree(key) else {
+            return 0;
+        };
         let mut pairs = Vec::new();
         collect_pairs(&self.doc, &tree, b"Names", &mut pairs);
-        let names = self.doc.catalog().ok().and_then(|c| c.get(b"Names").ok().cloned());
+        let names = self
+            .doc
+            .catalog()
+            .ok()
+            .and_then(|c| c.get(b"Names").ok().cloned());
         match names {
             Some(Object::Reference(id)) => {
                 self.remove_from(id, key);
@@ -230,13 +269,20 @@ impl Pdf {
             count += usize::from(catalog.remove(b"OpenAction").is_some());
         }
         count += remove_key_everywhere(&mut self.doc, b"AA");
-        let code: HashSet<ObjectId> =
-            self.doc.objects.iter().filter(|(_, object)| object.as_dict().is_ok_and(runs_code)).map(|(id, _)| *id).collect();
+        let code: HashSet<ObjectId> = self
+            .doc
+            .objects
+            .iter()
+            .filter(|(_, object)| object.as_dict().is_ok_and(runs_code))
+            .map(|(id, _)| *id)
+            .collect();
         let mut removed = HashSet::new();
         let ids: Vec<ObjectId> = self.doc.objects.keys().copied().collect();
         for id in ids {
             // Taken out while it is changed, so the rest of the document can still be read.
-            let Some(mut object) = self.doc.objects.remove(&id) else { continue };
+            let Some(mut object) = self.doc.objects.remove(&id) else {
+                continue;
+            };
             count += strip_code(&self.doc, &mut object, &code, &mut removed, 0);
             self.doc.objects.insert(id, object);
         }
@@ -247,10 +293,21 @@ impl Pdf {
     /// default values, the appearances that draw them, and any XFA form data. Viewers draw the
     /// emptied fields afresh.
     fn remove_form_data(&mut self) -> usize {
-        let Ok(catalog_id) = self.doc.trailer.get(b"Root").and_then(Object::as_reference) else { return 0 };
-        let Ok(form) = self.doc.get_dictionary(catalog_id).and_then(|c| c.get(b"AcroForm")).cloned() else { return 0 };
+        let Ok(catalog_id) = self.doc.trailer.get(b"Root").and_then(Object::as_reference) else {
+            return 0;
+        };
+        let Ok(form) = self
+            .doc
+            .get_dictionary(catalog_id)
+            .and_then(|c| c.get(b"AcroForm"))
+            .cloned()
+        else {
+            return 0;
+        };
         let form_id = form.as_reference().ok();
-        let Some(mut dict) = self.resolve(&form).as_dict().ok().cloned() else { return 0 };
+        let Some(mut dict) = self.resolve(&form).as_dict().ok().cloned() else {
+            return 0;
+        };
         let mut count = usize::from(dict.remove(b"XFA").is_some());
         let fields: Vec<Object> = match dict.get(b"Fields").map(|f| self.resolve(f)) {
             Ok(Object::Array(fields)) => fields,
@@ -278,13 +335,28 @@ impl Pdf {
 
     /// Clears the value of the field `field` and of the fields below it, and the appearances of
     /// their widgets. `field_type` is the type (/FT) it inherits. Returns how many fields it cleared.
-    fn clear_field(&mut self, field: &Object, field_type: Option<&[u8]>, visited: &mut HashSet<ObjectId>, depth: usize) -> usize {
-        let Ok(id) = field.as_reference() else { return 0 };
+    fn clear_field(
+        &mut self,
+        field: &Object,
+        field_type: Option<&[u8]>,
+        visited: &mut HashSet<ObjectId>,
+        depth: usize,
+    ) -> usize {
+        let Ok(id) = field.as_reference() else {
+            return 0;
+        };
         if depth > MAX_DEPTH || !visited.insert(id) {
             return 0;
         }
-        let Ok(dict) = self.doc.get_dictionary(id).cloned() else { return 0 };
-        let field_type = dict.get(b"FT").and_then(Object::as_name).ok().or(field_type).map(<[u8]>::to_vec);
+        let Ok(dict) = self.doc.get_dictionary(id).cloned() else {
+            return 0;
+        };
+        let field_type = dict
+            .get(b"FT")
+            .and_then(Object::as_name)
+            .ok()
+            .or(field_type)
+            .map(<[u8]>::to_vec);
         if field_type.as_deref() == Some(b"Sig") {
             return 0;
         }
@@ -292,9 +364,15 @@ impl Pdf {
         if let Ok(dict) = self.doc.get_dictionary_mut(id) {
             // The value, its rich text, the options picked in a list (/I) and the value a reset
             // restores (/DV).
-            let cleared = [&b"V"[..], b"RV", b"I", b"DV"].into_iter().filter(|key| dict.remove(key).is_some()).count();
+            let cleared = [&b"V"[..], b"RV", b"I", b"DV"]
+                .into_iter()
+                .filter(|key| dict.remove(key).is_some())
+                .count();
             count += usize::from(cleared > 0);
-            let is_widget = dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Widget");
+            let is_widget = dict
+                .get(b"Subtype")
+                .and_then(Object::as_name)
+                .is_ok_and(|s| s == b"Widget");
             if is_widget {
                 match field_type.as_deref() {
                     // A check box or radio button shows its state through /AS.
@@ -319,7 +397,12 @@ impl Pdf {
         let mut removed: HashSet<ObjectId> = HashSet::new();
         let mut counted = 0;
         for page in self.page_ids() {
-            let annotations = match self.doc.get_dictionary(page).and_then(|d| d.get(b"Annots")).map(|a| self.resolve(a)) {
+            let annotations = match self
+                .doc
+                .get_dictionary(page)
+                .and_then(|d| d.get(b"Annots"))
+                .map(|a| self.resolve(a))
+            {
                 Ok(Object::Array(items)) => items,
                 _ => continue,
             };
@@ -331,7 +414,10 @@ impl Pdf {
                     Object::Dictionary(dict) => dict,
                     _ => return None,
                 };
-                dict.get(b"Subtype").and_then(Object::as_name).ok().map(<[u8]>::to_vec)
+                dict.get(b"Subtype")
+                    .and_then(Object::as_name)
+                    .ok()
+                    .map(<[u8]>::to_vec)
             };
             for annotation in &annotations {
                 let kind = subtype(&self.doc, annotation).unwrap_or_default();
@@ -339,7 +425,12 @@ impl Pdf {
                     counted += 1;
                     if let Ok(id) = annotation.as_reference() {
                         removed.insert(id);
-                        if let Ok(popup) = self.doc.get_dictionary(id).and_then(|d| d.get(b"Popup")).and_then(Object::as_reference) {
+                        if let Ok(popup) = self
+                            .doc
+                            .get_dictionary(id)
+                            .and_then(|d| d.get(b"Popup"))
+                            .and_then(Object::as_reference)
+                        {
                             popups.insert(popup);
                         }
                     }
@@ -349,8 +440,15 @@ impl Pdf {
             }
             // A pop-up goes with its comment, or when it belongs to no annotation that stays.
             kept.retain(|annotation| {
-                let Ok(id) = annotation.as_reference() else { return true };
-                let parent = self.doc.get_dictionary(id).and_then(|d| d.get(b"Parent")).and_then(Object::as_reference).ok();
+                let Ok(id) = annotation.as_reference() else {
+                    return true;
+                };
+                let parent = self
+                    .doc
+                    .get_dictionary(id)
+                    .and_then(|d| d.get(b"Parent"))
+                    .and_then(Object::as_reference)
+                    .ok();
                 let goes = popups.contains(&id) || parent.is_some_and(|p| removed.contains(&p));
                 if goes {
                     removed.insert(id);
@@ -360,7 +458,11 @@ impl Pdf {
             if kept.len() == annotations.len() {
                 continue;
             }
-            let stored = self.doc.get_dictionary(page).and_then(|d| d.get(b"Annots")).cloned();
+            let stored = self
+                .doc
+                .get_dictionary(page)
+                .and_then(|d| d.get(b"Annots"))
+                .cloned();
             match stored {
                 Ok(Object::Reference(id)) => {
                     self.doc.objects.insert(id, Object::Array(kept));
@@ -386,10 +488,17 @@ impl Pdf {
     /// The outline and the named destinations; the count is how many items and names there were.
     fn remove_bookmarks(&mut self) -> usize {
         let mut count = 0;
-        if let Ok(Object::Reference(root)) = self.doc.catalog().and_then(|c| c.get(b"Outlines")).cloned() {
+        if let Ok(Object::Reference(root)) =
+            self.doc.catalog().and_then(|c| c.get(b"Outlines")).cloned()
+        {
             count += count_outline(&self.doc, root);
         }
-        if let Ok(Object::Dictionary(dests)) = self.doc.catalog().and_then(|c| c.get(b"Dests")).map(|d| self.resolve(d)) {
+        if let Ok(Object::Dictionary(dests)) = self
+            .doc
+            .catalog()
+            .and_then(|c| c.get(b"Dests"))
+            .map(|d| self.resolve(d))
+        {
             count += dests.len();
         }
         if let Ok(catalog) = self.doc.catalog_mut() {
@@ -410,7 +519,9 @@ fn count_outline(doc: &Document, node: ObjectId) -> usize {
         if !seen.insert(id) {
             continue;
         }
-        let Ok(dict) = doc.get_dictionary(id) else { continue };
+        let Ok(dict) = doc.get_dictionary(id) else {
+            continue;
+        };
         if id != node {
             count += 1;
         }
@@ -425,31 +536,59 @@ fn count_outline(doc: &Document, node: ObjectId) -> usize {
 
 /// True for an action that runs code: JavaScript, or launching an application or file.
 fn runs_code(action: &Dictionary) -> bool {
-    action.get(b"S").and_then(Object::as_name).is_ok_and(|s| matches!(s, b"JavaScript" | b"Launch"))
+    action
+        .get(b"S")
+        .and_then(Object::as_name)
+        .is_ok_and(|s| matches!(s, b"JavaScript" | b"Launch"))
 }
 
 /// Takes the actions that run code out of the action chains in `object` and in everything it holds
 /// directly. `code` are the actions stored as objects of their own that run code; those taken out
 /// are added to `removed`. Returns how many actions held directly were taken out, and how many
 /// rendition scripts.
-fn strip_code(doc: &Document, object: &mut Object, code: &HashSet<ObjectId>, removed: &mut HashSet<ObjectId>, depth: usize) -> usize {
+fn strip_code(
+    doc: &Document,
+    object: &mut Object,
+    code: &HashSet<ObjectId>,
+    removed: &mut HashSet<ObjectId>,
+    depth: usize,
+) -> usize {
     if depth > MAX_DEPTH {
         return 0;
     }
     let dict = match object {
         Object::Dictionary(dict) => dict,
         Object::Stream(stream) => &mut stream.dict,
-        Object::Array(items) => return items.iter_mut().map(|item| strip_code(doc, item, code, removed, depth + 1)).sum(),
+        Object::Array(items) => {
+            return items
+                .iter_mut()
+                .map(|item| strip_code(doc, item, code, removed, depth + 1))
+                .sum()
+        }
         _ => return 0,
     };
     let mut count = 0;
-    if dict.get(b"S").and_then(Object::as_name).is_ok_and(|s| s == b"Rendition") && dict.remove(b"JS").is_some() {
+    if dict
+        .get(b"S")
+        .and_then(Object::as_name)
+        .is_ok_and(|s| s == b"Rendition")
+        && dict.remove(b"JS").is_some()
+    {
         count += 1;
     }
     for key in [&b"A"[..], b"Next"] {
         let Ok(value) = dict.get(key) else { continue };
         let mut kept = Vec::new();
-        if !splice(doc, value, code, removed, &mut kept, &mut count, &mut HashSet::new(), 0) {
+        if !splice(
+            doc,
+            value,
+            code,
+            removed,
+            &mut kept,
+            &mut count,
+            &mut HashSet::new(),
+            0,
+        ) {
             continue;
         }
         match kept.len() {
@@ -517,7 +656,9 @@ fn splice(
             if !chain.insert(*id) {
                 return true;
             }
-            doc.get_dictionary(*id).ok().and_then(|action| action.get(b"Next").ok())
+            doc.get_dictionary(*id)
+                .ok()
+                .and_then(|action| action.get(b"Next").ok())
         }
         Object::Dictionary(action) if runs_code(action) => {
             *count += 1;
@@ -551,9 +692,15 @@ fn remove_key_everywhere(doc: &mut Document, key: &[u8]) -> usize {
         match object {
             Object::Dictionary(dict) => strip(dict, key, depth),
             Object::Stream(stream) => strip(&mut stream.dict, key, depth),
-            Object::Array(items) => items.iter_mut().map(|item| strip_object(item, key, depth + 1)).sum(),
+            Object::Array(items) => items
+                .iter_mut()
+                .map(|item| strip_object(item, key, depth + 1))
+                .sum(),
             _ => 0,
         }
     }
-    doc.objects.values_mut().map(|object| strip_object(object, key, 0)).sum()
+    doc.objects
+        .values_mut()
+        .map(|object| strip_object(object, key, 0))
+        .sum()
 }

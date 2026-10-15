@@ -20,13 +20,21 @@ pub const MAX_DEPTH: usize = 32;
 
 /// Repairs the page labels and the field tree of `doc` as the module documentation describes.
 pub(crate) fn repair(doc: &mut Document) {
-    let Ok(catalog_id) = doc.trailer.get(b"Root").and_then(Object::as_reference) else { return };
+    let Ok(catalog_id) = doc.trailer.get(b"Root").and_then(Object::as_reference) else {
+        return;
+    };
     repair_page_labels(doc, catalog_id);
     repair_fields(doc, catalog_id);
 }
 
 fn repair_page_labels(doc: &mut Document, catalog_id: ObjectId) {
-    let Ok(tree) = doc.get_dictionary(catalog_id).and_then(|c| c.get(b"PageLabels")).cloned() else { return };
+    let Ok(tree) = doc
+        .get_dictionary(catalog_id)
+        .and_then(|c| c.get(b"PageLabels"))
+        .cloned()
+    else {
+        return;
+    };
     if listed_once(doc, &tree, &mut HashSet::new(), 0) {
         return;
     }
@@ -37,7 +45,10 @@ fn repair_page_labels(doc: &mut Document, catalog_id: ObjectId) {
             labels.entry(start).or_insert(label);
         }
     }
-    let nums: Vec<Object> = labels.into_iter().flat_map(|(start, label)| [Object::Integer(start), label]).collect();
+    let nums: Vec<Object> = labels
+        .into_iter()
+        .flat_map(|(start, label)| [Object::Integer(start), label])
+        .collect();
     let labels = doc.add_object(dictionary! { "Nums" => nums });
     if let Ok(catalog) = doc.get_dictionary_mut(catalog_id) {
         catalog.set("PageLabels", labels);
@@ -60,10 +71,17 @@ fn labels_in(doc: &Document, root: Object) -> Vec<(Object, Object)> {
                 continue;
             }
         }
-        let Object::Dictionary(dict) = resolved(&node) else { continue };
+        let Object::Dictionary(dict) = resolved(&node) else {
+            continue;
+        };
         if let Ok(nums) = dict.get(b"Nums") {
             if let Object::Array(nums) = resolved(nums) {
-                labels.extend(nums.as_chunks::<2>().0.iter().map(|[start, label]| (resolved(start), label.clone())));
+                labels.extend(
+                    nums.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|[start, label]| (resolved(start), label.clone())),
+                );
             }
         } else if let Ok(Object::Array(kids)) = dict.get(b"Kids").map(resolved) {
             nodes.extend(kids.into_iter().rev());
@@ -92,13 +110,18 @@ fn listed_once(doc: &Document, node: &Object, seen: &mut HashSet<ObjectId>, dept
         other => other.ok(),
     };
     match kids {
-        Some(Object::Array(kids)) => kids.iter().all(|kid| listed_once(doc, kid, seen, depth + 1)),
+        Some(Object::Array(kids)) => kids
+            .iter()
+            .all(|kid| listed_once(doc, kid, seen, depth + 1)),
         _ => true,
     }
 }
 
 fn repair_fields(doc: &mut Document, catalog_id: ObjectId) {
-    let form = match doc.get_dictionary(catalog_id).and_then(|c| c.get(b"AcroForm")) {
+    let form = match doc
+        .get_dictionary(catalog_id)
+        .and_then(|c| c.get(b"AcroForm"))
+    {
         Ok(Object::Reference(id)) => Holder::Object(*id),
         Ok(Object::Dictionary(_)) => Holder::InCatalog(catalog_id),
         _ => return,
@@ -110,7 +133,13 @@ fn repair_fields(doc: &mut Document, catalog_id: ObjectId) {
 /// already listed before, in the order PDFium reads them: the fields of an array one after the
 /// other, each with all that is below it. `depth` is how deep the fields of the array are; PDFium
 /// reads no deeper than [`MAX_DEPTH`].
-fn list_once(doc: &mut Document, holder: Holder, key: &[u8], seen: &mut HashSet<ObjectId>, depth: usize) {
+fn list_once(
+    doc: &mut Document,
+    holder: Holder,
+    key: &[u8],
+    seen: &mut HashSet<ObjectId>,
+    depth: usize,
+) {
     let listed = match holder.get(doc, key) {
         Some(Object::Reference(id)) => match doc.get_object(id) {
             Ok(Object::Array(items)) => items.clone(),
@@ -148,10 +177,12 @@ impl Holder {
     fn dictionary_mut<'a>(&self, doc: &'a mut Document) -> Option<&'a mut lopdf::Dictionary> {
         match *self {
             Holder::Object(id) => doc.get_dictionary_mut(id).ok(),
-            Holder::InCatalog(catalog) => match doc.get_dictionary_mut(catalog).ok()?.get_mut(b"AcroForm") {
-                Ok(Object::Dictionary(form)) => Some(form),
-                _ => None,
-            },
+            Holder::InCatalog(catalog) => {
+                match doc.get_dictionary_mut(catalog).ok()?.get_mut(b"AcroForm") {
+                    Ok(Object::Dictionary(form)) => Some(form),
+                    _ => None,
+                }
+            }
         }
     }
 

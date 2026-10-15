@@ -2,7 +2,15 @@
 name = "carbide-engine"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Engine library for Carbide PDF: PDF operations with no UI dependencies."
+readme = "../../README.md"
 
 [dependencies]
 lopdf.workspace = true

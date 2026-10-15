@@ -42,7 +42,8 @@ impl MarkupStyle {
     }
 }
 
-const NOT_A_NUMBER: &str = "Annotation positions and sizes have to be numbers, and text sizes larger than 0.";
+const NOT_A_NUMBER: &str =
+    "Annotation positions and sizes have to be numbers, and text sizes larger than 0.";
 
 fn real_array(values: &[f32]) -> Object {
     Object::Array(values.iter().map(|v| Object::Real(*v)).collect())
@@ -82,10 +83,15 @@ impl Pdf {
         match slot {
             Slot::Inline => {
                 let dict = self.doc.get_dictionary_mut(page_id)?;
-                dict.get_mut(b"Annots")?.as_array_mut()?.push(Object::Reference(annotation));
+                dict.get_mut(b"Annots")?
+                    .as_array_mut()?
+                    .push(Object::Reference(annotation));
             }
             Slot::Indirect(id) => {
-                self.doc.get_object_mut(id)?.as_array_mut()?.push(Object::Reference(annotation));
+                self.doc
+                    .get_object_mut(id)?
+                    .as_array_mut()?
+                    .push(Object::Reference(annotation));
             }
             Slot::Missing => {
                 self.doc
@@ -98,11 +104,21 @@ impl Pdf {
 
     /// Adds a highlight, underline or strikeout covering `rects` (display space, one per text line).
     /// A rect given from its other corner covers the same area.
-    pub fn add_markup(&mut self, page: usize, rects: &[Rect], style: MarkupStyle, color: Option<[f32; 3]>) -> Result<()> {
+    pub fn add_markup(
+        &mut self,
+        page: usize,
+        rects: &[Rect],
+        style: MarkupStyle,
+        color: Option<[f32; 3]>,
+    ) -> Result<()> {
         if !rects.iter().all(Rect::is_finite) {
             return Err(Error::Other(NOT_A_NUMBER.into()));
         }
-        let rects: Vec<Rect> = rects.iter().map(Rect::normalized).filter(|r| !r.is_empty()).collect();
+        let rects: Vec<Rect> = rects
+            .iter()
+            .map(Rect::normalized)
+            .filter(|r| !r.is_empty())
+            .collect();
         if rects.is_empty() {
             return Ok(());
         }
@@ -113,25 +129,58 @@ impl Pdf {
 
         let min_x = user.iter().map(|u| u.x).fold(f32::INFINITY, f32::min);
         let min_y = user.iter().map(|u| u.y).fold(f32::INFINITY, f32::min);
-        let max_x = user.iter().map(|u| u.max_x()).fold(f32::NEG_INFINITY, f32::max);
-        let max_y = user.iter().map(|u| u.max_y()).fold(f32::NEG_INFINITY, f32::max);
+        let max_x = user
+            .iter()
+            .map(|u| u.max_x())
+            .fold(f32::NEG_INFINITY, f32::max);
+        let max_y = user
+            .iter()
+            .map(|u| u.max_y())
+            .fold(f32::NEG_INFINITY, f32::max);
         let bounds = [min_x, min_y, max_x, max_y];
 
         let mut quads: Vec<f32> = Vec::new();
         let mut content = String::new();
         for u in &user {
-            quads.extend_from_slice(&[u.x, u.max_y(), u.max_x(), u.max_y(), u.x, u.y, u.max_x(), u.y]);
+            quads.extend_from_slice(&[
+                u.x,
+                u.max_y(),
+                u.max_x(),
+                u.max_y(),
+                u.x,
+                u.y,
+                u.max_x(),
+                u.y,
+            ]);
             match style {
                 MarkupStyle::Highlight => {
-                    content.push_str(&format!("{} {} {} {} re f\n", fmt(u.x), fmt(u.y), fmt(u.width), fmt(u.height)));
+                    content.push_str(&format!(
+                        "{} {} {} {} re f\n",
+                        fmt(u.x),
+                        fmt(u.y),
+                        fmt(u.width),
+                        fmt(u.height)
+                    ));
                 }
                 MarkupStyle::Underline => {
                     let y = u.y + (u.height * 0.12).max(0.5);
-                    content.push_str(&format!("{} {} m {} {} l S\n", fmt(u.x), fmt(y), fmt(u.max_x()), fmt(y)));
+                    content.push_str(&format!(
+                        "{} {} m {} {} l S\n",
+                        fmt(u.x),
+                        fmt(y),
+                        fmt(u.max_x()),
+                        fmt(y)
+                    ));
                 }
                 MarkupStyle::StrikeOut => {
                     let y = u.y + u.height * 0.5;
-                    content.push_str(&format!("{} {} m {} {} l S\n", fmt(u.x), fmt(y), fmt(u.max_x()), fmt(y)));
+                    content.push_str(&format!(
+                        "{} {} m {} {} l S\n",
+                        fmt(u.x),
+                        fmt(y),
+                        fmt(u.max_x()),
+                        fmt(y)
+                    ));
                 }
             }
         }
@@ -203,7 +252,14 @@ impl Pdf {
     }
 
     /// Free text ("typewriter") with its top-left corner at (`x`, `y`) in display space.
-    pub fn add_text_box(&mut self, page: usize, x: f32, y: f32, text: &str, font_size: f32) -> Result<()> {
+    pub fn add_text_box(
+        &mut self,
+        page: usize,
+        x: f32,
+        y: f32,
+        text: &str,
+        font_size: f32,
+    ) -> Result<()> {
         if !(x.is_finite() && y.is_finite() && font_size.is_finite() && font_size > 0.0) {
             return Err(Error::Other(NOT_A_NUMBER.into()));
         }
@@ -211,13 +267,21 @@ impl Pdf {
         let geometry = self.page_geometry(page)?;
         let font = StandardFont::Helvetica;
         let lines: Vec<&str> = text.lines().collect();
-        let widest = lines.iter().map(|l| font.text_width(l, font_size)).fold(0.0f32, f32::max);
+        let widest = lines
+            .iter()
+            .map(|l| font.text_width(l, font_size))
+            .fold(0.0f32, f32::max);
         let leading = font_size * 1.2;
         let width = (widest + 8.0).max(24.0);
         let height = leading * lines.len().max(1) as f32 + 8.0;
         let rect = geometry.map_rect(Rect::new(x, y - height, width, height));
 
-        let mut content: Vec<u8> = format!("BT\n/Helv {} Tf\n0 g\n{} TL\n", fmt(font_size), fmt(leading)).into_bytes();
+        let mut content: Vec<u8> = format!(
+            "BT\n/Helv {} Tf\n0 g\n{} TL\n",
+            fmt(font_size),
+            fmt(leading)
+        )
+        .into_bytes();
         content.extend_from_slice(format!("4 {} Td\n", fmt(height - 4.0 - font_size)).as_bytes());
         for (i, line) in lines.iter().enumerate() {
             if i > 0 {
@@ -260,7 +324,12 @@ impl Pdf {
     /// Annotation dictionaries of a page, for inspection and tests.
     pub fn annotations(&self, page: usize) -> Result<Vec<Dictionary>> {
         let page_id = self.page_id(page)?;
-        Ok(self.doc.get_page_annotations(page_id)?.into_iter().cloned().collect())
+        Ok(self
+            .doc
+            .get_page_annotations(page_id)?
+            .into_iter()
+            .cloned()
+            .collect())
     }
 
     /// Every comment-like annotation in the document (links, widgets and popups are left out),
@@ -268,7 +337,9 @@ impl Pdf {
     pub fn annotation_summaries(&self) -> Vec<AnnotationSummary> {
         let mut out = Vec::new();
         for (page, page_id) in self.page_ids().into_iter().enumerate() {
-            let Ok(annotations) = self.doc.get_page_annotations(page_id) else { continue };
+            let Ok(annotations) = self.doc.get_page_annotations(page_id) else {
+                continue;
+            };
             for dict in annotations {
                 let kind = dict
                     .get(b"Subtype")
@@ -283,7 +354,11 @@ impl Pdf {
                     Ok(Object::String(bytes, _)) => crate::revisions::decode_text(bytes),
                     _ => String::new(),
                 };
-                out.push(AnnotationSummary { page, kind, contents });
+                out.push(AnnotationSummary {
+                    page,
+                    kind,
+                    contents,
+                });
             }
         }
         out

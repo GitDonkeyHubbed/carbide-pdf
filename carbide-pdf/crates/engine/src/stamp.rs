@@ -26,7 +26,10 @@ impl PageAnchor {
     ];
 
     fn is_top(self) -> bool {
-        matches!(self, PageAnchor::TopLeft | PageAnchor::TopCenter | PageAnchor::TopRight)
+        matches!(
+            self,
+            PageAnchor::TopLeft | PageAnchor::TopCenter | PageAnchor::TopRight
+        )
     }
 }
 
@@ -69,8 +72,14 @@ impl WatermarkOptions {
             return Err(Error::Other("watermark text is empty".into()));
         }
         let fraction = |v: f32| (0.0..=1.0).contains(&v);
-        let sized = self.font_size.is_finite() && self.font_size > 0.0 && self.font_size <= crate::pdf::MAX_PAGE_SIDE;
-        if !(sized && self.rotation_degrees.is_finite() && fraction(self.opacity) && self.color.iter().all(|&c| fraction(c))) {
+        let sized = self.font_size.is_finite()
+            && self.font_size > 0.0
+            && self.font_size <= crate::pdf::MAX_PAGE_SIDE;
+        if !(sized
+            && self.rotation_degrees.is_finite()
+            && fraction(self.opacity)
+            && self.color.iter().all(|&c| fraction(c)))
+        {
             return Err(Error::Other(messages::WATERMARK.into()));
         }
         Ok(())
@@ -94,7 +103,9 @@ impl Pdf {
 
         let ids = self.page_ids();
         for index in selected {
-            let page_id = *ids.get(index).ok_or(Error::PageOutOfRange { index, count })?;
+            let page_id = *ids
+                .get(index)
+                .ok_or(Error::PageOutOfRange { index, count })?;
             let geometry = self.geometry_of(page_id);
             let (w, h) = geometry.display_size();
             let font_name = self.add_standard_font(page_id, options.font)?;
@@ -163,9 +174,12 @@ pub const MAX_BATES_DIGITS: usize = 20;
 
 pub mod messages {
     pub const BATES_DIGITS: &str = "Bates numbers can be padded to between 1 and 20 digits.";
-    pub const BATES_RANGE: &str = "The Bates numbers would go past 18446744073709551615, the largest that can be stamped.";
-    pub const BATES_TEXT: &str = "The Bates text size and margin have to be numbers, and the size larger than 0.";
-    pub const WATERMARK: &str = "The watermark size and angle have to be numbers, the size larger than 0, and the opacity \
+    pub const BATES_RANGE: &str =
+        "The Bates numbers would go past 18446744073709551615, the largest that can be stamped.";
+    pub const BATES_TEXT: &str =
+        "The Bates text size and margin have to be numbers, and the size larger than 0.";
+    pub const WATERMARK: &str =
+        "The watermark size and angle have to be numbers, the size larger than 0, and the opacity \
 and colour between 0 and 1.";
 }
 
@@ -175,7 +189,13 @@ impl BatesOptions {
     /// [`BatesOptions::validate`] refuses options that would need either.
     pub fn label(&self, page_index: usize) -> String {
         let number = self.start_number.saturating_add(page_index as u64);
-        format!("{}{:0width$}{}", self.prefix, number, self.suffix, width = self.digits.clamp(1, MAX_BATES_DIGITS))
+        format!(
+            "{}{:0width$}{}",
+            self.prefix,
+            number,
+            self.suffix,
+            width = self.digits.clamp(1, MAX_BATES_DIGITS)
+        )
     }
 
     /// Checks that `pages` pages can be numbered with these options.
@@ -183,7 +203,11 @@ impl BatesOptions {
         if !(1..=MAX_BATES_DIGITS).contains(&self.digits) {
             return Err(Error::Other(messages::BATES_DIGITS.into()));
         }
-        if self.start_number.checked_add(pages.saturating_sub(1) as u64).is_none() {
+        if self
+            .start_number
+            .checked_add(pages.saturating_sub(1) as u64)
+            .is_none()
+        {
             return Err(Error::Other(messages::BATES_RANGE.into()));
         }
         if !(self.font_size.is_finite() && self.font_size > 0.0 && self.margin.is_finite()) {
@@ -253,16 +277,34 @@ mod tests {
         let fine = BatesOptions::default();
         assert!(fine.validate(3).is_ok());
         for digits in [0, 21, 70_000, usize::MAX] {
-            let options = BatesOptions { digits, ..Default::default() };
-            assert_eq!(options.validate(3).unwrap_err().to_string(), messages::BATES_DIGITS);
+            let options = BatesOptions {
+                digits,
+                ..Default::default()
+            };
+            assert_eq!(
+                options.validate(3).unwrap_err().to_string(),
+                messages::BATES_DIGITS
+            );
             // Formatting never panics, whatever the width asked for.
             assert!(!options.label(0).is_empty());
         }
-        let last = BatesOptions { start_number: u64::MAX, ..Default::default() };
+        let last = BatesOptions {
+            start_number: u64::MAX,
+            ..Default::default()
+        };
         assert!(last.validate(1).is_ok());
-        assert_eq!(last.validate(2).unwrap_err().to_string(), messages::BATES_RANGE);
+        assert_eq!(
+            last.validate(2).unwrap_err().to_string(),
+            messages::BATES_RANGE
+        );
         assert_eq!(last.label(5), u64::MAX.to_string());
-        let size = BatesOptions { font_size: f32::NAN, ..Default::default() };
-        assert_eq!(size.validate(1).unwrap_err().to_string(), messages::BATES_TEXT);
+        let size = BatesOptions {
+            font_size: f32::NAN,
+            ..Default::default()
+        };
+        assert_eq!(
+            size.validate(1).unwrap_err().to_string(),
+            messages::BATES_TEXT
+        );
     }
 }
