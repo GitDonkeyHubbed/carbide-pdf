@@ -90,7 +90,8 @@ pub(crate) fn parse_pdf_date(text: &str) -> Option<chrono::DateTime<chrono::Utc>
     if !(1971..=3000).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
-    if hour > 24 || minute > 60 || second > 60 {
+    // PDF allows 00-23, 00-59 and 00-59; there is no hour 24 and no leap second.
+    if hour > 23 || minute > 59 || second > 59 {
         return None;
     }
 
@@ -107,15 +108,14 @@ pub(crate) fn parse_pdf_date(text: &str) -> Option<chrono::DateTime<chrono::Utc>
             numbers.first().copied().unwrap_or(0),
             numbers.get(1).copied().unwrap_or(0),
         );
+        if h > 23 || m > 59 {
+            return None;
+        }
         let total = (h * 3600 + m * 60) as i32;
         offset_seconds = if sign == '-' { -total } else { total };
     }
 
-    let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(
-        hour.min(23),
-        minute.min(59),
-        second.min(59),
-    )?;
+    let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, second)?;
     let zone = FixedOffset::east_opt(offset_seconds)?;
     Some(
         zone.from_local_datetime(&naive)
@@ -337,6 +337,46 @@ mod tests {
         let local = Local::now();
         assert!(pdf_date_to_local(&now).starts_with(&format!("{}-", local.year())));
         let _ = local.hour();
+    }
+
+    #[test]
+    fn pdf_date_time_fields_are_range_checked() {
+        let utc = |text: &str| parse_pdf_date(text).map(|d| d.to_rfc3339());
+        // The last valid moment of a day is accepted as written.
+        assert_eq!(
+            utc("D:20260304235959Z").as_deref(),
+            Some("2026-03-04T23:59:59+00:00")
+        );
+        assert_eq!(
+            utc("D:20260101000000Z").as_deref(),
+            Some("2026-01-01T00:00:00+00:00")
+        );
+        // Shorter dates fall back to the start of the period.
+        assert_eq!(utc("D:2026").as_deref(), Some("2026-01-01T00:00:00+00:00"));
+        for bad in [
+            "D:20260304240000Z", // hour 24
+            "D:20260304246000Z", // hour 24 with minute 60
+            "D:20260304006000Z", // minute 60
+            "D:20260304000060Z", // second 60: no leap seconds
+            "D:20260304000061Z", // second 61
+            "D:20260304000099Z",
+            "D:20261301000000Z", // month 13
+            "D:20260001000000Z", // month 0
+            "D:20260300000000Z", // day 0
+            "D:20260332000000Z", // day 32
+            "D:20260230000000Z", // no 30th of February
+            "D:20260304050607+24'00'",
+            "D:20260304050607+05'60'",
+            "D:20260304050607-99'00'",
+        ] {
+            assert_eq!(parse_pdf_date(bad), None, "{bad:?}");
+            assert_eq!(pdf_date_to_local(bad), "", "{bad:?}");
+        }
+        // Edge offsets still work.
+        assert_eq!(
+            utc("D:20260304120000+23'59'").as_deref(),
+            Some("2026-03-03T12:01:00+00:00")
+        );
     }
 
     #[test]
