@@ -465,8 +465,10 @@ fn appended_updates(bytes: &[u8], doc: &Document) -> usize {
     links - usize::from(is_linearized(doc) && links > 0)
 }
 
-/// True when the first object of the file is a linearization dictionary: text that merely reads
-/// `/Linearized` near the start of the file does not count.
+/// True when the first object of the file is a linearization dictionary: one that starts within
+/// the first 1024 bytes and has the version and every entry the format requires. Text that merely
+/// reads `/Linearized` near the start of the file does not count, nor does a dictionary that
+/// names it without the rest.
 fn is_linearized(doc: &Document) -> bool {
     let first = doc
         .reference_table
@@ -477,11 +479,19 @@ fn is_linearized(doc: &Document) -> bool {
             _ => None,
         })
         .min();
-    first.is_some_and(|(_, id)| {
-        doc.objects
-            .get(&id)
-            .and_then(|object| object.as_dict().ok())
-            .is_some_and(|dict| dict.get(b"Linearized").is_ok_and(|v| v.as_float().is_ok()))
+    first.is_some_and(|(offset, id)| {
+        offset < 1024
+            && doc
+                .objects
+                .get(&id)
+                .and_then(|object| object.as_dict().ok())
+                .is_some_and(|dict| {
+                    let integer = |key: &[u8]| dict.get(key).is_ok_and(|v| v.as_i64().is_ok());
+                    dict.get(b"Linearized")
+                        .is_ok_and(|v| v.as_float().is_ok_and(|version| version > 0.0))
+                        && dict.get(b"H").is_ok_and(|v| v.as_array().is_ok())
+                        && [&b"L"[..], b"O", b"E", b"N", b"T"].into_iter().all(integer)
+                })
     })
 }
 
