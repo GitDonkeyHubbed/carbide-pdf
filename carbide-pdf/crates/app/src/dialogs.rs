@@ -9,8 +9,7 @@ use carbide_engine::fs::Existing;
 use carbide_engine::imposition::{ImpositionOptions, Media, RegistrationStyle, PAPER_SIZES};
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PrintingOrder, Style};
 use carbide_engine::reduce::{
-    messages as reduce_messages, reduce_files, FileOutcome, OutputOptions, ReduceOptions,
-    TargetFolder,
+    messages as reduce_messages, FileOutcome, OutputOptions, ReduceOptions, TargetFolder,
 };
 use carbide_engine::signature::{
     CertifyLevel, HttpTimestampSource, Identity, SignOptions, SignatureReport, SubFilter,
@@ -1668,7 +1667,7 @@ fn reduce_dialog(app: &mut CarbideApp, ctx: &egui::Context, form: &mut ReduceFor
                     overwrite: form.overwrite,
                     replace_originals: form.replace_originals && !form.add_to_names,
                 };
-                form.results = Some(reduce_files(
+                form.results = Some(app.reduce_files(
                     &form.files,
                     &output,
                     &ReduceOptions {

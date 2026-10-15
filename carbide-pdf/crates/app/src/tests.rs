@@ -2050,3 +2050,49 @@ fn a_failed_recovery_copy_is_tried_again_soon() {
         "the retry waited a whole interval"
     );
 }
+
+#[test]
+fn batch_reduce_leaves_unsaved_tabs_alone_and_refreshes_the_clean_ones() {
+    use carbide_engine::reduce::{OutputOptions, ReduceOptions};
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["A", "A2", "A3"]);
+    let b = plain(&dir, "b.pdf", &["B", "B2", "B3"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    app.open_path(&b);
+    // a.pdf has unsaved changes, b.pdf has none.
+    app.activate(Some(0));
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    let a_before = std::fs::read(&a).unwrap();
+    let b_before = std::fs::read(&b).unwrap();
+
+    let outcomes = app.reduce_files(
+        &[a.clone(), b.clone()],
+        &OutputOptions::in_place(),
+        &ReduceOptions::default(),
+    );
+    assert!(
+        outcomes[0]
+            .warning
+            .as_deref()
+            .is_some_and(|w| w.contains("not saved")),
+        "{:?}",
+        outcomes[0]
+    );
+    assert_eq!(
+        std::fs::read(&a).unwrap(),
+        a_before,
+        "an unsaved tab's file was replaced"
+    );
+    assert!(outcomes[1].warning.is_none(), "{:?}", outcomes[1]);
+    let b_after = std::fs::read(&b).unwrap();
+    assert!(b_after != b_before && b_after.len() < b_before.len());
+
+    // The tab on b.pdf shows the file as it is now, so a save cannot put the old bytes back.
+    let tab = app.tab_on(&b).unwrap();
+    let open = app.doc_at(tab).unwrap();
+    assert!(!open.dirty);
+    assert!(open.saved.as_ref().unwrap().bytes() == b_after);
+    // And the unsaved one is untouched.
+    assert!(app.doc_at(0).unwrap().dirty);
+}

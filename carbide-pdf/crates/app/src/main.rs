@@ -1151,6 +1151,128 @@ impl CarbideApp {
             .collect()
     }
 
+    /// The document in tab `index`, whether it is the active one or parked.
+    fn doc_at_mut(&mut self, index: usize) -> Option<&mut OpenDoc> {
+        if self.active_tab == Some(index) {
+            self.doc.as_mut()
+        } else {
+            self.tabs.get_mut(index).and_then(|slot| slot.as_mut())
+        }
+    }
+
+    /// Every tab, the active one included, whose document is the file `path`.
+    fn tabs_on(&self, path: &Path) -> Vec<usize> {
+        (0..self.tabs.len())
+            .filter(|&i| {
+                self.doc_at(i)
+                    .and_then(|d| d.path.as_deref())
+                    .is_some_and(|p| same_file(p, path))
+            })
+            .collect()
+    }
+
+    /// Reduces several files. A result is not written over a file that is open in a tab with
+    /// unsaved changes, which that tab would put back with its next save; that file says so in
+    /// its outcome. A tab with nothing unsaved that shows a file that was replaced is read from the
+    /// file again, so it does not go on showing the old one.
+    pub fn reduce_files(
+        &mut self,
+        inputs: &[PathBuf],
+        output: &carbide_engine::reduce::OutputOptions,
+        options: &carbide_engine::reduce::ReduceOptions,
+    ) -> Vec<carbide_engine::reduce::FileOutcome> {
+        use carbide_engine::reduce::{messages, reduce_files, FileOutcome};
+        let planned = output.plan(inputs);
+        // A batch whose results collide stops as a whole; reduce_files says so for every file.
+        let stopped = planned.contains(&Err(messages::OUTPUT_COLLIDES));
+        let blocked: Vec<bool> = planned
+            .iter()
+            .map(|target| match target {
+                Ok(target) if !stopped => self
+                    .tabs_on(target)
+                    .into_iter()
+                    .any(|i| self.doc_at(i).is_some_and(|d| d.dirty)),
+                _ => false,
+            })
+            .collect();
+        let allowed: Vec<PathBuf> = inputs
+            .iter()
+            .zip(&blocked)
+            .filter(|(_, blocked)| !**blocked)
+            .map(|(input, _)| input.clone())
+            .collect();
+        let mut done = reduce_files(&allowed, output, options).into_iter();
+        let outcomes: Vec<FileOutcome> = inputs
+            .iter()
+            .zip(blocked)
+            .filter_map(|(input, blocked)| match blocked {
+                true => Some(FileOutcome {
+                    input: input.clone(),
+                    output: None,
+                    warning: Some(
+                        "The file this would replace is open in a tab with changes that are not saved. \
+                         Save or close that tab first."
+                            .into(),
+                    ),
+                    report: None,
+                }),
+                false => done.next(),
+            })
+            .collect();
+        for path in outcomes.iter().filter_map(|o| o.output.as_deref()) {
+            self.reload_tabs_on(path);
+        }
+        outcomes
+    }
+
+    /// Reads the file `path`, just replaced by another program or operation, again into each tab
+    /// that shows it and has nothing unsaved. A tab that cannot read it is closed.
+    fn reload_tabs_on(&mut self, path: &Path) {
+        let mut failed = Vec::new();
+        for index in self.tabs_on(path) {
+            let Some(doc) = self.doc_at_mut(index).filter(|d| !d.dirty) else {
+                continue;
+            };
+            let password = doc
+                .saved
+                .as_ref()
+                .and_then(|s| s.password())
+                .map(str::to_owned);
+            let opened = std::fs::read(path)
+                .map_err(EngineError::from)
+                .and_then(|bytes| match SavedFile::open(bytes.clone(), None) {
+                    Err(EngineError::PasswordRequired) => SavedFile::open(bytes, password),
+                    other => other,
+                });
+            let reloaded = opened.and_then(|(pdf, saved)| {
+                doc.adopt(pdf, saved)?;
+                doc.forget_history();
+                let last = doc.pdf.page_count().saturating_sub(1);
+                doc.view_page = doc.view_page.min(last);
+                Ok(())
+            });
+            match reloaded {
+                Ok(()) if self.active_tab == Some(index) => {
+                    self.current_page = self.current_page.min(
+                        self.doc
+                            .as_ref()
+                            .map_or(0, |d| d.pdf.page_count().saturating_sub(1)),
+                    );
+                    self.after_writing(path);
+                }
+                Ok(()) => {}
+                Err(e) => failed.push((index, e)),
+            }
+        }
+        for (index, e) in failed.into_iter().rev() {
+            self.close_tab(index);
+            self.alert(format!(
+                "{} was replaced, but could not be read again ({e}), so its tab was closed.",
+                path.display()
+            ));
+        }
+    }
+
     /// Writes `bytes`, a new file made from the active document (a protected or a reduced copy),
     /// to `path`, which the user chose, and returns whether it did; `Some(true)` when `path` was
     /// the document's own file. The document then is that file: it is read back from `bytes`
