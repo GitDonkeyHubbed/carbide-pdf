@@ -2479,8 +2479,14 @@ fn gentime_to_utc(text: &str) -> Option<DateTime<Utc>> {
     let year = field(0, 4)? as i32;
     let (month, day) = (field(4, 2)?, field(6, 2)?);
     let (hour, minute, second) = (field(8, 2)?, field(10, 2)?, field(12, 2)?);
+    // Nanoseconds are as fine as the time can be; digits past them are dropped.
+    let nanos = fraction.map_or(0, |f| {
+        let f = &f[..f.len().min(9)];
+        f.parse::<u32>().unwrap_or(0) * 10u32.pow(9 - f.len() as u32)
+    });
     Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
-        .single()
+        .single()?
+        .checked_add_signed(chrono::Duration::nanoseconds(nanos.into()))
 }
 
 impl Pdf {
@@ -2496,5 +2502,19 @@ impl Pdf {
                     .and_then(|d| d.get(b"DocMDP").ok().cloned())
             })
             .is_some_and(|o| matches!(o, Object::Reference(r) if r == id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_time_stamp_time_keeps_its_fraction_of_a_second() {
+        let whole = gentime_to_utc("20260101000000Z").unwrap();
+        let quarter = gentime_to_utc("20260101000000.25Z").unwrap();
+        assert_eq!(quarter - whole, chrono::Duration::milliseconds(250));
+        let fine = gentime_to_utc("20260101000000.0000000019Z").unwrap();
+        assert_eq!(fine - whole, chrono::Duration::nanoseconds(1));
     }
 }
