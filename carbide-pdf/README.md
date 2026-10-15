@@ -94,7 +94,8 @@ Forms is empty: form fields are not implemented.
 
 A signed document shows a notice bar that sums up its signatures. Signatures are checked in the file on disk, so while
 the document has unsaved changes the notice bar, the signatures panel and Validate say that what they report is about
-the document as last saved or opened, and that the unsaved changes are not covered by any signature.
+the document as last saved or opened, and that the unsaved changes are not covered by any signature. Validate's
+results say so as soon as the document is edited while they are shown, and close when its file is written.
 
 Add Location on the Start screen lists the cloud folders it finds on the computer (iCloud Drive, and the folders that the
 Dropbox, Google Drive, OneDrive and similar desktop apps keep in `~/Library/CloudStorage` or the home folder) and lets

@@ -185,6 +185,8 @@ pub enum AfterSave {
 /// document other than the one it was opened for.
 pub enum Dialog {
     Sign(Box<SignRequest>),
+    /// The signatures of document `doc`'s file as last saved or opened, and their summary. The
+    /// heading says so while the document has unsaved changes; writing the file closes it.
     Signatures { doc: u64, reports: Vec<SignatureReport>, notice: String },
     Message(String),
     Password { path: PathBuf, bytes: Vec<u8>, input: String, failed: bool },
@@ -508,8 +510,10 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
         }
 
         Dialog::Signatures { reports, notice, .. } => {
+            // Edits made while the results are on screen are not covered either.
+            let heading = app.about_saved_file(notice);
             window("Signatures").show(ctx, |ui| {
-                ui.strong(notice.as_str());
+                ui.strong(heading);
                 egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                     for report in reports.iter() {
                         ui.group(|ui| {

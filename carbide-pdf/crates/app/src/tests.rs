@@ -1183,7 +1183,7 @@ fn signature_results_say_when_unsaved_changes_are_not_covered() {
     // So do the results of checking the signatures.
     app.validate_signatures();
     match app.dialog.take() {
-        Some(Dialog::Signatures { notice, .. }) => assert_eq!(notice, unsaved),
+        Some(Dialog::Signatures { notice, .. }) => assert_eq!(app.about_saved_file(&notice), unsaved),
         _ => panic!("the signatures were not shown"),
     }
 
@@ -1266,3 +1266,36 @@ fn protecting_the_open_file_keeps_it_protected_from_then_on() {
     assert!(Pdf::from_bytes_with_password(&saved, "old pw").is_err(), "the old password still opens it");
     assert_eq!(Pdf::from_bytes_with_password(&saved, "new pw").unwrap().page_rotation(0).unwrap(), 90);
 }
+
+/// The heading the Signatures dialog on screen shows, if it is on screen.
+fn signatures_heading(app: &CarbideApp) -> Option<String> {
+    match &app.dialog {
+        Some(Dialog::Signatures { notice, .. }) => Some(app.about_saved_file(notice)),
+        _ => None,
+    }
+}
+
+#[test]
+fn signature_results_on_screen_follow_edits_and_close_when_the_file_is_written() {
+    let dir = scratch();
+    let signed = with_signature(&dir, "signed.pdf", &["SIGNED"]);
+    let mut app = app(&dir);
+    app.open_path(&signed);
+
+    // Checked with nothing unsaved, then edited with the results still up: they say the edit is
+    // not covered.
+    app.validate_signatures();
+    let summary = signatures_heading(&app).expect("the signatures are shown");
+    assert!(!summary.contains(crate::UNSAVED_CHANGES_NOT_SIGNED), "{summary}");
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    assert_eq!(signatures_heading(&app), Some(format!("{summary} {}", crate::UNSAVED_CHANGES_NOT_SIGNED)));
+
+    // Saving writes a new file, which the results are not about: they close, waiting ones too.
+    app.validate_signatures();
+    app.queued_dialogs.push_back(Dialog::Signatures { doc: active_id(&app), reports: Vec::new(), notice: summary });
+    app.save();
+    assert!(!app.doc.as_ref().unwrap().dirty);
+    assert!(signatures_heading(&app).is_none());
+    assert!(!app.queued_dialogs.iter().any(|d| matches!(d, Dialog::Signatures { .. })));
+}
+
