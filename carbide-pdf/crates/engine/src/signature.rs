@@ -42,7 +42,7 @@ pub mod messages {
     pub const SUBSEQUENT_CHANGES: &str = "The document was changed after it was signed";
     pub const NOT_MODIFIED: &str = "The document has not changed since it was signed";
     pub const IDENTITY_UNKNOWN: &str = "The signer's identity is not confirmed: neither the certificate nor any certificate above it is in your trusted list";
-    pub const IDENTITY_EXPIRED: &str = "The signer's certificate has expired or is not valid yet";
+    pub const IDENTITY_EXPIRED: &str = "The signer's certificate has expired or is not valid yet, and no trusted time stamp shows it was valid when the document was signed";
     pub const CHAIN_REJECTED: &str = "The signer's certificate leads to your trusted list, but through a certificate that may not issue it or was not valid at the time";
     pub const SIGNER_NOT_PERMITTED: &str = "The signer's certificate is not allowed to sign documents";
     pub const TIMESTAMP_AUTHORITY_UNKNOWN: &str = "The time stamp authority is not confirmed: neither its certificate nor any certificate above it is in your trusted list";
@@ -1394,7 +1394,8 @@ fn integer_array(object: Option<&Object>) -> Option<Vec<i64>> {
 
 impl Pdf {
     /// Validates every signature in `file_bytes` (the file this document was loaded from).
-    /// `now` is the reference time for certificate validity when a signature has no usable date.
+    /// Certificates are checked at `now`, or at the time of a time stamp from a trusted authority;
+    /// never at the signing time a signature claims for itself.
     pub fn verify_signatures(file_bytes: &[u8], trust: &TrustStore, now: DateTime<Utc>) -> Result<Vec<SignatureReport>> {
         Self::verify_signatures_with_password(file_bytes, None, trust, now)
     }
@@ -1644,9 +1645,9 @@ fn verify_one(
     }
 
     // An embedded signature time stamp counts only when it is present and itself verifies: its
-    // message imprint is over the signature value, and its own token signature holds. Its time is
-    // a better reference than the signer-chosen /M for the validity checks, but only when its
-    // authority is trusted: anyone can add an unsigned attribute, with any time in it.
+    // message imprint is over the signature value, and its own token signature holds. Only the
+    // time of one whose authority is trusted shows when the signature existed: anyone can add an
+    // unsigned attribute, with any time in it.
     let embedded = cms::unsigned_attribute(signer_info, cms::OID_SIGNATURE_TIMESTAMP)
         .map(|token| check_timestamp_token(token, &[&signer_info.signature], trust, now));
     let mut timestamp_time = None;
@@ -1656,11 +1657,14 @@ fn verify_one(
         timestamp_time = report.embedded_timestamp_trusted.then_some(time);
     }
 
-    // 5. Trust and validity period.
-    let reference_time = timestamp_time
-        .or_else(|| report.signing_time.as_deref().and_then(parse_pdf_date))
-        .unwrap_or(now);
-    if reference_time > now + chrono::Duration::minutes(5) {
+    // 5. Trust and validity period, at the time a trusted time stamp gives, otherwise now. The
+    //    signing time in /M is whatever the signer chose to write: a key that has expired could
+    //    otherwise sign today with a date from when it was valid. A /M in the future is still
+    //    named, as nothing that claims it can be taken at its word.
+    let claimed_time = report.signing_time.as_deref().and_then(parse_pdf_date);
+    let reference_time = timestamp_time.unwrap_or(now);
+    let future = |time: DateTime<Utc>| time > now + chrono::Duration::minutes(5);
+    if future(reference_time) || (timestamp_time.is_none() && claimed_time.is_some_and(future)) {
         unknown(&mut report, Detail::SignedInFuture);
         return report;
     }

@@ -5139,6 +5139,56 @@ fn signer_key_usage_and_future_dates_are_named_as_such() {
     assert!(report.description_lines().contains(&sig_messages::SIGNED_IN_FUTURE));
 }
 
+#[test]
+fn the_signing_time_a_signature_claims_does_not_bring_back_a_lapsed_certificate() {
+    let backdated = |identity: &Identity| {
+        let mut doc = text_pdf(&[&["backdated"]]);
+        let base = file_bytes(&mut doc);
+        let options = SignOptions { identity: Some(identity), signing_time: Some("D:20200601000000Z".into()), ..Default::default() };
+        doc.sign(&base, &options).unwrap()
+    };
+
+    // A trusted certificate that expired in 2021 signs now, writing a signing time from when it
+    // was still valid: expired, and the document is not called valid.
+    let (pair, key) = rsa_key();
+    let mut params = cert_params("Expired Signer", IsCa::ExplicitNoCa, &[KeyUsagePurpose::DigitalSignature]);
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+    let reports = verify(&backdated(&Identity::new(vec![cert.clone()], key).unwrap()), &TrustStore { certificates: vec![cert] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::ValidityUnknown, Detail::Expired));
+    assert!(reports[0].description_lines().contains(&sig_messages::IDENTITY_EXPIRED));
+    assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_NOT_CONFIRMED));
+    // The time is still reported, as what the signer claims.
+    assert_eq!(reports[0].signing_time.as_deref(), Some("D:20200601000000Z"));
+
+    // A signer certificate valid today, below a root and an intermediate that both lapsed in 2021:
+    // the chain is not accepted at the time the signature claims either.
+    let lapsed = |name: &str| {
+        let mut params = cert_params(name, IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+        params.not_before = rcgen::date_time_ymd(2019, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+        params
+    };
+    let (root_pair, _) = rsa_key();
+    let root_params = lapsed("Lapsed Root");
+    let root = root_params.self_signed(&root_pair).unwrap().der().to_vec();
+    let root_issuer = Issuer::new(root_params, root_pair);
+    let (int_pair, _) = rsa_key();
+    let int_params = lapsed("Lapsed Intermediate");
+    let intermediate = int_params.signed_by(&int_pair, &root_issuer).unwrap().der().to_vec();
+    let (identity, _) = chain_identity(&Issuer::new(int_params, int_pair), &[intermediate]);
+    let report = verify(&backdated(&identity), &TrustStore { certificates: vec![root] }).remove(0);
+    assert_rejected(&report, "lapsed chain, backdated signing time");
+
+    // A certificate valid today with an old signing time is valid: the time only ever is a claim.
+    let options = SignOptions { signing_time: Some("D:19990101000000Z".into()), ..sign_options(SubFilter::Pkcs7Detached) };
+    let mut doc = text_pdf(&[&["old date"]]);
+    let base = file_bytes(&mut doc);
+    let reports = verify(&doc.sign(&base, &options).unwrap(), &trust_test_identity());
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
+}
+
 // ---- OpenSSL cross-checks ------------------------------------------------------------------
 
 /// Runs `openssl` with `args`; `None` when OpenSSL 3 is not on the PATH (the cross-checks are then
