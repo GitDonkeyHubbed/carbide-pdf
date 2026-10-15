@@ -592,10 +592,17 @@ fn hash_values(
     depth: usize,
 ) {
     match object {
-        Object::Integer(_) | Object::Real(_) => {
-            let value = object.as_float().unwrap_or_default();
+        // A whole number hashes the same whether written as an integer or a real, and an
+        // integer keeps every digit: one past what a real can hold exactly is still different.
+        Object::Integer(value) => (1u8, *value).hash(hasher),
+        Object::Real(value) => {
             // -0 and 0 are the same number.
-            (1u8, (value + 0.0).to_bits()).hash(hasher);
+            let value = value + 0.0;
+            if value.fract() == 0.0 && value.abs() < 9.0e18 {
+                (1u8, value as i64).hash(hasher);
+            } else {
+                (8u8, value.to_bits()).hash(hasher);
+            }
         }
         Object::Boolean(value) => (2u8, value).hash(hasher),
         Object::Name(name) => (3u8, name).hash(hasher),

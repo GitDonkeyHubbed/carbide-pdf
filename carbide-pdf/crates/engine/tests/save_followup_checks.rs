@@ -55,6 +55,25 @@ fn ink_points_shortened_in_a_referenced_object_count_as_removed() {
 }
 
 #[test]
+fn ink_points_that_differ_only_past_what_a_real_holds_count_as_removed() {
+    let (bytes, _, points, _) = ink_with_referenced_points();
+    let (mut pdf, _) = SavedFile::open(bytes, None).unwrap();
+    pdf.document_mut()
+        .objects
+        .insert(points, Object::Array(vec![16_777_217.into(), 10.into()]));
+    let mut changed = Vec::new();
+    pdf.document_mut().save_to(&mut changed).unwrap();
+    let (mut pdf, saved) = SavedFile::open(changed, None).unwrap();
+    pdf.document_mut()
+        .objects
+        .insert(points, Object::Array(vec![16_777_216.into(), 10.into()]));
+    assert!(
+        saved.removed_from(&pdf),
+        "a point moved by one past what a real holds went unnoticed"
+    );
+}
+
+#[test]
 fn changes_to_the_page_an_annotation_sits_on_are_not_removals() {
     let (bytes, _, _, page) = ink_with_referenced_points();
     let (mut pdf, saved) = SavedFile::open(bytes, None).unwrap();
