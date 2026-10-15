@@ -1268,6 +1268,78 @@ fn extracted_pages_carry_nothing_of_the_other_pages() {
     assert!(page_text(r, &mut last, 0).contains("FORM-CHARLIE"));
 }
 
+#[test]
+fn extracted_and_split_pages_carry_no_article_threads_of_the_other_pages() {
+    // The article runs through the second and third pages only.
+    let source = navigable_pdf();
+    for part in [source.extract_pages(&[0, 3]).unwrap(), source.split(&[0..=0, 3..=3]).unwrap().remove(1)] {
+        let mut part = part;
+        let bytes = file_bytes(&mut part);
+        assert_gone(&bytes, "Secret Article");
+        assert!(!part.document().catalog().unwrap().has(b"Threads"));
+    }
+    // A page it runs through keeps it.
+    let mut part = source.extract_pages(&[2]).unwrap();
+    assert!(holds_string(&file_bytes(&mut part), "Secret Article"));
+}
+
+/// True when some string in the file `bytes`, as read back, holds `needle`.
+fn holds_string(bytes: &[u8], needle: &str) -> bool {
+    fn find(object: &Object, needle: &[u8]) -> bool {
+        match object {
+            Object::String(text, _) => contains(text, needle),
+            Object::Array(items) => items.iter().any(|item| find(item, needle)),
+            Object::Dictionary(dict) => dict.iter().any(|(_, value)| find(value, needle)),
+            Object::Stream(stream) => stream.dict.iter().any(|(_, value)| find(value, needle)),
+            _ => false,
+        }
+    }
+    Pdf::from_bytes(bytes).unwrap().document().objects.values().any(|object| find(object, needle.as_bytes()))
+}
+
+/// Two pages: a note on the first whose text is a secret, and on the second two replies to it
+/// (one written straight into the page's annotation list) and a highlight whose pop-up is on the
+/// first page.
+fn replies_across_pages() -> Pdf {
+    let mut pdf = numbered_pages(2);
+    let ids = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let rect = || vec![10.into(), 10.into(), 50.into(), 50.into()];
+    let text = Object::string_literal;
+    let note = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Text", "Rect" => rect(), "P" => ids[0], "Contents" => text("NOTESECRET on page one") });
+    let popup = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Popup", "Rect" => rect(), "P" => ids[0] });
+    let reply = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Text", "Rect" => rect(), "P" => ids[1], "IRT" => note, "Contents" => text("a reply") });
+    let highlight = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Highlight", "Rect" => rect(), "P" => ids[1], "Popup" => popup, "Contents" => text("highlighted") });
+    doc.get_dictionary_mut(popup).unwrap().set("Parent", highlight);
+    let direct = dictionary! { "Type" => "Annot", "Subtype" => "Text", "Rect" => rect(), "IRT" => note, "Contents" => text("a direct reply") };
+    doc.get_dictionary_mut(ids[0]).unwrap().set("Annots", vec![note.into(), popup.into()]);
+    doc.get_dictionary_mut(ids[1]).unwrap().set("Annots", vec![reply.into(), highlight.into(), direct.into()]);
+    let bytes = pdf.to_bytes().unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
+#[test]
+fn replies_on_pages_that_stay_do_not_keep_annotations_of_pages_that_go() {
+    let check = |mut pdf: Pdf, what: &str| {
+        let bytes = file_bytes(&mut pdf);
+        assert_gone(&bytes, "NOTESECRET");
+        assert!(["a reply", "a direct reply", "highlighted"].iter().all(|text| holds_string(&bytes, text)), "{what}");
+    };
+    let source = replies_across_pages();
+    check(source.extract_pages(&[1]).unwrap(), "extract");
+    check(source.split(&[1..=1]).unwrap().remove(0), "split");
+    let mut deleted = source.clone();
+    deleted.delete_pages(&[0]).unwrap();
+    check(deleted, "delete");
+    let mut redacted = source.clone();
+    redacted.apply_redactions(renderer(), &[Redaction { page: 0, rect: Rect::new(0.0, 0.0, 20.0, 20.0) }], 72.0).unwrap();
+    check(redacted, "redact");
+    // Annotations that only go with their own pages are left alone.
+    let mut kept = source.clone();
+    kept.delete_pages(&[1]).unwrap();
+    assert!(holds_string(&file_bytes(&mut kept), "NOTESECRET"));
+}
+
 /// A signed one-page file whose page carries an ink drawing: numbers only, no appearance stream.
 fn signed_with_ink() -> (Vec<u8>, Vec<Object>) {
     let mut doc = text_pdf(&[&["contract body"]]);
