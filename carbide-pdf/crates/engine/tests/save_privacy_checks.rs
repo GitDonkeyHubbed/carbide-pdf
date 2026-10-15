@@ -264,6 +264,56 @@ fn font_chosen_across_two_content_streams_of_a_page_is_kept() {
     );
 }
 
+/// A document whose first page draws `levels` forms inside one another, each with resources of
+/// its own; the innermost one's hold an image nothing draws.
+fn nested_forms_pdf(levels: usize) -> Pdf {
+    shared_resources_pdf(
+        |doc| {
+            let font = helvetica(doc);
+            let image = secret_image(doc);
+            let mut inner = form(
+                doc,
+                Object::Dictionary(dictionary! {
+                    "Font" => dictionary! { "F1" => font },
+                    "XObject" => dictionary! { "ImS" => image },
+                }),
+                "BT /F1 9 Tf (inner) Tj ET",
+            );
+            for _ in 1..levels {
+                inner = form(
+                    doc,
+                    Object::Dictionary(dictionary! { "XObject" => dictionary! { "G" => inner } }),
+                    "/G Do",
+                );
+            }
+            dictionary! { "XObject" => dictionary! { "F" => inner } }
+        },
+        &["/F Do", "BT ET"],
+    )
+}
+
+#[test]
+fn unused_image_deep_in_nested_forms_does_not_survive() {
+    let mut pdf = nested_forms_pdf(100);
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the unused image is still in the file"
+    );
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the innermost form lost its font"
+    );
+
+    // Forms nested deeper than a page may draw them are not left untrimmed.
+    let mut pdf = nested_forms_pdf(140);
+    assert!(matches!(
+        pdf.delete_pages(&[1]),
+        Err(carbide_engine::Error::TooLarge(_))
+    ));
+}
+
 // ---- legacy passwords ----------------------------------------------------------------------
 
 const PADDING: [u8; 32] = [

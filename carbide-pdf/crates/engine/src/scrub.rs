@@ -12,7 +12,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::content::{name, tokens, Token};
 use crate::error::{Error, Result};
-use crate::limits::DecodeBudget;
+use crate::limits::{messages, DecodeBudget, MAX_FORM_DEPTH};
 use crate::pdf::Pdf;
 
 const FONT: &[u8] = b"Font";
@@ -277,8 +277,9 @@ impl Pdf {
     /// one resource dictionary. A page whose content cannot be read keeps all of its resources.
     ///
     /// Each page's content, with the forms it draws, is decoded within the limit for one page in
-    /// [`crate::limits`]; past it this fails with [`Error::TooLarge`] rather than keep resources
-    /// that may be what removed content alone used.
+    /// [`crate::limits`]; past it, or with forms nested deeper than a page may draw them, this
+    /// fails with [`Error::TooLarge`] rather than keep resources that may be what removed content
+    /// alone used.
     pub(crate) fn trim_resources(&mut self) -> Result<()> {
         let pages = self.page_ids();
         let mut shared = HashSet::new();
@@ -502,9 +503,6 @@ impl Pdf {
         changed: &mut HashMap<ObjectId, Object>,
         depth: usize,
     ) -> Result<()> {
-        if depth > MAX_DEPTH {
-            return Ok(());
-        }
         for category in [XOBJECT, PATTERN, FONT] {
             let Ok(value) = resources.get(category) else {
                 continue;
@@ -540,7 +538,9 @@ impl Pdf {
     /// Trims the resources `owner` (a form, a tiling pattern or a Type 3 font; object `id` when
     /// it is one of its own) has of its own to what its content uses, and those of what they hold
     /// in turn. True when `owner` changed. When its content cannot be read, its resources are kept
-    /// whole, but what they hold is still trimmed.
+    /// whole, but what they hold is still trimmed. `depth` is how many such owners enclose it;
+    /// one nested deeper than a page may draw forms (see [`MAX_FORM_DEPTH`]) is an error rather
+    /// than left with resources that may be what removed content alone used.
     fn trim_own_resources(
         &self,
         id: Option<ObjectId>,
@@ -571,6 +571,9 @@ impl Pdf {
             }
             _ => return Ok(false),
         };
+        if depth >= MAX_FORM_DEPTH {
+            return Err(Error::TooLarge(messages::TOO_COMPLEX.into()));
+        }
         let uses = match content {
             Some(uses) => self.scope_uses(uses, &resources, scan)?,
             None => None,
