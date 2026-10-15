@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lopdf::xref::XrefEntry;
 use lopdf::{Document, EncryptionState, Object, ObjectId, SaveOptions};
@@ -568,6 +569,9 @@ impl Fingerprint {
 /// How many references in a row are followed when hashing an annotation's values.
 const MAX_REFERENCE_DEPTH: usize = 8;
 
+/// Hands out a different marker each time a reference is met beyond [`MAX_REFERENCE_DEPTH`].
+static UNCOMPARABLE: AtomicU64 = AtomicU64::new(0);
+
 /// Keys that lead from an annotation to the rest of the document rather than to its own drawing
 /// data: following them would count a change to a page, a reply thread or a popup as a change to
 /// the annotation.
@@ -621,7 +625,12 @@ fn hash_values(
                         .is_ok_and(|dict| dict.has_type(b"Page") || dict.has_type(b"Pages"))
             });
             match target {
-                Some(target) if depth < MAX_REFERENCE_DEPTH && seen.insert(*id) => {
+                // A chain too deep to follow cannot be compared, so it never matches: the
+                // annotation counts as changed rather than risk missing a change beyond the limit.
+                Some(_) if depth >= MAX_REFERENCE_DEPTH => {
+                    (7u8, UNCOMPARABLE.fetch_add(1, Ordering::Relaxed)).hash(hasher)
+                }
+                Some(target) if seen.insert(*id) => {
                     6u8.hash(hasher);
                     hash_values(doc, target, hasher, seen, depth + 1);
                     seen.remove(id);
