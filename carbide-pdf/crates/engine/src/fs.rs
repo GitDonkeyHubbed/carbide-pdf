@@ -173,13 +173,14 @@ pub fn remove_private_temp_file(path: &Path) -> io::Result<()> {
 ///
 /// A symbolic link is followed: the file it points to is replaced and the link itself stays. The
 /// new file gets what decides who may use the one it replaces: its group (and owner, when root
-/// saves), its permission bits, and its access control list, on macOS also its extended
-/// attributes (Finder tags, where it was downloaded from) and its hidden and no-backup flags. Where
-/// the group or the access control list cannot be given to the new file and that would let others
-/// do more with it, nothing is replaced. A target that cannot be written (a read-only file) is
-/// refused instead of being replaced, as writing to it directly would be, and so is a file of
-/// another user, as the new file would belong to whoever saves it. The temporary file is removed
-/// again on any error.
+/// saves), its permission bits, and exactly its access control list (not the entries its folder
+/// gives new files), on macOS also its extended attributes (Finder tags, where it was downloaded
+/// from) and its hidden and no-backup flags. All but the permission bits are given before anything
+/// is written into it. Where the access control list cannot be given to the new file, or the group
+/// cannot and that would change who may do what with it, nothing is replaced. A target that cannot
+/// be written (a read-only file) is refused instead of being replaced, as writing to it directly
+/// would be, and so is a file of another user, as the new file would belong to whoever saves it.
+/// The temporary file is removed again on any error.
 ///
 /// On Windows only the read-only attribute is carried over, not the file's access control list.
 /// Other hard links to the file keep the old contents: replacing the file is what makes the write
@@ -221,9 +222,15 @@ fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) ->
         )
     })?;
     let written = (|| {
-        write(&mut file)?;
+        // The contents go into a file whose access is already the old file's, not one with the
+        // entries its folder gives new files.
         if let Some(metadata) = &existing {
             keep_access(&target, metadata, &file)?;
+        }
+        write(&mut file)?;
+        // After writing, which takes the set-user and set-group bits off.
+        if let Some(metadata) = &existing {
+            keep_mode(metadata, &file)?;
         }
         file.sync_all()?;
         drop(file);
@@ -258,11 +265,11 @@ fn check_owner(target: &Path, existing: &fs::Metadata) -> io::Result<()> {
 }
 
 /// Gives `staged`, the new file about to replace `target`, what decides who may use `target` (see
-/// [`write_replacing`]). Fails, so that nothing is replaced, where the new file would otherwise
-/// let others do more than the old one did.
+/// [`write_replacing`]) but its permission bits, which [`keep_mode`] gives. Fails, so that nothing
+/// is replaced, where the new file would otherwise let someone do more than the old one did.
 #[cfg(unix)]
 fn keep_access(target: &Path, existing: &fs::Metadata, staged: &File) -> io::Result<()> {
-    use std::os::unix::fs::{fchown, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{fchown, MetadataExt};
     let created = staged.metadata()?;
     // Only root can give a file away; `check_owner` has made sure that any other user owns it.
     let owner = Some(existing.uid()).filter(|&uid| uid != created.uid());
@@ -276,36 +283,49 @@ fn keep_access(target: &Path, existing: &fs::Metadata, staged: &File) -> io::Res
                     format!("the new file could not be given to the owner of {} ({e}), so it was left as it is", target.display()),
                 ));
             }
-            if group_allows_more(existing.mode()) {
+            if group_differs(existing.mode()) {
                 return Err(io::Error::new(
                     e.kind(),
                     format!(
-                        "{} is shared with its group, which the new file could not be given ({e}), so it was left as it is: the new file would have been shared with another group.",
+                        "{} gives its group other access than everyone else, and the new file could not be given that group ({e}), so it was left as it is: the new file would have given another group that access, and the old group everyone else's.",
                         target.display()
                     ),
                 ));
             }
         }
     }
-    copy_platform_metadata(target, staged, existing)?;
-    staged.set_permissions(fs::Permissions::from_mode(existing.mode() & 0o7777))
+    copy_platform_metadata(target, staged, existing)
 }
 
 #[cfg(not(unix))]
-fn keep_access(_target: &Path, existing: &fs::Metadata, staged: &File) -> io::Result<()> {
+fn keep_access(_target: &Path, _existing: &fs::Metadata, _staged: &File) -> io::Result<()> {
+    Ok(())
+}
+
+/// Gives `staged` the permission bits of the file it replaces (on Windows, its read-only
+/// attribute).
+fn keep_mode(existing: &fs::Metadata, staged: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        staged.set_permissions(fs::Permissions::from_mode(existing.mode() & 0o7777))
+    }
+    #[cfg(not(unix))]
     staged.set_permissions(existing.permissions())
 }
 
-/// True when the group permission bits of `mode` allow something its bits for everyone else do
-/// not: a file like that, given another group, lets that group's members in.
+/// True when the group permission bits of `mode` differ from its bits for everyone else: a file
+/// like that, given another group, changes what someone may do with it. Members of the new group
+/// get the group's access, and members of the old one fall back to everyone else's, more than
+/// they had where the group was kept out (`0604`).
 #[cfg(unix)]
-fn group_allows_more(mode: u32) -> bool {
-    (mode >> 3) & 0o7 & !mode & 0o7 != 0
+fn group_differs(mode: u32) -> bool {
+    (mode >> 3) & 0o7 != mode & 0o7
 }
 
 /// Copies the access control list, extended attributes and the hidden and no-backup flags of
 /// `target` onto `staged`. Attributes and flags come along as far as they can; the access control
-/// list has to, or this fails.
+/// list has to, exactly, or this fails.
 #[cfg(target_os = "macos")]
 fn copy_platform_metadata(target: &Path, staged: &File, existing: &fs::Metadata) -> io::Result<()> {
     use std::os::fd::AsRawFd;
@@ -313,18 +333,18 @@ fn copy_platform_metadata(target: &Path, staged: &File, existing: &fs::Metadata)
     if let Ok(source) = File::open(target) {
         // SAFETY: both descriptors are open for the duration of the call, and a null state is allowed.
         unsafe {
-            libc::fcopyfile(source.as_raw_fd(), staged.as_raw_fd(), std::ptr::null_mut(), libc::COPYFILE_XATTR | libc::COPYFILE_ACL);
+            libc::fcopyfile(source.as_raw_fd(), staged.as_raw_fd(), std::ptr::null_mut(), libc::COPYFILE_XATTR);
         }
     }
-    // The new file may carry more entries, which its folder gives every new file, but none fewer.
-    if let Some(wanted) = acl::of_path(target) {
-        let given = acl::of_file(staged).unwrap_or_default();
-        if !acl::entries(&wanted).all(|entry| acl::entries(&given).any(|g| g == entry)) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("the access control list of {} could not be given to the new file, so it was left as it is", target.display()),
-            ));
-        }
+    // The list the old file has, its inherited entries included, in place of the one the new file
+    // got from its folder: entries the folder gives every new file could let others in that the
+    // old file kept out. A file system without access control lists has none on either file.
+    acl::copy_exact(target, staged);
+    if acl::entries(acl::of_path(target)) != acl::entries(acl::of_file(staged)) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("the access control list of {} could not be given to the new file, so it was left as it is", target.display()),
+        ));
     }
     let flags = existing.st_flags() & (libc::UF_HIDDEN | libc::UF_NODUMP);
     if flags != 0 {
@@ -354,7 +374,16 @@ fn copy_platform_metadata(target: &Path, staged: &File, _existing: &fs::Metadata
     if size < 0 {
         let error = io::Error::last_os_error();
         return match error.raw_os_error() {
-            Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(()),
+            // No list, so the new file may have none either, even one its folder's default list gave it.
+            // SAFETY: the descriptor is open and the name a valid NUL-terminated string.
+            Some(libc::ENODATA) => match unsafe { libc::fremovexattr(staged.as_raw_fd(), name.as_ptr()) } {
+                0 => Ok(()),
+                _ => match io::Error::last_os_error() {
+                    e if matches!(e.raw_os_error(), Some(libc::ENODATA) | Some(libc::ENOTSUP)) => Ok(()),
+                    e => Err(refused(e)),
+                },
+            },
+            Some(libc::ENOTSUP) => Ok(()),
             _ => Err(refused(error)),
         };
     }
@@ -391,8 +420,31 @@ mod acl {
     extern "C" {
         fn acl_get_file(path: *const c_char, kind: c_int) -> *mut c_void;
         fn acl_get_fd_np(fd: c_int, kind: c_int) -> *mut c_void;
+        fn acl_set_fd_np(fd: c_int, acl: *mut c_void, kind: c_int) -> c_int;
+        fn acl_init(count: c_int) -> *mut c_void;
         fn acl_to_text(acl: *mut c_void, length: *mut isize) -> *mut c_char;
         fn acl_free(object: *mut c_void) -> c_int;
+    }
+
+    /// Gives `file` the access control list of the file at `path` as it is, inherited entries
+    /// included, or an empty one when that file has none. Whether that worked is for the caller
+    /// to check by comparing the two.
+    pub fn copy_exact(path: &Path, file: &std::fs::File) {
+        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else { return };
+        // SAFETY: a valid NUL-terminated path; a list that is returned is freed once, below.
+        let mut acl = unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            // SAFETY: no preconditions.
+            acl = unsafe { acl_init(0) };
+        }
+        if acl.is_null() {
+            return;
+        }
+        // SAFETY: the descriptor is open and `acl` is a list from the calls above, freed once.
+        unsafe {
+            acl_set_fd_np(file.as_raw_fd(), acl, ACL_TYPE_EXTENDED);
+            acl_free(acl);
+        }
     }
 
     /// The access control list of the file at `path`, as text; `None` when it has none.
@@ -408,9 +460,9 @@ mod acl {
         text(unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) })
     }
 
-    /// The entries of a list given as text: every line but the header.
-    pub fn entries(text: &str) -> impl Iterator<Item = &str> {
-        text.lines().filter(|line| !line.starts_with("!#acl"))
+    /// The entries of a list given as text, in order: every line but the header. No list has none.
+    pub fn entries(text: Option<String>) -> Vec<String> {
+        text.unwrap_or_default().lines().filter(|line| !line.starts_with("!#acl")).map(str::to_owned).collect()
     }
 
     /// `acl`, which this frees, as text.
@@ -693,9 +745,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_group_that_would_let_more_people_in_is_told_apart() {
-        assert!(group_allows_more(0o640) && group_allows_more(0o664) && group_allows_more(0o674));
-        assert!(!group_allows_more(0o600) && !group_allows_more(0o644) && !group_allows_more(0o604) && !group_allows_more(0o666));
+    fn a_group_that_cannot_be_kept_and_was_kept_out_stops_the_replacement() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = scratch("foreign-group");
+        // A file made in /tmp gets its group (wheel on macOS), which this user may not be in.
+        let made = Path::new("/tmp").join(format!("carbide-fs-foreign-{}", std::process::id()));
+        if fs::write(&made, b"old").is_err() {
+            eprintln!("skipped: /tmp cannot be written");
+            return;
+        }
+        let path = dir.join("kept-out.pdf");
+        let moved = fs::rename(&made, &path);
+        let gid = fs::metadata(&path).map(|m| m.gid()).ok();
+        let local = fs::metadata(&dir).unwrap().gid();
+        // SAFETY: no preconditions; `getgroups` is given a buffer of the length passed.
+        let member = gid.is_some_and(|gid| unsafe {
+            let mut groups = vec![0 as libc::gid_t; 256];
+            let count = libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr());
+            libc::getegid() == gid || groups[..count.max(0) as usize].contains(&gid)
+        });
+        if moved.is_err() || gid == Some(local) || member || unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: no group here that this user is not in");
+            let _ = fs::remove_file(&made);
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        // Everyone may read it but its group: given the folder's group, the old group could read it.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o604)).unwrap();
+        let error = write_replacing(&path, b"new").unwrap_err();
+        assert!(error.to_string().contains("could not be given that group"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        // With the same access for the group as for everyone else, nobody's access changes.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        write_replacing(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_with_access_of_its_own_is_told_apart() {
+        // More than everyone else, or less: the group kept out of a file others may read.
+        assert!(group_differs(0o640) && group_differs(0o664) && group_differs(0o674) && group_differs(0o604) && group_differs(0o606));
+        assert!(!group_differs(0o600) && !group_differs(0o644) && !group_differs(0o666) && !group_differs(0o755));
     }
 
     #[cfg(target_os = "macos")]
@@ -713,6 +805,58 @@ mod tests {
         assert!(list(&path).contains("user:nobody deny read"));
         write_replacing(&path, b"new").unwrap();
         assert!(list(&path).contains("user:nobody deny read"), "{}", list(&path));
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What `ls -le` says about `path`: its mode and access control list entries.
+    #[cfg(target_os = "macos")]
+    fn listing(path: &Path) -> String {
+        let output = std::process::Command::new("/bin/ls").arg("-le").arg(path).output().unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn chmod(args: &[&str], path: &Path) {
+        assert!(std::process::Command::new("/bin/chmod").args(args).arg(path).status().unwrap().success(), "chmod {args:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_replaced_file_gets_no_entries_its_folder_gives_new_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("acl-folder");
+        // Every new file in the folder may be read by everyone; this one is private.
+        chmod(&["+a", "everyone allow read,file_inherit"], &dir);
+        let path = dir.join("private.pdf");
+        fs::write(&path, b"old").unwrap();
+        chmod(&["-N"], &path);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!listing(&path).contains("allow"), "{}", listing(&path));
+        write_replacing(&path, b"new").unwrap();
+        assert!(!listing(&path).contains("everyone"), "{}", listing(&path));
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+
+        // With an entry of its own, that one alone comes along.
+        chmod(&["+a", "user:nobody deny read"], &path);
+        write_replacing(&path, b"newer").unwrap();
+        let listed = listing(&path);
+        assert!(listed.contains("user:nobody deny read") && !listed.contains("everyone"), "{listed}");
+        chmod(&["-N"], &dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_entry_the_folder_no_longer_gives_stays_with_the_file() {
+        let dir = scratch("acl-stale");
+        chmod(&["+a", "user:nobody allow read,file_inherit"], &dir);
+        let path = dir.join("inherited.pdf");
+        fs::write(&path, b"old").unwrap();
+        assert!(listing(&path).contains("user:nobody inherited allow read"), "{}", listing(&path));
+        chmod(&["-N"], &dir);
+        write_replacing(&path, b"new").unwrap();
+        assert!(listing(&path).contains("user:nobody inherited allow read"), "{}", listing(&path));
         assert_eq!(fs::read(&path).unwrap(), b"new");
         let _ = fs::remove_dir_all(&dir);
     }
