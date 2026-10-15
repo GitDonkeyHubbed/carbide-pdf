@@ -1128,3 +1128,75 @@ fn save_all_carries_on_with_another_dialog_on_screen() {
     let (_, path) = question(&app).expect("a.pdf asks");
     assert_eq!(path, a);
 }
+
+/// `labels` written to `name` with a signature field whose signature does not match the file: any
+/// document with a signature has a notice, and this one needs no signing key.
+fn with_signature(dir: &Path, name: &str, labels: &[&str]) -> PathBuf {
+    use lopdf::{dictionary, Object, StringFormat};
+    let mut pdf = document(labels);
+    let page = pdf.page_id(0).unwrap();
+    let doc = pdf.document_mut();
+    let value = doc.add_object(dictionary! {
+        "Type" => "Sig", "Filter" => "Adobe.PPKLite", "SubFilter" => "adbe.pkcs7.detached",
+        "ByteRange" => vec![0.into(), 10.into(), 20.into(), 30.into()],
+        "Contents" => Object::String(vec![0; 16], StringFormat::Hexadecimal),
+    });
+    let field = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Sig", "T" => Object::string_literal("Signature1"),
+        "V" => value, "P" => page, "Rect" => vec![0.into(), 0.into(), 0.into(), 0.into()],
+    });
+    doc.get_dictionary_mut(page).unwrap().set("Annots", vec![Object::Reference(field)]);
+    doc.catalog_mut().unwrap().set("AcroForm", dictionary! { "Fields" => vec![Object::Reference(field)] });
+    let path = dir.join(name);
+    std::fs::write(&path, pdf.to_bytes().unwrap()).unwrap();
+    path
+}
+
+#[test]
+fn signature_results_say_when_unsaved_changes_are_not_covered() {
+    let dir = scratch();
+    let signed = with_signature(&dir, "signed.pdf", &["SIGNED"]);
+    let other = plain(&dir, "other.pdf", &["OTHER"]);
+    let mut app = app(&dir);
+    app.open_path(&signed);
+    let summary = app.notice.clone().expect("a signed document has a notice");
+    assert_eq!(app.shown_notice(), Some(summary.clone()));
+    let unsaved = format!("{summary} {}", crate::UNSAVED_CHANGES_NOT_SIGNED);
+
+    // Every way the shown document comes to differ from its file says so.
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    assert_eq!(app.shown_notice().as_ref(), Some(&unsaved), "after an edit");
+    app.undo();
+    assert_eq!(app.shown_notice().as_ref(), Some(&unsaved), "after undo");
+    app.redo();
+    assert_eq!(app.shown_notice().as_ref(), Some(&unsaved), "after redo");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let doc = app.doc.as_ref().unwrap();
+    app.ocr_job = Some(OcrJob { doc: doc.id, version: doc.version, receiver, result: None });
+    let mut recognized = doc.pdf.clone();
+    recognized.add_text_box(0, 72.0, 600.0, "RECOGNIZED", 12.0).unwrap();
+    sender.send(Ok((recognized, OcrReport::default()))).unwrap();
+    app.poll_ocr();
+    assert!(contains(&app.doc.as_ref().unwrap().bytes, "RECOGNIZED"));
+    assert_eq!(app.shown_notice().as_ref(), Some(&unsaved), "after OCR");
+
+    // So do the results of checking the signatures.
+    app.validate_signatures();
+    match app.dialog.take() {
+        Some(Dialog::Signatures { notice, .. }) => assert_eq!(notice, unsaved),
+        _ => panic!("the signatures were not shown"),
+    }
+
+    // Another document in front has its own notice (none); coming back brings this one back.
+    app.open_path(&other);
+    assert_eq!(app.shown_notice(), None);
+    app.activate(Some(0));
+    assert_eq!(app.shown_notice().as_ref(), Some(&unsaved), "after switching tabs");
+
+    // Saved, the notice is about what is shown again.
+    app.save();
+    assert!(question(&app).is_none() && !app.doc.as_ref().unwrap().dirty);
+    let saved = app.shown_notice().expect("still signed");
+    assert!(!saved.contains(crate::UNSAVED_CHANGES_NOT_SIGNED), "{saved}");
+    assert_eq!(Some(saved), app.notice);
+}

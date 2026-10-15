@@ -778,7 +778,7 @@ impl CarbideApp {
                 .show_separator_line(false)
                 .frame(Frame::new().fill(theme::RIBBON))
                 .show(ui, |ui| self.ribbon_strip(ui));
-            if let Some(text) = self.notice.clone() {
+            if let Some(text) = self.shown_notice() {
                 egui::Panel::top("notice")
                     .show_separator_line(false)
                     .frame(Frame::new().fill(theme::NOTICE).inner_margin(Margin::symmetric(12, 5)))
@@ -1232,7 +1232,7 @@ impl CarbideApp {
             ui.weak("Use Security > Sign to add one.");
             return;
         }
-        if let Some(text) = &self.notice {
+        if let Some(text) = self.shown_notice() {
             ui.label(text);
         }
         ui.add_space(6.0);

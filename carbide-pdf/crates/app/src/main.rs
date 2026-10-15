@@ -286,7 +286,8 @@ pub struct CarbideApp {
     ocr_job: Option<OcrJob>,
     /// A signature waiting for (or holding, not yet written) its time stamp.
     sign_job: Option<SignJob>,
-    /// The document notice bar text (signature summary).
+    /// The summary of the signatures of the active document's file, as last checked. The notice
+    /// bar shows it through [`CarbideApp::shown_notice`].
     pub notice: Option<String>,
     /// One slot per open document, in tab order. The active document lives in `doc`, and its slot
     /// here is `None` until it is parked behind another tab.
@@ -1556,18 +1557,31 @@ impl CarbideApp {
         }
     }
 
+    /// Checks the signatures of the active document's file. With unsaved changes, the results say
+    /// they are about that file, and that the changes are not signed.
     pub fn validate_signatures(&mut self) {
         let Some(doc) = self.doc.as_ref() else { return };
+        let (id, unsaved) = (doc.id, doc.dirty);
         let (bytes, password) = signed_file(doc);
         match Pdf::verify_signatures_with_password(bytes, password, &paths::load_trust_store(), chrono::Utc::now()) {
             Ok(reports) if reports.is_empty() => self.alert("This document has no signatures.".into()),
             Ok(reports) => {
                 let notice = carbide_engine::signature::notice_text(&reports).unwrap_or_default().to_string();
                 self.notice = Some(notice.clone());
-                self.open_dialog(Dialog::Signatures { doc: doc.id, reports, notice });
+                let notice = about_saved_file(notice, unsaved);
+                self.open_dialog(Dialog::Signatures { doc: id, reports, notice });
             }
             Err(e) => self.alert(format!("Could not read the signatures: {e}")),
         }
+    }
+
+    /// The notice bar text: the signature summary of the active document's file. While the
+    /// document has unsaved changes, after an edit, undo, redo or OCR, it also says that the
+    /// summary is about the document as last saved or opened, and that no signature covers those
+    /// changes; saving brings back the summary alone.
+    pub fn shown_notice(&self) -> Option<String> {
+        let notice = self.notice.clone()?;
+        Some(about_saved_file(notice, self.doc.as_ref().is_some_and(|d| d.dirty)))
     }
 
     // ---- file helpers ------------------------------------------------------------------
@@ -1866,6 +1880,20 @@ fn signed_file(doc: &OpenDoc) -> (&[u8], Option<&str>) {
     match &doc.saved {
         Some(saved) => (saved.bytes(), saved.password()),
         None => (&doc.bytes, None),
+    }
+}
+
+/// Said after what is known about the signatures of a document with unsaved changes.
+pub const UNSAVED_CHANGES_NOT_SIGNED: &str =
+    "This is about the document as last saved or opened. Your unsaved changes are not covered by any signature.";
+
+/// `notice`, a summary of a document's signatures, with [`UNSAVED_CHANGES_NOT_SIGNED`] after it when
+/// the document has `unsaved` changes.
+fn about_saved_file(notice: String, unsaved: bool) -> String {
+    if unsaved {
+        format!("{notice} {UNSAVED_CHANGES_NOT_SIGNED}")
+    } else {
+        notice
     }
 }
 
