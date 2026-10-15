@@ -285,6 +285,8 @@ impl Pdf {
     /// and stops page-tree nodes from passing resources down. Images, forms and fonts that only
     /// removed content used are then no longer part of the document, even when the pages shared
     /// one resource dictionary. A page whose content cannot be read keeps all of its resources.
+    /// An annotation appearance with no resources of its own is drawn with the page's, so the
+    /// names it uses are kept too; one that cannot be read keeps the page's resources whole.
     ///
     /// Each page's content, with the forms it draws, is decoded within the limit for one page in
     /// [`crate::limits`]; past it, with forms nested deeper than a page may draw them, or with
@@ -333,7 +335,13 @@ impl Pdf {
             let mut kept = match self.names_used_by_page(*page, &resources, &mut scan)? {
                 Some(mut uses) => {
                     uses.extend(group);
-                    self.keep_named(&resources, &uses)
+                    if self.include_inherited_appearance_uses(
+                        *page, &resources, &mut uses, &mut scan,
+                    )? {
+                        self.keep_named(&resources, &uses)
+                    } else {
+                        resources.clone()
+                    }
                 }
                 None => resources.clone(),
             };
@@ -605,16 +613,11 @@ impl Pdf {
         mask.get(b"G").and_then(Object::as_reference).ok()
     }
 
-    /// Trims the resources of the appearances of the annotations on `page` (normal, rollover and
-    /// down, one for each state of the annotation where it has several) as [`Self::trim_nested`]
-    /// trims those of the forms the page draws. An annotation that stays keeps its appearances,
-    /// and their resources can be shared with content that went.
-    fn trim_appearances(
-        &self,
-        page: ObjectId,
-        scan: &mut NameScan,
-        changed: &mut HashMap<ObjectId, Object>,
-    ) -> Result<()> {
+    /// The appearance streams of the annotations on `page`: normal, rollover and down, and each
+    /// state where an appearance has several. Streams are indirect objects, so each entry is an
+    /// object id.
+    fn appearance_ids(&self, page: ObjectId) -> Result<Vec<ObjectId>> {
+        let mut ids = Vec::new();
         let Some(Object::Array(annotations)) = self
             .doc
             .get_dictionary(page)?
@@ -622,7 +625,7 @@ impl Pdf {
             .ok()
             .map(|a| self.resolve(a))
         else {
-            return Ok(());
+            return Ok(ids);
         };
         for annotation in &annotations {
             let Object::Dictionary(annotation) = self.resolve(annotation) else {
@@ -637,25 +640,70 @@ impl Pdf {
                 let Ok(appearance) = appearances.get(key) else {
                     continue;
                 };
-                let forms: Vec<ObjectId> = match self.resolve(appearance) {
-                    Object::Dictionary(states) => states
-                        .iter()
-                        .filter_map(|(_, state)| state.as_reference().ok())
-                        .collect(),
-                    _ => appearance.as_reference().into_iter().collect(),
-                };
-                for id in forms {
-                    if !scan.trimmed.insert(id) {
-                        continue;
-                    }
-                    let Ok(object) = self.doc.get_object(id) else {
-                        continue;
-                    };
-                    let mut object = object.clone();
-                    if self.trim_own_resources(Some(id), &mut object, scan, changed, 0)? {
-                        changed.insert(id, object);
-                    }
+                match self.resolve(appearance) {
+                    Object::Dictionary(states) => ids.extend(
+                        states
+                            .iter()
+                            .filter_map(|(_, state)| state.as_reference().ok()),
+                    ),
+                    _ => ids.extend(appearance.as_reference()),
                 }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Adds what annotation appearances on `page` draw from the page's `resources` to `uses`.
+    /// An appearance with a resource dictionary of its own is trimmed on its own. Returns false
+    /// when an appearance that draws from the page cannot be read, so the caller keeps the
+    /// page's resources whole.
+    fn include_inherited_appearance_uses(
+        &self,
+        page: ObjectId,
+        resources: &Dictionary,
+        uses: &mut Uses,
+        scan: &mut NameScan,
+    ) -> Result<bool> {
+        for id in self.appearance_ids(page)? {
+            let Ok(Object::Stream(stream)) = self.doc.get_object(id) else {
+                continue;
+            };
+            if stream.dict.has(b"Resources") {
+                continue;
+            }
+            let Some(found) = scan.uses_in(Some(id), stream)? else {
+                return Ok(false);
+            };
+            let Some(found) = self.scope_uses(found, resources, scan)? else {
+                return Ok(false);
+            };
+            uses.extend(found);
+        }
+        Ok(true)
+    }
+
+    /// Trims the resources of the appearances of the annotations on `page` (normal, rollover and
+    /// down, one for each state of the annotation where it has several) as [`Self::trim_nested`]
+    /// trims those of the forms the page draws. An annotation that stays keeps its appearances,
+    /// and their resources can be shared with content that went.
+    fn trim_appearances(
+        &self,
+        page: ObjectId,
+        scan: &mut NameScan,
+        changed: &mut HashMap<ObjectId, Object>,
+    ) -> Result<()> {
+        for id in self.appearance_ids(page)? {
+            if !scan.trimmed.insert(id) {
+                continue;
+            }
+            let Ok(object) = self.doc.get_object(id) else {
+                continue;
+            };
+            let mut object = object.clone();
+            if self.trim_own_resources(Some(id), &mut object, scan, changed, 0)? {
+                changed.insert(id, object);
             }
         }
         Ok(())

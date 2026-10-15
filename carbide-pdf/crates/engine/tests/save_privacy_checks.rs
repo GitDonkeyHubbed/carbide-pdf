@@ -464,6 +464,57 @@ fn deleted_page_image_does_not_survive_in_the_appearance_of_a_kept_annotation() 
     );
 }
 
+#[test]
+fn annotation_appearance_drawn_with_the_page_resources_keeps_its_font() {
+    // The note's appearance has no resource dictionary, so it draws /F1 from the page.
+    // The page content never names that font. Deleting another page must not drop it.
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let font = helvetica(&mut doc);
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font },
+    });
+    let appearance = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 24.into(), 24.into()],
+        },
+        b"BT /F1 12 Tf (note) Tj ET".to_vec(),
+    ));
+    let note = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Text",
+        "Rect" => vec![0.into(), 0.into(), 24.into(), 24.into()],
+        "AP" => dictionary! { "N" => Object::Reference(appearance) },
+    });
+    let mut kids = Vec::new();
+    for (content, annots) in [("q Q", vec![Object::Reference(note)]), ("q Q", vec![])] {
+        let contents = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            content.as_bytes().to_vec(),
+        ));
+        kids.push(Object::Reference(doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+            "Contents" => contents, "Resources" => resources_id, "Annots" => annots,
+        })));
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 2 }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the note's font was dropped with the other page"
+    );
+}
+
 /// A document whose first page draws `names` different forms, none of them there, and whose
 /// second page draws the secret image.
 fn many_names_pdf(names: usize) -> Pdf {
