@@ -380,9 +380,11 @@ impl Pdf {
         }
     }
 
-    /// The resources the page's content uses, following forms, patterns and Type 3 fonts that use
-    /// the page's resources instead of their own. `None` when some content cannot be read; an
-    /// error when decoding it would go past the limits in [`crate::limits`].
+    /// The resources the page's content uses, with those the appearances of its annotations that
+    /// have no resources of their own use (they are looked up in the page's), following forms,
+    /// patterns and Type 3 fonts that use the page's resources instead of their own. `None` when
+    /// some content cannot be read; an error when decoding it would go past the limits in
+    /// [`crate::limits`].
     fn names_used_by_page(
         &self,
         page: ObjectId,
@@ -390,9 +392,21 @@ impl Pdf {
         scan: &mut NameScan,
     ) -> Result<Option<Uses>> {
         let streams = self.doc.get_page_contents(page);
-        let Some(uses) = scan.page_uses(&self.doc, streams)? else {
+        let Some(mut uses) = scan.page_uses(&self.doc, streams)? else {
             return Ok(None);
         };
+        for id in self.appearances_on(page) {
+            let Ok(Object::Stream(appearance)) = self.doc.get_object(id) else {
+                continue;
+            };
+            if appearance.dict.has(b"Resources") {
+                continue;
+            }
+            let Some(found) = scan.uses_in(Some(id), appearance)? else {
+                return Ok(None);
+            };
+            uses.extend(found);
+        }
         self.scope_uses(uses, resources, scan)
     }
 

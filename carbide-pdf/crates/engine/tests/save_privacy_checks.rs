@@ -637,6 +637,75 @@ fn deleting_a_page_does_not_copy_the_images_of_the_pages_that_stay() {
     );
 }
 
+#[test]
+fn an_appearance_without_resources_keeps_what_it_draws_from_the_page() {
+    // The kept page's annotation has an appearance with no resources of its own, so the logo it
+    // draws is looked up in the page's resources; the page's content never draws it.
+    const LOGO: &[u8] = b"LOGO-PAYLOAD-91c2";
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let mut data = LOGO.to_vec();
+    data.resize(3 * 8 * 8, 0);
+    let logo = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 8, "Height" => 8,
+            "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+        },
+        data,
+    ));
+    let image = secret_image(&mut doc);
+    let shared = doc.add_object(dictionary! {
+        "XObject" => dictionary! { "Logo" => logo, "Im1" => image },
+    });
+    let appearance = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        },
+        b"q 100 0 0 100 0 0 cm /Logo Do Q".to_vec(),
+    ));
+    let annotation = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Stamp",
+        "Rect" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        "AP" => dictionary! { "N" => appearance },
+    });
+    let mut kids = Vec::new();
+    for (content, annots) in [
+        ("BT ET", vec![annotation.into()]),
+        ("q 100 0 0 100 0 0 cm /Im1 Do Q", vec![]),
+    ] {
+        let contents = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            content.as_bytes().to_vec(),
+        ));
+        kids.push(Object::Reference(doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+            "Contents" => contents, "Resources" => shared, "Annots" => annots,
+        })));
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 2 }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, LOGO),
+        "the annotation's appearance lost the logo it draws"
+    );
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+}
+
 // ---- legacy passwords ----------------------------------------------------------------------
 
 const PADDING: [u8; 32] = [
