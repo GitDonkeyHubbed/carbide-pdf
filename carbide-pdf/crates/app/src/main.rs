@@ -27,6 +27,9 @@ use eframe::egui;
 
 const MAX_UNDO: usize = 10;
 
+/// How long to wait before writing an Auto Recovery copy again after one could not be written.
+const AUTOSAVE_RETRY: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Select,
@@ -1447,7 +1450,14 @@ impl CarbideApp {
                 let mut copy = doc.pdf.clone();
                 match store.autosave(id, &mut copy, now_unix()) {
                     Ok(()) => saved += 1,
-                    Err(e) => failure = Some(e.to_string()),
+                    Err(e) => {
+                        failure = Some(e.to_string());
+                        // Try again soon, not after a whole interval without a copy.
+                        let wait = AUTOSAVE_RETRY.min(interval);
+                        doc.autosaved_at = Instant::now()
+                            .checked_sub(interval - wait)
+                            .unwrap_or_else(Instant::now);
+                    }
                 }
             }
         }

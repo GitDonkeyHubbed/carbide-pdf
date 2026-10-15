@@ -2016,3 +2016,37 @@ fn a_protected_file_asked_for_twice_opens_in_one_tab() {
     assert!(app.open_with_password(path, bytes, "user pw".into()));
     assert_eq!(app.tabs.len(), 1, "the file was opened twice");
 }
+
+#[test]
+fn a_failed_recovery_copy_is_tried_again_soon() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["A"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+
+    // The recovery folder cannot be written to.
+    let away = dir.join("Away");
+    std::fs::rename(dir.join("AutoSave"), &away).unwrap();
+    overdue(&mut app);
+    app.autosave_tick();
+    assert!(
+        app.status.starts_with("Auto Recovery failed"),
+        "{}",
+        app.status
+    );
+
+    // It is not retried at once...
+    std::fs::rename(&away, dir.join("AutoSave")).unwrap();
+    app.autosave_tick();
+    assert_eq!(recovery_copies(&dir), 0);
+    // ...but soon, not after the whole interval.
+    let open = app.doc.as_mut().unwrap();
+    open.autosaved_at -= crate::AUTOSAVE_RETRY;
+    app.autosave_tick();
+    assert_eq!(
+        recovery_copies(&dir),
+        1,
+        "the retry waited a whole interval"
+    );
+}
