@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # PDFium is loaded at run time. This is the release the tests are run against; it works with
+  # pdfium-render 0.9. To move to another release, change the tag and the checksum together.
+  PDFIUM_TAG: chromium/8086
+  PDFIUM_SHA256: e98679e052c07edbb5a627980902abb823d4b3f35744d877bd21668bd9fc13ab
+  # OCR models, from the location the README gives. The files at that address are not versioned,
+  # so they are checked against these checksums.
+  OCR_MODELS_URL: https://ocrs-models.s3-accelerate.amazonaws.com
+  OCR_DETECTION_SHA256: f15cfb56bd02c4bf478a20343986504a1f01e1665c2b3a0ad66340f054b1b5ca
+  OCR_RECOGNITION_SHA256: e484866d4cce403175bd8d00b128feb08ab42e208de30e42cd9889d8f1735a6e
+
+jobs:
+  check:
+    name: Build, lint and test (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: carbide-pdf
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: carbide-pdf
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Download PDFium
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/pdfium"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/pdfium.tgz" \
+            "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_TAG}/pdfium-mac-arm64.tgz"
+          echo "${PDFIUM_SHA256}  $dir/pdfium.tgz" | shasum -a 256 -c -
+          tar -xzf "$dir/pdfium.tgz" -C "$dir"
+          test -f "$dir/lib/libpdfium.dylib"
+          echo "CARBIDE_PDFIUM_LIB=$dir/lib/libpdfium.dylib" >> "$GITHUB_ENV"
+
+      - name: Download the OCR models
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/ocr-models"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/text-detection.rten" "${OCR_MODELS_URL}/text-detection.rten"
+          curl -fsSL --retry 3 -o "$dir/text-recognition.rten" "${OCR_MODELS_URL}/text-recognition.rten"
+          echo "${OCR_DETECTION_SHA256}  $dir/text-detection.rten" | shasum -a 256 -c -
+          echo "${OCR_RECOGNITION_SHA256}  $dir/text-recognition.rten" | shasum -a 256 -c -
+          echo "CARBIDE_OCR_MODELS=$dir" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: cargo test --workspace
