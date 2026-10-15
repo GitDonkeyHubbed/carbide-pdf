@@ -1038,6 +1038,22 @@ impl CarbideApp {
         };
     }
 
+    /// Why nothing may be written to `path`, chosen for a new file made from the active document (an
+    /// extracted page, imposed sheets, split parts, exported text), if anything: it is a document
+    /// open in a tab, this one included, which would go on showing what is no longer on disk and
+    /// could put it back with its next save, or it is in one of the app's own folders.
+    fn open_file_refusal(&self, path: &Path) -> Option<String> {
+        if self.is_private_location(path) {
+            return Some(format!(
+                "{} is in a folder Carbide PDF keeps for itself (recovery or temporary copies), so nothing was written there. Choose another location.",
+                path.display()
+            ));
+        }
+        let is_path = |doc: &OpenDoc| doc.path.as_deref().is_some_and(|p| same_file(p, path));
+        let open = self.doc.as_ref().is_some_and(is_path) || (0..self.tabs.len()).any(|i| self.doc_at(i).is_some_and(is_path));
+        open.then(|| format!("{} is open in Carbide PDF, so nothing was written to it. Choose another name, or close it first.", path.display()))
+    }
+
     /// True for a place Save never writes to: the Auto Recovery folder, or a private temporary
     /// folder the app made.
     fn is_private_location(&self, path: &Path) -> bool {
@@ -1752,6 +1768,12 @@ impl CarbideApp {
                 Existing::Refuse
             }
         };
+        if existing == Existing::Replace {
+            if let Some(refusal) = targets.iter().find_map(|target| self.open_file_refusal(target)) {
+                return self.alert(refusal);
+            }
+        }
+        let Some(doc) = self.doc.as_ref() else { return };
         let mut written = 0;
         for (range, target) in parsed.iter().zip(&targets) {
             let result = doc
@@ -1782,8 +1804,14 @@ impl CarbideApp {
     }
 
     fn export_text(&mut self) {
-        let (Some(renderer), Some(doc)) = (self.renderer, self.doc.as_mut()) else { return };
+        if self.renderer.is_none() || self.doc.is_none() {
+            return;
+        }
         let Some(path) = rfd::FileDialog::new().add_filter("Text", &["txt"]).set_file_name("document.txt").save_file() else { return };
+        if let Some(refusal) = self.open_file_refusal(&path) {
+            return self.alert(refusal);
+        }
+        let (Some(renderer), Some(doc)) = (self.renderer, self.doc.as_mut()) else { return };
         let written = carbide_engine::export_text(renderer, &mut doc.pdf)
             .and_then(|text| Ok(carbide_engine::fs::write_replacing(&path, text.as_bytes())?));
         match written {
@@ -1841,8 +1869,11 @@ impl CarbideApp {
     }
 
     /// Writes page `page` of the active document to `path` as a new file, protected like the
-    /// document.
+    /// document. A file open in a tab is not written over (see [`CarbideApp::open_file_refusal`]).
     pub fn extract_page_to(&mut self, page: usize, path: &Path) {
+        if let Some(refusal) = self.open_file_refusal(path) {
+            return self.alert(refusal);
+        }
         let Some(doc) = self.doc.as_ref() else { return };
         let written = doc
             .pdf
@@ -1856,6 +1887,18 @@ impl CarbideApp {
             }
             Err(e) => self.alert(format!("Could not extract: {e}")),
         }
+    }
+
+    /// Writes the active document imposed with `options` to `path`, protected like the document.
+    /// A file open in a tab is not written over (see [`CarbideApp::open_file_refusal`]).
+    pub fn impose_to(&self, options: &carbide_engine::imposition::ImpositionOptions, path: &Path) -> Result<(), String> {
+        if let Some(refusal) = self.open_file_refusal(path) {
+            return Err(refusal);
+        }
+        let doc = self.doc.as_ref().ok_or("No document is open.")?;
+        let mut imposed = doc.pdf.impose(options, None).map_err(|e| e.to_string())?;
+        let bytes = doc.derived_bytes(&mut imposed).map_err(|e| e.to_string())?;
+        carbide_engine::fs::write_replacing(path, &bytes).map_err(|e| e.to_string())
     }
 
     fn apply_redactions(&mut self) {

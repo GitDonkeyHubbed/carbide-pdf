@@ -97,6 +97,9 @@ the document has unsaved changes the notice bar, the signatures panel and Valida
 the document as last saved or opened, and that the unsaved changes are not covered by any signature. Validate's
 results say so as soon as the document is edited while they are shown, and close when its file is written.
 
+Extract Page, Imposition, Split and Export Text do not write over a file that is open in a tab, the document's own
+included: that tab would go on showing, and could save back, what is no longer on disk.
+
 Add Location on the Start screen lists the cloud folders it finds on the computer (iCloud Drive, and the folders that the
 Dropbox, Google Drive, OneDrive and similar desktop apps keep in `~/Library/CloudStorage` or the home folder) and lets
 you pin any folder. These are ordinary folders to Carbide PDF: it does not sign in to a cloud service or use its API.

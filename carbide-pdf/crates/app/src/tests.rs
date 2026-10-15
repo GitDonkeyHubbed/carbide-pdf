@@ -1299,3 +1299,38 @@ fn signature_results_on_screen_follow_edits_and_close_when_the_file_is_written()
     assert!(!app.queued_dialogs.iter().any(|d| matches!(d, Dialog::Signatures { .. })));
 }
 
+#[test]
+fn files_made_from_a_document_never_replace_an_open_one() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["ONE", "TWO", "THREE"]);
+    let b = plain(&dir, "b.pdf", &["B"]);
+    let (a_before, b_before) = (std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+    let mut app = app(&dir);
+    app.open_path(&b);
+    app.open_path(&a);
+
+    // Its own file, and that of another tab, are refused; the documents stay what is on disk.
+    for target in [&a, &b] {
+        app.extract_page_to(0, target);
+        assert!(matches!(app.dialog.take(), Some(Dialog::Message(m)) if m.contains("is open")), "{}", target.display());
+        let options = carbide_engine::imposition::ImpositionOptions::default();
+        assert!(app.impose_to(&options, target).is_err_and(|m| m.contains("is open")), "{}", target.display());
+    }
+    assert_eq!(std::fs::read(&a).unwrap(), a_before);
+    assert_eq!(std::fs::read(&b).unwrap(), b_before);
+    assert_eq!(app.doc.as_ref().unwrap().pdf.page_count(), 3);
+
+    // Split parts that would replace an open file are refused too.
+    let part = dir.join("a-pages-1-1.pdf");
+    std::fs::write(&part, &b_before).unwrap();
+    app.open_path(&part);
+    app.activate(Some(1));
+    app.split_into(dir.clone(), "1", Some(carbide_engine::fs::Existing::Replace));
+    assert!(matches!(app.dialog.take(), Some(Dialog::Message(m)) if m.contains("is open")));
+    assert_eq!(std::fs::read(&part).unwrap(), b_before);
+
+    // Anywhere else is written.
+    let c = dir.join("c.pdf");
+    app.extract_page_to(1, &c);
+    assert_eq!(Pdf::open(&c).unwrap().page_count(), 1);
+}

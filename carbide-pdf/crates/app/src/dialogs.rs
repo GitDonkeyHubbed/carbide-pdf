@@ -1253,14 +1253,10 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
 
 fn run_imposition(app: &mut CarbideApp, form: &ImposeForm) -> Result<(), String> {
     form.options.validate().map_err(|e| e.to_string())?;
-    let doc = app.doc.as_ref().ok_or("No document is open.")?;
     let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name("New Imposition.pdf").save_file() else {
         return Err("No output file was chosen.".into());
     };
-    // The sheets are protected like the document.
-    let mut imposed = doc.pdf.impose(&form.options, None).map_err(|e| e.to_string())?;
-    let bytes = doc.derived_bytes(&mut imposed).map_err(|e| e.to_string())?;
-    carbide_engine::fs::write_replacing(&path, &bytes).map_err(|e| e.to_string())?;
+    app.impose_to(&form.options, &path)?;
     app.spawn_window(&path);
     Ok(())
 }
