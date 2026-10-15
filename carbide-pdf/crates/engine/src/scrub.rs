@@ -285,6 +285,8 @@ impl Pdf {
     /// and stops page-tree nodes from passing resources down. Images, forms and fonts that only
     /// removed content used are then no longer part of the document, even when the pages shared
     /// one resource dictionary. A page whose content cannot be read keeps all of its resources.
+    /// An annotation appearance with no resources of its own is drawn with the page's, so the
+    /// names it uses are kept too; one that cannot be read keeps the page's resources whole.
     ///
     /// Each page's content, with the forms it draws, is decoded within the limit for one page in
     /// [`crate::limits`]; past it, with forms nested deeper than a page may draw them, or with
@@ -333,7 +335,13 @@ impl Pdf {
             let mut kept = match self.names_used_by_page(*page, &resources, &mut scan)? {
                 Some(mut uses) => {
                     uses.extend(group);
-                    self.keep_named(&resources, &uses)
+                    if self.include_inherited_appearance_uses(
+                        *page, &resources, &mut uses, &mut scan,
+                    )? {
+                        self.keep_named(&resources, &uses)
+                    } else {
+                        resources.clone()
+                    }
                 }
                 None => resources.clone(),
             };
@@ -615,15 +623,34 @@ impl Pdf {
         scan: &mut NameScan,
         changed: &mut HashMap<ObjectId, Object>,
     ) -> Result<()> {
+        for id in self.appearance_ids(page) {
+            if !scan.trimmed.insert(id) {
+                continue;
+            }
+            let Ok(object) = self.doc.get_object(id) else {
+                continue;
+            };
+            let mut object = object.clone();
+            if self.trim_own_resources(Some(id), &mut object, scan, changed, 0)? {
+                changed.insert(id, object);
+            }
+        }
+        Ok(())
+    }
+
+    /// The stream ids in the normal, rollover and down appearances of annotations on `page`.
+    /// Appearance state dictionaries hold one stream for each state of the annotation.
+    fn appearance_ids(&self, page: ObjectId) -> Vec<ObjectId> {
         let Some(Object::Array(annotations)) = self
             .doc
-            .get_dictionary(page)?
-            .get(b"Annots")
+            .get_dictionary(page)
             .ok()
+            .and_then(|dict| dict.get(b"Annots").ok())
             .map(|a| self.resolve(a))
         else {
-            return Ok(());
+            return Vec::new();
         };
+        let mut ids = Vec::new();
         for annotation in &annotations {
             let Object::Dictionary(annotation) = self.resolve(annotation) else {
                 continue;
@@ -644,21 +671,39 @@ impl Pdf {
                         .collect(),
                     _ => appearance.as_reference().into_iter().collect(),
                 };
-                for id in forms {
-                    if !scan.trimmed.insert(id) {
-                        continue;
-                    }
-                    let Ok(object) = self.doc.get_object(id) else {
-                        continue;
-                    };
-                    let mut object = object.clone();
-                    if self.trim_own_resources(Some(id), &mut object, scan, changed, 0)? {
-                        changed.insert(id, object);
-                    }
-                }
+                ids.extend(forms);
             }
         }
-        Ok(())
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Adds the resources used by annotation appearances without resources of their own to the
+    /// page's uses. False when one cannot be read, in which case the page's resources stay whole.
+    fn include_inherited_appearance_uses(
+        &self,
+        page: ObjectId,
+        resources: &Dictionary,
+        uses: &mut Uses,
+        scan: &mut NameScan,
+    ) -> Result<bool> {
+        for id in self.appearance_ids(page) {
+            let Ok(Object::Stream(stream)) = self.doc.get_object(id) else {
+                continue;
+            };
+            if stream.dict.has(b"Resources") {
+                continue;
+            }
+            let Some(found) = scan.uses_in(Some(id), stream)? else {
+                return Ok(false);
+            };
+            let Some(found) = self.scope_uses(found, resources, scan)? else {
+                return Ok(false);
+            };
+            uses.extend(found);
+        }
+        Ok(true)
     }
 
     /// Trims the resources `owner` (a form, a tiling pattern or a Type 3 font; object `id` when
