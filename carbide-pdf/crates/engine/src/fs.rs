@@ -172,11 +172,16 @@ pub fn remove_private_temp_file(path: &Path) -> io::Result<()> {
 /// over the target, so the file is either the old one or the complete new one, never a torn write.
 ///
 /// A symbolic link is followed: the file it points to is replaced and the link itself stays. The
-/// new file gets the permission bits of the one it replaces, and on macOS its extended attributes
-/// (Finder tags, where it was downloaded from) and access control list too. A target that cannot
-/// be written (a read-only file, or one owned by someone else) is refused instead of being
-/// replaced, as writing to it directly would be. The temporary file is removed again on any error.
+/// new file gets what decides who may use the one it replaces: its group (and owner, when root
+/// saves), its permission bits, and its access control list, on macOS also its extended
+/// attributes (Finder tags, where it was downloaded from) and its hidden and no-backup flags. Where
+/// the group or the access control list cannot be given to the new file and that would let others
+/// do more with it, nothing is replaced. A target that cannot be written (a read-only file) is
+/// refused instead of being replaced, as writing to it directly would be, and so is a file of
+/// another user, as the new file would belong to whoever saves it. The temporary file is removed
+/// again on any error.
 ///
+/// On Windows only the read-only attribute is carried over, not the file's access control list.
 /// Other hard links to the file keep the old contents: replacing the file is what makes the write
 /// all-or-nothing, and writing into it in place would give that up.
 pub fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -199,6 +204,8 @@ fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) ->
         if let Err(e) = OpenOptions::new().write(true).open(&target) {
             return Err(io::Error::new(e.kind(), format!("{} is read-only or cannot be changed ({e})", target.display())));
         }
+        #[cfg(unix)]
+        check_owner(&target, metadata)?;
     }
 
     let dir = match target.parent() {
@@ -216,8 +223,7 @@ fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) ->
     let written = (|| {
         write(&mut file)?;
         if let Some(metadata) = &existing {
-            copy_metadata(&target, &file);
-            file.set_permissions(metadata.permissions())?;
+            keep_access(&target, metadata, &file)?;
         }
         file.sync_all()?;
         drop(file);
@@ -234,20 +240,192 @@ fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) ->
     Ok(())
 }
 
-/// Copies the extended attributes and access control list of `from` onto `to`. Best effort: the
-/// contents matter, these do not have to come along.
-#[cfg(target_os = "macos")]
-fn copy_metadata(from: &Path, to: &File) {
-    use std::os::fd::AsRawFd;
-    let Ok(source) = File::open(from) else { return };
-    // SAFETY: both descriptors are open for the duration of the call, and a null state is allowed.
-    unsafe {
-        libc::fcopyfile(source.as_raw_fd(), to.as_raw_fd(), std::ptr::null_mut(), libc::COPYFILE_XATTR | libc::COPYFILE_ACL);
+/// Refuses to replace `target` when it belongs to another user. The new file belongs to whoever
+/// writes it, so a file of someone else that this user may change (through its group, say) would
+/// change hands. Root gives the new file back to the owner, so it may.
+#[cfg(unix)]
+fn check_owner(target: &Path, existing: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let user = unsafe { libc::geteuid() };
+    if existing.uid() != user && user != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} belongs to another user, and replacing it would make it yours, so it was left as it is. Save a copy instead.", target.display()),
+        ));
     }
+    Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn copy_metadata(_from: &Path, _to: &File) {}
+/// Gives `staged`, the new file about to replace `target`, what decides who may use `target` (see
+/// [`write_replacing`]). Fails, so that nothing is replaced, where the new file would otherwise
+/// let others do more than the old one did.
+#[cfg(unix)]
+fn keep_access(target: &Path, existing: &fs::Metadata, staged: &File) -> io::Result<()> {
+    use std::os::unix::fs::{fchown, MetadataExt, PermissionsExt};
+    let created = staged.metadata()?;
+    // Only root can give a file away; `check_owner` has made sure that any other user owns it.
+    let owner = Some(existing.uid()).filter(|&uid| uid != created.uid());
+    let group = Some(existing.gid()).filter(|&gid| gid != created.gid());
+    // Before the permission bits: a new owner or group takes the set-user and set-group bits off.
+    if owner.is_some() || group.is_some() {
+        if let Err(e) = fchown(staged, owner, group) {
+            if group_allows_more(existing.mode()) {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{} is shared with its group, which the new file could not be given ({e}), so it was left as it is: the new file would have been shared with another group.",
+                        target.display()
+                    ),
+                ));
+            }
+        }
+    }
+    copy_platform_metadata(target, staged, existing)?;
+    staged.set_permissions(fs::Permissions::from_mode(existing.mode() & 0o7777))
+}
+
+#[cfg(not(unix))]
+fn keep_access(_target: &Path, existing: &fs::Metadata, staged: &File) -> io::Result<()> {
+    staged.set_permissions(existing.permissions())
+}
+
+/// True when the group permission bits of `mode` allow something its bits for everyone else do
+/// not: a file like that, given another group, lets that group's members in.
+#[cfg(unix)]
+fn group_allows_more(mode: u32) -> bool {
+    (mode >> 3) & 0o7 & !mode & 0o7 != 0
+}
+
+/// Copies the access control list, extended attributes and the hidden and no-backup flags of
+/// `target` onto `staged`. Attributes and flags come along as far as they can; the access control
+/// list has to, or this fails.
+#[cfg(target_os = "macos")]
+fn copy_platform_metadata(target: &Path, staged: &File, existing: &fs::Metadata) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::macos::fs::MetadataExt;
+    if let Ok(source) = File::open(target) {
+        // SAFETY: both descriptors are open for the duration of the call, and a null state is allowed.
+        unsafe {
+            libc::fcopyfile(source.as_raw_fd(), staged.as_raw_fd(), std::ptr::null_mut(), libc::COPYFILE_XATTR | libc::COPYFILE_ACL);
+        }
+    }
+    // The new file may carry more entries, which its folder gives every new file, but none fewer.
+    if let Some(wanted) = acl::of_path(target) {
+        let given = acl::of_file(staged).unwrap_or_default();
+        if !acl::entries(&wanted).all(|entry| acl::entries(&given).any(|g| g == entry)) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("the access control list of {} could not be given to the new file, so it was left as it is", target.display()),
+            ));
+        }
+    }
+    let flags = existing.st_flags() & (libc::UF_HIDDEN | libc::UF_NODUMP);
+    if flags != 0 {
+        // SAFETY: the descriptor is open.
+        unsafe {
+            libc::fchflags(staged.as_raw_fd(), flags);
+        }
+    }
+    Ok(())
+}
+
+/// Copies the access control list of `target`, which Linux keeps in the extended attribute
+/// `system.posix_acl_access`, onto `staged`. A file system without access control lists has
+/// nothing to copy; one that has a list it cannot copy fails.
+#[cfg(target_os = "linux")]
+fn copy_platform_metadata(target: &Path, staged: &File, _existing: &fs::Metadata) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let name = c"system.posix_acl_access";
+    let path = CString::new(target.as_os_str().as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let refused = |e: io::Error| {
+        io::Error::new(e.kind(), format!("the access control list of {} could not be given to the new file ({e}), so it was left as it is", target.display()))
+    };
+    // SAFETY: valid NUL-terminated strings; a null buffer of length 0 asks for the size.
+    let size = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(()),
+            _ => Err(refused(error)),
+        };
+    }
+    let mut value = vec![0u8; size as usize];
+    // SAFETY: as above, with a writable buffer of the given length.
+    let read = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+    if read < 0 {
+        return Err(refused(io::Error::last_os_error()));
+    }
+    // SAFETY: the descriptor is open, and the value is a buffer of the given length.
+    let set = unsafe { libc::fsetxattr(staged.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), read as usize, 0) };
+    if set != 0 {
+        return Err(refused(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn copy_platform_metadata(_target: &Path, _staged: &File, _existing: &fs::Metadata) -> io::Result<()> {
+    Ok(())
+}
+
+/// Access control lists on macOS, which the libc crate has no bindings for.
+#[cfg(target_os = "macos")]
+mod acl {
+    use std::ffi::{c_char, c_int, c_void, CStr, CString};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    /// `ACL_TYPE_EXTENDED` from <sys/acl.h>, the kind of list macOS keeps.
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+
+    extern "C" {
+        fn acl_get_file(path: *const c_char, kind: c_int) -> *mut c_void;
+        fn acl_get_fd_np(fd: c_int, kind: c_int) -> *mut c_void;
+        fn acl_to_text(acl: *mut c_void, length: *mut isize) -> *mut c_char;
+        fn acl_free(object: *mut c_void) -> c_int;
+    }
+
+    /// The access control list of the file at `path`, as text; `None` when it has none.
+    pub fn of_path(path: &Path) -> Option<String> {
+        let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: a valid NUL-terminated path.
+        text(unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) })
+    }
+
+    /// The access control list of an open file, as text; `None` when it has none.
+    pub fn of_file(file: &std::fs::File) -> Option<String> {
+        // SAFETY: the descriptor is open.
+        text(unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) })
+    }
+
+    /// The entries of a list given as text: every line but the header.
+    pub fn entries(text: &str) -> impl Iterator<Item = &str> {
+        text.lines().filter(|line| !line.starts_with("!#acl"))
+    }
+
+    /// `acl`, which this frees, as text.
+    fn text(acl: *mut c_void) -> Option<String> {
+        if acl.is_null() {
+            return None;
+        }
+        // SAFETY: `acl` is a list one of the functions above returned; it and its text are each
+        // freed once, the text after it is copied.
+        unsafe {
+            let text = acl_to_text(acl, std::ptr::null_mut());
+            acl_free(acl);
+            if text.is_null() {
+                return None;
+            }
+            let owned = CStr::from_ptr(text).to_string_lossy().into_owned();
+            acl_free(text.cast());
+            Some(owned)
+        }
+    }
+}
 
 /// The file `path` finally refers to after following symbolic links, even when that file does not
 /// exist yet.
@@ -477,6 +655,59 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), b"original");
             assert_eq!(names(&dir), ["doc.pdf"]);
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_file_keeps_its_group() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = scratch("group");
+        let path = dir.join("shared.pdf");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let default = fs::metadata(&path).unwrap().gid();
+        // Another group this user is in, which a new file in the folder would not get.
+        let mut groups = vec![0 as libc::gid_t; 256];
+        // SAFETY: a buffer of the length given.
+        let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        groups.truncate(count.max(0) as usize);
+        let other = groups.into_iter().filter(|&g| g != default).find(|&g| std::os::unix::fs::chown(&path, None, Some(g)).is_ok());
+        let Some(other) = other else {
+            eprintln!("skipped: this user is in no other group");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        };
+        write_replacing(&path, b"new").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!((metadata.gid(), metadata.mode() & 0o777), (other, 0o640));
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_that_would_let_more_people_in_is_told_apart() {
+        assert!(group_allows_more(0o640) && group_allows_more(0o664) && group_allows_more(0o674));
+        assert!(!group_allows_more(0o600) && !group_allows_more(0o644) && !group_allows_more(0o604) && !group_allows_more(0o666));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_access_control_list_comes_along() {
+        let dir = scratch("acl");
+        let path = dir.join("restricted.pdf");
+        fs::write(&path, b"old").unwrap();
+        let list = |path: &Path| {
+            let output = std::process::Command::new("/bin/ls").arg("-le").arg(path).output().unwrap();
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        let added = std::process::Command::new("/bin/chmod").args(["+a", "user:nobody deny read"]).arg(&path).status().unwrap();
+        assert!(added.success());
+        assert!(list(&path).contains("user:nobody deny read"));
+        write_replacing(&path, b"new").unwrap();
+        assert!(list(&path).contains("user:nobody deny read"), "{}", list(&path));
+        assert_eq!(fs::read(&path).unwrap(), b"new");
         let _ = fs::remove_dir_all(&dir);
     }
 
