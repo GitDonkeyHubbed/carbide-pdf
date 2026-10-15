@@ -40,6 +40,8 @@ target/release/carbide-gui [file.pdf]
 
 `cargo build --release` writes `target/release/carbide` and `target/release/carbide-gui`. `carbide-gui` opens the PDF named on the command line, if one is given.
 
+Most tests need PDFium. Set `CARBIDE_PDFIUM_LIB` (see Requirements and setup) before `cargo test`, otherwise the tests that render pages or extract text fail or skip. The OCR tests need the models as well: set `CARBIDE_OCR_MODELS` to the folder that holds them.
+
 ## Features
 
 | Feature | Engine module | CLI command | In GUI? |
