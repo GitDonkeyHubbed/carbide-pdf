@@ -523,8 +523,15 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                                 let role = if report.document_time_stamp { "Time stamp authority" } else { "Signer" };
                                 ui.label(format!("{role}: {who}"));
                             }
-                            if let Some(time) = time_stamp_time(report) {
-                                ui.label(format!("Time stamp: {time}"));
+                            if let Some(time) = local_time(report.time_stamp_time.as_deref()) {
+                                ui.label(if report.time_stamp_trusted() {
+                                    format!("Time stamp: {time}")
+                                } else {
+                                    format!("Time stamp (authority not confirmed): {time}")
+                                });
+                            }
+                            if let Some(time) = local_time(report.signing_time.as_deref()) {
+                                ui.weak(format!("Signing time in signature (unverified): {time}"));
                             }
                             if let Some(claimed) = &report.claimed_name {
                                 ui.weak(format!("Name in signature (unverified): {claimed}"));
@@ -1579,8 +1586,7 @@ fn recovery_panel(app: &mut CarbideApp, ctx: &egui::Context, question: &mut Opti
     }
 }
 
-/// The time a document time stamp gives, in local time.
-fn time_stamp_time(report: &SignatureReport) -> Option<String> {
-    let time = report.signing_time.as_deref().filter(|_| report.document_time_stamp)?;
-    Some(carbide_engine::revisions::pdf_date_to_local(time)).filter(|t| !t.is_empty())
+/// A PDF date from a signature report, in local time.
+fn local_time(date: Option<&str>) -> Option<String> {
+    Some(carbide_engine::revisions::pdf_date_to_local(date?)).filter(|t| !t.is_empty())
 }

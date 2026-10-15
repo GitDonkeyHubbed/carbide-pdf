@@ -875,7 +875,12 @@ pub struct SignatureReport {
     pub sub_filter: Option<String>,
     pub reason: Option<String>,
     pub location: Option<String>,
+    /// The signing time the signature claims (its `/M`), which nothing verifies. A document time
+    /// stamp has none: its time is in `time_stamp_time`.
     pub signing_time: Option<String>,
+    /// The time a time stamp whose token verifies gives: a document time stamp's own, or the one
+    /// carried by a signature. See [`SignatureReport::time_stamp_trusted`].
+    pub time_stamp_time: Option<String>,
     pub validity: Validity,
     pub detail: Detail,
     /// The file continues past the end of this signature's byte range.
@@ -918,6 +923,7 @@ impl SignatureReport {
             reason: None,
             location: None,
             signing_time: None,
+            time_stamp_time: None,
             validity: Validity::Unknown,
             detail: Detail::NotVerified,
             modified_after_signing: false,
@@ -931,15 +937,26 @@ impl SignatureReport {
     }
 
     /// Takes what the signature dictionary `v` says about itself: its handler, type, and the
-    /// signer's claims (name, reason, location, time).
+    /// signer's claims (name, reason, location, time). A document time stamp's time is the one in
+    /// its token, and only once that verifies: a `/M` beside it is not taken.
     fn describe(&mut self, v: &Dictionary) {
         self.sub_filter = v.get(b"SubFilter").ok().and_then(|o| o.as_name().ok()).map(|n| String::from_utf8_lossy(n).into_owned());
         self.claimed_name = text_of(v, b"Name");
         self.reason = text_of(v, b"Reason");
         self.location = text_of(v, b"Location");
-        self.signing_time = text_of(v, b"M");
         self.document_time_stamp = v.get(b"Type").ok().and_then(|o| o.as_name().ok()) == Some(b"DocTimeStamp".as_slice())
             || self.sub_filter.as_deref() == Some("ETSI.RFC3161");
+        self.signing_time = if self.document_time_stamp { None } else { text_of(v, b"M") };
+    }
+
+    /// True when the time stamp that gives `time_stamp_time` comes from a trusted authority whose
+    /// certificate was valid and for time stamping at that time.
+    pub fn time_stamp_trusted(&self) -> bool {
+        if self.document_time_stamp {
+            self.validity == Validity::Valid
+        } else {
+            self.embedded_timestamp_trusted
+        }
     }
 
     /// The panel's status line.
@@ -1654,6 +1671,7 @@ fn verify_one(
     if let Some(TokenResult::Verified { time, standing, .. }) = embedded {
         report.has_embedded_timestamp = true;
         report.embedded_timestamp_trusted = is_trusted(standing);
+        report.time_stamp_time = Some(pdf_date(time));
         timestamp_time = report.embedded_timestamp_trusted.then_some(time);
     }
 
@@ -1705,13 +1723,18 @@ fn verify_document_timestamp(
         TokenResult::Unsupported => (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm),
         TokenResult::Verified { time, signer, standing } => {
             report.signer = signer;
-            report.signing_time = Some(time.format("D:%Y%m%d%H%M%SZ").to_string());
+            report.time_stamp_time = Some(pdf_date(time));
             (if is_trusted(standing) { Validity::Valid } else { Validity::ValidityUnknown }, standing)
         }
     };
     report.validity = validity;
     report.detail = detail;
     report
+}
+
+/// `time` as a PDF date string.
+fn pdf_date(time: DateTime<Utc>) -> String {
+    time.format("D:%Y%m%d%H%M%SZ").to_string()
 }
 
 /// True for the details that mean a certificate is trusted.

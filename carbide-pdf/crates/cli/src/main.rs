@@ -1037,8 +1037,15 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 if let Some(who) = &r.signer {
                     println!("  {}: {who}", if r.document_time_stamp { "time stamp authority" } else { "signer" });
                 }
-                if let Some(time) = r.signing_time.as_deref().filter(|_| r.document_time_stamp) {
-                    println!("  time stamp: {}", carbide_engine::revisions::pdf_date_to_local(time));
+                let local = |date: Option<&str>| {
+                    Some(carbide_engine::revisions::pdf_date_to_local(date?)).filter(|time| !time.is_empty())
+                };
+                if let Some(time) = local(r.time_stamp_time.as_deref()) {
+                    let label = if r.time_stamp_trusted() { "time stamp" } else { "time stamp (authority not confirmed)" };
+                    println!("  {label}: {time}");
+                }
+                if let Some(time) = local(r.signing_time.as_deref()) {
+                    println!("  signing time in signature (unverified): {time}");
                 }
                 if let Some(claimed) = &r.claimed_name {
                     println!("  name in signature (unverified): {claimed}");

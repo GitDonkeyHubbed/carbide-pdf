@@ -4607,10 +4607,12 @@ fn an_embedded_time_stamp_is_reported_only_when_it_verifies() {
     assert_eq!(reports[0].validity, Validity::Valid);
     assert!(reports[0].has_embedded_timestamp && reports[0].embedded_timestamp_trusted);
     assert!(reports[0].description_lines().contains(&sig_messages::TIME_STAMPED));
+    assert!(reports[0].time_stamp_time.as_deref().is_some_and(|t| t.contains("20260101")) && reports[0].time_stamp_trusted());
 
     // The same time stamp when its authority is not trusted: present, but not vouched for.
     let reports = verify(&signed, &trust_test_identity());
     assert!(reports[0].has_embedded_timestamp && !reports[0].embedded_timestamp_trusted);
+    assert!(reports[0].time_stamp_time.is_some() && !reports[0].time_stamp_trusted());
     let lines = reports[0].description_lines();
     assert!(lines.contains(&sig_messages::TIME_STAMP_UNCONFIRMED) && !lines.contains(&sig_messages::TIME_STAMPED));
 
@@ -4620,7 +4622,7 @@ fn an_embedded_time_stamp_is_reported_only_when_it_verifies() {
     options.timestamp = Some(&wrong);
     let reports = verify(&doc.sign(&base, &options).unwrap(), &tsa_trust());
     assert_eq!(reports[0].validity, Validity::Valid);
-    assert!(!reports[0].has_embedded_timestamp);
+    assert!(!reports[0].has_embedded_timestamp && reports[0].time_stamp_time.is_none());
     let lines = reports[0].description_lines();
     assert!(!lines.contains(&sig_messages::TIME_STAMPED) && !lines.contains(&sig_messages::TIME_STAMP_UNCONFIRMED));
 
@@ -4672,7 +4674,8 @@ fn a_document_time_stamp_verifies_as_a_time_stamp() {
     assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
     assert_eq!(reports[0].status_line(), sig_messages::TIMESTAMP_VALID);
     assert_eq!(reports[0].signer.as_deref(), Some("Test TSA"));
-    assert!(reports[0].signing_time.as_deref().is_some_and(|t| t.contains("20260101")));
+    assert!(reports[0].time_stamp_time.as_deref().is_some_and(|t| t.contains("20260101")) && reports[0].time_stamp_trusted());
+    assert_eq!(reports[0].signing_time, None);
     assert!(reports[0].description_lines().contains(&sig_messages::DOCUMENT_TIME_STAMPED));
     assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_ALL_VALID));
 
@@ -4681,6 +4684,7 @@ fn a_document_time_stamp_verifies_as_a_time_stamp() {
     let untrusted = verify(&stamped, &TrustStore::default());
     assert_eq!((untrusted[0].validity, untrusted[0].detail), (Validity::ValidityUnknown, Detail::DigestOkUntrusted));
     assert_eq!(untrusted[0].status_line(), sig_messages::TIMESTAMP_VALIDITY_UNKNOWN);
+    assert!(untrusted[0].time_stamp_time.is_some() && !untrusted[0].time_stamp_trusted());
     let lines = untrusted[0].description_lines();
     assert!(lines.contains(&sig_messages::TIMESTAMP_AUTHORITY_UNKNOWN) && !lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED));
     assert_eq!(notice_text(&untrusted), Some(sig_messages::NOTICE_TIMESTAMP_NOT_CONFIRMED));
@@ -4692,6 +4696,29 @@ fn a_document_time_stamp_verifies_as_a_time_stamp() {
     let reports = verify(&tampered, &tsa_trust());
     assert_eq!(reports[0].validity, Validity::Invalid);
     assert!(!reports[0].description_lines().contains(&sig_messages::DOCUMENT_TIME_STAMPED));
+}
+
+/// `signed`, which holds one ordinary signature, relabelled as a document time stamp. The name
+/// keeps its length, so the byte range still fits, but what the signature holds is no time-stamp
+/// token.
+fn as_document_time_stamp(signed: &[u8]) -> Vec<u8> {
+    let at = signed.windows(19).rposition(|w| w == b"adbe.pkcs7.detached").unwrap();
+    let mut relabelled = signed.to_vec();
+    relabelled[at..at + 19].copy_from_slice(b"ETSI.RFC3161       ");
+    relabelled
+}
+
+#[test]
+fn a_document_time_stamp_that_does_not_verify_gives_no_time() {
+    // The dictionary carries a /M, which is no time stamp's time.
+    let mut doc = text_pdf(&[&["no time"]]);
+    let base = file_bytes(&mut doc);
+    let options = SignOptions { signing_time: Some("D:20000101000000Z".into()), ..sign_options(SubFilter::Pkcs7Detached) };
+    let stamped = as_document_time_stamp(&doc.sign(&base, &options).unwrap());
+    let report = verify(&stamped, &tsa_trust()).remove(0);
+    assert!(report.document_time_stamp);
+    assert_eq!((report.validity, report.detail), (Validity::Invalid, Detail::Corrupt));
+    assert_eq!((report.signing_time, report.time_stamp_time), (None, None));
 }
 
 #[test]
@@ -4743,6 +4770,7 @@ fn time_stamp_tokens_that_cannot_be_checked_or_name_another_certificate_are_not_
     put_signature_value(&mut sha224, &tsa.token(SHA224_OID, &digest, None));
     let report = verify(&sha224, &tsa_trust()).remove(0);
     assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm));
+    assert_eq!(report.time_stamp_time, None);
     let lines = report.description_lines();
     assert!(!lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED) && !lines.contains(&sig_messages::CORRUPTED), "{lines:?}");
 

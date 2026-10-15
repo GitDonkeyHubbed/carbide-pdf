@@ -800,6 +800,9 @@ dependencies = [
  "carbide-engine",
  "chrono",
  "clap",
+ "rand 0.8.8",
+ "rcgen",
+ "rsa",
 ]
 
 [[package]]

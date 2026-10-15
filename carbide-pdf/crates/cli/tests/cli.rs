@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use carbide_engine::signature::{Identity, SignOptions};
 use carbide_engine::{Error, Pdf, ProtectionOptions};
 
 fn carbide(args: &[&str]) -> Output {
@@ -482,5 +483,58 @@ fn inputs_that_cannot_work_are_refused_with_messages_that_say_why() {
     if !output.status.success() {
         assert_eq!(stderr(&output).matches("rendering backend").count(), 1, "{}", stderr(&output));
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ---- verify ------------------------------------------------------------------------------------
+
+/// A signing identity named `name` whose certificate is valid from 1 January of `from` to 1 January
+/// of `until`, and that certificate as PEM.
+fn identity(name: &str, (from, until): (i32, i32)) -> (Identity, String) {
+    use rsa::pkcs8::EncodePrivateKey;
+    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(rcgen::DnType::CommonName, name);
+    params.not_before = rcgen::date_time_ymd(from, 1, 1);
+    params.not_after = rcgen::date_time_ymd(until, 1, 1);
+    let cert = params.self_signed(&pair).unwrap();
+    (Identity::new(vec![cert.der().to_vec()], key).unwrap(), cert.pem())
+}
+
+/// A one-page file showing `label`, signed by `identity` with the signing time `time`.
+fn signed(identity: &Identity, label: &str, time: &str) -> Vec<u8> {
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    pdf.add_text_box(0, 72.0, 720.0, label, 18.0).unwrap();
+    let base = pdf.to_bytes().unwrap();
+    let pdf = Pdf::from_bytes(&base).unwrap();
+    pdf.sign(&base, &SignOptions { identity: Some(identity), signing_time: Some(time.into()), ..Default::default() }).unwrap()
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn verify_shows_a_time_stamp_time_only_from_a_time_stamp_that_verifies() {
+    let dir = scratch("time-stamp-time");
+    let (identity, _) = identity("Some Signer", (2020, 2040));
+    // An ordinary signature relabelled as a document time stamp: its /M is no time stamp's time.
+    let mut bytes = signed(&identity, "stamped", "D:20000101000000Z");
+    let at = bytes.windows(19).rposition(|w| w == b"adbe.pkcs7.detached").unwrap();
+    bytes[at..at + 19].copy_from_slice(b"ETSI.RFC3161       ");
+    let file = dir.join("stamped.pdf");
+    std::fs::write(&file, bytes).unwrap();
+    let output = carbide(&["verify", file.to_str().unwrap()]);
+    assert!(stdout(&output).contains("The time stamp is not valid"), "{}", stdout(&output));
+    assert!(!stdout(&output).contains("  time stamp") && !stdout(&output).contains("2000"), "{}", stdout(&output));
+
+    // An ordinary signature's own time is shown as what it claims.
+    let file = dir.join("signed.pdf");
+    std::fs::write(&file, signed(&identity, "signed", "D:20200601120000Z")).unwrap();
+    let output = carbide(&["verify", file.to_str().unwrap()]);
+    assert!(stdout(&output).contains("signing time in signature (unverified): 2020-06-0"), "{}", stdout(&output));
+    assert!(!stdout(&output).contains("  time stamp"), "{}", stdout(&output));
     let _ = std::fs::remove_dir_all(dir);
 }
