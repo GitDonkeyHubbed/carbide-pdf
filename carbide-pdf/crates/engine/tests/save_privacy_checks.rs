@@ -30,16 +30,35 @@ fn shared_resources_pdf(
     build: impl FnOnce(&mut Document) -> lopdf::Dictionary,
     contents: &[&str],
 ) -> Pdf {
+    let parts: Vec<Vec<&str>> = contents.iter().map(|c| vec![*c]).collect();
+    let parts: Vec<&[&str]> = parts.iter().map(Vec::as_slice).collect();
+    split_contents_pdf(build, &parts)
+}
+
+/// Like [`shared_resources_pdf`], with each page's content split over the streams given for it.
+fn split_contents_pdf(
+    build: impl FnOnce(&mut Document) -> lopdf::Dictionary,
+    contents: &[&[&str]],
+) -> Pdf {
     let mut doc = Document::with_version("1.7");
     let pages_id = doc.new_object_id();
     let resources = build(&mut doc);
     let resources_id = doc.add_object(resources);
     let mut kids = Vec::new();
-    for content in contents {
-        let content_id = doc.add_object(Stream::new(
-            lopdf::Dictionary::new(),
-            content.as_bytes().to_vec(),
-        ));
+    for parts in contents {
+        let mut streams: Vec<Object> = parts
+            .iter()
+            .map(|part| {
+                Object::Reference(doc.add_object(Stream::new(
+                    lopdf::Dictionary::new(),
+                    part.as_bytes().to_vec(),
+                )))
+            })
+            .collect();
+        let content_id = match streams.len() {
+            1 => streams.remove(0),
+            _ => Object::Array(streams),
+        };
         kids.push(Object::Reference(doc.add_object(dictionary! {
             "Type" => "Page", "Parent" => pages_id, "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
             "Contents" => content_id, "Resources" => resources_id,
@@ -212,6 +231,36 @@ fn unused_image_of_a_type3_font_written_into_a_shared_font_list_does_not_survive
     assert!(
         !contains(&saved, SECRET),
         "the unused image is still in the file"
+    );
+}
+
+#[test]
+fn font_chosen_across_two_content_streams_of_a_page_is_kept() {
+    // The kept page's content is split over two streams, between the font's name and the `Tf`
+    // that chooses it: the page's content is the two read as one.
+    let mut pdf = split_contents_pdf(
+        |doc| {
+            let font = helvetica(doc);
+            let image = secret_image(doc);
+            dictionary! {
+                "Font" => dictionary! { "F1" => font },
+                "XObject" => dictionary! { "Im1" => image },
+            }
+        },
+        &[
+            &["BT /F1 12 ", "Tf 10 10 Td (kept) Tj ET"],
+            &["q 100 0 0 100 0 0 cm /Im1 Do Q"],
+        ],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the kept page lost its font"
+    );
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
     );
 }
 

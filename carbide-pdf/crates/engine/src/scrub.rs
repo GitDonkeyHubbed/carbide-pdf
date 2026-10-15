@@ -299,6 +299,7 @@ impl Pdf {
         let mut scan = NameScan {
             budget: DecodeBudget::for_page(),
             names: HashMap::new(),
+            joined: HashMap::new(),
             trimmed: HashSet::new(),
         };
         // Forms, patterns and Type 3 fonts with resources of their own, trimmed in turn.
@@ -364,16 +365,10 @@ impl Pdf {
         resources: &Dictionary,
         scan: &mut NameScan,
     ) -> Result<Option<Uses>> {
-        let mut uses = HashSet::new();
-        for stream in self.doc.get_page_contents(page) {
-            let Ok(content) = self.doc.get_object(stream).and_then(Object::as_stream) else {
-                return Ok(None);
-            };
-            let Some(found) = scan.uses_in(Some(stream), content)? else {
-                return Ok(None);
-            };
-            uses.extend(found);
-        }
+        let streams = self.doc.get_page_contents(page);
+        let Some(uses) = scan.page_uses(&self.doc, streams)? else {
+            return Ok(None);
+        };
         self.scope_uses(uses, resources, scan)
     }
 
@@ -638,11 +633,51 @@ impl Pdf {
 struct NameScan {
     budget: DecodeBudget,
     names: HashMap<ObjectId, Option<Uses>>,
+    /// What the content of pages split over several streams uses, by the streams, in order.
+    joined: HashMap<Vec<ObjectId>, Option<Uses>>,
     /// Forms, patterns and fonts whose own resources were already trimmed.
     trimmed: HashSet<ObjectId>,
 }
 
 impl NameScan {
+    /// The resources a page's content, the streams `streams`, uses; `None` when one cannot be
+    /// decoded, and an error when decoding them would go past the budget. The streams are read
+    /// as one, as the page's content is: an operator can take its operands from the stream
+    /// before its own, so what one stream uses on its own is not what it uses on a page.
+    fn page_uses(&mut self, doc: &Document, streams: Vec<ObjectId>) -> Result<Option<Uses>> {
+        if let [id] = streams[..] {
+            let Ok(content) = doc.get_object(id).and_then(Object::as_stream) else {
+                return Ok(None);
+            };
+            return self.uses_in(Some(id), content);
+        }
+        if let Some(found) = self.joined.get(&streams) {
+            return Ok(found.clone());
+        }
+        let mut joined = Vec::new();
+        let mut readable = true;
+        for id in &streams {
+            let Ok(content) = doc.get_object(*id).and_then(Object::as_stream) else {
+                readable = false;
+                break;
+            };
+            match self.budget.stream(content) {
+                Ok(mut plain) => {
+                    joined.append(&mut plain);
+                    joined.push(b'\n');
+                }
+                Err(error @ Error::TooLarge(_)) => return Err(error),
+                Err(_) => {
+                    readable = false;
+                    break;
+                }
+            }
+        }
+        let found = readable.then(|| uses_in(&joined));
+        self.joined.insert(streams, found.clone());
+        Ok(found)
+    }
+
     /// The resources `stream` (object `id`, when it is one of its own) uses; `None` when it
     /// cannot be decoded, and an error when decoding it would go past the budget.
     fn uses_in(&mut self, id: Option<ObjectId>, stream: &lopdf::Stream) -> Result<Option<Uses>> {
