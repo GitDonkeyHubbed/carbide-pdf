@@ -1210,13 +1210,13 @@ fn protecting_the_open_file_keeps_it_protected_from_then_on() {
     app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
     let options = ProtectionOptions::new("open pw", "owner pw");
     app.protect_to(&a, &options);
-    let protected = std::fs::read(&a).unwrap();
-    assert!(matches!(Pdf::from_bytes(&protected), Err(carbide_engine::Error::PasswordRequired)));
-    let key = file_key(&protected, "owner pw");
+    let written = std::fs::read(&a).unwrap();
+    assert!(matches!(Pdf::from_bytes(&written), Err(carbide_engine::Error::PasswordRequired)));
+    let key = file_key(&written, "owner pw");
     // The document is that file now, the edit made before included.
     let doc = app.doc.as_ref().unwrap();
     assert!(doc.is_protected() && !doc.dirty);
-    assert_eq!(doc.saved.as_ref().unwrap().bytes(), protected.as_slice());
+    assert_eq!(doc.saved.as_ref().unwrap().bytes(), written.as_slice());
     assert_eq!(doc.pdf.page_rotation(0).unwrap(), 90);
 
     // Later edits get no unencrypted recovery copy, and Save and Save As keep the protection.
@@ -1255,4 +1255,14 @@ fn protecting_the_open_file_keeps_it_protected_from_then_on() {
     let private = dir.join("AutoSave").join("copy.pdf");
     app.protect_to(&private, &options);
     assert!(!private.exists());
+
+    // A protected document protected again over its own file goes on with the new passwords.
+    let locked = protected(&dir, "locked.pdf", &["LOCKED"], "old pw");
+    assert!(app.open_with_password(locked.clone(), std::fs::read(&locked).unwrap(), "old pw".into()));
+    app.protect_to(&locked, &ProtectionOptions::new("new pw", "new owner"));
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    app.save();
+    let saved = std::fs::read(&locked).unwrap();
+    assert!(Pdf::from_bytes_with_password(&saved, "old pw").is_err(), "the old password still opens it");
+    assert_eq!(Pdf::from_bytes_with_password(&saved, "new pw").unwrap().page_rotation(0).unwrap(), 90);
 }
