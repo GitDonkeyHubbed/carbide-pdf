@@ -4793,6 +4793,46 @@ fn a_time_stamp_authority_refuses_credentials_over_plain_http() {
     assert!(err.contains("https") || err.contains("insecure"), "{err}");
 }
 
+#[test]
+fn credentials_written_into_a_time_stamp_url_never_go_over_plain_http() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    // A user and password in the URL itself are refused before anything is sent.
+    for url in [format!("http://user:secretpw@{address}/"), format!("HTTP://user@{address}/tsa?x=1")] {
+        let source = HttpTimestampSource { url: url.clone(), username: None, password: None };
+        let err = source.token_for_digest(&[0u8; 32]).unwrap_err().to_string();
+        assert!(err.contains("https://"), "{url}: {err}");
+    }
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "the authority was contacted"
+    );
+
+    // An "@" past the host is no user name: that request goes out, without credentials.
+    listener.set_nonblocking(false).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        let (mut request, mut chunk) = (Vec::new(), [0u8; 4096]);
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..n]);
+        }
+        let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        String::from_utf8_lossy(&request).to_ascii_lowercase()
+    });
+    let source = HttpTimestampSource { url: format!("http://{address}/stamp@here"), username: None, password: None };
+    assert!(source.token_for_digest(&[0u8; 32]).is_err());
+    let request = server.join().unwrap();
+    assert!(request.starts_with("post /stamp@here"), "{request}");
+    assert!(!request.contains("authorization") && !request.contains("secretpw"), "{request}");
+}
+
 /// Answers `requests` HTTP requests on localhost, each with the bytes `answer` gives for its body,
 /// and returns the URL to post to.
 fn serve(requests: usize, answer: impl Fn(&[u8]) -> Vec<u8> + Send + 'static) -> String {

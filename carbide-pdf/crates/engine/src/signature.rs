@@ -228,6 +228,8 @@ pub trait TimestampSource {
 }
 
 /// A time-stamp authority reached over HTTP (RFC 3161), optionally with basic authentication.
+/// Credentials, given here or written into the URL (`https://user:password@host/`), are only ever
+/// sent over https.
 pub struct HttpTimestampSource {
     pub url: String,
     pub username: Option<String>,
@@ -333,7 +335,9 @@ impl TimestampSource for HttpTimestampSource {
     fn token_for_digest(&self, digest: &[u8; 32]) -> Result<Vec<u8>> {
         use base64::Engine;
         let secure = self.url.trim_start().to_ascii_lowercase().starts_with("https://");
-        let authenticating = self.username.as_ref().is_some_and(|u| !u.is_empty()) || self.password.is_some();
+        let authenticating = self.username.as_ref().is_some_and(|u| !u.is_empty())
+            || self.password.is_some()
+            || url_has_credentials(&self.url);
         if authenticating && !secure {
             return Err(Error::Other(
                 "refusing to send time stamp credentials over an insecure connection: use an https:// URL".into(),
@@ -363,6 +367,13 @@ impl TimestampSource for HttpTimestampSource {
         check_timestamp_response(&token, digest, &nonce)?;
         Ok(token)
     }
+}
+
+/// True when `url` names a user, and perhaps a password, before its host
+/// (`http://user:password@host/`): the HTTP client sends those as basic authentication.
+fn url_has_credentials(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().is_some_and(|authority| authority.contains('@'))
 }
 
 // ---- CMS -----------------------------------------------------------------------------------
