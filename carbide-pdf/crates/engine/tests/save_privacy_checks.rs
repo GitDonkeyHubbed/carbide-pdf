@@ -637,10 +637,12 @@ fn deleting_a_page_does_not_copy_the_images_of_the_pages_that_stay() {
     );
 }
 
-#[test]
-fn an_appearance_without_resources_keeps_what_it_draws_from_the_page() {
-    // The kept page's annotation has an appearance with no resources of its own, so the logo it
-    // draws is looked up in the page's resources; the page's content never draws it.
+/// Deletes the second page of a document whose first page has an annotation appearance that draws
+/// a logo found only in the page's resources, and checks the logo stays. The appearance's
+/// `/Resources` entry is whatever `entry` makes: none at all, or one that is no dictionary.
+fn appearance_keeps_what_it_draws_from_the_page(
+    entry: impl FnOnce(&mut Document) -> Option<Object>,
+) {
     const LOGO: &[u8] = b"LOGO-PAYLOAD-91c2";
     let mut doc = Document::with_version("1.7");
     let pages_id = doc.new_object_id();
@@ -657,11 +659,15 @@ fn an_appearance_without_resources_keeps_what_it_draws_from_the_page() {
     let shared = doc.add_object(dictionary! {
         "XObject" => dictionary! { "Logo" => logo, "Im1" => image },
     });
+    let mut form = dictionary! {
+        "Type" => "XObject", "Subtype" => "Form",
+        "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+    };
+    if let Some(resources) = entry(&mut doc) {
+        form.set("Resources", resources);
+    }
     let appearance = doc.add_object(Stream::new(
-        dictionary! {
-            "Type" => "XObject", "Subtype" => "Form",
-            "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
-        },
+        form,
         b"q 100 0 0 100 0 0 cm /Logo Do Q".to_vec(),
     ));
     let annotation = doc.add_object(dictionary! {
@@ -704,6 +710,22 @@ fn an_appearance_without_resources_keeps_what_it_draws_from_the_page() {
         !contains(&saved, SECRET),
         "the deleted page's image is still in the file"
     );
+}
+
+#[test]
+fn an_appearance_without_resources_keeps_what_it_draws_from_the_page() {
+    // The kept page's annotation has an appearance with no resources of its own, so the logo it
+    // draws is looked up in the page's resources; the page's content never draws it.
+    appearance_keeps_what_it_draws_from_the_page(|_| None);
+}
+
+#[test]
+fn an_appearance_with_null_resources_keeps_what_it_draws_from_the_page() {
+    // A null entry, or a reference to nothing, is the same as none.
+    appearance_keeps_what_it_draws_from_the_page(|_| Some(Object::Null));
+    appearance_keeps_what_it_draws_from_the_page(|doc| {
+        Some(Object::Reference(doc.add_object(Object::Null)))
+    });
 }
 
 // ---- legacy passwords ----------------------------------------------------------------------

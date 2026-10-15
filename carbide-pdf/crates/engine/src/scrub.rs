@@ -399,7 +399,7 @@ impl Pdf {
             let Ok(Object::Stream(appearance)) = self.doc.get_object(id) else {
                 continue;
             };
-            if appearance.dict.has(b"Resources") {
+            if self.has_own_resources(&appearance.dict) {
                 continue;
             }
             let Some(found) = scan.uses_in(Some(id), appearance)? else {
@@ -408,6 +408,16 @@ impl Pdf {
             uses.extend(found);
         }
         self.scope_uses(uses, resources, scan)
+    }
+
+    /// Whether `dict` has a resource dictionary of its own. An entry that is null, refers to
+    /// nothing, or is not a dictionary counts as absent, so the content draws with the resources
+    /// of what encloses it.
+    fn has_own_resources(&self, dict: &Dictionary) -> bool {
+        dict.get(b"Resources")
+            .ok()
+            .and_then(|r| self.resolved(r))
+            .is_some_and(|r| matches!(r, Object::Dictionary(_)))
     }
 
     /// `uses`, the resources some content uses directly, together with what the forms, patterns
@@ -461,7 +471,7 @@ impl Pdf {
                     if category == EXT_G_STATE {
                         if let Some(id) = self.soft_mask_form(value) {
                             if let Ok(Object::Stream(mask)) = self.doc.get_object(id) {
-                                if !mask.dict.has(b"Resources") && is_content(&mask.dict) {
+                                if !self.has_own_resources(&mask.dict) && is_content(&mask.dict) {
                                     let Some(found) = scan.uses_in(Some(id), mask)? else {
                                         return Ok(None);
                                     };
@@ -472,7 +482,8 @@ impl Pdf {
                     }
                     match resolved {
                         Object::Stream(stream)
-                            if !stream.dict.has(b"Resources") && is_content(&stream.dict) =>
+                            if !self.has_own_resources(&stream.dict)
+                                && is_content(&stream.dict) =>
                         {
                             let Some(found) = scan.uses_in(value.as_reference().ok(), stream)?
                             else {
@@ -485,7 +496,7 @@ impl Pdf {
                                 .get(b"Subtype")
                                 .and_then(Object::as_name)
                                 .is_ok_and(|s| s == b"Type3")
-                                && !font.has(b"Resources") =>
+                                && !self.has_own_resources(font) =>
                         {
                             let Object::Dictionary(procs) = font
                                 .get(b"CharProcs")
