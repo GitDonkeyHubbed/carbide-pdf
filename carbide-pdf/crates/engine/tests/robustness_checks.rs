@@ -220,11 +220,7 @@ fn what_follows_a_real_inline_image_is_still_read() {
     // Drawing something that looks like a form inside the image data is not drawing it.
     let mut pdf = blank_page_pdf();
     let f = self_drawing_form(&mut pdf);
-    page_drawing(
-        &mut pdf,
-        b"BI /W 2 /H 1 /CS /G /BPC 8 ID /F Do EI",
-        f,
-    );
+    page_drawing(&mut pdf, b"BI /W 2 /H 1 /CS /G /BPC 8 ID /F Do EI", f);
     pdf.check_drawable(0).unwrap();
 }
 
@@ -232,8 +228,7 @@ fn what_follows_a_real_inline_image_is_still_read() {
 
 /// Zlib data that decodes to `megabytes` MB of zeros.
 fn zeros_deflated(megabytes: usize) -> Vec<u8> {
-    let mut encoder =
-        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
     let block = vec![0u8; 1 << 20];
     for _ in 0..megabytes {
         encoder.write_all(&block).unwrap();
@@ -362,3 +357,75 @@ fn refused_text_recognition_does_not_prune_the_document() {
     );
 }
 
+// ---- reducing ------------------------------------------------------------------------------
+
+#[test]
+fn images_that_cannot_be_decoded_do_not_use_up_the_budget_for_those_that_can() {
+    use carbide_engine::limits::MAX_DECODED;
+
+    // A photo, uncompressed and drawn small, so that reducing shrinks it.
+    let (w, h) = (1200usize, 900usize);
+    let mut state = 12345u32;
+    let mut samples = Vec::with_capacity(w * h * 3);
+    for _ in 0..w * h * 3 {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        samples.push((state >> 24) as u8);
+    }
+    let photo_len = samples.len();
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    // Images of a filter the engine does not decode, declared so large that together they would
+    // use the whole budget for decoding images: they come first, in the order images are visited.
+    let mut left = MAX_DECODED + 32 * (photo_len + 10 * 16);
+    let mut count = 0;
+    while left > 1_000_000 {
+        count += 1;
+        let size = (left - 1_000_000).min(100_000_000);
+        left -= size;
+        doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image", "Width" => size as i64, "Height" => 1,
+                "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8, "Filter" => "LZWDecode",
+            },
+            // Different data, so that identical images are not merged into one.
+            format!("data {count}").into_bytes(),
+        ));
+    }
+    let photo = doc.add_object(
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image", "Width" => w as i64, "Height" => h as i64,
+                "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+            },
+            samples,
+        )
+        .with_compression(false),
+    );
+    let content = doc.add_object(Stream::new(
+        Dictionary::new(),
+        b"q 200 0 0 150 50 500 cm /Im1 Do Q".to_vec(),
+    ));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages_id, "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => photo } },
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(
+            dictionary! { "Type" => "Pages", "Kids" => vec![Object::Reference(page)], "Count" => 1 },
+        ),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+    let (_, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert_eq!(
+        report.images_downsampled, 1,
+        "the photo was left alone because of the images before it: {report:?}"
+    );
+}

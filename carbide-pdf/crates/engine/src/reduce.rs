@@ -582,8 +582,19 @@ fn image_budget(stored: usize) -> usize {
 }
 
 /// Decodes an 8-bit gray or RGB image, or `None` when this image should be left alone. What it
-/// decodes to is taken from `budget`; an image that would take more than is left is not decoded.
+/// decodes to is taken from `budget`; an image that would take more than is left is not decoded,
+/// and one that turns out not to be decodable gives back what was taken for it, so that images
+/// that cannot be re-encoded do not use up the budget of those that can.
 fn decode_image(doc: &Document, stream: &Stream, budget: &mut usize) -> Option<Decoded> {
+    let before = *budget;
+    let decoded = decode_within(doc, stream, budget);
+    if decoded.is_none() {
+        *budget = before;
+    }
+    decoded
+}
+
+fn decode_within(doc: &Document, stream: &Stream, budget: &mut usize) -> Option<Decoded> {
     let dict = &stream.dict;
     if matches!(dict.get(b"ImageMask"), Ok(Object::Boolean(true))) {
         return None;
