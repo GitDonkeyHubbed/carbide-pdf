@@ -363,6 +363,11 @@ impl Pdf {
             return 0;
         }
         let mut count = 0;
+        // The state a check box or radio button shows, which may be stored as a reference to a name.
+        let on = matches!(
+            dict.get(b"AS").map(|state| self.resolve(state)),
+            Ok(Object::Name(state)) if state != b"Off"
+        );
         if let Ok(dict) = self.doc.get_dictionary_mut(id) {
             // The value, its rich text, the options picked in a list (/I) and the value a reset
             // restores (/DV).
@@ -379,10 +384,6 @@ impl Pdf {
                 && match field_type.as_deref() {
                     // A check box or radio button shows its state through /AS.
                     Some(b"Btn") => {
-                        let on = dict
-                            .get(b"AS")
-                            .and_then(Object::as_name)
-                            .is_ok_and(|state| state != b"Off");
                         dict.set("AS", Object::Name(b"Off".to_vec()));
                         on
                     }

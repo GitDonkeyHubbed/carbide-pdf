@@ -1007,6 +1007,29 @@ fn removals_that_were_the_only_hidden_information_are_reported() {
     assert_eq!(report.count(HiddenItem::FormData), 2);
 }
 
+#[test]
+fn a_check_box_whose_state_is_a_reference_to_a_name_counts_as_cleared() {
+    use carbide_engine::HiddenItem;
+    // The state is stored as a reference to a name object, and the field holds no value.
+    let mut pdf = one_page(|doc, catalog, page| {
+        let state = doc.add_object(Object::Name(b"Yes".to_vec()));
+        let check = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Btn", "T" => Object::string_literal("c"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page, "AS" => state,
+        });
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![check.into()]);
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("AcroForm", dictionary! { "Fields" => vec![check.into()] });
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+}
+
 // ---- changes to annotations ----------------------------------------------------------------
 
 #[test]
