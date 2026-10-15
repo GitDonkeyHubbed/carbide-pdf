@@ -829,7 +829,7 @@ impl Pdf {
     pub fn has_signatures(&self) -> bool {
         self.doc.objects.values().any(|o| match o {
             Object::Dictionary(d) => {
-                is_signature_dictionary(d) || signature_field_value(d).is_some()
+                is_signature_dictionary(d) || signature_field_value(self, d).is_some()
             }
             _ => false,
         })
@@ -1096,10 +1096,28 @@ fn is_signature_dictionary(d: &Dictionary) -> bool {
     d.has(b"ByteRange") && d.has(b"Contents") && d.has(b"SubFilter")
 }
 
+/// How many `/Parent` levels a field's inherited type is looked for in.
+const MAX_FIELD_DEPTH: usize = 32;
+
 /// The object a signature field's `/V` names, for a field (or merged field and widget) of type
-/// `/Sig`.
-fn signature_field_value(d: &Dictionary) -> Option<ObjectId> {
-    let is_signature = d.get(b"FT").ok().and_then(|o| o.as_name().ok()) == Some(b"Sig".as_slice());
+/// `/Sig`. The type is inheritable: a field without its own `/FT` takes its nearest ancestor's.
+fn signature_field_value(pdf: &Pdf, d: &Dictionary) -> Option<ObjectId> {
+    let mut field = d;
+    let mut field_type = None;
+    for _ in 0..MAX_FIELD_DEPTH {
+        if let Ok(kind) = field.get(b"FT") {
+            field_type = kind.as_name().ok();
+            break;
+        }
+        match field.get(b"Parent") {
+            Ok(Object::Reference(parent)) => match pdf.doc.objects.get(parent) {
+                Some(Object::Dictionary(parent)) => field = parent,
+                _ => break,
+            },
+            _ => break,
+        }
+    }
+    let is_signature = field_type == Some(b"Sig".as_slice());
     match d.get(b"V") {
         Ok(Object::Reference(value)) if is_signature => Some(*value),
         _ => None,
@@ -1809,7 +1827,7 @@ impl Pdf {
             let Object::Dictionary(field) = field else {
                 continue;
             };
-            let Some(value) = signature_field_value(field) else {
+            let Some(value) = signature_field_value(&pdf, field) else {
                 continue;
             };
             match pdf.doc.objects.get(&value) {

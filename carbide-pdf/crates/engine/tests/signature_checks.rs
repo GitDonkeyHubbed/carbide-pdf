@@ -619,3 +619,60 @@ fn a_time_stamp_time_must_be_a_plain_utc_generalized_time() {
         assert!(!stamped(bad), "{bad} was taken as a time");
     }
 }
+
+// ---- signature fields ----------------------------------------------------------------------
+
+#[test]
+fn a_signature_field_typed_by_its_parent_is_still_checked() {
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1,
+        }),
+    );
+    // The value is no longer a signature dictionary: it has lost its byte range and contents.
+    let value = doc.add_object(dictionary! { "Type" => "Sig" });
+    let grandparent = doc.new_object_id();
+    let parent = doc.new_object_id();
+    let kid = doc.add_object(dictionary! {
+        "T" => Object::string_literal("Approval"),
+        "Parent" => parent,
+        "V" => value,
+    });
+    doc.objects.insert(
+        parent,
+        Object::Dictionary(dictionary! {
+            "T" => Object::string_literal("Section"),
+            "Parent" => grandparent,
+            "Kids" => vec![kid.into()],
+        }),
+    );
+    doc.objects.insert(
+        grandparent,
+        Object::Dictionary(dictionary! {
+            "T" => Object::string_literal("Form"),
+            "FT" => "Sig",
+            "Kids" => vec![parent.into()],
+        }),
+    );
+    let catalog = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+        "AcroForm" => dictionary! { "Fields" => vec![grandparent.into()] },
+    });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+
+    let reports = verify(&bytes, &TrustStore::default());
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].field_name, "Approval");
+    assert_eq!(outcome(&reports[0]), (Validity::Invalid, Detail::Corrupt));
+}
