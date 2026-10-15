@@ -1946,8 +1946,8 @@ fn verify_one(
         report.detail = detail;
     };
 
-    // Signer certificate: match issuer and serial, or subject key identifier, else the first
-    // embedded certificate.
+    // Signer certificate: the embedded one the SignerInfo names by issuer and serial, or by subject
+    // key identifier. Without it the signature names no signer here.
     let certificates: Vec<Certificate> = cms
         .certificates
         .iter()
@@ -2208,17 +2208,16 @@ fn check_timestamp_token(
 }
 
 /// Finds the certificate a SignerInfo names, by issuer and serial or by subject key identifier.
+/// When none of the embedded certificates is the one named, there is no signer certificate: some
+/// other certificate that happens to verify the signature is not the one the signer chose.
 fn find_signer<'a>(certificates: &'a [Certificate], id: &cms::SignerId) -> Option<&'a Certificate> {
-    certificates
-        .iter()
-        .find(|c| match id {
-            cms::SignerId::IssuerAndSerial { issuer, serial } => {
-                c.tbs_certificate.issuer.to_der().ok().as_ref() == Some(issuer)
-                    && c.tbs_certificate.serial_number.to_der().ok().as_ref() == Some(serial)
-            }
-            cms::SignerId::KeyIdentifier(key_id) => subject_key_id(c).as_deref() == Some(key_id),
-        })
-        .or_else(|| certificates.first())
+    certificates.iter().find(|c| match id {
+        cms::SignerId::IssuerAndSerial { issuer, serial } => {
+            c.tbs_certificate.issuer.to_der().ok().as_ref() == Some(issuer)
+                && c.tbs_certificate.serial_number.to_der().ok().as_ref() == Some(serial)
+        }
+        cms::SignerId::KeyIdentifier(key_id) => subject_key_id(c).as_deref() == Some(key_id),
+    })
 }
 
 /// True when `certificate` is for time stamping as RFC 3161 asks: a critical extended key usage
