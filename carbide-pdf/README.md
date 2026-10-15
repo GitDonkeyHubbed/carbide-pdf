@@ -92,6 +92,10 @@ macOS names Carbide PDF as the app that stopped it, and it has to be started aga
 the app ends without asking (it is killed, say), documents with unsaved changes keep their Auto Recovery copies.
 Forms is empty: form fields are not implemented.
 
+A signed document shows a notice bar that sums up its signatures. Signatures are checked in the file on disk, so while
+the document has unsaved changes the notice bar, the signatures panel and Validate say that what they report is about
+the document as last saved or opened, and that the unsaved changes are not covered by any signature.
+
 Add Location on the Start screen lists the cloud folders it finds on the computer (iCloud Drive, and the folders that the
 Dropbox, Google Drive, OneDrive and similar desktop apps keep in `~/Library/CloudStorage` or the home folder) and lets
 you pin any folder. These are ordinary folders to Carbide PDF: it does not sign in to a cloud service or use its API.
