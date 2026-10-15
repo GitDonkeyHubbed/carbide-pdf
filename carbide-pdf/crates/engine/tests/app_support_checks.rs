@@ -105,3 +105,21 @@ fn a_file_is_renamed_only_to_a_name_nothing_has() {
         .is_symlink());
     assert_eq!(std::fs::read(&from).unwrap(), b"newer");
 }
+
+#[test]
+fn moving_a_page_to_where_it_is_changes_nothing() {
+    let mut pdf = blank(3);
+    let labels = pdf
+        .document_mut()
+        .add_object(dictionary! { "Nums" => vec![0.into(), dictionary! { "S" => "r" }.into()] });
+    pdf.document_mut()
+        .catalog_mut()
+        .unwrap()
+        .set("PageLabels", labels);
+    let before = pdf.document_mut().objects.clone();
+    pdf.move_page(1, 1).unwrap();
+    assert!(
+        pdf.document_mut().objects == before,
+        "moving a page in place edited the document"
+    );
+}

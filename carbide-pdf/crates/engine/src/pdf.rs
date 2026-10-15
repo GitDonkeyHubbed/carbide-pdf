@@ -486,6 +486,9 @@ impl Pdf {
         if to >= count {
             return Err(Error::PageOutOfRange { index: to, count });
         }
+        if from == to {
+            return Ok(());
+        }
         self.flatten_page_tree()?;
         // Each page keeps its page label, so the labels are laid out again for the new order.
         let mut order: Vec<usize> = (0..count).collect();
