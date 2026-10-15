@@ -35,6 +35,8 @@ rsa.workspace = true
 base64.workspace = true
 ocrs.workspace = true
 rten.workspace = true
+caseless = "0.2"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

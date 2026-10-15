@@ -5,6 +5,8 @@
 //! `read_ber` and `children_ber` accept that too, and `normalize` turns such an element back into
 //! DER where its encoding is hashed.
 
+use unicode_normalization::UnicodeNormalization;
+
 pub const SEQUENCE: u8 = 0x30;
 pub const SET: u8 = 0x31;
 pub const INTEGER: u8 = 0x02;
@@ -287,8 +289,9 @@ const MAX_RDN_ATTRIBUTES: usize = 32;
 /// Whether two encoded X.501 Names are the same name: byte-for-byte equal, or equal as RFC 5280
 /// section 7.1 compares them (simplified RFC 4518). The same number of relative distinguished
 /// names, each with the same attribute types, and every value equal once a DirectoryString is
-/// decoded, trimmed, its inner runs of white space made one space and its case folded. Any other
-/// kind of value has to match exactly.
+/// decoded, put in Unicode NFKC form, trimmed, its inner runs of white space made one space and its
+/// case folded (full case folding, so `Straße` matches `STRASSE`). Any other kind of value has to
+/// match exactly.
 pub fn names_match(a: &[u8], b: &[u8]) -> bool {
     if a == b {
         return true;
@@ -358,7 +361,7 @@ fn values_match(a: &Element<'_>, b: &Element<'_>) -> bool {
 }
 
 /// A DirectoryString value as it is compared: decoded, trimmed, inner white space collapsed to one
-/// space and case folded. `None` for any other kind of value, or one that does not decode.
+/// space, normalized (NFKC) and case folded. `None` for any other kind of value, or one that does not decode.
 fn directory_string(value: &Element<'_>) -> Option<String> {
     let bytes = value.content;
     let text = match value.tag {
@@ -393,12 +396,12 @@ fn directory_string(value: &Element<'_>) -> Option<String> {
         }
         _ => return None,
     };
-    Some(
-        text.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase(),
-    )
+    // Compatibility normalization first, since it can turn characters into white space; then the
+    // white space is collapsed and the case folded, and the result normalized again because
+    // folding can leave text that is no longer in normal form.
+    let normalized: String = text.nfkc().collect();
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(caseless::default_case_fold_str(&collapsed).nfkc().collect())
 }
 
 #[cfg(test)]
@@ -529,5 +532,42 @@ mod tests {
         assert!(names_match(&octets, &octets));
         assert!(!names_match(&octets, &name(&[(cn, 0x04, b"abc")])));
         assert!(!names_match(&base, &[0x30, 0x80]));
+    }
+
+    #[test]
+    fn names_match_after_unicode_normalization_and_full_case_folding() {
+        let name = |value: &[u8]| {
+            sequence(&[&set(&[&sequence(&[
+                &oid(&[2, 5, 4, 10]),
+                &tlv(0x0C, value),
+            ])])])
+        };
+        // Full case folding: sharp s is "ss", final sigma is sigma.
+        assert!(names_match(
+            &name("Stra\u{DF}e".as_bytes()),
+            &name("STRASSE".as_bytes())
+        ));
+        assert!(names_match(
+            &name("\u{3A3}\u{3A3}".as_bytes()),
+            &name("\u{3C2}\u{3C3}".as_bytes())
+        ));
+        // Compatibility normalization: a ligature, full-width letters and a no-break space.
+        assert!(names_match(
+            &name("o\u{FB03}ce".as_bytes()),
+            &name("OFFICE".as_bytes())
+        ));
+        assert!(names_match(
+            &name("\u{FF21}cme\u{A0}Corp".as_bytes()),
+            &name("acme corp".as_bytes())
+        ));
+        // Composed and decomposed forms of the same letter.
+        assert!(names_match(
+            &name("Caf\u{E9}".as_bytes()),
+            &name("Cafe\u{301}".as_bytes())
+        ));
+        assert!(!names_match(
+            &name("Stra\u{DF}e".as_bytes()),
+            &name("STRASE".as_bytes())
+        ));
     }
 }
