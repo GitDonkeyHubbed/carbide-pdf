@@ -360,8 +360,8 @@ fn values_match(a: &Element<'_>, b: &Element<'_>) -> bool {
     }
 }
 
-/// A DirectoryString value as it is compared: decoded, trimmed, inner white space collapsed to one
-/// space, normalized (NFKC) and case folded. `None` for any other kind of value, or one that does not decode.
+/// A DirectoryString value as it is compared: decoded, characters that map to nothing removed,
+/// trimmed, inner white space collapsed to one space, normalized (NFKC) and case folded. `None` for any other kind of value, or one that does not decode.
 fn directory_string(value: &Element<'_>) -> Option<String> {
     let bytes = value.content;
     let text = match value.tag {
@@ -396,12 +396,45 @@ fn directory_string(value: &Element<'_>) -> Option<String> {
         }
         _ => return None,
     };
-    // Compatibility normalization first, since it can turn characters into white space; then the
-    // white space is collapsed and the case folded, and the result normalized again because
-    // folding can leave text that is no longer in normal form.
-    let normalized: String = text.nfkc().collect();
+    // Characters RFC 4518 (2.2) maps to nothing go first, so text that differs only by an invisible
+    // character compares equal. Then compatibility normalization, since it can turn characters
+    // into white space; then the white space is collapsed and the case folded, and the result
+    // normalized again because folding can leave text that is no longer in normal form.
+    let normalized: String = text
+        .chars()
+        .filter(|c| !mapped_to_nothing(*c))
+        .nfkc()
+        .collect();
     let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     Some(caseless::default_case_fold_str(&collapsed).nfkc().collect())
+}
+
+/// True for a character RFC 4518 (2.2) maps to nothing: soft hyphens, the combining grapheme
+/// joiner, variation selectors, zero-width characters, and the control and formatting characters
+/// that have no visible effect. Tab, line feed, line tabulation, form feed, carriage return and
+/// next line are not among them; they map to a space, which collapsing white space covers.
+fn mapped_to_nothing(c: char) -> bool {
+    matches!(c,
+        '\u{0000}'..='\u{0008}'
+        | '\u{000E}'..='\u{001F}'
+        | '\u{007F}'..='\u{0084}'
+        | '\u{0086}'..='\u{009F}'
+        | '\u{00AD}'
+        | '\u{034F}'
+        | '\u{06DD}'
+        | '\u{070F}'
+        | '\u{1806}'
+        | '\u{180B}'..='\u{180E}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2063}'
+        | '\u{206A}'..='\u{206F}'
+        | '\u{FE00}'..='\u{FE0F}'
+        | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFC}'
+        | '\u{1D173}'..='\u{1D17A}'
+        | '\u{E0001}'
+        | '\u{E0020}'..='\u{E007F}')
 }
 
 #[cfg(test)]
@@ -568,6 +601,31 @@ mod tests {
         assert!(!names_match(
             &name("Stra\u{DF}e".as_bytes()),
             &name("STRASE".as_bytes())
+        ));
+    }
+
+    #[test]
+    fn names_match_ignoring_characters_that_map_to_nothing() {
+        let name = |value: &[u8]| {
+            sequence(&[&set(&[&sequence(&[
+                &oid(&[2, 5, 4, 10]),
+                &tlv(0x0C, value),
+            ])])])
+        };
+        // A soft hyphen, a zero-width space, a variation selector and a control character.
+        assert!(names_match(
+            &name("Ac\u{AD}me\u{200B} Corp\u{FE0F}\u{1}".as_bytes()),
+            &name("Acme Corp".as_bytes())
+        ));
+        // An invisible character is not a separator: the words still need their space.
+        assert!(!names_match(
+            &name("Acme\u{AD}Corp".as_bytes()),
+            &name("Acme Corp".as_bytes())
+        ));
+        // Tab and next line map to a space.
+        assert!(names_match(
+            &name("Acme\t\u{85}Corp".as_bytes()),
+            &name("Acme Corp".as_bytes())
         ));
     }
 }
