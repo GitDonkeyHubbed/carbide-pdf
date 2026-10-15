@@ -449,3 +449,29 @@ fn ink_points_taken_out_in_place_count_as_removed() {
         "the removed stroke points went unnoticed"
     );
 }
+
+// ---- reading the file as it is -------------------------------------------------------------
+
+#[test]
+fn names_and_text_that_read_like_object_streams_come_back_unchanged() {
+    let pdf = one_page(|doc, catalog, _| {
+        let info =
+            doc.add_object(dictionary! { "Title" => Object::string_literal("/Cb-ObS notes") });
+        doc.trailer.set("Info", info);
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("ObjStm", Object::Name(b"Custom".to_vec()));
+    });
+    let doc = pdf.document();
+    let catalog = doc.catalog().unwrap();
+    assert!(catalog.has(b"ObjStm"), "a key named /ObjStm was renamed");
+    assert!(!catalog.has(b"Cb-ObS"));
+    let info = doc
+        .get_dictionary(doc.trailer.get(b"Info").unwrap().as_reference().unwrap())
+        .unwrap();
+    assert_eq!(
+        info.get(b"Title").unwrap().as_str().unwrap(),
+        b"/Cb-ObS notes",
+        "text in the file was changed"
+    );
+}
