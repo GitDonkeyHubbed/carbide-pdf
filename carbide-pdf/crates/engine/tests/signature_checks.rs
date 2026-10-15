@@ -688,6 +688,38 @@ fn an_rsa_pss_key_restricted_to_other_parameters_does_not_verify_the_signature()
     );
 }
 
+#[test]
+fn an_rsa_pss_key_with_null_parameters_is_not_taken_as_unrestricted() {
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    // RFC 4055: the parameters of an id-RSASSA-PSS key are absent or RSASSA-PSS-params, never NULL.
+    let mut certificate = x509_cert::Certificate::from_der(&signer().cert).unwrap();
+    certificate
+        .tbs_certificate
+        .subject_public_key_info
+        .algorithm = x509_cert::spki::AlgorithmIdentifierOwned {
+        oid: "1.2.840.113549.1.1.10".parse().unwrap(),
+        parameters: Some(x509_cert::der::Any::from_der(&null()).unwrap()),
+    };
+    let cert = certificate.to_der().unwrap();
+    let file = signed_with(SubFilter::Pkcs7Detached, |covered| {
+        let signature = rsa::pss::SigningKey::<Sha256>::new(signer().key.clone())
+            .sign_with_rng(&mut rand::rngs::OsRng, covered)
+            .to_vec();
+        signed_data(
+            &[&cert],
+            &signer_id(&cert, None),
+            &seq(&[&oid(DATA_OID)]),
+            None,
+            &seq(&[&oid(RSA_PSS_OID), &pss_params(SHA256_OID, 32)]),
+            &signature,
+        )
+    });
+    let trust = TrustStore {
+        certificates: vec![cert.clone()],
+    };
+    assert_ne!(verify(&file, &trust).remove(0).validity, Validity::Valid);
+}
+
 // ---- time stamps ---------------------------------------------------------------------------
 
 /// An RFC 3161 authority using the test signer's key, whose tokens give `gen_time`.
