@@ -276,12 +276,16 @@ pub struct HttpTimestampSource {
 }
 
 /// A time-stamp request, and the content of the random nonce INTEGER it carries (checked against
-/// the response).
-fn timestamp_request(digest: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
+/// the response). Fails when the system cannot supply random bytes.
+fn timestamp_request(digest: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>)> {
     let sha256 = der::sequence(&[&der::oid(OID_SHA256), &der::null()]);
     let imprint = der::sequence(&[&sha256, &der::octet_string(digest)]);
     let mut nonce = [0u8; 16];
-    getrandom::fill(&mut nonce).expect("system randomness");
+    getrandom::fill(&mut nonce).map_err(|e| {
+        Error::Other(format!(
+            "could not make a time stamp request: no system randomness ({e})"
+        ))
+    })?;
     nonce[0] &= 0x7F; // a positive INTEGER
     let nonce = der::integer_unsigned(&nonce);
     let request = der::sequence(&[
@@ -293,7 +297,7 @@ fn timestamp_request(digest: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
     let content = der::read(&nonce)
         .map(|(e, _)| e.content.to_vec())
         .unwrap_or_default();
-    (request, content)
+    Ok((request, content))
 }
 
 /// Extracts the token from a `TimeStampResp`; status 0 and 1 are "granted".
@@ -437,7 +441,7 @@ impl TimestampSource for HttpTimestampSource {
                 "refusing to send time stamp credentials over an insecure connection: use an https:// URL".into(),
             ));
         }
-        let (body, nonce) = timestamp_request(digest);
+        let (body, nonce) = timestamp_request(digest)?;
         // An authority that accepts the connection and never answers must not hang the caller.
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(30)))
