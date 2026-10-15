@@ -374,15 +374,9 @@ fn timestamp_signature(cms: &cms::SignedData, econtent: &[u8]) -> Verified {
         Some(_) => return Verified::Bad,
         None => return Verified::Unsupported,
     }
-    if let Some((hash_oid, hash)) = &signer_info.signing_certificate {
-        let Ok(der) = signer.to_der() else {
-            return Verified::Bad;
-        };
-        match sigcrypto::digest(hash_oid, &[&der]) {
-            Some(expected) if &expected == hash => {}
-            Some(_) => return Verified::Bad,
-            None => return Verified::Unsupported,
-        }
+    match names_certificate(signer_info, signer) {
+        Verified::Ok => {}
+        other => return other,
     }
     let mut outcome = Verified::Bad;
     for set in signer_info.signed_attribute_encodings() {
@@ -399,6 +393,32 @@ fn timestamp_signature(cms: &cms::SignedData, econtent: &[u8]) -> Verified {
         }
     }
     outcome
+}
+
+/// Whether the ESS signing-certificate attribute, when there is one, names `certificate`: by its
+/// hash, and by its issuer and serial number when it gives them.
+fn names_certificate(signer_info: &cms::SignerInfo, certificate: &Certificate) -> Verified {
+    let Some(named) = &signer_info.signing_certificate else {
+        return Verified::Ok;
+    };
+    let Ok(der) = certificate.to_der() else {
+        return Verified::Bad;
+    };
+    match sigcrypto::digest(&named.hash_algorithm, &[&der]) {
+        Some(expected) if expected == named.hash => {}
+        Some(_) => return Verified::Bad,
+        None => return Verified::Unsupported,
+    }
+    if let Some((issuers, serial)) = &named.issuer_serial {
+        let issuer = certificate.tbs_certificate.issuer.to_der().ok();
+        let own_serial = certificate.tbs_certificate.serial_number.to_der().ok();
+        if own_serial.as_ref() != Some(serial)
+            || !issuers.iter().any(|n| Some(n) == issuer.as_ref())
+        {
+            return Verified::Bad;
+        }
+    }
+    Verified::Ok
 }
 
 impl TimestampSource for HttpTimestampSource {
@@ -1960,6 +1980,25 @@ fn verify_one(
     report.signer = Some(subject_name(signer));
     if report.claimed_name.as_deref() == Some(report.signer.as_deref().unwrap_or_default()) {
         report.claimed_name = None;
+    }
+    // The signed signing-certificate attribute ties the signature to one certificate, so another
+    // with the same key cannot be put in its place. CAdES requires it; when present it must name
+    // the signer certificate.
+    let cades = report.sub_filter.as_deref() == Some(SubFilter::CadesDetached.name());
+    if cades && signer_info.signing_certificate.is_none() {
+        invalid(&mut report, Detail::Corrupt);
+        return report;
+    }
+    match names_certificate(signer_info, signer) {
+        Verified::Ok => {}
+        Verified::Bad => {
+            invalid(&mut report, Detail::Corrupt);
+            return report;
+        }
+        Verified::Unsupported => {
+            unknown(&mut report, Detail::UnsupportedAlgorithm);
+            return report;
+        }
     }
 
     let digest_oid = &signer_info.digest_algorithm;

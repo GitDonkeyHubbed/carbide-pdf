@@ -346,6 +346,38 @@ fn signed_attributes_must_name_the_content_type() {
 }
 
 #[test]
+fn the_signing_certificate_attribute_must_name_the_signer() {
+    let cert = &signer().cert;
+    let with = |sub_filter: SubFilter, extra: Option<Vec<u8>>| {
+        let file = signed_with(sub_filter, |covered| {
+            let mut attributes = vec![content_type(DATA_OID), message_digest(&sha256(covered))];
+            attributes.extend(extra.clone());
+            signer_cms(covered, Some(&attributes), None)
+        });
+        outcome(&verify(&file, &trust_signer())[0])
+    };
+    let good = (Validity::Valid, Detail::TrustedDirectly);
+    let bad = (Validity::Invalid, Detail::Corrupt);
+
+    let right = signing_certificate_v2(&sha256(cert), None);
+    assert_eq!(with(SubFilter::Pkcs7Detached, Some(right.clone())), good);
+    assert_eq!(with(SubFilter::CadesDetached, Some(right)), good);
+    let named = signing_certificate_v2(&sha256(cert), Some(issuer_serial(cert, None)));
+    assert_eq!(with(SubFilter::CadesDetached, Some(named)), good);
+
+    // Another certificate's hash.
+    let other = signing_certificate_v2(&sha256(b"another certificate"), None);
+    assert_eq!(with(SubFilter::Pkcs7Detached, Some(other.clone())), bad);
+    assert_eq!(with(SubFilter::CadesDetached, Some(other)), bad);
+    // The right hash, with another serial number.
+    let misnamed = signing_certificate_v2(&sha256(cert), Some(issuer_serial(cert, Some(&[0x7B]))));
+    assert_eq!(with(SubFilter::Pkcs7Detached, Some(misnamed)), bad);
+    // CAdES requires the attribute; PKCS#7 does not.
+    assert_eq!(with(SubFilter::Pkcs7Detached, None), good);
+    assert_eq!(with(SubFilter::CadesDetached, None), bad);
+}
+
+#[test]
 fn a_signer_identifier_that_names_no_embedded_certificate_is_not_valid() {
     let file = signed_with(SubFilter::Pkcs7Detached, |covered| {
         signer_cms(
