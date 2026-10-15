@@ -1200,3 +1200,59 @@ fn signature_results_say_when_unsaved_changes_are_not_covered() {
     assert!(!saved.contains(crate::UNSAVED_CHANGES_NOT_SIGNED), "{saved}");
     assert_eq!(Some(saved), app.notice);
 }
+
+#[test]
+fn protecting_the_open_file_keeps_it_protected_from_then_on() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["PRIVATE WORDS"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    let options = ProtectionOptions::new("open pw", "owner pw");
+    app.protect_to(&a, &options);
+    let protected = std::fs::read(&a).unwrap();
+    assert!(matches!(Pdf::from_bytes(&protected), Err(carbide_engine::Error::PasswordRequired)));
+    let key = file_key(&protected, "owner pw");
+    // The document is that file now, the edit made before included.
+    let doc = app.doc.as_ref().unwrap();
+    assert!(doc.is_protected() && !doc.dirty);
+    assert_eq!(doc.saved.as_ref().unwrap().bytes(), protected.as_slice());
+    assert_eq!(doc.pdf.page_rotation(0).unwrap(), 90);
+
+    // Later edits get no unencrypted recovery copy, and Save and Save As keep the protection.
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    overdue(&mut app);
+    app.autosave_tick();
+    assert_eq!(recovery_copies(&dir), 0, "an unencrypted recovery copy was written");
+    app.save();
+    let saved = std::fs::read(&a).unwrap();
+    assert!(matches!(Pdf::from_bytes(&saved), Err(carbide_engine::Error::PasswordRequired)), "saved without protection");
+    assert_eq!(file_key(&saved, "open pw"), key);
+    assert_eq!(Pdf::from_bytes_with_password(&saved, "open pw").unwrap().page_rotation(0).unwrap(), 180);
+    let b = dir.join("b.pdf");
+    app.write_to(&b, None, AfterSave::Nothing);
+    assert_eq!(file_key(&std::fs::read(&b).unwrap(), "open pw"), key);
+
+    // A file open in another tab is only written over when that tab has nothing unsaved, and the
+    // tab then closes rather than go on showing the old file.
+    let c = plain(&dir, "c.pdf", &["C"]);
+    let c_before = std::fs::read(&c).unwrap();
+    app.open_path(&c);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    app.activate(Some(0));
+    app.protect_to(&c, &options);
+    assert_eq!(std::fs::read(&c).unwrap(), c_before, "a file with unsaved changes in another tab was replaced");
+    app.dialog = None;
+    app.activate(Some(1));
+    app.save();
+    app.activate(Some(0));
+    let tabs = app.tabs.len();
+    app.protect_to(&c, &options);
+    assert!(matches!(Pdf::from_bytes(&std::fs::read(&c).unwrap()), Err(carbide_engine::Error::PasswordRequired)));
+    assert_eq!(app.tabs.len(), tabs - 1);
+
+    // Nothing goes into the recovery folder.
+    let private = dir.join("AutoSave").join("copy.pdf");
+    app.protect_to(&private, &options);
+    assert!(!private.exists());
+}

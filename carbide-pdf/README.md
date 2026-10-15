@@ -153,7 +153,7 @@ carbide ocr scan.pdf scan-searchable.pdf --dpi 300 --pages 1-4
 Interface differences, as found in the code:
 
 - Auto Save and Auto Recovery are available in the GUI only. There is no CLI command for them.
-- Removing protection (`decrypt`) is CLI only. The GUI can only write a protected copy.
+- Removing protection (`decrypt`) is CLI only. The GUI can only write a protected copy. Written over the open document's own file, the protected copy (or a reduced one) becomes the document: it is read back with the new password, so later saves, Save As and Auto Recovery keep the protection. Like Save, these copies are not written over a file open in another tab with unsaved changes, and close other tabs showing the file they replace.
 - `verify` takes a file on the command line. The GUI checks the open document.
 - Most GUI page actions act on the current page. The CLI takes page lists.
 - `blank` puts the new page at position AT. The GUI inserts after the current page.

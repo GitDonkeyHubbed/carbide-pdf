@@ -822,19 +822,14 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                 });
                 ui.checkbox(&mut f.print, "Allow printing");
                 ui.checkbox(&mut f.copy, "Allow copying text");
-                ui.weak("The open document is not changed; an AES-256 encrypted copy is written.");
+                ui.weak("An AES-256 encrypted copy is written. Saved over this document's own file, it protects that file, and the document goes on from it.");
                 let (ok, cancel) = buttons(ui, "Save...", !f.owner.is_empty());
                 if ok {
                     if let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name("document-protected.pdf").save_file() {
                         let mut options = ProtectionOptions::new(f.user.clone(), f.owner.clone());
                         options.allow_printing = f.print;
                         options.allow_copying = f.copy;
-                        let result = app.doc.as_mut().map(|d| d.pdf.save_encrypted(&path, &options));
-                        match result {
-                            Some(Ok(())) => app.status = format!("Saved protected copy {}", path.display()),
-                            Some(Err(e)) => app.alert(format!("Could not protect the document: {e}")),
-                            None => {}
-                        }
+                        app.protect_to(&path, &options);
                     }
                     open = false;
                 }
@@ -1410,19 +1405,16 @@ fn reduce_current(app: &mut CarbideApp, slider: u8) -> bool {
     let before = doc.saved.as_ref().map(|s| s.bytes().len());
     let mut copy = doc.pdf.clone();
     match copy.reduce(&ReduceOptions { image_factor: slider }, before) {
-        Ok((bytes, report)) => match carbide_engine::fs::write_replacing(&path, &bytes) {
-            Ok(()) => {
+        // Over the document's own file, the document goes on from the reduced file.
+        Ok((bytes, report)) => {
+            if app.write_copy(&path, &bytes, None).is_some() {
                 app.status = format!(
                     "Reduced {} -> {} bytes ({} images re-encoded, {} streams merged).",
                     report.size_before, report.size_after, report.images_recompressed, report.streams_merged
                 );
-                true
             }
-            Err(e) => {
-                app.alert(format!("{}\n{e}", reduce_messages::SAVE_ERROR));
-                true
-            }
-        },
+            true
+        }
         Err(e) => {
             app.alert(e.to_string());
             true

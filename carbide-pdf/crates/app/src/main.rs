@@ -19,7 +19,7 @@ use carbide_engine::autosave::{now_unix, AutoSaveSettings, AutoSaveStore, Record
 use carbide_engine::fs::Existing;
 use carbide_engine::{
     open_revision_bytes, pdf_date_now, revision_display_name, Error as EngineError, MarkupStyle, Pdf, PageGeometry,
-    Protection, Rect, Redaction, Renderer, Revision, SavePlan, SavedFile,
+    Protection, ProtectionOptions, Rect, Redaction, Renderer, Revision, SavePlan, SavedFile,
 };
 use dialogs::{AfterSave, Dialog, Export, Writing};
 use eframe::egui;
@@ -171,6 +171,11 @@ impl OpenDoc {
     fn adopt_saved(&mut self, bytes: Vec<u8>) -> Result<(), EngineError> {
         let password = self.saved.as_ref().and_then(|s| s.password()).map(str::to_owned);
         let (pdf, saved) = SavedFile::open(bytes, password)?;
+        self.adopt(pdf, saved)
+    }
+
+    /// Makes `saved` the file this document is based on, and `pdf`, read from it, the document.
+    fn adopt(&mut self, pdf: Pdf, saved: SavedFile) -> Result<(), EngineError> {
         self.pdf = pdf;
         self.saved = Some(saved);
         self.dirty = false;
@@ -953,12 +958,77 @@ impl CarbideApp {
 
     /// The tabs other than the active one whose document is the file `path`, in tab order.
     fn other_tabs_on(&self, path: &Path) -> Vec<usize> {
-        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-        let wanted = canonical(path);
         (0..self.tabs.len())
             .filter(|&i| Some(i) != self.active_tab)
-            .filter(|&i| self.doc_at(i).and_then(|d| d.path.as_deref()).is_some_and(|p| canonical(p) == wanted))
+            .filter(|&i| self.doc_at(i).and_then(|d| d.path.as_deref()).is_some_and(|p| same_file(p, path)))
             .collect()
+    }
+
+    /// Writes `bytes`, a new file made from the active document (a protected or a reduced copy),
+    /// to `path`, which the user chose, and returns whether it did; `Some(true)` when `path` was
+    /// the document's own file. The document then is that file: it is read back from `bytes`
+    /// with `password` before anything is written, so that Save, Save As and Auto Recovery go on
+    /// from what is on disk, protection included, and never write the old file's contents or its
+    /// lack of protection over it. Other tabs on the file close once it is written, as after Save;
+    /// one with unsaved changes stops the write. Nothing is written into the app's own folders.
+    fn write_copy(&mut self, path: &Path, bytes: &[u8], password: Option<String>) -> Option<bool> {
+        if self.is_private_location(path) {
+            self.alert(format!(
+                "{} is in a folder Carbide PDF keeps for itself (recovery or temporary copies), so nothing was written there. Choose another location.",
+                path.display()
+            ));
+            return None;
+        }
+        if self.refuse_over_unsaved_tab(path) {
+            return None;
+        }
+        let others = self.other_tabs_on(path);
+        let doc = self.doc.as_mut()?;
+        let own_file = doc.path.as_deref().is_some_and(|own| same_file(own, path));
+        let reopened = match own_file.then(|| SavedFile::open(bytes.to_vec(), password)).transpose() {
+            Ok(reopened) => reopened,
+            Err(e) => {
+                self.alert(format!("Nothing was written to {}: the new file could not be read back ({e}).", path.display()));
+                return None;
+            }
+        };
+        if let Err(e) = carbide_engine::fs::write_replacing(path, bytes) {
+            self.alert(format!("Could not write {}: {e}", path.display()));
+            return None;
+        }
+        let reloaded = match reopened {
+            Some((pdf, saved)) => {
+                let reloaded = doc.adopt(pdf, saved);
+                self.after_writing(path);
+                reloaded
+            }
+            None => Ok(()),
+        };
+        for index in others.into_iter().rev() {
+            self.close_tab(index);
+        }
+        if let Err(e) = reloaded {
+            self.alert(format!("Wrote {}, but could not read it back: {e}", path.display()));
+        }
+        Some(own_file)
+    }
+
+    /// Writes a copy of the active document protected with `options` to `path` (see
+    /// [`CarbideApp::write_copy`]). Over the document's own file, the document goes on as that
+    /// protected file, opened with the new open password.
+    pub fn protect_to(&mut self, path: &Path, options: &ProtectionOptions) {
+        let Some(doc) = self.doc.as_mut() else { return };
+        let bytes = match doc.pdf.to_encrypted_bytes(options) {
+            Ok(bytes) => bytes,
+            Err(e) => return self.alert(format!("Could not protect the document: {e}")),
+        };
+        // A file without an open password opens without one.
+        let password = Some(options.user_password.clone()).filter(|p| !p.is_empty());
+        self.status = match self.write_copy(path, &bytes, password) {
+            Some(true) => format!("Protected {}. The document now goes on from the protected file.", path.display()),
+            Some(false) => format!("Saved protected copy {}", path.display()),
+            None => return,
+        };
     }
 
     /// True for a place Save never writes to: the Auto Recovery folder, or a private temporary
@@ -1867,6 +1937,13 @@ fn follow(change: PageChange, before: &[PageGeometry], page: usize, rect: Rect) 
         _ => rect,
     };
     Some((page, rect))
+}
+
+/// True when `a` and `b` name the same file, links followed, or the same path when either cannot
+/// be found.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canonical(a) == canonical(b)
 }
 
 /// Those of `paths` that are already taken.
