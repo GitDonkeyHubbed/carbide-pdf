@@ -291,16 +291,6 @@ impl Pdf {
     }
 }
 
-impl Pdf {
-    /// `object`, or the object it refers to, without copying it.
-    fn resolved<'a>(&'a self, object: &'a Object) -> Option<&'a Object> {
-        match object {
-            Object::Reference(id) => self.doc.get_object(*id).ok(),
-            other => Some(other),
-        }
-    }
-}
-
 /// The names each content stream uses, found once per stream however many pages draw it, each
 /// page's streams decoded within the budget of one page.
 struct NameScan {

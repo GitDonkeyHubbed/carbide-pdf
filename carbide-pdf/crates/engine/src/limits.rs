@@ -127,13 +127,13 @@ struct Drawing<'a> {
     path: Vec<ObjectId>,
 }
 
-impl Drawing<'_> {
+impl<'a> Drawing<'a> {
     /// What drawing `data` takes, with `resources`, those of the page or form `holder`.
     fn content(&mut self, data: &[u8], resources: &Dictionary, holder: ObjectId) -> Result<Cost> {
-        let xobjects = match resources.get(b"XObject").map(|o| self.pdf.resolve(o)) {
-            Ok(Object::Dictionary(dict)) => dict,
-            _ => Dictionary::new(),
-        };
+        // Read where it is, not copied: a document can give many forms one large dictionary.
+        let pdf = self.pdf;
+        let no_xobjects = Dictionary::new();
+        let xobjects = resources.get(b"XObject").ok().and_then(|o| pdf.resolved(o)).and_then(|o| o.as_dict().ok()).unwrap_or(&no_xobjects);
         let mut cost = Cost { bytes: data.len(), operators: 0 };
         let mut last_name: Option<Vec<u8>> = None;
         let mut failure = None;
@@ -168,14 +168,12 @@ impl Drawing<'_> {
     /// What drawing the form XObject `id` takes; nothing for an image or anything else. A form
     /// without resources of its own uses `resources`, those of `holder`, which draws it.
     fn form(&mut self, id: ObjectId, resources: &Dictionary, holder: ObjectId) -> Result<Cost> {
-        let Ok(Object::Stream(stream)) = self.pdf.doc.get_object(id) else { return Ok(Cost::default()) };
+        let pdf: &'a Pdf = self.pdf;
+        let Ok(Object::Stream(stream)) = pdf.doc.get_object(id) else { return Ok(Cost::default()) };
         if !stream.dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Form") {
             return Ok(Cost::default());
         }
-        let own = match stream.dict.get(b"Resources").map(|o| self.pdf.resolve(o)) {
-            Ok(Object::Dictionary(dict)) => Some(dict),
-            _ => None,
-        };
+        let own = stream.dict.get(b"Resources").ok().and_then(|o| pdf.resolved(o)).and_then(|o| o.as_dict().ok());
         let holder = if own.is_some() { id } else { holder };
         if let Some(cost) = self.forms.get(&(id, holder)) {
             return Ok(*cost);
@@ -192,7 +190,7 @@ impl Drawing<'_> {
             Err(_) => return Ok(Cost::default()),
         };
         self.path.push(id);
-        let cost = self.content(&data, own.as_ref().unwrap_or(resources), holder);
+        let cost = self.content(&data, own.unwrap_or(resources), holder);
         self.path.pop();
         let cost = cost?;
         self.forms.insert((id, holder), cost);
@@ -209,16 +207,14 @@ impl Pdf {
     pub fn check_drawable(&self, index: usize) -> Result<()> {
         let id = self.page_id(index)?;
         let holder = self.inherited_from(id, b"Resources").unwrap_or(id);
-        let resources = match self.inherited(id, b"Resources") {
-            Some(Object::Dictionary(dict)) => dict,
-            _ => Dictionary::new(),
-        };
+        let no_resources = Dictionary::new();
+        let resources = self.page_resources(id).unwrap_or(&no_resources);
         let mut drawing = Drawing { pdf: self, forms: HashMap::new(), path: Vec::new() };
         let content = self.doc.get_page_content_with_limit(id, MAX_DECODED_AT_ONCE).map_err(|error| match too_large(error) {
             Error::TooLarge(_) => Error::TooLarge(messages::TOO_COMPLEX.into()),
             other => other,
         })?;
-        let mut cost = drawing.content(&content, &resources, holder)?;
+        let mut cost = drawing.content(&content, resources, holder)?;
         drop(content);
         // Annotations are drawn from their appearance streams, forms that use the page's resources
         // when they have none of their own.
@@ -241,7 +237,7 @@ impl Pdf {
                 _ => Vec::new(),
             };
             for form in forms {
-                cost.add(drawing.form(form, &resources, holder)?)?;
+                cost.add(drawing.form(form, resources, holder)?)?;
             }
         }
         Ok(())

@@ -3432,6 +3432,66 @@ fn reduce_shrinks_photos_and_merges_duplicates() {
 }
 
 #[test]
+fn forms_drawn_over_and_over_are_worked_out_once() {
+    // A photo drawn through a form whose matrix halves it, and that form drawn once as it is and
+    // once twice as large: the photo is drawn at 200 x 150 pt at most, and sized for that.
+    let mut pdf = photo_pdf();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let page_xobjects = doc.get_dictionary(page).unwrap().get(b"Resources").unwrap().as_dict().unwrap().get(b"XObject").unwrap();
+    let photo = page_xobjects.as_dict().unwrap().get(b"Im1").unwrap().as_reference().unwrap();
+    let bbox = || vec![0.into(), 0.into(), 612.into(), 792.into()];
+    let half = vec![0.5.into(), 0.into(), 0.into(), 0.5.into(), 0.into(), 0.into()];
+    let photo_form = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form", "BBox" => bbox(), "Matrix" => half,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im" => photo } },
+        },
+        b"q 200 0 0 150 0 0 cm /Im Do Q".to_vec(),
+    ));
+    // Next to it, 20,000 names for one empty form, drawn 30,000 times, and 20,000 more forms
+    // without resources of their own, each drawn once.
+    let empty = doc.add_object(Stream::new(dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => bbox() }, Vec::new()));
+    let mut xobjects = lopdf::Dictionary::new();
+    xobjects.set("F", photo_form);
+    let mut content = b"q 1 0 0 1 50 500 cm /F Do Q q 2 0 0 2 50 100 cm /F Do Q\n".to_vec();
+    for i in 0..20_000 {
+        xobjects.set(format!("E{i}"), empty);
+        let own = doc.add_object(Stream::new(dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => bbox() }, b"0 0 m".to_vec()));
+        xobjects.set(format!("D{i}"), own);
+        content.extend_from_slice(format!("/D{i} Do\n").as_bytes());
+    }
+    for i in 0..30_000 {
+        content.extend_from_slice(format!("/E{} Do\n", i % 20_000).as_bytes());
+    }
+    let content = doc.add_object(Stream::new(lopdf::Dictionary::new(), content));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", dictionary! { "XObject" => xobjects });
+    page.set("Contents", content);
+
+    let started = std::time::Instant::now();
+    let checked = pdf.clone();
+    finishes("checking the page", move || checked.check_drawable(0)).unwrap();
+    let (reduced, report) = finishes("reduce", move || pdf.reduce(&ReduceOptions::default(), None).unwrap());
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let reduced = Pdf::from_bytes(&reduced).unwrap();
+    let widths: Vec<i64> = reduced
+        .document()
+        .objects
+        .values()
+        .filter_map(|o| match o {
+            Object::Stream(s) if s.dict.get(b"Subtype").and_then(|v| v.as_name()).ok() == Some(b"Image") => {
+                s.dict.get(b"Width").ok()?.as_i64().ok()
+            }
+            _ => None,
+        })
+        .collect();
+    // 200 pt at 150 ppi is about 417 pixels; the smaller drawing alone would have given half that.
+    assert!(widths.len() == 1 && widths[0] < 600 && widths[0] >= 300, "{widths:?}");
+}
+
+#[test]
 fn slider_trades_size_for_quality() {
     let mut pdf = photo_pdf();
     let small = pdf.reduce(&ReduceOptions { image_factor: 0 }, None).unwrap().0.len();

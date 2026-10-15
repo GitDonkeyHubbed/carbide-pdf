@@ -179,6 +179,26 @@ impl Pdf {
     }
 
     /// Follows references until a direct object is reached (bounded to avoid cycles).
+    /// `object`, or what it refers to through up to 16 references, without copying it; `None` for a
+    /// reference to nothing.
+    pub(crate) fn resolved<'a>(&'a self, object: &'a Object) -> Option<&'a Object> {
+        let mut current = object;
+        for _ in 0..16 {
+            match current {
+                Object::Reference(id) => current = self.doc.get_object(*id).ok()?,
+                other => return Some(other),
+            }
+        }
+        None
+    }
+
+    /// The resource dictionary page `page_id` uses, its own or one it inherits, without copying it.
+    pub(crate) fn page_resources(&self, page_id: ObjectId) -> Option<&Dictionary> {
+        let holder = self.inherited_from(page_id, b"Resources")?;
+        let resources = self.doc.get_dictionary(holder).ok()?.get(b"Resources").ok()?;
+        self.resolved(resources)?.as_dict().ok()
+    }
+
     pub(crate) fn resolve(&self, object: &Object) -> Object {
         let mut current = object.clone();
         for _ in 0..16 {
