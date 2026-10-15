@@ -89,3 +89,43 @@ fn deleted_page_image_does_not_survive_through_a_font_of_the_same_name() {
         "the kept page lost its font"
     );
 }
+
+#[test]
+fn deleted_page_image_does_not_survive_in_a_form_with_resources_of_its_own() {
+    // Each page draws a form; the two forms share one resource dictionary, which holds the image
+    // only the deleted page's form drew.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let font = helvetica(doc);
+            let image = secret_image(doc);
+            let shared = doc.add_object(dictionary! {
+                "Font" => dictionary! { "F1" => font },
+                "XObject" => dictionary! { "Im1" => image },
+            });
+            let form = |doc: &mut Document, content: &str| {
+                Object::Reference(doc.add_object(Stream::new(
+                    dictionary! {
+                        "Type" => "XObject", "Subtype" => "Form",
+                        "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                        "Resources" => shared,
+                    },
+                    content.as_bytes().to_vec(),
+                )))
+            };
+            let kept = form(doc, "BT /F1 12 Tf (kept) Tj ET");
+            let gone = form(doc, "q 100 0 0 100 0 0 cm /Im1 Do Q");
+            dictionary! { "XObject" => dictionary! { "Fm1" => kept, "Fm2" => gone } }
+        },
+        &["/Fm1 Do", "/Fm2 Do"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the kept form lost its font"
+    );
+}

@@ -299,7 +299,10 @@ impl Pdf {
         let mut scan = NameScan {
             budget: DecodeBudget::for_page(),
             names: HashMap::new(),
+            trimmed: HashSet::new(),
         };
+        // Forms, patterns and Type 3 fonts with resources of their own, trimmed in turn.
+        let mut nested = HashMap::new();
         for page in &pages {
             let Some(Object::Dictionary(resources)) = self.inherited(*page, b"Resources") else {
                 continue;
@@ -311,19 +314,22 @@ impl Pdf {
                 .ok()
                 .cloned();
             scan.budget = DecodeBudget::for_page();
-            let kept = match self.names_used_by_page(*page, &resources, &mut scan)? {
+            let mut kept = match self.names_used_by_page(*page, &resources, &mut scan)? {
                 Some(uses) => self.keep_named(&resources, &uses),
                 None => resources.clone(),
             };
+            self.trim_nested(&mut kept, &mut scan, &mut nested, 0)?;
             let independent = match &own {
                 Some(Object::Reference(id)) => !shared.contains(id),
                 Some(_) => true,
                 None => false,
             };
-            if !(independent && kept == self.with_categories_resolved(&resources)) {
+            let unchanged = kept == resources || kept == self.with_categories_resolved(&resources);
+            if !(independent && unchanged) {
                 changes.push((*page, kept));
             }
         }
+        self.doc.objects.extend(nested);
         for (page, resources) in changes {
             self.doc
                 .get_dictionary_mut(page)?
@@ -490,6 +496,128 @@ impl Pdf {
         kept
     }
 
+    /// Trims the resources of each form, tiling pattern and Type 3 font in `resources` that has
+    /// resources of its own to what its own content uses, and so on down. Objects that change go
+    /// into `changed`, entries written straight into `resources` change in place. An object is
+    /// trimmed once however often it is drawn, so shared and looping resources end too.
+    fn trim_nested(
+        &self,
+        resources: &mut Dictionary,
+        scan: &mut NameScan,
+        changed: &mut HashMap<ObjectId, Object>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > MAX_DEPTH {
+            return Ok(());
+        }
+        for category in [XOBJECT, PATTERN, FONT] {
+            let Ok(value) = resources.get(category) else {
+                continue;
+            };
+            let Object::Dictionary(mut entries) = self.resolve(value) else {
+                continue;
+            };
+            let mut edited = false;
+            for (_, entry) in entries.iter_mut() {
+                if let Object::Reference(id) = entry {
+                    let id = *id;
+                    if !scan.trimmed.insert(id) {
+                        continue;
+                    }
+                    let Ok(object) = self.doc.get_object(id) else {
+                        continue;
+                    };
+                    let mut object = object.clone();
+                    if self.trim_own_resources(Some(id), &mut object, scan, changed, depth)? {
+                        changed.insert(id, object);
+                    }
+                } else {
+                    edited |= self.trim_own_resources(None, entry, scan, changed, depth)?;
+                }
+            }
+            if edited {
+                resources.set(category, entries);
+            }
+        }
+        Ok(())
+    }
+
+    /// Trims the resources `owner` (a form, a tiling pattern or a Type 3 font; object `id` when
+    /// it is one of its own) has of its own to what its content uses, and those of what they hold
+    /// in turn. True when `owner` changed. When its content cannot be read, its resources are kept
+    /// whole, but what they hold is still trimmed.
+    fn trim_own_resources(
+        &self,
+        id: Option<ObjectId>,
+        owner: &mut Object,
+        scan: &mut NameScan,
+        changed: &mut HashMap<ObjectId, Object>,
+        depth: usize,
+    ) -> Result<bool> {
+        let dict = match owner {
+            Object::Stream(stream) => &stream.dict,
+            Object::Dictionary(dict) => &*dict,
+            _ => return Ok(false),
+        };
+        let Some(Object::Dictionary(resources)) =
+            dict.get(b"Resources").ok().map(|r| self.resolve(r))
+        else {
+            return Ok(false);
+        };
+        let content = match &*owner {
+            Object::Stream(stream) if is_content(&stream.dict) => scan.uses_in(id, stream)?,
+            Object::Dictionary(font)
+                if font
+                    .get(b"Subtype")
+                    .and_then(Object::as_name)
+                    .is_ok_and(|s| s == b"Type3") =>
+            {
+                self.glyph_uses(font, scan)?
+            }
+            _ => return Ok(false),
+        };
+        let uses = match content {
+            Some(uses) => self.scope_uses(uses, &resources, scan)?,
+            None => None,
+        };
+        let mut kept = match &uses {
+            Some(uses) => self.keep_named(&resources, uses),
+            None => resources.clone(),
+        };
+        self.trim_nested(&mut kept, scan, changed, depth + 1)?;
+        if kept == resources || kept == self.with_categories_resolved(&resources) {
+            return Ok(false);
+        }
+        match owner {
+            Object::Stream(stream) => stream.dict.set("Resources", kept),
+            Object::Dictionary(dict) => dict.set("Resources", kept),
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    /// The resources the glyphs of the Type 3 font `font` use; `None` when one cannot be read.
+    fn glyph_uses(&self, font: &Dictionary, scan: &mut NameScan) -> Result<Option<Uses>> {
+        let mut uses = HashSet::new();
+        let Object::Dictionary(procs) = font
+            .get(b"CharProcs")
+            .map(|o| self.resolve(o))
+            .unwrap_or(Object::Null)
+        else {
+            return Ok(Some(uses));
+        };
+        for (_, glyph) in procs.iter() {
+            let Some(Object::Stream(stream)) = self.resolved(glyph) else {
+                continue;
+            };
+            let Some(found) = scan.uses_in(glyph.as_reference().ok(), stream)? else {
+                return Ok(None);
+            };
+            uses.extend(found);
+        }
+        Ok(Some(uses))
+    }
+
     /// `resources` with its categories as direct dictionaries, for comparing with `keep_named`.
     fn with_categories_resolved(&self, resources: &Dictionary) -> Dictionary {
         resources
@@ -510,6 +638,8 @@ impl Pdf {
 struct NameScan {
     budget: DecodeBudget,
     names: HashMap<ObjectId, Option<Uses>>,
+    /// Forms, patterns and fonts whose own resources were already trimmed.
+    trimmed: HashSet<ObjectId>,
 }
 
 impl NameScan {
