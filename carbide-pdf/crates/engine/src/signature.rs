@@ -1367,8 +1367,9 @@ const MAX_CHAIN: usize = 8;
 /// cA=true, keyUsage keyCertSign when present), satisfy its pathLenConstraint, and be valid at
 /// `at`. A non-CA leaf can never act as an issuer, so one leaf cannot vouch for another. No
 /// certificate on the path, the signer's included, may carry a critical extension this verifier
-/// does not process, and no CA on it may set name constraints, which are not enforced. When no
-/// chain qualifies, the error says whether one reaches the store by names and signatures alone
+/// does not process, and no CA on it may set name constraints, which are not enforced. A signer
+/// that is itself in the store is held to the same rule on critical extensions. When no chain
+/// qualifies, the error says whether one reaches the store by names and signatures alone
 /// (`ChainRejected`) or none does (`DigestOkUntrusted`).
 fn trust_level(
     signer: &Certificate,
@@ -1382,10 +1383,16 @@ fn trust_level(
             .ok()
             .is_some_and(|der| store.certificates.contains(&der))
     };
-    // A certificate the user trusts outright needs nothing further: this is the "trust one
-    // person's certificate" flow, where that certificate may be an ordinary end-entity one.
+    // A certificate the user trusts outright needs no chain: this is the "trust one person's
+    // certificate" flow, where that certificate may be an ordinary end-entity one. It still may
+    // not carry a critical extension this verifier cannot honour.
+    let understood = critical_extensions_understood(signer);
     if in_store(signer) {
-        return Ok(Detail::TrustedDirectly);
+        return if understood {
+            Ok(Detail::TrustedDirectly)
+        } else {
+            Err(Detail::ChainRejected)
+        };
     }
     let trusted: Vec<Certificate> = store
         .certificates
@@ -1393,7 +1400,7 @@ fn trust_level(
         .filter_map(|d| Certificate::from_der(d).ok())
         .collect();
     let mut search = ChainSearch::new(signer, trusted.iter().chain(embedded), &in_store, purpose);
-    if critical_extensions_understood(signer) && search.reaches_store(Some(at)) {
+    if understood && search.reaches_store(Some(at)) {
         Ok(Detail::TrustedViaChain)
     } else if search.reaches_store(None) {
         Err(Detail::ChainRejected)

@@ -420,6 +420,36 @@ fn a_critical_extension_nothing_checks_leaves_the_identity_unconfirmed() {
     assert_eq!(chain_outcome(&identity, &root), VIA_CHAIN);
 }
 
+#[test]
+fn a_directly_trusted_certificate_with_a_critical_extension_nothing_checks_is_not_accepted() {
+    let pair = KeyPair::try_from(signer().pkcs8.as_slice()).unwrap();
+    let self_signed = |critical: bool| {
+        let mut params = cert_params(
+            "Direct Signer",
+            IsCa::ExplicitNoCa,
+            &[KeyUsagePurpose::DigitalSignature],
+        );
+        let mut extension = unknown_critical_extension();
+        extension.set_criticality(critical);
+        params.custom_extensions.push(extension);
+        params.self_signed(&pair).unwrap().der().to_vec()
+    };
+    let direct_outcome = |cert: Vec<u8>| {
+        let identity = Identity::new(vec![cert.clone()], signer().key.clone()).unwrap();
+        let signed = sign(&identity, SubFilter::Pkcs7Detached, None);
+        let trust = TrustStore {
+            certificates: vec![cert],
+        };
+        outcome(&verify(&signed, &trust)[0])
+    };
+    assert_eq!(direct_outcome(self_signed(true)), REJECTED);
+    // The same extension, not marked critical, may be ignored.
+    assert_eq!(
+        direct_outcome(self_signed(false)),
+        (Validity::Valid, Detail::TrustedDirectly)
+    );
+}
+
 /// A critical extension under a standard `oid` whose value is a NULL, which none of them allow.
 fn malformed_critical_extension(oid: &[u64]) -> rcgen::CustomExtension {
     let mut extension = rcgen::CustomExtension::from_oid_content(oid, null());
