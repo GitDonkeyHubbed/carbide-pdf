@@ -72,7 +72,9 @@ impl Pdf {
     /// update appended to the file has to be compared with, so that repairs are written too.
     pub(crate) fn load_unrepaired(bytes: &[u8], password: Option<&str>) -> Result<Document> {
         match crate::crypt::load(bytes, password) {
-            Err(Error::Pdf(lopdf::Error::InvalidPassword | lopdf::Error::Decryption(_))) if password.is_some() => {
+            Err(Error::Pdf(lopdf::Error::InvalidPassword | lopdf::Error::Decryption(_)))
+                if password.is_some() =>
+            {
                 Err(Error::WrongPassword)
             }
             other => other,
@@ -125,7 +127,10 @@ impl Pdf {
     pub fn page_id(&self, index: usize) -> Result<ObjectId> {
         match self.doc.page_iter().nth(index) {
             Some(id) => Ok(id),
-            None => Err(Error::PageOutOfRange { index, count: self.page_count() }),
+            None => Err(Error::PageOutOfRange {
+                index,
+                count: self.page_count(),
+            }),
         }
     }
 
@@ -133,7 +138,12 @@ impl Pdf {
     /// engine does, and shows each of `pages` at the size the engine works with. Edits that render
     /// page N and then rebuild page N need the two to agree; the page tree is repaired when a
     /// document is opened, so this only guards against later damage.
-    pub(crate) fn check_pages_agree(&self, renderer: &crate::render::Renderer, serialized: &[u8], pages: &[usize]) -> Result<()> {
+    pub(crate) fn check_pages_agree(
+        &self,
+        renderer: &crate::render::Renderer,
+        serialized: &[u8],
+        pages: &[usize],
+    ) -> Result<()> {
         let (ours, theirs) = (self.page_count(), renderer.page_count(serialized)?);
         if ours != theirs {
             return Err(Error::Other(format!(
@@ -195,7 +205,12 @@ impl Pdf {
     /// The resource dictionary page `page_id` uses, its own or one it inherits, without copying it.
     pub(crate) fn page_resources(&self, page_id: ObjectId) -> Option<&Dictionary> {
         let holder = self.inherited_from(page_id, b"Resources")?;
-        let resources = self.doc.get_dictionary(holder).ok()?.get(b"Resources").ok()?;
+        let resources = self
+            .doc
+            .get_dictionary(holder)
+            .ok()?
+            .get(b"Resources")
+            .ok()?;
         self.resolved(resources)?.as_dict().ok()
     }
 
@@ -222,7 +237,12 @@ impl Pdf {
         }
         let mut values = [0f32; 4];
         for (slot, item) in values.iter_mut().zip(array.iter()) {
-            *slot = self.resolve(item).as_float().ok().filter(|v| v.is_finite()).unwrap_or(0.0);
+            *slot = self
+                .resolve(item)
+                .as_float()
+                .ok()
+                .filter(|v| v.is_finite())
+                .unwrap_or(0.0);
         }
         Some([
             values[0].min(values[2]),
@@ -238,7 +258,10 @@ impl Pdf {
 
     /// The geometry of every page, in page order.
     pub fn page_geometries(&self) -> Vec<PageGeometry> {
-        self.page_ids().into_iter().map(|id| self.geometry_of(id)).collect()
+        self.page_ids()
+            .into_iter()
+            .map(|id| self.geometry_of(id))
+            .collect()
     }
 
     /// The geometry of the page object `id`.
@@ -259,8 +282,15 @@ impl Pdf {
             None => media,
         };
         let (w, h) = (visible[2] - visible[0], visible[3] - visible[1]);
-        let (visible, w, h) = if w > 0.0 && h > 0.0 { (visible, w, h) } else { (media, media[2] - media[0], media[3] - media[1]) };
-        let rotation = self.inherited(id, b"Rotate").map(|o| rotation_value(&o)).unwrap_or(0);
+        let (visible, w, h) = if w > 0.0 && h > 0.0 {
+            (visible, w, h)
+        } else {
+            (media, media[2] - media[0], media[3] - media[1])
+        };
+        let rotation = self
+            .inherited(id, b"Rotate")
+            .map(|o| rotation_value(&o))
+            .unwrap_or(0);
         PageGeometry::new(visible[0], visible[1], w, h, rotation)
     }
 
@@ -276,7 +306,10 @@ impl Pdf {
         let root_id = self.pages_root()?;
         for &id in &ids {
             for key in INHERITABLE {
-                let Some(holder) = self.inherited_from(id, key).filter(|&holder| holder != id) else { continue };
+                let Some(holder) = self.inherited_from(id, key).filter(|&holder| holder != id)
+                else {
+                    continue;
+                };
                 let value = crate::pagetree::share(&mut self.doc, holder, key)?;
                 self.doc.get_dictionary_mut(id)?.set(key, value);
             }
@@ -286,7 +319,12 @@ impl Pdf {
             self.doc.get_dictionary_mut(id)?.set("Parent", root_id);
         }
         let root = self.doc.get_dictionary_mut(root_id)?;
-        root.set("Kids", ids.iter().map(|id| Object::Reference(*id)).collect::<Vec<_>>());
+        root.set(
+            "Kids",
+            ids.iter()
+                .map(|id| Object::Reference(*id))
+                .collect::<Vec<_>>(),
+        );
         root.set("Count", ids.len() as i64);
         // Every page holds its own values now. Left on the root they would also reach pages added
         // later, which have their own size and orientation.
@@ -305,11 +343,16 @@ impl Pdf {
     /// A page listed more than once is turned once.
     pub fn rotate_pages(&mut self, pages: &[usize], degrees: i32) -> Result<()> {
         if degrees % 90 != 0 {
-            return Err(Error::Other(format!("pages can only be turned by a multiple of 90 degrees, not {degrees}")));
+            return Err(Error::Other(format!(
+                "pages can only be turned by a multiple of 90 degrees, not {degrees}"
+            )));
         }
         let ids = self.page_ids();
         if let Some(&index) = pages.iter().find(|&&p| p >= ids.len()) {
-            return Err(Error::PageOutOfRange { index, count: ids.len() });
+            return Err(Error::PageOutOfRange {
+                index,
+                count: ids.len(),
+            });
         }
         for index in once_each(pages) {
             let id = ids[index];
@@ -337,11 +380,17 @@ impl Pdf {
         }
         let ids = self.page_ids();
         let doomed: HashSet<ObjectId> = unique.iter().map(|&p| ids[p]).collect();
-        let staying: HashSet<ObjectId> = ids.iter().copied().filter(|id| !doomed.contains(id)).collect();
+        let staying: HashSet<ObjectId> = ids
+            .iter()
+            .copied()
+            .filter(|id| !doomed.contains(id))
+            .collect();
         let doomed_annotations = self.annotations_leaving(&doomed, &staying);
         // What refers to the pages is found through them, so this comes first. An invisible
         // signature only sits on a page because every field has to; it is not the page's content.
-        self.drop_form_fields_on(&doomed, &|_, widget, signature| !signature || widget_area(widget).is_some());
+        self.drop_form_fields_on(&doomed, &|_, widget, signature| {
+            !signature || widget_area(widget).is_some()
+        });
         self.drop_structure_of(&doomed);
         self.drop_navigation_to(&doomed);
         let labels = self.page_labels_without(&unique);
@@ -366,17 +415,34 @@ impl Pdf {
             return Err(Error::PageOutOfRange { index, count });
         }
         let (width, height) = match size {
-            Some((w, h)) if [w, h].iter().all(|v| v.is_finite() && (1.0..=MAX_PAGE_SIDE).contains(v)) => (w, h),
-            Some((w, h)) => return Err(Error::Other(format!("a page can be 1 to {MAX_PAGE_SIDE} points wide and high, not {w} x {h}"))),
+            Some((w, h))
+                if [w, h]
+                    .iter()
+                    .all(|v| v.is_finite() && (1.0..=MAX_PAGE_SIDE).contains(v)) =>
+            {
+                (w, h)
+            }
+            Some((w, h)) => {
+                return Err(Error::Other(format!(
+                    "a page can be 1 to {MAX_PAGE_SIDE} points wide and high, not {w} x {h}"
+                )))
+            }
             None if count > 0 => {
-                let (w, h) = self.page_geometry(index.saturating_sub(1).min(count - 1))?.display_size();
+                let (w, h) = self
+                    .page_geometry(index.saturating_sub(1).min(count - 1))?
+                    .display_size();
                 (w.clamp(1.0, MAX_PAGE_SIDE), h.clamp(1.0, MAX_PAGE_SIDE))
             }
             None => (612.0, 792.0),
         };
         self.flatten_page_tree()?;
         let root_id = self.pages_root()?;
-        let page_box = vec![0.into(), 0.into(), Object::Real(width), Object::Real(height)];
+        let page_box = vec![
+            0.into(),
+            0.into(),
+            Object::Real(width),
+            Object::Real(height),
+        ];
         let page_id = self.doc.add_object(dictionary! {
             "Type" => "Page",
             "Parent" => root_id,
@@ -404,7 +470,11 @@ impl Pdf {
         }
         self.flatten_page_tree()?;
         let root_id = self.pages_root()?;
-        let kids = self.doc.get_dictionary_mut(root_id)?.get_mut(b"Kids")?.as_array_mut()?;
+        let kids = self
+            .doc
+            .get_dictionary_mut(root_id)?
+            .get_mut(b"Kids")?
+            .as_array_mut()?;
         let item = kids.remove(from);
         kids.insert(to, item);
         Ok(())
@@ -427,7 +497,11 @@ impl Pdf {
         copy.flatten_page_tree()?;
         let ids = copy.page_ids();
         let kept: HashSet<ObjectId> = pages.iter().map(|&p| ids[p]).collect();
-        let dropped: HashSet<ObjectId> = ids.iter().copied().filter(|id| !kept.contains(id)).collect();
+        let dropped: HashSet<ObjectId> = ids
+            .iter()
+            .copied()
+            .filter(|id| !kept.contains(id))
+            .collect();
         let dropped_annotations = copy.annotations_leaving(&dropped, &kept);
         copy.drop_form_fields_on(&dropped, &|_, _, _| true);
         // Article threads that run only through other pages, with their titles, go too.
@@ -441,7 +515,15 @@ impl Pdf {
         // tree holds the tagged content of every page.
         if let Ok(catalog_id) = copy.doc.trailer.get(b"Root").and_then(|o| o.as_reference()) {
             if let Ok(catalog) = copy.doc.get_dictionary_mut(catalog_id) {
-                for key in [&b"Outlines"[..], b"Names", b"Dests", b"OpenAction", b"PageLabels", b"StructTreeRoot", b"MarkInfo"] {
+                for key in [
+                    &b"Outlines"[..],
+                    b"Names",
+                    b"Dests",
+                    b"OpenAction",
+                    b"PageLabels",
+                    b"StructTreeRoot",
+                    b"MarkInfo",
+                ] {
                     catalog.remove(key);
                 }
             }
@@ -466,7 +548,9 @@ impl Pdf {
     }
 
     pub fn split_every_page(&self) -> Result<Vec<Pdf>> {
-        (0..self.page_count()).map(|p| self.extract_pages(&[p])).collect()
+        (0..self.page_count())
+            .map(|p| self.extract_pages(&[p]))
+            .collect()
     }
 
     /// Concatenates documents. Outlines and named destinations of the inputs are not carried over.
@@ -514,7 +598,13 @@ impl Pdf {
             result.doc.get_dictionary_mut(*id)?.set("Parent", root_id);
         }
         let root = result.doc.get_dictionary_mut(root_id)?;
-        root.set("Kids", page_ids.iter().map(|id| Object::Reference(*id)).collect::<Vec<_>>());
+        root.set(
+            "Kids",
+            page_ids
+                .iter()
+                .map(|id| Object::Reference(*id))
+                .collect::<Vec<_>>(),
+        );
         root.set("Count", page_ids.len() as i64);
         result.set_protection(protection);
         Ok(result)
@@ -524,7 +614,10 @@ impl Pdf {
     /// order they are first named: for edits that act on each page (rotate, watermark, recognize
     /// text, extract), where doing a page twice would turn it twice or stamp it twice.
     pub fn parse_pages(text: &str, page_count: usize) -> Result<Vec<usize>> {
-        let all: Vec<usize> = Self::parse_ranges(text, page_count)?.into_iter().flatten().collect();
+        let all: Vec<usize> = Self::parse_ranges(text, page_count)?
+            .into_iter()
+            .flatten()
+            .collect();
         Ok(once_each(&all))
     }
 
@@ -568,7 +661,9 @@ const MAX_WRITABLE: f32 = 1.0e15;
 /// put in.
 pub(crate) fn writable_numbers(doc: &mut Document) {
     doc.objects.values_mut().for_each(writable);
-    doc.trailer.iter_mut().for_each(|(_, value)| writable(value));
+    doc.trailer
+        .iter_mut()
+        .for_each(|(_, value)| writable(value));
 }
 
 /// Brings every real number in `object` within what can be written out and read back: one that
@@ -581,7 +676,10 @@ pub(crate) fn writable(object: &mut Object) {
         Object::Real(value) if value.abs() > MAX_WRITABLE => *value = MAX_WRITABLE.copysign(*value),
         Object::Array(items) => items.iter_mut().for_each(writable),
         Object::Dictionary(dict) => dict.iter_mut().for_each(|(_, value)| writable(value)),
-        Object::Stream(stream) => stream.dict.iter_mut().for_each(|(_, value)| writable(value)),
+        Object::Stream(stream) => stream
+            .dict
+            .iter_mut()
+            .for_each(|(_, value)| writable(value)),
         _ => {}
     }
 }
@@ -589,7 +687,11 @@ pub(crate) fn writable(object: &mut Object) {
 /// `pages` with each page kept the first time it appears.
 pub(crate) fn once_each(pages: &[usize]) -> Vec<usize> {
     let mut seen = HashSet::new();
-    pages.iter().copied().filter(|page| seen.insert(*page)).collect()
+    pages
+        .iter()
+        .copied()
+        .filter(|page| seen.insert(*page))
+        .collect()
 }
 
 impl std::fmt::Debug for Pdf {

@@ -11,15 +11,21 @@ impl Pdf {
     /// `q`/`Q` so that any graphics state it leaves behind cannot affect the stamp.
     pub(crate) fn append_content(&mut self, page_id: ObjectId, stamp: Vec<u8>) -> Result<()> {
         let existing = self.doc.get_page_contents(page_id);
-        let open = self.doc.add_object(Stream::new(Dictionary::new(), b"q\n".to_vec()));
-        let close = self.doc.add_object(Stream::new(Dictionary::new(), b"\nQ\n".to_vec()));
+        let open = self
+            .doc
+            .add_object(Stream::new(Dictionary::new(), b"q\n".to_vec()));
+        let close = self
+            .doc
+            .add_object(Stream::new(Dictionary::new(), b"\nQ\n".to_vec()));
         let stamp_id = self.doc.add_object(Stream::new(Dictionary::new(), stamp));
 
         let mut list: Vec<Object> = vec![Object::Reference(open)];
         list.extend(existing.into_iter().map(Object::Reference));
         list.push(Object::Reference(close));
         list.push(Object::Reference(stamp_id));
-        self.doc.get_dictionary_mut(page_id)?.set("Contents", Object::Array(list));
+        self.doc
+            .get_dictionary_mut(page_id)?
+            .set("Contents", Object::Array(list));
         Ok(())
     }
 
@@ -39,7 +45,12 @@ impl Pdf {
             .and_then(|o| o.as_dict().ok().cloned())
             .unwrap_or_default();
         let mut group = match resources.get(category.as_bytes()) {
-            Ok(entry) => self.resolve(entry).as_dict().ok().cloned().unwrap_or_default(),
+            Ok(entry) => self
+                .resolve(entry)
+                .as_dict()
+                .ok()
+                .cloned()
+                .unwrap_or_default(),
             Err(_) => Dictionary::new(),
         };
         let mut n = 1;
@@ -52,12 +63,18 @@ impl Pdf {
         };
         group.set(name.as_bytes().to_vec(), value);
         resources.set(category.as_bytes().to_vec(), Object::Dictionary(group));
-        self.doc.get_dictionary_mut(page_id)?.set("Resources", Object::Dictionary(resources));
+        self.doc
+            .get_dictionary_mut(page_id)?
+            .set("Resources", Object::Dictionary(resources));
         Ok(name)
     }
 
     /// Registers one of the standard fonts on the page and returns its resource name.
-    pub(crate) fn add_standard_font(&mut self, page_id: ObjectId, font: StandardFont) -> Result<String> {
+    pub(crate) fn add_standard_font(
+        &mut self,
+        page_id: ObjectId,
+        font: StandardFont,
+    ) -> Result<String> {
         let font_id = self.doc.add_object(dictionary! {
             "Type" => "Font",
             "Subtype" => "Type1",
@@ -95,7 +112,12 @@ pub(crate) enum Token<'a> {
 /// stream of a few megabytes of `q` would take gigabytes. The data of inline images is skipped.
 pub(crate) fn tokens<'a>(data: &'a [u8], mut visit: impl FnMut(Token<'a>)) {
     let is_space = |b: u8| matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ');
-    let is_delimiter = |b: u8| matches!(b, b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%');
+    let is_delimiter = |b: u8| {
+        matches!(
+            b,
+            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+        )
+    };
     let mut at = 0;
     while at < data.len() {
         let byte = data[at];
@@ -133,11 +155,18 @@ pub(crate) fn tokens<'a>(data: &'a [u8], mut visit: impl FnMut(Token<'a>)) {
                 visit(Token::Other);
             }
             b'<' => {
-                at += data[at..].iter().position(|&b| b == b'>').map_or(data.len(), |end| end + 1);
+                at += data[at..]
+                    .iter()
+                    .position(|&b| b == b'>')
+                    .map_or(data.len(), |end| end + 1);
                 visit(Token::Other);
             }
             b'>' => {
-                at += if data.get(at + 1) == Some(&b'>') { 2 } else { 1 };
+                at += if data.get(at + 1) == Some(&b'>') {
+                    2
+                } else {
+                    1
+                };
                 visit(Token::Other);
             }
             b'[' | b']' | b'{' | b'}' | b')' => {
@@ -158,8 +187,16 @@ pub(crate) fn tokens<'a>(data: &'a [u8], mut visit: impl FnMut(Token<'a>)) {
                     at += 1;
                 }
                 let word = &data[start..at];
-                if word.iter().all(|b| matches!(b, b'0'..=b'9' | b'+' | b'-' | b'.')) {
-                    visit(std::str::from_utf8(word).ok().and_then(|w| w.parse().ok()).map_or(Token::Other, Token::Number));
+                if word
+                    .iter()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'+' | b'-' | b'.'))
+                {
+                    visit(
+                        std::str::from_utf8(word)
+                            .ok()
+                            .and_then(|w| w.parse().ok())
+                            .map_or(Token::Other, Token::Number),
+                    );
                 } else if matches!(word, b"true" | b"false" | b"null") {
                     visit(Token::Other);
                 } else {
@@ -170,7 +207,9 @@ pub(crate) fn tokens<'a>(data: &'a [u8], mut visit: impl FnMut(Token<'a>)) {
                         let end = (image..data.len().saturating_sub(1)).find(|&i| {
                             data[i..].starts_with(b"EI")
                                 && data.get(i.wrapping_sub(1)).is_some_and(|&b| is_space(b))
-                                && data.get(i + 2).is_none_or(|&b| is_space(b) || is_delimiter(b))
+                                && data
+                                    .get(i + 2)
+                                    .is_none_or(|&b| is_space(b) || is_delimiter(b))
                         });
                         at = end.map_or(data.len(), |end| end + 2);
                         visit(Token::Operator(b"EI"));
@@ -189,7 +228,10 @@ pub(crate) fn name(written: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     let mut out = Vec::with_capacity(written.len());
     let mut at = 0;
     while at < written.len() {
-        let hex = written.get(at + 1..at + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
+        let hex = written
+            .get(at + 1..at + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
         match (written[at], hex) {
             (b'#', Some(byte)) => {
                 out.push(byte);
@@ -256,7 +298,16 @@ mod tests {
     #[test]
     fn inline_image_data_is_skipped() {
         let data = b"BI /W 2 /H 1 /CS /RGB ID \x00/Fake EI\xffEI Q EI\n/After Do";
-        let names: Vec<_> = all(data).into_iter().filter_map(|t| if let Token::Name(n) = t { Some(n) } else { None }).collect();
+        let names: Vec<_> = all(data)
+            .into_iter()
+            .filter_map(|t| {
+                if let Token::Name(n) = t {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(names, vec![&b"W"[..], b"H", b"CS", b"RGB", b"After"]);
     }
 }

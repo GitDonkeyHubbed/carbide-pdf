@@ -47,7 +47,11 @@ pub(crate) enum Verified {
 /// True when the signature algorithm hashes with SHA-1, including RSA-PSS whose parameters name
 /// SHA-1 or leave the hash at its SHA-1 default. `digest_algorithm` is the SignerInfo's digest,
 /// which the plain key OIDs (`rsaEncryption`, `id-ecPublicKey`) sign with.
-pub(crate) fn uses_sha1(signature_algorithm: &str, parameters: Option<&[u8]>, digest_algorithm: &str) -> bool {
+pub(crate) fn uses_sha1(
+    signature_algorithm: &str,
+    parameters: Option<&[u8]>,
+    digest_algorithm: &str,
+) -> bool {
     signature_hash(signature_algorithm, parameters, digest_algorithm) == Some(SHA1)
 }
 
@@ -75,7 +79,11 @@ pub(crate) fn digest(oid: &str, parts: &[&[u8]]) -> Option<Vec<u8>> {
 }
 
 /// The digest a signature algorithm computes over what it signs, when this build knows it.
-fn signature_hash(signature_algorithm: &str, parameters: Option<&[u8]>, digest_algorithm: &str) -> Option<&'static str> {
+fn signature_hash(
+    signature_algorithm: &str,
+    parameters: Option<&[u8]>,
+    digest_algorithm: &str,
+) -> Option<&'static str> {
     match signature_algorithm {
         RSA_ENCRYPTION | EC_PUBLIC_KEY => known_hash(digest_algorithm),
         SHA1_RSA | ECDSA_SHA1 => Some(SHA1),
@@ -102,7 +110,9 @@ pub(crate) fn verify(
         return Verified::Unsupported;
     };
     match signature_algorithm {
-        RSA_ENCRYPTION | SHA1_RSA | SHA256_RSA | SHA384_RSA | SHA512_RSA => rsa_pkcs1(certificate, hash, parts, signature),
+        RSA_ENCRYPTION | SHA1_RSA | SHA256_RSA | SHA384_RSA | SHA512_RSA => {
+            rsa_pkcs1(certificate, hash, parts, signature)
+        }
         RSA_PSS => {
             let salt_len = pss_parameters(parameters).map_or(20, |(_, salt)| salt);
             rsa_pss(certificate, hash, salt_len, parts, signature)
@@ -123,22 +133,37 @@ fn rsa_public_key(certificate: &Certificate, pss: bool) -> Option<RsaPublicKey> 
 }
 
 fn rsa_pkcs1(certificate: &Certificate, hash: &str, parts: &[&[u8]], signature: &[u8]) -> Verified {
-    let Some(key) = rsa_public_key(certificate, false) else { return Verified::Unsupported };
-    let (scheme, Some(hashed)) = (match hash {
-        SHA1 => Pkcs1v15Sign::new::<Sha1>(),
-        SHA256 => Pkcs1v15Sign::new::<Sha256>(),
-        SHA384 => Pkcs1v15Sign::new::<Sha384>(),
-        SHA512 => Pkcs1v15Sign::new::<Sha512>(),
-        _ => return Verified::Unsupported,
-    }, digest(hash, parts)) else {
+    let Some(key) = rsa_public_key(certificate, false) else {
+        return Verified::Unsupported;
+    };
+    let (scheme, Some(hashed)) = (
+        match hash {
+            SHA1 => Pkcs1v15Sign::new::<Sha1>(),
+            SHA256 => Pkcs1v15Sign::new::<Sha256>(),
+            SHA384 => Pkcs1v15Sign::new::<Sha384>(),
+            SHA512 => Pkcs1v15Sign::new::<Sha512>(),
+            _ => return Verified::Unsupported,
+        },
+        digest(hash, parts),
+    ) else {
         return Verified::Unsupported;
     };
     bool_result(key.verify(scheme, &hashed, signature).is_ok())
 }
 
-fn rsa_pss(certificate: &Certificate, hash: &str, salt_len: usize, parts: &[&[u8]], signature: &[u8]) -> Verified {
-    let Some(key) = rsa_public_key(certificate, true) else { return Verified::Unsupported };
-    let Some(hashed) = digest(hash, parts) else { return Verified::Unsupported };
+fn rsa_pss(
+    certificate: &Certificate,
+    hash: &str,
+    salt_len: usize,
+    parts: &[&[u8]],
+    signature: &[u8],
+) -> Verified {
+    let Some(key) = rsa_public_key(certificate, true) else {
+        return Verified::Unsupported;
+    };
+    let Some(hashed) = digest(hash, parts) else {
+        return Verified::Unsupported;
+    };
     let scheme = match hash {
         SHA1 => Pss::new_with_salt::<Sha1>(salt_len),
         SHA256 => Pss::new_with_salt::<Sha256>(salt_len),
@@ -180,25 +205,33 @@ fn pss_parameters(parameters: Option<&[u8]>) -> Option<(&'static str, usize)> {
 
 /// `oid` when it names a digest this build computes.
 fn known_hash(oid: &str) -> Option<&'static str> {
-    [SHA1, SHA256, SHA384, SHA512].into_iter().find(|known| *known == oid)
+    [SHA1, SHA256, SHA384, SHA512]
+        .into_iter()
+        .find(|known| *known == oid)
 }
 
 fn ecdsa(certificate: &Certificate, hash: &str, parts: &[&[u8]], signature: &[u8]) -> Verified {
     let Ok(spki) = certificate.tbs_certificate.subject_public_key_info.to_der() else {
         return Verified::Unsupported;
     };
-    let Some(mut hashed) = digest(hash, parts) else { return Verified::Unsupported };
+    let Some(mut hashed) = digest(hash, parts) else {
+        return Verified::Unsupported;
+    };
     // A digest shorter than half the curve's field (SHA-1 on P-384) is refused by the curve code;
     // zeros on the left give the same integer, which is what ECDSA signs.
     if hashed.len() < 24 {
         hashed.splice(0..0, std::iter::repeat_n(0, 24 - hashed.len()));
     }
     if let Ok(key) = p256::ecdsa::VerifyingKey::from_public_key_der(&spki) {
-        let Ok(sig) = p256::ecdsa::Signature::from_der(signature) else { return Verified::Bad };
+        let Ok(sig) = p256::ecdsa::Signature::from_der(signature) else {
+            return Verified::Bad;
+        };
         return bool_result(key.verify_prehash(&hashed, &sig).is_ok());
     }
     if let Ok(key) = p384::ecdsa::VerifyingKey::from_public_key_der(&spki) {
-        let Ok(sig) = p384::ecdsa::Signature::from_der(signature) else { return Verified::Bad };
+        let Ok(sig) = p384::ecdsa::Signature::from_der(signature) else {
+            return Verified::Bad;
+        };
         return bool_result(key.verify_prehash(&hashed, &sig).is_ok());
     }
     Verified::Unsupported

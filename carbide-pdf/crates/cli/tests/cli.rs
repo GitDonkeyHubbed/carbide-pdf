@@ -7,7 +7,10 @@ use carbide_engine::signature::{Identity, SignOptions, TimestampSource};
 use carbide_engine::{Error, Pdf, ProtectionOptions};
 
 fn carbide(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_carbide")).args(args).output().unwrap()
+    Command::new(env!("CARGO_BIN_EXE_carbide"))
+        .args(args)
+        .output()
+        .unwrap()
 }
 
 fn scratch(tag: &str) -> PathBuf {
@@ -21,13 +24,24 @@ fn scratch(tag: &str) -> PathBuf {
 fn protected(path: &Path, user: &str, owner: &str) {
     let mut pdf = Pdf::new();
     pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
-    pdf.add_text_box(0, 72.0, 720.0, "private words", 18.0).unwrap();
-    std::fs::write(path, pdf.to_encrypted_bytes(&ProtectionOptions::new(user, owner)).unwrap()).unwrap();
+    pdf.add_text_box(0, 72.0, 720.0, "private words", 18.0)
+        .unwrap();
+    std::fs::write(
+        path,
+        pdf.to_encrypted_bytes(&ProtectionOptions::new(user, owner))
+            .unwrap(),
+    )
+    .unwrap();
 }
 
 fn key(bytes: &[u8]) -> Vec<u8> {
     let pdf = Pdf::from_bytes_with_password(bytes, "owner pw").unwrap();
-    pdf.document().encryption_state.as_ref().expect("still encrypted").file_encryption_key().to_vec()
+    pdf.document()
+        .encryption_state
+        .as_ref()
+        .expect("still encrypted")
+        .file_encryption_key()
+        .to_vec()
 }
 
 #[test]
@@ -41,14 +55,30 @@ fn editing_a_protected_file_in_place_keeps_it_encrypted() {
         let mut args = vec!["rotate", path, "1", "90", path];
         args.extend(password.iter().flat_map(|p| ["--password", p]));
         let output = carbide(&args);
-        assert!(output.status.success(), "{user:?}: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{user:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
         let bytes = std::fs::read(&file).unwrap();
-        assert!(!bytes.windows(7).any(|w| w == b"private"), "{user:?}: written in the clear");
+        assert!(
+            !bytes.windows(7).any(|w| w == b"private"),
+            "{user:?}: written in the clear"
+        );
         assert_eq!(key(&bytes), before, "{user:?}: encrypted with another key");
-        assert_eq!(Pdf::from_bytes_with_password(&bytes, "owner pw").unwrap().page_rotation(0).unwrap(), 90);
+        assert_eq!(
+            Pdf::from_bytes_with_password(&bytes, "owner pw")
+                .unwrap()
+                .page_rotation(0)
+                .unwrap(),
+            90
+        );
         if !user.is_empty() {
-            assert!(matches!(Pdf::from_bytes(&bytes), Err(Error::PasswordRequired)));
+            assert!(matches!(
+                Pdf::from_bytes(&bytes),
+                Err(Error::PasswordRequired)
+            ));
             assert!(Pdf::from_bytes_with_password(&bytes, user).is_ok());
         }
     }
@@ -69,7 +99,15 @@ fn new_documents_are_not_written_unencrypted_over_a_protected_input() {
 
     // To another file is fine: that is a new, separate document.
     let copy = dir.join("copy.pdf");
-    assert!(carbide(&["extract", path, "1", copy.to_str().unwrap(), "--unprotected"]).status.success());
+    assert!(carbide(&[
+        "extract",
+        path,
+        "1",
+        copy.to_str().unwrap(),
+        "--unprotected"
+    ])
+    .status
+    .success());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -88,7 +126,10 @@ fn new_documents_from_a_protected_input_keep_its_protection_unless_asked() {
         ("extract", vec!["extract", path, "1", &out("extract.pdf")]),
         ("split", vec!["split", path, "1", &out("parts")]),
         ("impose", vec!["impose", path, &out("impose.pdf")]),
-        ("merge", vec!["merge", &out("merge.pdf"), path, plain.to_str().unwrap()]),
+        (
+            "merge",
+            vec!["merge", &out("merge.pdf"), path, plain.to_str().unwrap()],
+        ),
     ] {
         let mut args: Vec<&str> = args;
         args.extend(["--password", "user pw"]);
@@ -99,24 +140,56 @@ fn new_documents_from_a_protected_input_keep_its_protection_unless_asked() {
             name => dir.join(format!("{name}.pdf")),
         };
         let bytes = std::fs::read(&written).unwrap();
-        assert!(!bytes.windows(7).any(|w| w == b"private"), "{what}: written in the clear");
-        assert!(matches!(Pdf::from_bytes(&bytes), Err(Error::PasswordRequired)), "{what}");
-        assert!(Pdf::from_bytes_with_password(&bytes, "user pw").is_ok(), "{what}");
+        assert!(
+            !bytes.windows(7).any(|w| w == b"private"),
+            "{what}: written in the clear"
+        );
+        assert!(
+            matches!(Pdf::from_bytes(&bytes), Err(Error::PasswordRequired)),
+            "{what}"
+        );
+        assert!(
+            Pdf::from_bytes_with_password(&bytes, "user pw").is_ok(),
+            "{what}"
+        );
         assert_eq!(key(&bytes), before, "{what}: protected with another key");
     }
 
     // Without protection only when asked for.
     let unprotected = out("unprotected.pdf");
-    let output = carbide(&["extract", path, "1", &unprotected, "--password", "user pw", "--unprotected"]);
+    let output = carbide(&[
+        "extract",
+        path,
+        "1",
+        &unprotected,
+        "--password",
+        "user pw",
+        "--unprotected",
+    ]);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(Pdf::open(&unprotected).unwrap().document().encryption_state.is_none());
+    assert!(Pdf::open(&unprotected)
+        .unwrap()
+        .document()
+        .encryption_state
+        .is_none());
 
     // Two inputs protected in different ways cannot share one protection.
     let other = dir.join("other.pdf");
     protected(&other, "user pw", "owner pw");
-    let output = carbide(&["merge", &out("both.pdf"), path, other.to_str().unwrap(), "--password", "user pw"]);
+    let output = carbide(&[
+        "merge",
+        &out("both.pdf"),
+        path,
+        other.to_str().unwrap(),
+        "--password",
+        "user pw",
+    ]);
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("--unprotected"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("--unprotected"),
+        "{}",
+        stderr(&output)
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -127,14 +200,24 @@ fn protected_documents_are_exported_only_when_asked() {
     // Page text, not a text box, so that it is part of the exported text.
     let mut pdf = Pdf::new();
     pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
-    pdf.apply_watermark(&carbide_engine::WatermarkOptions::new("private words")).unwrap();
-    std::fs::write(&file, pdf.to_encrypted_bytes(&ProtectionOptions::new("", "owner pw")).unwrap()).unwrap();
+    pdf.apply_watermark(&carbide_engine::WatermarkOptions::new("private words"))
+        .unwrap();
+    std::fs::write(
+        &file,
+        pdf.to_encrypted_bytes(&ProtectionOptions::new("", "owner pw"))
+            .unwrap(),
+    )
+    .unwrap();
     let path = file.to_str().unwrap();
     let images = dir.join("images");
 
     let output = carbide(&["text", path]);
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("--unprotected"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("--unprotected"),
+        "{}",
+        stderr(&output)
+    );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("private"));
     let output = carbide(&["images", path, images.to_str().unwrap(), "--dpi", "20"]);
     assert!(!output.status.success());
@@ -143,7 +226,14 @@ fn protected_documents_are_exported_only_when_asked() {
     let output = carbide(&["text", path, "--unprotected"]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(String::from_utf8_lossy(&output.stdout).contains("private words"));
-    let output = carbide(&["images", path, images.to_str().unwrap(), "--dpi", "20", "--unprotected"]);
+    let output = carbide(&[
+        "images",
+        path,
+        images.to_str().unwrap(),
+        "--dpi",
+        "20",
+        "--unprotected",
+    ]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(images.join("f-001.png").exists());
     let _ = std::fs::remove_dir_all(dir);
@@ -155,18 +245,31 @@ fn compare_prints_the_text_of_a_protected_document_only_when_asked() {
     let restricted = dir.join("restricted.pdf");
     let mut pdf = Pdf::new();
     pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
-    pdf.apply_watermark(&carbide_engine::WatermarkOptions::new("private words")).unwrap();
-    std::fs::write(&restricted, pdf.to_encrypted_bytes(&ProtectionOptions::new("", "owner pw")).unwrap()).unwrap();
+    pdf.apply_watermark(&carbide_engine::WatermarkOptions::new("private words"))
+        .unwrap();
+    std::fs::write(
+        &restricted,
+        pdf.to_encrypted_bytes(&ProtectionOptions::new("", "owner pw"))
+            .unwrap(),
+    )
+    .unwrap();
     let blank = dir.join("blank.pdf");
     plain_file(&blank, &[]);
     let (restricted, blank) = (restricted.to_str().unwrap(), blank.to_str().unwrap());
 
     // It opens without a password, but its text is not printed without --unprotected, whichever
     // side it is on.
-    for args in [["compare", restricted, blank], ["compare", blank, restricted]] {
+    for args in [
+        ["compare", restricted, blank],
+        ["compare", blank, restricted],
+    ] {
         let output = carbide(&args);
         assert!(!output.status.success());
-        assert!(stderr(&output).contains("--unprotected"), "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("--unprotected"),
+            "{}",
+            stderr(&output)
+        );
         assert!(!String::from_utf8_lossy(&output.stdout).contains("private"));
     }
     let output = carbide(&["compare", restricted, blank, "--unprotected"]);
@@ -204,31 +307,72 @@ fn split_and_image_export_replace_files_only_with_force() {
     std::fs::write(parts.join("doc-pages-2-2.pdf"), b"an earlier part").unwrap();
     let output = carbide(&["split", input, "1,2", parts.to_str().unwrap()]);
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("doc-pages-2-2.pdf already exists") && stderr(&output).contains("--force"), "{}", stderr(&output));
-    assert_eq!(std::fs::read(parts.join("doc-pages-2-2.pdf")).unwrap(), b"an earlier part");
-    assert!(!parts.join("doc-pages-1-1.pdf").exists(), "nothing is written when a name is taken");
+    assert!(
+        stderr(&output).contains("doc-pages-2-2.pdf already exists")
+            && stderr(&output).contains("--force"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        std::fs::read(parts.join("doc-pages-2-2.pdf")).unwrap(),
+        b"an earlier part"
+    );
+    assert!(
+        !parts.join("doc-pages-1-1.pdf").exists(),
+        "nothing is written when a name is taken"
+    );
     let output = carbide(&["split", input, "1,2", parts.to_str().unwrap(), "--force"]);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(Pdf::open(parts.join("doc-pages-2-2.pdf")).unwrap().page_count(), 1);
+    assert_eq!(
+        Pdf::open(parts.join("doc-pages-2-2.pdf"))
+            .unwrap()
+            .page_count(),
+        1
+    );
     // A range given twice would write one part over the other: refused before anything is written.
     let again = dir.join("again");
     std::fs::create_dir_all(&again).unwrap();
     let output = carbide(&["split", input, "1-2,2,1-2", again.to_str().unwrap()]);
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("doc-pages-1-2.pdf twice"), "{}", stderr(&output));
-    assert_eq!(std::fs::read_dir(&again).unwrap().count(), 0, "a part was written");
+    assert!(
+        stderr(&output).contains("doc-pages-1-2.pdf twice"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        std::fs::read_dir(&again).unwrap().count(),
+        0,
+        "a part was written"
+    );
 
     let images = dir.join("images");
     std::fs::create_dir_all(&images).unwrap();
     std::fs::write(images.join("doc-001.png"), b"an earlier image").unwrap();
     let output = carbide(&["images", input, images.to_str().unwrap(), "--dpi", "20"]);
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("doc-001.png already exists"), "{}", stderr(&output));
-    assert_eq!(std::fs::read(images.join("doc-001.png")).unwrap(), b"an earlier image");
+    assert!(
+        stderr(&output).contains("doc-001.png already exists"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        std::fs::read(images.join("doc-001.png")).unwrap(),
+        b"an earlier image"
+    );
     assert!(!images.join("doc-002.png").exists());
-    let output = carbide(&["images", input, images.to_str().unwrap(), "--dpi", "20", "--force"]);
+    let output = carbide(&[
+        "images",
+        input,
+        images.to_str().unwrap(),
+        "--dpi",
+        "20",
+        "--force",
+    ]);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_ne!(std::fs::read(images.join("doc-001.png")).unwrap(), b"an earlier image");
+    assert_ne!(
+        std::fs::read(images.join("doc-001.png")).unwrap(),
+        b"an earlier image"
+    );
     assert!(images.join("doc-002.png").exists());
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -240,7 +384,14 @@ fn reduce_keeps_the_originals_and_refuses_names_that_collide() {
     let bulky = |path: &Path| {
         let mut pdf = Pdf::new();
         pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
-        pdf.add_text_box(0, 72.0, 720.0, &"lorem ipsum dolor sit amet ".repeat(400), 10.0).unwrap();
+        pdf.add_text_box(
+            0,
+            72.0,
+            720.0,
+            &"lorem ipsum dolor sit amet ".repeat(400),
+            10.0,
+        )
+        .unwrap();
         std::fs::write(path, pdf.to_bytes().unwrap()).unwrap();
     };
     let file = dir.join("big.pdf");
@@ -250,7 +401,11 @@ fn reduce_keeps_the_originals_and_refuses_names_that_collide() {
 
     let output = carbide(&["reduce", path]);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(std::fs::read(&file).unwrap(), before, "the original was replaced");
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        before,
+        "the original was replaced"
+    );
     let reduced = dir.join("big-reduced.pdf");
     assert!(std::fs::metadata(&reduced).unwrap().len() < before.len() as u64);
     // The reduced copy is not replaced without --overwrite.
@@ -268,7 +423,16 @@ fn reduce_keeps_the_originals_and_refuses_names_that_collide() {
     bulky(&b.join("x.pdf"));
     let (a_x, b_x) = (a.join("x.pdf"), b.join("x.pdf"));
     let b_before = std::fs::read(&b_x).unwrap();
-    let output = carbide(&["reduce", a_x.to_str().unwrap(), b_x.to_str().unwrap(), "--out-dir", b.to_str().unwrap(), "--suffix", "", "--overwrite"]);
+    let output = carbide(&[
+        "reduce",
+        a_x.to_str().unwrap(),
+        b_x.to_str().unwrap(),
+        "--out-dir",
+        b.to_str().unwrap(),
+        "--suffix",
+        "",
+        "--overwrite",
+    ]);
     assert!(!output.status.success());
     assert!(stderr(&output).contains("same file"), "{}", stderr(&output));
     assert_eq!(std::fs::read(&b_x).unwrap(), b_before);
@@ -276,7 +440,11 @@ fn reduce_keeps_the_originals_and_refuses_names_that_collide() {
     // Replacing the originals takes --in-place, and the refusal says so.
     let output = carbide(&["reduce", path, "--suffix", ""]);
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("--in-place"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("--in-place"),
+        "{}",
+        stderr(&output)
+    );
     assert_eq!(std::fs::read(&file).unwrap(), before);
     // --no-overwrite, the default now, is still accepted.
     std::fs::remove_file(&reduced).unwrap();
@@ -298,17 +466,29 @@ fn sanitize_removes_what_is_chosen_and_keeps_protection() {
     pdf.add_note(0, 100.0, 100.0, "SECRET NOTE").unwrap();
     std::fs::write(&file, pdf.to_bytes().unwrap()).unwrap();
     let path = file.to_str().unwrap();
-    let has_note = |path: &Path| std::fs::read(path).unwrap().windows(11).any(|w| w == b"SECRET NOTE");
+    let has_note = |path: &Path| {
+        std::fs::read(path)
+            .unwrap()
+            .windows(11)
+            .any(|w| w == b"SECRET NOTE")
+    };
 
     let kept = dir.join("kept.pdf");
-    let output = carbide(&["sanitize", path, kept.to_str().unwrap(), "--keep", "comments,metadata"]);
+    let output = carbide(&[
+        "sanitize",
+        path,
+        kept.to_str().unwrap(),
+        "--keep",
+        "comments,metadata",
+    ]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(has_note(&kept), "a kept item was removed");
 
     let clean = dir.join("clean.pdf");
     let output = carbide(&["sanitize", path, clean.to_str().unwrap()]);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("removed Comments, text boxes and markup: 1"));
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("removed Comments, text boxes and markup: 1"));
     assert!(!has_note(&clean));
     assert!(has_note(&file), "the input was changed");
 
@@ -318,16 +498,33 @@ fn sanitize_removes_what_is_chosen_and_keeps_protection() {
     let base = std::fs::read(&file).unwrap();
     let mut later = Pdf::from_bytes(&base).unwrap();
     let page = later.page_ids()[0];
-    later.document_mut().get_dictionary_mut(page).unwrap().remove(b"Annots");
+    later
+        .document_mut()
+        .get_dictionary_mut(page)
+        .unwrap()
+        .remove(b"Annots");
     std::fs::write(&history, later.incremental_update(&base).unwrap()).unwrap();
     assert!(has_note(&history));
     let out = dir.join("history-clean.pdf");
-    let output = carbide(&["sanitize", history.to_str().unwrap(), out.to_str().unwrap(), "--only", "thumbnails"]);
+    let output = carbide(&[
+        "sanitize",
+        history.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "--only",
+        "thumbnails",
+    ]);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("removed Earlier versions and unused objects in the file"));
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("removed Earlier versions and unused objects in the file"));
     assert!(!has_note(&out), "the earlier version was written out again");
     // In place too.
-    let output = carbide(&["sanitize", history.to_str().unwrap(), history.to_str().unwrap(), "--only", "thumbnails"]);
+    let output = carbide(&[
+        "sanitize",
+        history.to_str().unwrap(),
+        history.to_str().unwrap(),
+        "--only",
+        "thumbnails",
+    ]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!has_note(&history));
 
@@ -336,19 +533,37 @@ fn sanitize_removes_what_is_chosen_and_keeps_protection() {
     protected(&locked, "user pw", "owner pw");
     let before = key(&std::fs::read(&locked).unwrap());
     let out = dir.join("locked-clean.pdf");
-    let output = carbide(&["sanitize", locked.to_str().unwrap(), out.to_str().unwrap(), "--only", "comments", "--password", "user pw"]);
+    let output = carbide(&[
+        "sanitize",
+        locked.to_str().unwrap(),
+        out.to_str().unwrap(),
+        "--only",
+        "comments",
+        "--password",
+        "user pw",
+    ]);
     assert!(output.status.success(), "{}", stderr(&output));
     let bytes = std::fs::read(&out).unwrap();
-    assert!(matches!(Pdf::from_bytes(&bytes), Err(Error::PasswordRequired)));
+    assert!(matches!(
+        Pdf::from_bytes(&bytes),
+        Err(Error::PasswordRequired)
+    ));
     assert_eq!(key(&bytes), before);
-    assert!(Pdf::from_bytes_with_password(&bytes, "user pw").unwrap().annotations(0).unwrap().is_empty());
+    assert!(Pdf::from_bytes_with_password(&bytes, "user pw")
+        .unwrap()
+        .annotations(0)
+        .unwrap()
+        .is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Mean brightness (0..255) of the display-space rect (x, y, w, h) of page `page` of `path`,
 /// rendered at 72 dpi.
 fn brightness(path: &Path, page: usize, (x, y, w, h): (u32, u32, u32, u32)) -> f32 {
-    let image = carbide_engine::Renderer::global().unwrap().render_page(&std::fs::read(path).unwrap(), page, 72.0).unwrap();
+    let image = carbide_engine::Renderer::global()
+        .unwrap()
+        .render_page(&std::fs::read(path).unwrap(), page, 72.0)
+        .unwrap();
     let top = image.height() - y - h;
     let mut total = 0.0;
     for row in top..top + h {
@@ -373,11 +588,23 @@ fn arguments_that_would_do_the_wrong_thing_are_refused_or_read_as_meant() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(Pdf::open(&out).unwrap().page_rotation(0).unwrap(), 270);
     let output = carbide(&["rotate", path, "1", "45", out_path]);
-    assert!(!output.status.success() && stderr(&output).contains("multiple of 90"), "{}", stderr(&output));
+    assert!(
+        !output.status.success() && stderr(&output).contains("multiple of 90"),
+        "{}",
+        stderr(&output)
+    );
     // A page named more than once is turned once.
-    assert!(carbide(&["rotate", path, "1,1,1-2", "90", out_path]).status.success());
+    assert!(carbide(&["rotate", path, "1,1,1-2", "90", out_path])
+        .status
+        .success());
     let turned = Pdf::open(&out).unwrap();
-    assert_eq!((turned.page_rotation(0).unwrap(), turned.page_rotation(1).unwrap()), (90, 90));
+    assert_eq!(
+        (
+            turned.page_rotation(0).unwrap(),
+            turned.page_rotation(1).unwrap()
+        ),
+        (90, 90)
+    );
 
     // Merging nothing writes nothing over the output.
     let before = std::fs::read(&out).unwrap();
@@ -388,17 +615,36 @@ fn arguments_that_would_do_the_wrong_thing_are_refused_or_read_as_meant() {
     // Bates numbers that cannot be stamped are an error, not a crash.
     for extra in [["--digits", "70000"], ["--start", "18446744073709551615"]] {
         let output = carbide(&[&["bates", path, out_path][..], &extra[..]].concat());
-        assert!(!output.status.success() && stderr(&output).starts_with("error: "), "{extra:?}: {}", stderr(&output));
+        assert!(
+            !output.status.success() && stderr(&output).starts_with("error: "),
+            "{extra:?}: {}",
+            stderr(&output)
+        );
     }
 
     // An absurd imposition grid is refused before any work.
-    let output = carbide(&["impose", path, out_path, "--layout", "step-and-repeat", "--columns", "1000000000"]);
-    assert!(!output.status.success() && stderr(&output).contains("Columns and rows"), "{}", stderr(&output));
+    let output = carbide(&[
+        "impose",
+        path,
+        out_path,
+        "--layout",
+        "step-and-repeat",
+        "--columns",
+        "1000000000",
+    ]);
+    assert!(
+        !output.status.success() && stderr(&output).contains("Columns and rows"),
+        "{}",
+        stderr(&output)
+    );
 
     // A rectangle given from its other corner redacts the same area; one with no area is refused.
     let output = carbide(&["redact", path, out_path, "--rect", "1:360,720,-300,-28"]);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(brightness(&out, 0, (70, 694, 280, 24)) < 30.0, "the area was not blacked out");
+    assert!(
+        brightness(&out, 0, (70, 694, 280, 24)) < 30.0,
+        "the area was not blacked out"
+    );
     for rect in ["1:100,100,0,50", "1:nan,100,10,10", "1:100,100,inf,10"] {
         let output = carbide(&["redact", path, out_path, "--rect", rect]);
         assert!(!output.status.success(), "{rect}");
@@ -413,7 +659,11 @@ fn verify_reads_files_that_need_their_open_password() {
     protected(&file, "user pw", "owner pw");
     let path = file.to_str().unwrap();
     let output = carbide(&["verify", path]);
-    assert!(!output.status.success() && stderr(&output).contains("password"), "{}", stderr(&output));
+    assert!(
+        !output.status.success() && stderr(&output).contains("password"),
+        "{}",
+        stderr(&output)
+    );
     let output = carbide(&["verify", path, "--password", "user pw"]);
     // Read, and found to have no signatures, which is no success for a check of signatures.
     assert_eq!(output.status.code(), Some(5), "{}", stderr(&output));
@@ -430,24 +680,59 @@ fn inputs_that_cannot_work_are_refused_with_messages_that_say_why() {
     let out_path = out.to_str().unwrap();
 
     // A watermark that cannot be drawn is refused, and nothing is written.
-    for extra in [&["--size", "nan"][..], &["--size", "inf"], &["--size", "0"], &["--size=-5"], &["--angle", "nan"], &["--opacity", "2"]] {
+    for extra in [
+        &["--size", "nan"][..],
+        &["--size", "inf"],
+        &["--size", "0"],
+        &["--size=-5"],
+        &["--angle", "nan"],
+        &["--opacity", "2"],
+    ] {
         let output = carbide(&[&["watermark", path, out_path, "--text", "HI"][..], extra].concat());
-        assert!(!output.status.success() && stderr(&output).contains("watermark size"), "{extra:?}: {}", stderr(&output));
+        assert!(
+            !output.status.success() && stderr(&output).contains("watermark size"),
+            "{extra:?}: {}",
+            stderr(&output)
+        );
         assert!(!out.exists(), "{extra:?}: an output was written");
     }
     // A redacted page rasterized at 1 dpi would be unreadable.
-    let output = carbide(&["redact", path, out_path, "--rect", "1:72,700,100,30", "--dpi", "1"]);
-    assert!(!output.status.success() && stderr(&output).contains("72 dpi"), "{}", stderr(&output));
+    let output = carbide(&[
+        "redact",
+        path,
+        out_path,
+        "--rect",
+        "1:72,700,100,30",
+        "--dpi",
+        "1",
+    ]);
+    assert!(
+        !output.status.success() && stderr(&output).contains("72 dpi"),
+        "{}",
+        stderr(&output)
+    );
 
     // Pages are named the way they were given, counted from 1.
     let output = carbide(&["move", path, "6", "1", out_path]);
-    assert!(stderr(&output).contains("page 6 does not exist (the document has 2 pages)"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("page 6 does not exist (the document has 2 pages)"),
+        "{}",
+        stderr(&output)
+    );
     let output = carbide(&["blank", path, "7", out_path]);
-    assert!(stderr(&output).contains("page 7 does not exist"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("page 7 does not exist"),
+        "{}",
+        stderr(&output)
+    );
     // A file that cannot be read is named.
     let missing = dir.join("missing.pdf");
     let output = carbide(&["verify", missing.to_str().unwrap()]);
-    assert!(!output.status.success() && stderr(&output).contains("missing.pdf"), "{}", stderr(&output));
+    assert!(
+        !output.status.success() && stderr(&output).contains("missing.pdf"),
+        "{}",
+        stderr(&output)
+    );
 
     // A page tree whose count is too large a number for the file to be read: every viewer shows
     // its pages, so it is refused rather than read as a document without pages.
@@ -469,20 +754,38 @@ fn inputs_that_cannot_work_are_refused_with_messages_that_say_why() {
     for offset in offsets {
         bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
     }
-    bytes.extend_from_slice(format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
     std::fs::write(&damaged, bytes).unwrap();
-    for args in [&["info", damaged.to_str().unwrap()][..], &["sanitize", damaged.to_str().unwrap(), out_path]] {
+    for args in [
+        &["info", damaged.to_str().unwrap()][..],
+        &["sanitize", damaged.to_str().unwrap(), out_path],
+    ] {
         let output = carbide(args);
-        assert!(!output.status.success() && stderr(&output).contains("page tree is damaged"), "{args:?}: {}", stderr(&output));
+        assert!(
+            !output.status.success() && stderr(&output).contains("page tree is damaged"),
+            "{args:?}: {}",
+            stderr(&output)
+        );
     }
     assert!(!out.exists());
 
     // PDFium that cannot be loaded is said once.
     let bogus = dir.join("libpdfium.dylib");
     std::fs::write(&bogus, b"not a library").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_carbide")).args(["text", path]).env("CARBIDE_PDFIUM_LIB", &bogus).output().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carbide"))
+        .args(["text", path])
+        .env("CARBIDE_PDFIUM_LIB", &bogus)
+        .output()
+        .unwrap();
     if !output.status.success() {
-        assert_eq!(stderr(&output).matches("rendering backend").count(), 1, "{}", stderr(&output));
+        assert_eq!(
+            stderr(&output).matches("rendering backend").count(),
+            1,
+            "{}",
+            stderr(&output)
+        );
     }
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -496,11 +799,16 @@ fn identity(name: &str, (from, until): (i32, i32)) -> (Identity, String) {
     let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
     let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.distinguished_name.push(rcgen::DnType::CommonName, name);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, name);
     params.not_before = rcgen::date_time_ymd(from, 1, 1);
     params.not_after = rcgen::date_time_ymd(until, 1, 1);
     let cert = params.self_signed(&pair).unwrap();
-    (Identity::new(vec![cert.der().to_vec()], key).unwrap(), cert.pem())
+    (
+        Identity::new(vec![cert.der().to_vec()], key).unwrap(),
+        cert.pem(),
+    )
 }
 
 /// A one-page file showing `label`, signed by `identity` with the signing time `time`.
@@ -510,7 +818,15 @@ fn signed(identity: &Identity, label: &str, time: &str) -> Vec<u8> {
     pdf.add_text_box(0, 72.0, 720.0, label, 18.0).unwrap();
     let base = pdf.to_bytes().unwrap();
     let pdf = Pdf::from_bytes(&base).unwrap();
-    pdf.sign(&base, &SignOptions { identity: Some(identity), signing_time: Some(time.into()), ..Default::default() }).unwrap()
+    pdf.sign(
+        &base,
+        &SignOptions {
+            identity: Some(identity),
+            signing_time: Some(time.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap()
 }
 
 fn stdout(output: &Output) -> String {
@@ -523,21 +839,40 @@ fn verify_shows_a_time_stamp_time_only_from_a_time_stamp_that_verifies() {
     let (identity, _) = identity("Some Signer", (2020, 2040));
     // An ordinary signature relabelled as a document time stamp: its /M is no time stamp's time.
     let mut bytes = signed(&identity, "stamped", "D:20000101000000Z");
-    let at = bytes.windows(19).rposition(|w| w == b"adbe.pkcs7.detached").unwrap();
+    let at = bytes
+        .windows(19)
+        .rposition(|w| w == b"adbe.pkcs7.detached")
+        .unwrap();
     bytes[at..at + 19].copy_from_slice(b"ETSI.RFC3161       ");
     let file = dir.join("stamped.pdf");
     std::fs::write(&file, bytes).unwrap();
     let output = carbide(&["verify", file.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
-    assert!(stdout(&output).contains("The time stamp is not valid"), "{}", stdout(&output));
-    assert!(!stdout(&output).contains("  time stamp") && !stdout(&output).contains("2000"), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("The time stamp is not valid"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        !stdout(&output).contains("  time stamp") && !stdout(&output).contains("2000"),
+        "{}",
+        stdout(&output)
+    );
 
     // An ordinary signature's own time is shown as what it claims.
     let file = dir.join("signed.pdf");
     std::fs::write(&file, signed(&identity, "signed", "D:20200601120000Z")).unwrap();
     let output = carbide(&["verify", file.to_str().unwrap()]);
-    assert!(stdout(&output).contains("signing time in signature (unverified): 2020-06-0"), "{}", stdout(&output));
-    assert!(!stdout(&output).contains("  time stamp"), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("signing time in signature (unverified): 2020-06-0"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        !stdout(&output).contains("  time stamp"),
+        "{}",
+        stdout(&output)
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -572,10 +907,33 @@ fn verify_succeeds_only_when_every_signature_is_valid() {
         ("signer not trusted", good.clone(), None, 4),
         ("another certificate trusted", good.clone(), Some(&other), 4),
         // Signed now with a key that expired: the date in the signature does not help.
-        ("expired signer", write("expired.pdf", &signed(&expired, "late", "D:20200601000000Z")), Some(&expired_trust), 4),
-        ("changed after signing", write("changed.pdf", &changed), Some(&trusted), 4),
-        ("altered", write("altered.pdf", &tampered), Some(&trusted), 3),
-        ("no signatures", write("unsigned.pdf", &unsigned.to_bytes().unwrap()), Some(&trusted), 5),
+        (
+            "expired signer",
+            write(
+                "expired.pdf",
+                &signed(&expired, "late", "D:20200601000000Z"),
+            ),
+            Some(&expired_trust),
+            4,
+        ),
+        (
+            "changed after signing",
+            write("changed.pdf", &changed),
+            Some(&trusted),
+            4,
+        ),
+        (
+            "altered",
+            write("altered.pdf", &tampered),
+            Some(&trusted),
+            3,
+        ),
+        (
+            "no signatures",
+            write("unsigned.pdf", &unsigned.to_bytes().unwrap()),
+            Some(&trusted),
+            5,
+        ),
         ("missing file", dir.join("missing.pdf"), Some(&trusted), 1),
     ];
     for (label, file, trust, status) in cases {
@@ -584,7 +942,13 @@ fn verify_succeeds_only_when_every_signature_is_valid() {
             args.extend(["--trust".to_string(), trust.to_string_lossy().into_owned()]);
         }
         let output = carbide(&args.iter().map(String::as_str).collect::<Vec<_>>());
-        assert_eq!(output.status.code(), Some(status), "{label}: {}{}", stdout(&output), stderr(&output));
+        assert_eq!(
+            output.status.code(),
+            Some(status),
+            "{label}: {}{}",
+            stdout(&output),
+            stderr(&output)
+        );
     }
     // A time stamp inside a signature that does not verify is said not to, and not used: the
     // status is that of the signature.
@@ -597,17 +961,49 @@ fn verify_succeeds_only_when_every_signature_is_valid() {
     let mut pdf = Pdf::new();
     pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
     let base = pdf.to_bytes().unwrap();
-    let options = SignOptions { identity: Some(&signer), timestamp: Some(&Damaged), ..Default::default() };
-    let stamped = write("damaged-stamp.pdf", &Pdf::from_bytes(&base).unwrap().sign(&base, &options).unwrap());
-    let output = carbide(&["verify", stamped.to_str().unwrap(), "--trust", trusted.to_str().unwrap()]);
-    assert_eq!(output.status.code(), Some(0), "{}{}", stdout(&output), stderr(&output));
-    assert!(stdout(&output).contains("time stamp that could not be verified"), "{}", stdout(&output));
-    assert!(!stdout(&output).contains("  time stamp"), "{}", stdout(&output));
+    let options = SignOptions {
+        identity: Some(&signer),
+        timestamp: Some(&Damaged),
+        ..Default::default()
+    };
+    let stamped = write(
+        "damaged-stamp.pdf",
+        &Pdf::from_bytes(&base)
+            .unwrap()
+            .sign(&base, &options)
+            .unwrap(),
+    );
+    let output = carbide(&[
+        "verify",
+        stamped.to_str().unwrap(),
+        "--trust",
+        trusted.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains("time stamp that could not be verified"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        !stdout(&output).contains("  time stamp"),
+        "{}",
+        stdout(&output)
+    );
 
     // A command line that is wrong.
     assert_eq!(carbide(&["verify"]).status.code(), Some(2));
     // The statuses are described in the help.
     let help = stdout(&carbide(&["verify", "--help"]));
-    assert!(help.contains("Exit status") && help.contains("5  The file has no signatures."), "{help}");
+    assert!(
+        help.contains("Exit status") && help.contains("5  The file has no signatures."),
+        "{help}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

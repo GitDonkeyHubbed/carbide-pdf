@@ -263,46 +263,131 @@ pub struct Group {
 }
 
 const HOME: &[Group] = &[
-    Group { name: "File", commands: &[Cmd::Open, Cmd::Save, Cmd::SaveAs, Cmd::NewBlank, Cmd::Combine] },
-    Group { name: "Pages", commands: &[Cmd::PageInsert, Cmd::PageExtract, Cmd::PageDelete, Cmd::Merge, Cmd::Imposition] },
-    Group { name: "Rotate", commands: &[Cmd::RotateRight, Cmd::RotateLeft, Cmd::MoveUp, Cmd::MoveDown] },
-    Group { name: "Tools", commands: &[Cmd::Typewriter, Cmd::Reduce, Cmd::Split] },
+    Group {
+        name: "File",
+        commands: &[
+            Cmd::Open,
+            Cmd::Save,
+            Cmd::SaveAs,
+            Cmd::NewBlank,
+            Cmd::Combine,
+        ],
+    },
+    Group {
+        name: "Pages",
+        commands: &[
+            Cmd::PageInsert,
+            Cmd::PageExtract,
+            Cmd::PageDelete,
+            Cmd::Merge,
+            Cmd::Imposition,
+        ],
+    },
+    Group {
+        name: "Rotate",
+        commands: &[
+            Cmd::RotateRight,
+            Cmd::RotateLeft,
+            Cmd::MoveUp,
+            Cmd::MoveDown,
+        ],
+    },
+    Group {
+        name: "Tools",
+        commands: &[Cmd::Typewriter, Cmd::Reduce, Cmd::Split],
+    },
 ];
 
 const EDIT: &[Group] = &[
-    Group { name: "Basic", commands: &[Cmd::Undo, Cmd::Redo, Cmd::SelectTool] },
-    Group { name: "Content Editing", commands: &[Cmd::Typewriter, Cmd::Watermark, Cmd::Bates] },
+    Group {
+        name: "Basic",
+        commands: &[Cmd::Undo, Cmd::Redo, Cmd::SelectTool],
+    },
+    Group {
+        name: "Content Editing",
+        commands: &[Cmd::Typewriter, Cmd::Watermark, Cmd::Bates],
+    },
 ];
 
 const VIEW: &[Group] = &[
-    Group { name: "Zoom", commands: &[Cmd::ZoomIn, Cmd::ZoomOut, Cmd::FitWidth, Cmd::FitPage, Cmd::ActualSize] },
-    Group { name: "Page View", commands: &[Cmd::FirstPage, Cmd::PrevPage, Cmd::NextPage, Cmd::LastPage] },
-    Group { name: "Panels", commands: &[Cmd::ToggleSidebar] },
+    Group {
+        name: "Zoom",
+        commands: &[
+            Cmd::ZoomIn,
+            Cmd::ZoomOut,
+            Cmd::FitWidth,
+            Cmd::FitPage,
+            Cmd::ActualSize,
+        ],
+    },
+    Group {
+        name: "Page View",
+        commands: &[Cmd::FirstPage, Cmd::PrevPage, Cmd::NextPage, Cmd::LastPage],
+    },
+    Group {
+        name: "Panels",
+        commands: &[Cmd::ToggleSidebar],
+    },
 ];
 
 const COMMENT: &[Group] = &[
-    Group { name: "Comment", commands: &[Cmd::Note, Cmd::Typewriter] },
+    Group {
+        name: "Comment",
+        commands: &[Cmd::Note, Cmd::Typewriter],
+    },
     Group {
         name: "Text Markup",
-        commands: &[Cmd::Highlight, Cmd::HighlightArea, Cmd::Strikeout, Cmd::Underline],
+        commands: &[
+            Cmd::Highlight,
+            Cmd::HighlightArea,
+            Cmd::Strikeout,
+            Cmd::Underline,
+        ],
     },
 ];
 
 const ADVANCED: &[Group] = &[
-    Group { name: "Document Processing", commands: &[Cmd::Reduce, Cmd::Split, Cmd::Compare] },
-    Group { name: "Convert", commands: &[Cmd::Ocr, Cmd::ExportImages, Cmd::ExportText] },
-    Group { name: "Revisions", commands: &[Cmd::SaveRevision, Cmd::OpenRevision] },
-    Group { name: "Preferences", commands: &[Cmd::AutoSaveSettings, Cmd::AutoRecovery] },
+    Group {
+        name: "Document Processing",
+        commands: &[Cmd::Reduce, Cmd::Split, Cmd::Compare],
+    },
+    Group {
+        name: "Convert",
+        commands: &[Cmd::Ocr, Cmd::ExportImages, Cmd::ExportText],
+    },
+    Group {
+        name: "Revisions",
+        commands: &[Cmd::SaveRevision, Cmd::OpenRevision],
+    },
+    Group {
+        name: "Preferences",
+        commands: &[Cmd::AutoSaveSettings, Cmd::AutoRecovery],
+    },
 ];
 
 const SECURITY: &[Group] = &[
-    Group { name: "Redaction", commands: &[Cmd::MarkRedaction, Cmd::ApplyRedactions, Cmd::RemoveHidden] },
+    Group {
+        name: "Redaction",
+        commands: &[Cmd::MarkRedaction, Cmd::ApplyRedactions, Cmd::RemoveHidden],
+    },
     Group {
         name: "Signature",
-        commands: &[Cmd::SignVisible, Cmd::SignInvisible, Cmd::TimeStamp, Cmd::Certify, Cmd::Verify],
+        commands: &[
+            Cmd::SignVisible,
+            Cmd::SignInvisible,
+            Cmd::TimeStamp,
+            Cmd::Certify,
+            Cmd::Verify,
+        ],
     },
-    Group { name: "Secure", commands: &[Cmd::Protect] },
-    Group { name: "Trusted", commands: &[Cmd::TrustCertificate] },
+    Group {
+        name: "Secure",
+        commands: &[Cmd::Protect],
+    },
+    Group {
+        name: "Trusted",
+        commands: &[Cmd::TrustCertificate],
+    },
 ];
 
 const FORMS: &[Group] = &[];

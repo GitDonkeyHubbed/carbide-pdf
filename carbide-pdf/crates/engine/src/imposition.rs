@@ -9,16 +9,19 @@ use lopdf::{dictionary, Dictionary, Object, ObjectId, Stream};
 use crate::error::{Error, Result};
 use crate::fonts::{literal_string, win_ansi, StandardFont};
 use crate::geometry::{fmt, PageGeometry};
-use crate::imposition_plan::{output_order, plan_plates, LayoutKind, Plate, PlanOptions, Style};
+use crate::imposition_plan::{output_order, plan_plates, LayoutKind, PlanOptions, Plate, Style};
 use crate::limits::DecodeBudget;
 use crate::pdf::Pdf;
 
 pub mod messages {
-    pub const NO_MEDIA: &str = "Choose a media size (or Autosize) before imposing; none is selected.";
+    pub const NO_MEDIA: &str =
+        "Choose a media size (or Autosize) before imposing; none is selected.";
     pub const MARGINS: &str = "The margins leave no room on this page size.";
     pub const INVALID_SETTINGS: &str = "The settings file is not valid and could not be loaded.";
-    pub const MEDIA_SIZE: &str = "Sheets must be between 1 and 14400 points (200 inches) on each side.";
-    pub const SPACING: &str = "Margins, gutters, spread and creep must each be between 0 and 14400 points.";
+    pub const MEDIA_SIZE: &str =
+        "Sheets must be between 1 and 14400 points (200 inches) on each side.";
+    pub const SPACING: &str =
+        "Margins, gutters, spread and creep must each be between 0 and 14400 points.";
     pub const SCALE: &str = "Scaling must be between 1% and 1000%.";
 }
 
@@ -65,7 +68,10 @@ pub enum Media {
     /// Nothing chosen: refused with [`messages::NO_MEDIA`].
     None,
     Named(String),
-    Custom { width: f32, height: f32 },
+    Custom {
+        width: f32,
+        height: f32,
+    },
     /// Sheet size follows the page size, scale, margins and gutters.
     Autosize,
 }
@@ -119,7 +125,12 @@ impl Default for ImpositionOptions {
             fit_to_media: true,
             scale_x_percent: 100.0,
             scale_y_percent: 100.0,
-            margins: Margins { left: 0.0, right: 0.0, top: 0.0, bottom: 0.0 },
+            margins: Margins {
+                left: 0.0,
+                right: 0.0,
+                top: 0.0,
+                bottom: 0.0,
+            },
             gutter_horizontal: 0.0,
             gutter_vertical: 0.0,
             spread: 0.0,
@@ -232,16 +243,30 @@ impl ImpositionOptions {
     fn check_values(&self) -> Result<()> {
         self.plan.validate()?;
         if let Media::Custom { width, height } = self.media {
-            if !(1.0..=MAX_SHEET_SIZE).contains(&width) || !(1.0..=MAX_SHEET_SIZE).contains(&height) {
+            if !(1.0..=MAX_SHEET_SIZE).contains(&width) || !(1.0..=MAX_SHEET_SIZE).contains(&height)
+            {
                 return Err(Error::Other(messages::MEDIA_SIZE.into()));
             }
         }
         let m = &self.margins;
-        let spacing = [m.left, m.right, m.top, m.bottom, self.gutter_horizontal, self.gutter_vertical, self.spread];
-        if !spacing.iter().all(|v| (0.0..=MAX_SHEET_SIZE).contains(v)) || !(-MAX_SHEET_SIZE..=MAX_SHEET_SIZE).contains(&self.creep) {
+        let spacing = [
+            m.left,
+            m.right,
+            m.top,
+            m.bottom,
+            self.gutter_horizontal,
+            self.gutter_vertical,
+            self.spread,
+        ];
+        if !spacing.iter().all(|v| (0.0..=MAX_SHEET_SIZE).contains(v))
+            || !(-MAX_SHEET_SIZE..=MAX_SHEET_SIZE).contains(&self.creep)
+        {
             return Err(Error::Other(messages::SPACING.into()));
         }
-        if ![self.scale_x_percent, self.scale_y_percent].iter().all(|v| (1.0..=1000.0).contains(v)) {
+        if ![self.scale_x_percent, self.scale_y_percent]
+            .iter()
+            .all(|v| (1.0..=1000.0).contains(v))
+        {
             return Err(Error::Other(messages::SCALE.into()));
         }
         Ok(())
@@ -260,10 +285,14 @@ impl ImpositionOptions {
             LayoutKind::Sequential => (1, 1),
             _ => (self.plan.columns, self.plan.rows),
         };
-        if matches!(self.plan.layout, LayoutKind::Booklet2Up | LayoutKind::Booklet4Up | LayoutKind::Booklet8Up)
-            && cols % 2 != 0
+        if matches!(
+            self.plan.layout,
+            LayoutKind::Booklet2Up | LayoutKind::Booklet4Up | LayoutKind::Booklet8Up
+        ) && cols % 2 != 0
         {
-            return Err(Error::Other("booklet layouts need an even number of columns".into()));
+            return Err(Error::Other(
+                "booklet layouts need an even number of columns".into(),
+            ));
         }
         self.layout_grid(cols, rows, (1.0, 1.0)).map(|_| ())
     }
@@ -295,15 +324,31 @@ impl Pdf {
     /// A page drawn by one content stream lends that stream to the form as it is stored, still
     /// compressed, so nothing is decoded however large it would be. Content split over several
     /// streams is decoded within `budget` and joined.
-    fn page_as_form(&mut self, page_id: ObjectId, geometry: PageGeometry, budget: &mut DecodeBudget) -> Result<ObjectId> {
-        let resources = self.inherited(page_id, b"Resources").unwrap_or(Object::Dictionary(Dictionary::new()));
+    fn page_as_form(
+        &mut self,
+        page_id: ObjectId,
+        geometry: PageGeometry,
+        budget: &mut DecodeBudget,
+    ) -> Result<ObjectId> {
+        let resources = self
+            .inherited(page_id, b"Resources")
+            .unwrap_or(Object::Dictionary(Dictionary::new()));
         let (w, h) = (geometry.box_width, geometry.box_height);
         let mut form = match self.doc.get_page_contents(page_id).as_slice() {
             [single] => match self.doc.get_object(*single) {
                 Ok(Object::Stream(stream)) => {
                     let mut stream = stream.clone();
-                    let encoding: Dictionary =
-                        stream.dict.iter().filter(|(key, _)| matches!(key.as_slice(), b"Filter" | b"DecodeParms" | b"Length" | b"DL")).map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let encoding: Dictionary = stream
+                        .dict
+                        .iter()
+                        .filter(|(key, _)| {
+                            matches!(
+                                key.as_slice(),
+                                b"Filter" | b"DecodeParms" | b"Length" | b"DL"
+                            )
+                        })
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
                     stream.dict = encoding;
                     stream
                 }
@@ -313,8 +358,14 @@ impl Pdf {
         };
         form.dict.set("Type", "XObject");
         form.dict.set("Subtype", "Form");
-        form.dict.set("BBox", real_array(&[geometry.x0, geometry.y0, geometry.x0 + w, geometry.y0 + h]));
-        form.dict.set("Matrix", real_array(&invert_matrix(geometry.display_to_user())));
+        form.dict.set(
+            "BBox",
+            real_array(&[geometry.x0, geometry.y0, geometry.x0 + w, geometry.y0 + h]),
+        );
+        form.dict.set(
+            "Matrix",
+            real_array(&invert_matrix(geometry.display_to_user())),
+        );
         form.dict.set("Resources", resources);
         Ok(self.doc.add_object(form))
     }
@@ -331,7 +382,13 @@ impl Pdf {
         let plates = plan_plates(&options.plan, total)?;
         let plan = &options.plan;
         let fold_active = plan.binding == crate::imposition_plan::Binding::Perfect;
-        let order = output_order(plates.len(), plan.printing_order, plan.double_sided, plan.style, fold_active);
+        let order = output_order(
+            plates.len(),
+            plan.printing_order,
+            plan.double_sided,
+            plan.style,
+            fold_active,
+        );
 
         let first = self.page_geometry(0)?;
         let first_size = first.display_size();
@@ -380,9 +437,13 @@ impl Pdf {
                         let s = (grid.cell_w / pw).min(grid.cell_h / ph);
                         (s, s)
                     } else {
-                        (options.scale_x_percent / 100.0, options.scale_y_percent / 100.0)
+                        (
+                            options.scale_x_percent / 100.0,
+                            options.scale_y_percent / 100.0,
+                        )
                     };
-                    if options.scale_large_pages && (pw * sx > grid.cell_w || ph * sy > grid.cell_h) {
+                    if options.scale_large_pages && (pw * sx > grid.cell_w || ph * sy > grid.cell_h)
+                    {
                         let s = (grid.cell_w / pw).min(grid.cell_h / ph);
                         sx = sx.min(s);
                         sy = sy.min(s);
@@ -431,14 +492,20 @@ impl Pdf {
                     "Encoding" => "WinAnsiEncoding",
                 });
                 fonts.set("CarbideInfo", Object::Reference(font_id));
-                let mut line = format!("BT /CarbideInfo 7 Tf 0 g {} {} Td ", fmt(options.margins.left.max(6.0)), fmt(grid.height - 10.0))
-                    .into_bytes();
+                let mut line = format!(
+                    "BT /CarbideInfo 7 Tf 0 g {} {} Td ",
+                    fmt(options.margins.left.max(6.0)),
+                    fmt(grid.height - 10.0)
+                )
+                .into_bytes();
                 line.extend_from_slice(&literal_string(&win_ansi(&text)));
                 line.extend_from_slice(b" Tj ET\n");
                 content.push_str(&String::from_utf8_lossy(&line));
             }
 
-            let content_id = out.doc.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
+            let content_id = out
+                .doc
+                .add_object(Stream::new(Dictionary::new(), content.into_bytes()));
             let mut resources = Dictionary::new();
             resources.set("XObject", Object::Dictionary(xobjects));
             if !fonts.is_empty() {
@@ -446,7 +513,8 @@ impl Pdf {
             }
             // A sheet sets its own boxes and rotation, so nothing meant for the source pages applies.
             let sheet_box = real_array(&[0.0, 0.0, grid.width, grid.height]);
-            let flipped = options.flip_backs && plan.double_sided && !plate.front && output_index % 2 == 1;
+            let flipped =
+                options.flip_backs && plan.double_sided && !plate.front && output_index % 2 == 1;
             let page = dictionary! {
                 "Type" => "Page",
                 "Parent" => root_id,
@@ -466,7 +534,14 @@ impl Pdf {
         // Outlines and named destinations pointed at pages that no longer exist.
         if let Ok(catalog_id) = out.doc.trailer.get(b"Root").and_then(|o| o.as_reference()) {
             if let Ok(catalog) = out.doc.get_dictionary_mut(catalog_id) {
-                for key in [&b"Outlines"[..], b"Names", b"Dests", b"OpenAction", b"PageLabels", b"StructTreeRoot"] {
+                for key in [
+                    &b"Outlines"[..],
+                    b"Names",
+                    b"Dests",
+                    b"OpenAction",
+                    b"PageLabels",
+                    b"StructTreeRoot",
+                ] {
                     catalog.remove(key);
                 }
             }
@@ -490,7 +565,13 @@ fn column_origins(options: &ImpositionOptions, plate: &Plate, grid: &Grid) -> Ve
 }
 
 /// Crop and registration marks, drawn in the margins as thin black lines.
-fn draw_marks(options: &ImpositionOptions, plate: &Plate, grid: &Grid, column_x: &[f32], out: &mut String) {
+fn draw_marks(
+    options: &ImpositionOptions,
+    plate: &Plate,
+    grid: &Grid,
+    column_x: &[f32],
+    out: &mut String,
+) {
     if !options.crop_marks && !options.registration_marks {
         return;
     }
@@ -499,7 +580,8 @@ fn draw_marks(options: &ImpositionOptions, plate: &Plate, grid: &Grid, column_x:
         const LENGTH: f32 = 12.0;
         const OFFSET: f32 = 3.0;
         for row in 0..plate.rows {
-            let y0 = options.margins.bottom + (plate.rows - 1 - row) as f32 * (grid.cell_h + options.gutter_vertical);
+            let y0 = options.margins.bottom
+                + (plate.rows - 1 - row) as f32 * (grid.cell_h + options.gutter_vertical);
             let y1 = y0 + grid.cell_h;
             for col in 0..plate.cols {
                 let outer_left = col == 0;
@@ -532,7 +614,12 @@ fn draw_marks(options: &ImpositionOptions, plate: &Plate, grid: &Grid, column_x:
     }
     if options.registration_marks {
         let (w, h) = (grid.width, grid.height);
-        for (cx, cy) in [(w / 2.0, 8.0), (w / 2.0, h - 8.0), (8.0, h / 2.0), (w - 8.0, h / 2.0)] {
+        for (cx, cy) in [
+            (w / 2.0, 8.0),
+            (w / 2.0, h - 8.0),
+            (8.0, h / 2.0),
+            (w - 8.0, h / 2.0),
+        ] {
             out.push_str(&format!(
                 "{} {} m {} {} l S {} {} m {} {} l S\n",
                 fmt(cx - 5.0),
@@ -571,8 +658,18 @@ impl ImpositionOptions {
         let b = |v: bool| if v { "1" } else { "0" };
         s.push_str("[Layout]\n");
         s.push_str(&format!("Layout={}\n", layout_code(self.plan.layout)));
-        s.push_str(&format!("Columns={}\nRows={}\n", self.plan.columns, self.plan.rows));
-        s.push_str(&format!("Binding={}\n", if self.plan.binding == crate::imposition_plan::Binding::Perfect { 1 } else { 0 }));
+        s.push_str(&format!(
+            "Columns={}\nRows={}\n",
+            self.plan.columns, self.plan.rows
+        ));
+        s.push_str(&format!(
+            "Binding={}\n",
+            if self.plan.binding == crate::imposition_plan::Binding::Perfect {
+                1
+            } else {
+                0
+            }
+        ));
         s.push_str(&format!("SheetsPerFold={}\n", self.plan.sheets_per_fold));
         s.push_str(&format!(
             "Style={}\n",
@@ -599,20 +696,39 @@ impl ImpositionOptions {
         match &self.media {
             Media::None => s.push_str("PaperSelected=\n"),
             Media::Named(n) => s.push_str(&format!("PaperSelected={n}\n")),
-            Media::Custom { width, height } => s.push_str(&format!("PaperSelected=Custom\nCustomWidth={width}\nCustomHeight={height}\n")),
+            Media::Custom { width, height } => s.push_str(&format!(
+                "PaperSelected=Custom\nCustomWidth={width}\nCustomHeight={height}\n"
+            )),
             Media::Autosize => s.push_str("PaperSelected=\n"),
         }
-        s.push_str(&format!("Autosize={}\nAutoRotate={}\nFit={}\n", b(matches!(self.media, Media::Autosize)), b(self.auto_rotate), b(self.fit_to_media)));
-        s.push_str(&format!("HorzScale={}\nVertScale={}\n", self.scale_x_percent, self.scale_y_percent));
+        s.push_str(&format!(
+            "Autosize={}\nAutoRotate={}\nFit={}\n",
+            b(matches!(self.media, Media::Autosize)),
+            b(self.auto_rotate),
+            b(self.fit_to_media)
+        ));
+        s.push_str(&format!(
+            "HorzScale={}\nVertScale={}\n",
+            self.scale_x_percent, self.scale_y_percent
+        ));
         s.push_str(&format!(
             "MarginLeft={}\nMarginRight={}\nMarginTop={}\nMarginBottom={}\nUnit=pt\n",
             self.margins.left, self.margins.right, self.margins.top, self.margins.bottom
         ));
         s.push_str("\n[Options]\n");
-        s.push_str(&format!("AddCropMark={}\nInnerMark={}\nAddRegMark={}\n", b(self.crop_marks), b(self.inner_marks), b(self.registration_marks)));
+        s.push_str(&format!(
+            "AddCropMark={}\nInnerMark={}\nAddRegMark={}\n",
+            b(self.crop_marks),
+            b(self.inner_marks),
+            b(self.registration_marks)
+        ));
         s.push_str(&format!(
             "RegStyle={}\nAddPageInfo={}\nScalePage={}\nFlipBack={}\n",
-            if self.registration_style == RegistrationStyle::Circle { 1 } else { 0 },
+            if self.registration_style == RegistrationStyle::Circle {
+                1
+            } else {
+                0
+            },
             b(self.page_info),
             b(self.scale_large_pages),
             b(self.flip_backs)
@@ -639,10 +755,14 @@ impl ImpositionOptions {
         }
         let get = |k: &str| values.get(k).map(String::as_str);
         let float = |k: &str, default: f32| -> Result<f32> {
-            get(k).map(|v| v.parse::<f32>().map_err(|_| invalid())).unwrap_or(Ok(default))
+            get(k)
+                .map(|v| v.parse::<f32>().map_err(|_| invalid()))
+                .unwrap_or(Ok(default))
         };
         let int = |k: &str, default: i64| -> Result<i64> {
-            get(k).map(|v| v.parse::<i64>().map_err(|_| invalid())).unwrap_or(Ok(default))
+            get(k)
+                .map(|v| v.parse::<i64>().map_err(|_| invalid()))
+                .unwrap_or(Ok(default))
         };
         let flag = |k: &str, default: bool| -> Result<bool> { Ok(int(k, default as i64)? != 0) };
 
@@ -678,9 +798,15 @@ impl ImpositionOptions {
         } else {
             match get("PaperSelected") {
                 None | Some("") => Media::None,
-                Some("Custom") => Media::Custom { width: float("CustomWidth", 0.0)?, height: float("CustomHeight", 0.0)? },
+                Some("Custom") => Media::Custom {
+                    width: float("CustomWidth", 0.0)?,
+                    height: float("CustomHeight", 0.0)?,
+                },
                 Some(name) => {
-                    if !PAPER_SIZES.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(name)) {
+                    if !PAPER_SIZES
+                        .iter()
+                        .any(|(n, _, _)| n.eq_ignore_ascii_case(name))
+                    {
                         return Err(Error::Other(
                             "The custom media size in this settings file no longer exists. Recreate it or choose another size.".into(),
                         ));
@@ -702,7 +828,11 @@ impl ImpositionOptions {
         o.crop_marks = flag("AddCropMark", false)?;
         o.inner_marks = flag("InnerMark", false)?;
         o.registration_marks = flag("AddRegMark", false)?;
-        o.registration_style = if int("RegStyle", 0)? == 1 { RegistrationStyle::Circle } else { RegistrationStyle::Cross };
+        o.registration_style = if int("RegStyle", 0)? == 1 {
+            RegistrationStyle::Circle
+        } else {
+            RegistrationStyle::Cross
+        };
         o.page_info = flag("AddPageInfo", false)?;
         o.scale_large_pages = flag("ScalePage", false)?;
         o.flip_backs = flag("FlipBack", false)?;
@@ -752,7 +882,12 @@ mod tests {
         o.media = Media::None;
         assert_eq!(o.validate().unwrap_err().to_string(), messages::NO_MEDIA);
         o.media = Media::Named("Letter".into());
-        o.margins = Margins { left: 400.0, right: 400.0, top: 0.0, bottom: 0.0 };
+        o.margins = Margins {
+            left: 400.0,
+            right: 400.0,
+            top: 0.0,
+            bottom: 0.0,
+        };
         assert_eq!(o.validate().unwrap_err().to_string(), messages::MARGINS);
     }
 
@@ -762,20 +897,48 @@ mod tests {
         assert!(ok.validate().is_ok());
         let refused = |o: ImpositionOptions| o.validate().unwrap_err().to_string();
 
-        for (width, height) in [(0.0, 792.0), (612.0, -1.0), (1.0e9, 792.0), (f32::NAN, 792.0), (612.0, f32::INFINITY)] {
-            assert_eq!(refused(ImpositionOptions { media: Media::Custom { width, height }, ..ok.clone() }), messages::MEDIA_SIZE);
+        for (width, height) in [
+            (0.0, 792.0),
+            (612.0, -1.0),
+            (1.0e9, 792.0),
+            (f32::NAN, 792.0),
+            (612.0, f32::INFINITY),
+        ] {
+            assert_eq!(
+                refused(ImpositionOptions {
+                    media: Media::Custom { width, height },
+                    ..ok.clone()
+                }),
+                messages::MEDIA_SIZE
+            );
         }
         let spaced = |left: f32, gutter: f32, creep: f32| ImpositionOptions {
-            margins: Margins { left, right: 0.0, top: 0.0, bottom: 0.0 },
+            margins: Margins {
+                left,
+                right: 0.0,
+                top: 0.0,
+                bottom: 0.0,
+            },
             gutter_horizontal: gutter,
             creep,
             ..ok.clone()
         };
-        for o in [spaced(-1.0, 0.0, 0.0), spaced(f32::NAN, 0.0, 0.0), spaced(0.0, 1.0e7, 0.0), spaced(0.0, 0.0, f32::INFINITY)] {
+        for o in [
+            spaced(-1.0, 0.0, 0.0),
+            spaced(f32::NAN, 0.0, 0.0),
+            spaced(0.0, 1.0e7, 0.0),
+            spaced(0.0, 0.0, f32::INFINITY),
+        ] {
             assert_eq!(refused(o), messages::SPACING);
         }
         for scale in [0.0, -50.0, 1.0e6, f32::NAN] {
-            assert_eq!(refused(ImpositionOptions { scale_x_percent: scale, ..ok.clone() }), messages::SCALE);
+            assert_eq!(
+                refused(ImpositionOptions {
+                    scale_x_percent: scale,
+                    ..ok.clone()
+                }),
+                messages::SCALE
+            );
         }
         let mut grid = ok.clone();
         grid.plan.layout = LayoutKind::StepAndRepeat;
@@ -783,9 +946,18 @@ mod tests {
         assert_eq!(refused(grid), crate::imposition_plan::messages::GRID);
 
         // Autosize follows the page: a sheet beyond the largest PDF page is refused.
-        let auto = ImpositionOptions { media: Media::Autosize, ..ok.clone() };
+        let auto = ImpositionOptions {
+            media: Media::Autosize,
+            ..ok.clone()
+        };
         assert!(auto.layout_grid(2, 1, (612.0, 792.0)).is_ok());
-        assert_eq!(auto.layout_grid(2, 1, (14400.0, 14400.0)).err().unwrap().to_string(), messages::MEDIA_SIZE);
+        assert_eq!(
+            auto.layout_grid(2, 1, (14400.0, 14400.0))
+                .err()
+                .unwrap()
+                .to_string(),
+            messages::MEDIA_SIZE
+        );
     }
 
     #[test]
@@ -799,10 +971,20 @@ mod tests {
             ("GutterVertical", "-3"),
             ("HorzScale", "inf"),
         ] {
-            let text = base.lines().map(|l| if l.starts_with(&format!("{key}=")) { format!("{key}={value}") } else { l.to_string() });
+            let text = base.lines().map(|l| {
+                if l.starts_with(&format!("{key}=")) {
+                    format!("{key}={value}")
+                } else {
+                    l.to_string()
+                }
+            });
             let text = text.collect::<Vec<_>>().join("\n");
             assert!(text.contains(&format!("{key}={value}")), "{key}");
-            assert_eq!(ImpositionOptions::from_ini(&text).unwrap_err().to_string(), messages::INVALID_SETTINGS, "{key}={value}");
+            assert_eq!(
+                ImpositionOptions::from_ini(&text).unwrap_err().to_string(),
+                messages::INVALID_SETTINGS,
+                "{key}={value}"
+            );
         }
     }
 
@@ -814,13 +996,18 @@ mod tests {
         o.plan.rows = 2;
         o.creep = 1.5;
         o.crop_marks = true;
-        o.media = Media::Custom { width: 300.0, height: 400.0 };
+        o.media = Media::Custom {
+            width: 300.0,
+            height: 400.0,
+        };
         let again = ImpositionOptions::from_ini(&o.to_ini()).unwrap();
         assert_eq!(again.plan, o.plan);
         assert_eq!(again.media, o.media);
         assert!(again.crop_marks && (again.creep - 1.5).abs() < 1e-6);
         assert_eq!(
-            ImpositionOptions::from_ini("nonsense").unwrap_err().to_string(),
+            ImpositionOptions::from_ini("nonsense")
+                .unwrap_err()
+                .to_string(),
             messages::INVALID_SETTINGS
         );
         assert!(ImpositionOptions::from_ini("[Layout]\nColumns=abc\n").is_err());

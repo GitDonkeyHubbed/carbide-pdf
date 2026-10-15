@@ -22,9 +22,20 @@ impl ImageFormat {
 }
 
 /// Where [`export_images`] writes the image of each page: `<base>-001.png`, `<base>-002.png`, ...
-pub fn image_paths(pdf: &Pdf, directory: impl AsRef<Path>, base_name: &str, format: ImageFormat) -> Vec<PathBuf> {
+pub fn image_paths(
+    pdf: &Pdf,
+    directory: impl AsRef<Path>,
+    base_name: &str,
+    format: ImageFormat,
+) -> Vec<PathBuf> {
     (0..pdf.page_count())
-        .map(|index| directory.as_ref().join(format!("{base_name}-{:03}.{}", index + 1, format.extension())))
+        .map(|index| {
+            directory.as_ref().join(format!(
+                "{base_name}-{:03}.{}",
+                index + 1,
+                format.extension()
+            ))
+        })
         .collect()
 }
 
@@ -45,7 +56,10 @@ pub fn export_images(
     std::fs::create_dir_all(directory.as_ref())?;
     let targets = image_paths(pdf, directory.as_ref(), base_name, format);
     if existing == Existing::Refuse {
-        if let Some(taken) = targets.iter().find(|path| std::fs::symlink_metadata(path).is_ok()) {
+        if let Some(taken) = targets
+            .iter()
+            .find(|path| std::fs::symlink_metadata(path).is_ok())
+        {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!("{} already exists", taken.display()),
@@ -62,7 +76,8 @@ pub fn export_images(
         let mut encoded = Cursor::new(Vec::new());
         match format {
             ImageFormat::Png => image.write_to(&mut encoded, image::ImageFormat::Png),
-            ImageFormat::Jpeg => image::DynamicImage::ImageRgb8(image.into_rgb8()).write_to(&mut encoded, image::ImageFormat::Jpeg),
+            ImageFormat::Jpeg => image::DynamicImage::ImageRgb8(image.into_rgb8())
+                .write_to(&mut encoded, image::ImageFormat::Jpeg),
         }
         .map_err(|e| Error::Other(format!("could not encode {}: {e}", target.display())))?;
         let written = crate::fs::write_file(target, encoded.get_ref(), existing)

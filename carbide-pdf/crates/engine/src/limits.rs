@@ -41,11 +41,14 @@ pub const MAX_DECODED: usize = 1 << 30;
 pub const MAX_DRAWN_OPERATORS: usize = 4_000_000;
 
 pub mod messages {
-    pub const TOO_LARGE: &str = "This document's content is too large to process safely: it decompresses to more than \
+    pub const TOO_LARGE: &str =
+        "This document's content is too large to process safely: it decompresses to more than \
 256 MB for one page or object, or more than 1 GB in all.";
-    pub const TOO_LARGE_TO_READ: &str = "This document is too large to open safely: its compressed objects would take more \
+    pub const TOO_LARGE_TO_READ: &str =
+        "This document is too large to open safely: its compressed objects would take more \
 memory than a file of its size can need.";
-    pub const TOO_COMPLEX: &str = "This page is too complex to show safely: drawing it would take more than 256 MB of \
+    pub const TOO_COMPLEX: &str =
+        "This page is too complex to show safely: drawing it would take more than 256 MB of \
 content or 4 million operations, or part of it draws itself.";
 }
 
@@ -69,12 +72,16 @@ impl DecodeBudget {
 
     /// The budget of one page.
     pub fn for_page() -> DecodeBudget {
-        DecodeBudget { left: MAX_DECODED_AT_ONCE }
+        DecodeBudget {
+            left: MAX_DECODED_AT_ONCE,
+        }
     }
 
     /// The decoded data of `stream`, counted against the budget.
     pub fn stream(&mut self, stream: &Stream) -> Result<Vec<u8>> {
-        let data = stream.get_plain_content_with_limit(self.at_once()).map_err(too_large)?;
+        let data = stream
+            .get_plain_content_with_limit(self.at_once())
+            .map_err(too_large)?;
         self.left = self.left.saturating_sub(data.len());
         Ok(data)
     }
@@ -82,7 +89,9 @@ impl DecodeBudget {
     /// The content of the page `page`, its streams decoded and joined, counted against the budget.
     /// A stream that cannot be decoded is used as it is stored, as lopdf does.
     pub fn page_content(&mut self, doc: &Document, page: ObjectId) -> Result<Vec<u8>> {
-        let data = doc.get_page_content_with_limit(page, self.at_once()).map_err(too_large)?;
+        let data = doc
+            .get_page_content_with_limit(page, self.at_once())
+            .map_err(too_large)?;
         self.left = self.left.saturating_sub(data.len());
         Ok(data)
     }
@@ -94,7 +103,9 @@ impl DecodeBudget {
 
 pub(crate) fn too_large(error: lopdf::Error) -> Error {
     match error {
-        lopdf::Error::Decompress(DecompressError::MemoryLimitExceeded { .. }) => Error::TooLarge(messages::TOO_LARGE.into()),
+        lopdf::Error::Decompress(DecompressError::MemoryLimitExceeded { .. }) => {
+            Error::TooLarge(messages::TOO_LARGE.into())
+        }
         other => Error::Pdf(other),
     }
 }
@@ -133,8 +144,16 @@ impl<'a> Drawing<'a> {
         // Read where it is, not copied: a document can give many forms one large dictionary.
         let pdf = self.pdf;
         let no_xobjects = Dictionary::new();
-        let xobjects = resources.get(b"XObject").ok().and_then(|o| pdf.resolved(o)).and_then(|o| o.as_dict().ok()).unwrap_or(&no_xobjects);
-        let mut cost = Cost { bytes: data.len(), operators: 0 };
+        let xobjects = resources
+            .get(b"XObject")
+            .ok()
+            .and_then(|o| pdf.resolved(o))
+            .and_then(|o| o.as_dict().ok())
+            .unwrap_or(&no_xobjects);
+        let mut cost = Cost {
+            bytes: data.len(),
+            operators: 0,
+        };
         let mut last_name: Option<Vec<u8>> = None;
         let mut failure = None;
         tokens(data, |token| {
@@ -145,12 +164,20 @@ impl<'a> Drawing<'a> {
                 Token::Name(name) => last_name = Some(crate::content::name(name).into_owned()),
                 Token::Operator(operator) => {
                     let form = match (operator, last_name.take()) {
-                        (b"Do", Some(name)) => xobjects.get(&name).ok().and_then(|o| o.as_reference().ok()),
+                        (b"Do", Some(name)) => {
+                            xobjects.get(&name).ok().and_then(|o| o.as_reference().ok())
+                        }
                         _ => None,
                     };
                     let step = match form {
-                        Some(id) => self.form(id, resources, holder).map(|form| Cost { operators: form.operators + 1, ..form }),
-                        None => Ok(Cost { bytes: 0, operators: 1 }),
+                        Some(id) => self.form(id, resources, holder).map(|form| Cost {
+                            operators: form.operators + 1,
+                            ..form
+                        }),
+                        None => Ok(Cost {
+                            bytes: 0,
+                            operators: 1,
+                        }),
                     };
                     if let Err(error) = step.and_then(|step| cost.add(step)) {
                         failure = Some(error);
@@ -169,11 +196,23 @@ impl<'a> Drawing<'a> {
     /// without resources of its own uses `resources`, those of `holder`, which draws it.
     fn form(&mut self, id: ObjectId, resources: &Dictionary, holder: ObjectId) -> Result<Cost> {
         let pdf: &'a Pdf = self.pdf;
-        let Ok(Object::Stream(stream)) = pdf.doc.get_object(id) else { return Ok(Cost::default()) };
-        if !stream.dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Form") {
+        let Ok(Object::Stream(stream)) = pdf.doc.get_object(id) else {
+            return Ok(Cost::default());
+        };
+        if !stream
+            .dict
+            .get(b"Subtype")
+            .and_then(Object::as_name)
+            .is_ok_and(|s| s == b"Form")
+        {
             return Ok(Cost::default());
         }
-        let own = stream.dict.get(b"Resources").ok().and_then(|o| pdf.resolved(o)).and_then(|o| o.as_dict().ok());
+        let own = stream
+            .dict
+            .get(b"Resources")
+            .ok()
+            .and_then(|o| pdf.resolved(o))
+            .and_then(|o| o.as_dict().ok());
         let holder = if own.is_some() { id } else { holder };
         if let Some(cost) = self.forms.get(&(id, holder)) {
             return Ok(*cost);
@@ -209,25 +248,48 @@ impl Pdf {
         let holder = self.inherited_from(id, b"Resources").unwrap_or(id);
         let no_resources = Dictionary::new();
         let resources = self.page_resources(id).unwrap_or(&no_resources);
-        let mut drawing = Drawing { pdf: self, forms: HashMap::new(), path: Vec::new() };
-        let content = self.doc.get_page_content_with_limit(id, MAX_DECODED_AT_ONCE).map_err(|error| match too_large(error) {
-            Error::TooLarge(_) => Error::TooLarge(messages::TOO_COMPLEX.into()),
-            other => other,
-        })?;
+        let mut drawing = Drawing {
+            pdf: self,
+            forms: HashMap::new(),
+            path: Vec::new(),
+        };
+        let content = self
+            .doc
+            .get_page_content_with_limit(id, MAX_DECODED_AT_ONCE)
+            .map_err(|error| match too_large(error) {
+                Error::TooLarge(_) => Error::TooLarge(messages::TOO_COMPLEX.into()),
+                other => other,
+            })?;
         let mut cost = drawing.content(&content, resources, holder)?;
         drop(content);
         // Annotations are drawn from their appearance streams, forms that use the page's resources
         // when they have none of their own.
-        let annotations = match self.doc.get_dictionary(id)?.get(b"Annots").map(|a| self.resolve(a)) {
+        let annotations = match self
+            .doc
+            .get_dictionary(id)?
+            .get(b"Annots")
+            .map(|a| self.resolve(a))
+        {
             Ok(Object::Array(items)) => items,
             _ => Vec::new(),
         };
         for annotation in annotations {
-            let Object::Dictionary(annotation) = self.resolve(&annotation) else { continue };
-            let Ok(appearances) = annotation.get(b"AP").map(|ap| self.resolve(ap)) else { continue };
-            let Ok(normal) = appearances.as_dict().and_then(|ap| ap.get(b"N")) else { continue };
+            let Object::Dictionary(annotation) = self.resolve(&annotation) else {
+                continue;
+            };
+            let Ok(appearances) = annotation.get(b"AP").map(|ap| self.resolve(ap)) else {
+                continue;
+            };
+            let Ok(normal) = appearances.as_dict().and_then(|ap| ap.get(b"N")) else {
+                continue;
+            };
             // One appearance, or one for each state of the annotation.
-            let states = |states: &Dictionary| states.iter().filter_map(|(_, state)| state.as_reference().ok()).collect();
+            let states = |states: &Dictionary| {
+                states
+                    .iter()
+                    .filter_map(|(_, state)| state.as_reference().ok())
+                    .collect()
+            };
             let forms: Vec<ObjectId> = match normal {
                 Object::Reference(id) => match self.doc.get_object(*id) {
                     Ok(Object::Dictionary(dict)) => states(dict),
@@ -254,10 +316,15 @@ mod tests {
         let stream = Stream::new(Dictionary::new(), vec![b'x'; 600]);
         let mut budget = DecodeBudget { left: 1000 };
         assert_eq!(budget.stream(&stream).unwrap().len(), 600);
-        assert!(matches!(budget.stream(&stream), Err(Error::TooLarge(message)) if message == messages::TOO_LARGE));
+        assert!(
+            matches!(budget.stream(&stream), Err(Error::TooLarge(message)) if message == messages::TOO_LARGE)
+        );
 
         // A stream that cannot be decoded is an error of its own, not a limit.
         let unknown = Stream::new(dictionary! { "Filter" => "JBIG2Decode" }, b"data".to_vec());
-        assert!(matches!(DecodeBudget::new().stream(&unknown), Err(Error::Pdf(_))));
+        assert!(matches!(
+            DecodeBudget::new().stream(&unknown),
+            Err(Error::Pdf(_))
+        ));
     }
 }

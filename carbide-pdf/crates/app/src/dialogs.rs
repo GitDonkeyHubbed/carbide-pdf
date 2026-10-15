@@ -2,19 +2,23 @@
 
 use std::path::PathBuf;
 
-use carbide_engine::autosave::{format_time, messages as autosave_messages, AutoSaveSettings, RecordId, RowKind};
+use carbide_engine::autosave::{
+    format_time, messages as autosave_messages, AutoSaveSettings, RecordId, RowKind,
+};
 use carbide_engine::fs::Existing;
 use carbide_engine::imposition::{ImpositionOptions, Media, RegistrationStyle, PAPER_SIZES};
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PrintingOrder, Style};
 use carbide_engine::reduce::{
-    messages as reduce_messages, reduce_files, FileOutcome, OutputOptions, ReduceOptions, TargetFolder,
+    messages as reduce_messages, reduce_files, FileOutcome, OutputOptions, ReduceOptions,
+    TargetFolder,
 };
 use carbide_engine::signature::{
-    CertifyLevel, HttpTimestampSource, Identity, SignOptions, SignatureReport, SubFilter, TimestampSource, Validity,
+    CertifyLevel, HttpTimestampSource, Identity, SignOptions, SignatureReport, SubFilter,
+    TimestampSource, Validity,
 };
 use carbide_engine::{
-    validate_label, BatesOptions, HiddenItem, PageAnchor, PageDiff, Pdf, ProtectionOptions, Rect, Revision, StandardFont,
-    WatermarkOptions,
+    validate_label, BatesOptions, HiddenItem, PageAnchor, PageDiff, Pdf, ProtectionOptions, Rect,
+    Revision, StandardFont, WatermarkOptions,
 };
 use eframe::egui;
 
@@ -106,9 +110,16 @@ impl SignRequest {
         if self.document_timestamp {
             return Ok(None);
         }
-        let path = self.identity_path.as_ref().ok_or("Choose a digital ID file first.")?;
-        let bytes = std::fs::read(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
-        let extension = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let path = self
+            .identity_path
+            .as_ref()
+            .ok_or("Choose a digital ID file first.")?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+        let extension = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
         let identity = if extension == "pem" {
             let text = String::from_utf8_lossy(&bytes).into_owned();
             Identity::from_pem(&text, &text)
@@ -187,9 +198,18 @@ pub enum Dialog {
     Sign(Box<SignRequest>),
     /// The signatures of document `doc`'s file as last saved or opened, and their summary. The
     /// heading says so while the document has unsaved changes; writing the file closes it.
-    Signatures { doc: u64, reports: Vec<SignatureReport>, notice: String },
+    Signatures {
+        doc: u64,
+        reports: Vec<SignatureReport>,
+        notice: String,
+    },
     Message(String),
-    Password { path: PathBuf, bytes: Vec<u8>, input: String, failed: bool },
+    Password {
+        path: PathBuf,
+        bytes: Vec<u8>,
+        input: String,
+        failed: bool,
+    },
     /// Saving document `doc` to `path` has to write the whole file again, which costs its
     /// signatures or its saved revisions. `then` waits for the save. The question is dropped as
     /// soon as another document comes to the front.
@@ -202,34 +222,85 @@ pub enum Dialog {
         then: AfterSave,
     },
     /// Writing files for document `doc` would replace the files `taken`.
-    ExistingFiles { doc: u64, writing: Writing, taken: Vec<PathBuf> },
+    ExistingFiles {
+        doc: u64,
+        writing: Writing,
+        taken: Vec<PathBuf>,
+    },
     /// Exporting the protected document `doc` gives files that are not protected.
-    ConfirmExport { doc: u64, export: Export },
+    ConfirmExport {
+        doc: u64,
+        export: Export,
+    },
     /// Appending `others` (named `names`) to document `doc`: `protected` are protected in a way it
     /// does not share, so their pages would be saved with its protection (`keeps_protection`) or
     /// none.
-    ConfirmMerge { doc: u64, others: Vec<Pdf>, names: Vec<String>, protected: Vec<String>, keeps_protection: bool },
+    ConfirmMerge {
+        doc: u64,
+        others: Vec<Pdf>,
+        names: Vec<String>,
+        protected: Vec<String>,
+        keeps_protection: bool,
+    },
     /// The files to combine are protected in different ways, so the result cannot keep them all.
-    ConfirmCombine { documents: Vec<Pdf> },
+    ConfirmCombine {
+        documents: Vec<Pdf>,
+    },
     /// Remove Hidden Information from document `doc`, with each item and whether it is chosen.
-    RemoveHidden { doc: u64, chosen: Vec<(HiddenItem, bool)> },
+    RemoveHidden {
+        doc: u64,
+        chosen: Vec<(HiddenItem, bool)>,
+    },
     /// Redactions were just applied to document `doc`: offer to remove its hidden information too.
-    SuggestRemoveHidden { doc: u64 },
+    SuggestRemoveHidden {
+        doc: u64,
+    },
     Watermark(WatermarkForm),
     Bates(BatesForm),
     Protect(ProtectForm),
-    Split { doc: u64, ranges: String },
-    Note { doc: u64, page: usize, x: f32, y: f32, on_page: bool, text: String },
-    SaveRevision { doc: u64, label: String, error: Option<String> },
-    OpenRevision { doc: u64, items: Vec<Revision>, selected: Option<usize> },
+    Split {
+        doc: u64,
+        ranges: String,
+    },
+    Note {
+        doc: u64,
+        page: usize,
+        x: f32,
+        y: f32,
+        on_page: bool,
+        text: String,
+    },
+    SaveRevision {
+        doc: u64,
+        label: String,
+        error: Option<String>,
+    },
+    OpenRevision {
+        doc: u64,
+        items: Vec<Revision>,
+        selected: Option<usize>,
+    },
     Impose(Box<ImposeForm>),
     Reduce(Box<ReduceForm>),
-    Compare { title: String, diffs: Vec<PageDiff> },
+    Compare {
+        title: String,
+        diffs: Vec<PageDiff>,
+    },
     /// The Auto Recovery panel, with the question it is asking, if any.
-    AutoRecovery { question: Option<RecoveryQuestion> },
+    AutoRecovery {
+        question: Option<RecoveryQuestion>,
+    },
     /// Saving the recovered document `doc` would replace `path`, the file it was recovered for.
-    ReplaceOriginal { doc: u64, path: PathBuf, then: AfterSave },
-    Preferences { enabled: bool, minutes: String, error: Option<&'static str> },
+    ReplaceOriginal {
+        doc: u64,
+        path: PathBuf,
+        then: AfterSave,
+    },
+    Preferences {
+        enabled: bool,
+        minutes: String,
+        error: Option<&'static str>,
+    },
 }
 
 impl Dialog {
@@ -271,7 +342,10 @@ impl Dialog {
 
     /// The dialog with the page and spot it places something on moved by `follow` (see
     /// [`CarbideApp::follow_page_change`]), or `None` when `follow` says its page is gone.
-    pub fn follow(mut self, follow: impl Fn(usize, Rect) -> Option<(usize, Rect)>) -> Option<Dialog> {
+    pub fn follow(
+        mut self,
+        follow: impl Fn(usize, Rect) -> Option<(usize, Rect)>,
+    ) -> Option<Dialog> {
         match &mut self {
             Dialog::Note { page, x, y, .. } => {
                 let (moved, spot) = follow(*page, Rect::new(*x, *y, 0.0, 0.0))?;
@@ -289,7 +363,13 @@ impl Dialog {
 
     /// Remove Hidden Information for document `doc`, with the usual items chosen.
     pub fn remove_hidden(doc: u64) -> Dialog {
-        Dialog::RemoveHidden { doc, chosen: HiddenItem::ALL.into_iter().map(|item| (item, item.chosen_by_default())).collect() }
+        Dialog::RemoveHidden {
+            doc,
+            chosen: HiddenItem::ALL
+                .into_iter()
+                .map(|item| (item, item.chosen_by_default()))
+                .collect(),
+        }
     }
 
     pub fn watermark(doc: u64) -> Dialog {
@@ -336,13 +416,21 @@ impl Dialog {
     }
 
     pub fn timestamp(doc: u64) -> Dialog {
-        let Dialog::Sign(mut request) = Dialog::sign(doc, None, false) else { unreachable!() };
+        let Dialog::Sign(mut request) = Dialog::sign(doc, None, false) else {
+            unreachable!()
+        };
         request.document_timestamp = true;
         Dialog::Sign(request)
     }
 
     pub fn protect(doc: u64) -> Dialog {
-        Dialog::Protect(ProtectForm { doc, user: String::new(), owner: String::new(), print: true, copy: true })
+        Dialog::Protect(ProtectForm {
+            doc,
+            user: String::new(),
+            owner: String::new(),
+            print: true,
+            copy: true,
+        })
     }
 
     pub fn impose(doc: u64) -> Dialog {
@@ -350,7 +438,10 @@ impl Dialog {
             doc,
             options: ImpositionOptions::default(),
             custom_media: (612.0, 792.0),
-            media_choice: PAPER_SIZES.iter().position(|(n, _, _)| *n == "Letter").unwrap_or(0),
+            media_choice: PAPER_SIZES
+                .iter()
+                .position(|(n, _, _)| *n == "Letter")
+                .unwrap_or(0),
             error: None,
         }))
     }
@@ -381,12 +472,19 @@ impl Dialog {
     }
 
     pub fn preferences(settings: &AutoSaveSettings) -> Dialog {
-        Dialog::Preferences { enabled: settings.enabled, minutes: settings.interval_minutes.to_string(), error: None }
+        Dialog::Preferences {
+            enabled: settings.enabled,
+            minutes: settings.interval_minutes.to_string(),
+            error: None,
+        }
     }
 }
 
 fn window<'a>(title: &str) -> egui::Window<'a> {
-    egui::Window::new(title.to_string()).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+    egui::Window::new(title.to_string())
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
 }
 
 fn buttons(ui: &mut egui::Ui, ok: &str, ok_enabled: bool) -> (bool, bool) {
@@ -407,8 +505,13 @@ fn buttons(ui: &mut egui::Ui, ok: &str, ok_enabled: bool) -> (bool, bool) {
 /// longer in front goes without being shown.
 pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
     app.next_dialog();
-    let Some(mut dialog) = app.dialog.take() else { return };
-    if dialog.document().is_some_and(|doc| app.doc.as_ref().map(|d| d.id) != Some(doc)) {
+    let Some(mut dialog) = app.dialog.take() else {
+        return;
+    };
+    if dialog
+        .document()
+        .is_some_and(|doc| app.doc.as_ref().map(|d| d.id) != Some(doc))
+    {
         return app.next_dialog();
     }
     let mut open = true;
@@ -509,62 +612,88 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::Signatures { reports, notice, .. } => {
+        Dialog::Signatures {
+            reports, notice, ..
+        } => {
             // Edits made while the results are on screen are not covered either.
             let heading = app.about_saved_file(notice);
             window("Signatures").show(ctx, |ui| {
                 ui.strong(heading);
-                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                    for report in reports.iter() {
-                        ui.group(|ui| {
-                            let color = match report.validity {
-                                Validity::Valid => egui::Color32::from_rgb(20, 130, 40),
-                                Validity::Invalid => egui::Color32::from_rgb(190, 30, 30),
-                                _ => egui::Color32::from_rgb(170, 110, 0),
-                            };
-                            ui.colored_label(color, format!("{}: {}", report.field_name, report.status_line()));
-                            if let Some(who) = &report.signer {
-                                let role = if report.document_time_stamp { "Time stamp authority" } else { "Signer" };
-                                ui.label(format!("{role}: {who}"));
-                            }
-                            if let Some(time) = local_time(report.time_stamp_time.as_deref()) {
-                                ui.label(if report.time_stamp_trusted() {
-                                    format!("Time stamp: {time}")
-                                } else {
-                                    format!("Time stamp (authority not confirmed): {time}")
-                                });
-                            }
-                            if let Some(time) = local_time(report.signing_time.as_deref()) {
-                                ui.weak(format!("Signing time in signature (unverified): {time}"));
-                            }
-                            if let Some(claimed) = &report.claimed_name {
-                                ui.weak(format!("Name in signature (unverified): {claimed}"));
-                            }
-                            if let Some(reason) = &report.reason {
-                                ui.label(format!("Reason: {reason}"));
-                            }
-                            if let Some(location) = &report.location {
-                                ui.label(format!("Location: {location}"));
-                            }
-                            for line in report.description_lines() {
-                                ui.label(format!("  {line}"));
-                            }
-                            if report.certifying {
-                                ui.label("  Certifying signature");
-                            }
-                        });
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        for report in reports.iter() {
+                            ui.group(|ui| {
+                                let color = match report.validity {
+                                    Validity::Valid => egui::Color32::from_rgb(20, 130, 40),
+                                    Validity::Invalid => egui::Color32::from_rgb(190, 30, 30),
+                                    _ => egui::Color32::from_rgb(170, 110, 0),
+                                };
+                                ui.colored_label(
+                                    color,
+                                    format!("{}: {}", report.field_name, report.status_line()),
+                                );
+                                if let Some(who) = &report.signer {
+                                    let role = if report.document_time_stamp {
+                                        "Time stamp authority"
+                                    } else {
+                                        "Signer"
+                                    };
+                                    ui.label(format!("{role}: {who}"));
+                                }
+                                if let Some(time) = local_time(report.time_stamp_time.as_deref()) {
+                                    ui.label(if report.time_stamp_trusted() {
+                                        format!("Time stamp: {time}")
+                                    } else {
+                                        format!("Time stamp (authority not confirmed): {time}")
+                                    });
+                                }
+                                if let Some(time) = local_time(report.signing_time.as_deref()) {
+                                    ui.weak(format!(
+                                        "Signing time in signature (unverified): {time}"
+                                    ));
+                                }
+                                if let Some(claimed) = &report.claimed_name {
+                                    ui.weak(format!("Name in signature (unverified): {claimed}"));
+                                }
+                                if let Some(reason) = &report.reason {
+                                    ui.label(format!("Reason: {reason}"));
+                                }
+                                if let Some(location) = &report.location {
+                                    ui.label(format!("Location: {location}"));
+                                }
+                                for line in report.description_lines() {
+                                    ui.label(format!("  {line}"));
+                                }
+                                if report.certifying {
+                                    ui.label("  Certifying signature");
+                                }
+                            });
+                        }
+                    });
                 if ui.button("Close").clicked() {
                     open = false;
                 }
             });
         }
 
-        Dialog::Password { path, bytes, input, failed } => {
+        Dialog::Password {
+            path,
+            bytes,
+            input,
+            failed,
+        } => {
             window("This document is password protected").show(ctx, |ui| {
-                ui.label(path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-                ui.add(egui::TextEdit::singleline(input).password(true).hint_text("Password"));
+                ui.label(
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(input)
+                        .password(true)
+                        .hint_text("Password"),
+                );
                 if *failed {
                     ui.colored_label(egui::Color32::RED, "That password did not work.");
                 }
@@ -583,7 +712,14 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::ConfirmRewrite { doc, path, content_removed, breaks_signatures, drops_revisions, then } => {
+        Dialog::ConfirmRewrite {
+            doc,
+            path,
+            content_removed,
+            breaks_signatures,
+            drops_revisions,
+            then,
+        } => {
             window("Save").show(ctx, |ui| {
                 ui.set_max_width(420.0);
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -608,17 +744,30 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::ExistingFiles { doc, writing, taken } => {
+        Dialog::ExistingFiles {
+            doc,
+            writing,
+            taken,
+        } => {
             window("Replace Files?").show(ctx, |ui| {
                 ui.set_max_width(440.0);
                 let folder = match writing {
-                    Writing::Images { folder } | Writing::Split { folder, .. } => folder.display().to_string(),
+                    Writing::Images { folder } | Writing::Split { folder, .. } => {
+                        folder.display().to_string()
+                    }
                 };
-                let name = |path: &PathBuf| path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let name = |path: &PathBuf| {
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                };
                 if let [only] = taken.as_slice() {
                     ui.label(format!("\"{}\" already exists in {folder}.", name(only)));
                 } else {
-                    ui.label(format!("{} files with these names already exist in {folder}:", taken.len()));
+                    ui.label(format!(
+                        "{} files with these names already exist in {folder}:",
+                        taken.len()
+                    ));
                     for path in taken.iter().take(6) {
                         ui.label(format!("  {}", name(path)));
                     }
@@ -641,7 +790,12 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                     }
                 });
                 if let Some(existing) = choice {
-                    let writing = std::mem::replace(writing, Writing::Images { folder: PathBuf::new() });
+                    let writing = std::mem::replace(
+                        writing,
+                        Writing::Images {
+                            folder: PathBuf::new(),
+                        },
+                    );
                     app.continue_writing(*doc, writing, existing);
                     open = false;
                 }
@@ -656,7 +810,9 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                     Export::Text => "text",
                 };
                 let name = app.doc.as_ref().map(|d| d.title()).unwrap_or_default();
-                ui.label(format!("\"{name}\" is password-protected, but the exported {what} will not be."));
+                ui.label(format!(
+                    "\"{name}\" is password-protected, but the exported {what} will not be."
+                ));
                 ui.label("Anyone who can open the exported files can read the content.");
                 let (ok, cancel) = buttons(ui, "Export Anyway", true);
                 if ok {
@@ -667,7 +823,13 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::ConfirmMerge { doc, others, names, protected, keeps_protection } => {
+        Dialog::ConfirmMerge {
+            doc,
+            others,
+            names,
+            protected,
+            keeps_protection,
+        } => {
             window("Merge PDFs").show(ctx, |ui| {
                 ui.set_max_width(440.0);
                 let list = protected.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
@@ -789,11 +951,13 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                     ui.label("Digits");
                     ui.add(egui::DragValue::new(&mut f.digits).range(1..=12));
                 });
-                egui::ComboBox::from_label("Position").selected_text(anchor_name(f.anchor)).show_ui(ui, |ui| {
-                    for anchor in PageAnchor::ALL {
-                        ui.selectable_value(&mut f.anchor, anchor, anchor_name(anchor));
-                    }
-                });
+                egui::ComboBox::from_label("Position")
+                    .selected_text(anchor_name(f.anchor))
+                    .show_ui(ui, |ui| {
+                        for anchor in PageAnchor::ALL {
+                            ui.selectable_value(&mut f.anchor, anchor, anchor_name(anchor));
+                        }
+                    });
                 let mut options = BatesOptions {
                     prefix: f.prefix.clone(),
                     suffix: f.suffix.clone(),
@@ -857,9 +1021,20 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::Note { page, x, y, on_page, text, .. } => {
+        Dialog::Note {
+            page,
+            x,
+            y,
+            on_page,
+            text,
+            ..
+        } => {
             window(if *on_page { "Add Text" } else { "Add Note" }).show(ctx, |ui| {
-                ui.add(egui::TextEdit::multiline(text).desired_rows(3).desired_width(320.0));
+                ui.add(
+                    egui::TextEdit::multiline(text)
+                        .desired_rows(3)
+                        .desired_width(320.0),
+                );
                 let (ok, cancel) = buttons(ui, "Add", !text.trim().is_empty());
                 if ok {
                     let (page, x, y, on_page, text) = (*page, *x, *y, *on_page, text.clone());
@@ -899,7 +1074,9 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::OpenRevision { items, selected, .. } => {
+        Dialog::OpenRevision {
+            items, selected, ..
+        } => {
             window("Open Revision").show(ctx, |ui| {
                 egui::Grid::new("revisions").striped(true).show(ui, |ui| {
                     ui.strong("Label");
@@ -916,7 +1093,10 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                 });
                 ui.horizontal(|ui| {
                     // Open is available only while exactly one row is selected.
-                    if ui.add_enabled(selected.is_some(), egui::Button::new("Open")).clicked() {
+                    if ui
+                        .add_enabled(selected.is_some(), egui::Button::new("Open"))
+                        .clicked()
+                    {
                         if let Some(i) = *selected {
                             let revision = items[i].clone();
                             app.open_revision(&revision);
@@ -963,17 +1143,27 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                 } else {
                     format!("{} page(s) differ.", changed.len())
                 });
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    for diff in changed {
-                        ui.label(egui::RichText::new(format!("Page {}", diff.page_number)).strong());
-                        for line in &diff.removed {
-                            ui.colored_label(egui::Color32::from_rgb(190, 30, 30), format!("- {line}"));
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for diff in changed {
+                            ui.label(
+                                egui::RichText::new(format!("Page {}", diff.page_number)).strong(),
+                            );
+                            for line in &diff.removed {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(190, 30, 30),
+                                    format!("- {line}"),
+                                );
+                            }
+                            for line in &diff.added {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(20, 130, 40),
+                                    format!("+ {line}"),
+                                );
+                            }
                         }
-                        for line in &diff.added {
-                            ui.colored_label(egui::Color32::from_rgb(20, 130, 40), format!("+ {line}"));
-                        }
-                    }
-                });
+                    });
                 ui.weak("Text comparison only; layout and image changes are not detected.");
                 if ui.button("Done").clicked() {
                     open = false;
@@ -988,9 +1178,15 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
         Dialog::ReplaceOriginal { doc, path, then } => {
             window("Save Recovered Document").show(ctx, |ui| {
                 ui.set_max_width(440.0);
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 ui.label(format!("Save the recovered document over \"{name}\"?"));
-                ui.label(format!("This replaces {} on disk with the recovered version.", path.display()));
+                ui.label(format!(
+                    "This replaces {} on disk with the recovered version.",
+                    path.display()
+                ));
                 ui.add_space(6.0);
                 let mut choice = None;
                 ui.horizontal(|ui| {
@@ -1016,11 +1212,18 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
             });
         }
 
-        Dialog::Preferences { enabled, minutes, error } => {
+        Dialog::Preferences {
+            enabled,
+            minutes,
+            error,
+        } => {
             window(autosave_messages::PREFERENCE_TITLE).show(ctx, |ui| {
                 ui.checkbox(enabled, autosave_messages::PREFERENCE_CHECKBOX);
                 ui.horizontal(|ui| {
-                    ui.add_enabled(*enabled, egui::TextEdit::singleline(minutes).desired_width(50.0));
+                    ui.add_enabled(
+                        *enabled,
+                        egui::TextEdit::singleline(minutes).desired_width(50.0),
+                    );
                     ui.label(autosave_messages::PREFERENCE_UNIT);
                 });
                 if let Some(message) = error {
@@ -1068,7 +1271,12 @@ fn split_document(app: &mut CarbideApp, ranges: &str) {
     if let Err(e) = Pdf::parse_ranges(ranges, doc.pdf.page_count()) {
         return app.alert(e.to_string());
     }
-    let Some(folder) = rfd::FileDialog::new().set_title("Choose Folder").pick_folder() else { return };
+    let Some(folder) = rfd::FileDialog::new()
+        .set_title("Choose Folder")
+        .pick_folder()
+    else {
+        return;
+    };
     app.split_into(folder, ranges, None);
 }
 
@@ -1085,10 +1293,19 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
         (LayoutKind::CutStacks, "Cut Stacks"),
     ];
     egui::ComboBox::from_label("Layout")
-        .selected_text(layouts.iter().find(|(l, _)| *l == o.plan.layout).map(|(_, n)| *n).unwrap_or(""))
+        .selected_text(
+            layouts
+                .iter()
+                .find(|(l, _)| *l == o.plan.layout)
+                .map(|(_, n)| *n)
+                .unwrap_or(""),
+        )
         .show_ui(ui, |ui| {
             for (layout, name) in layouts {
-                if ui.selectable_value(&mut o.plan.layout, layout, name).clicked() {
+                if ui
+                    .selectable_value(&mut o.plan.layout, layout, name)
+                    .clicked()
+                {
                     let (c, r) = match layout {
                         LayoutKind::Booklet2Up => (2, 1),
                         LayoutKind::Booklet4Up => (2, 2),
@@ -1100,7 +1317,10 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
                 }
             }
         });
-    let booklet = matches!(o.plan.layout, LayoutKind::Booklet2Up | LayoutKind::Booklet4Up | LayoutKind::Booklet8Up);
+    let booklet = matches!(
+        o.plan.layout,
+        LayoutKind::Booklet2Up | LayoutKind::Booklet4Up | LayoutKind::Booklet8Up
+    );
     if booklet {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut o.plan.binding, Binding::Saddle, "Saddle-Stitching");
@@ -1141,8 +1361,16 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
             PrintingOrder::FrontsThenBacksReversed => "All fronts, then all backs in reverse",
         })
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut o.plan.printing_order, PrintingOrder::Interleaved, "(front, back, front, back)");
-            ui.selectable_value(&mut o.plan.printing_order, PrintingOrder::FrontsThenBacks, "All fronts, then all backs");
+            ui.selectable_value(
+                &mut o.plan.printing_order,
+                PrintingOrder::Interleaved,
+                "(front, back, front, back)",
+            );
+            ui.selectable_value(
+                &mut o.plan.printing_order,
+                PrintingOrder::FrontsThenBacks,
+                "All fronts, then all backs",
+            );
             ui.selectable_value(
                 &mut o.plan.printing_order,
                 PrintingOrder::FrontsThenBacksReversed,
@@ -1157,11 +1385,13 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
         .map(|(n, _, _)| n.to_string())
         .chain(["Custom size".to_string(), "Autosize".to_string()])
         .collect();
-    egui::ComboBox::from_label("Media").selected_text(&media_names[form.media_choice.min(media_names.len() - 1)]).show_ui(ui, |ui| {
-        for (i, name) in media_names.iter().enumerate() {
-            ui.selectable_value(&mut form.media_choice, i, name);
-        }
-    });
+    egui::ComboBox::from_label("Media")
+        .selected_text(&media_names[form.media_choice.min(media_names.len() - 1)])
+        .show_ui(ui, |ui| {
+            for (i, name) in media_names.iter().enumerate() {
+                ui.selectable_value(&mut form.media_choice, i, name);
+            }
+        });
     let custom_index = PAPER_SIZES.len();
     o.media = if form.media_choice < custom_index {
         Media::Named(PAPER_SIZES[form.media_choice].0.to_string())
@@ -1172,7 +1402,10 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
             ui.label("Height (pt)");
             ui.add(egui::DragValue::new(&mut form.custom_media.1).range(72.0..=14400.0));
         });
-        Media::Custom { width: form.custom_media.0, height: form.custom_media.1 }
+        Media::Custom {
+            width: form.custom_media.0,
+            height: form.custom_media.1,
+        }
     } else {
         Media::Autosize
     };
@@ -1204,7 +1437,11 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
         ui.label("Spread");
         ui.add(egui::DragValue::new(&mut o.spread).range(0.0..=200.0));
         ui.label("Creep");
-        ui.add(egui::DragValue::new(&mut o.creep).speed(0.1).range(0.0..=50.0));
+        ui.add(
+            egui::DragValue::new(&mut o.creep)
+                .speed(0.1)
+                .range(0.0..=50.0),
+        );
     });
 
     ui.separator();
@@ -1216,7 +1453,11 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
     if o.registration_marks {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut o.registration_style, RegistrationStyle::Cross, "Cross");
-            ui.selectable_value(&mut o.registration_style, RegistrationStyle::Circle, "Circle");
+            ui.selectable_value(
+                &mut o.registration_style,
+                RegistrationStyle::Circle,
+                "Circle",
+            );
         });
     }
     ui.checkbox(&mut o.page_info, "Description");
@@ -1224,7 +1465,10 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
     ui.checkbox(&mut o.flip_backs, "Flip the back side of each sheet");
     ui.horizontal(|ui| {
         if ui.button("Save Settings...").clicked() {
-            if let Some(path) = rfd::FileDialog::new().set_file_name("imposition.ini").save_file() {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name("imposition.ini")
+                .save_file()
+            {
                 if let Err(e) = carbide_engine::fs::write_replacing(&path, o.to_ini().as_bytes()) {
                     form.error = Some(format!("Could not save the settings: {e}"));
                 }
@@ -1232,10 +1476,16 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
         }
         if ui.button("Load Settings...").clicked() {
             if let Some(path) = rfd::FileDialog::new().pick_file() {
-                match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| ImpositionOptions::from_ini(&t).map_err(|e| e.to_string())) {
+                match std::fs::read_to_string(path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| ImpositionOptions::from_ini(&t).map_err(|e| e.to_string()))
+                {
                     Ok(loaded) => {
                         form.media_choice = match &loaded.media {
-                            Media::Named(n) => PAPER_SIZES.iter().position(|(p, _, _)| p.eq_ignore_ascii_case(n)).unwrap_or(0),
+                            Media::Named(n) => PAPER_SIZES
+                                .iter()
+                                .position(|(p, _, _)| p.eq_ignore_ascii_case(n))
+                                .unwrap_or(0),
                             Media::Custom { width, height } => {
                                 form.custom_media = (*width, *height);
                                 PAPER_SIZES.len()
@@ -1253,7 +1503,11 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
 
 fn run_imposition(app: &mut CarbideApp, form: &ImposeForm) -> Result<(), String> {
     form.options.validate().map_err(|e| e.to_string())?;
-    let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name("New Imposition.pdf").save_file() else {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("PDF Files", &["pdf"])
+        .set_file_name("New Imposition.pdf")
+        .save_file()
+    else {
         return Err("No output file was chosen.".into());
     };
     app.impose_to(&form.options, &path)?;
@@ -1268,13 +1522,26 @@ fn reduce_dialog(app: &mut CarbideApp, ctx: &egui::Context, form: &mut ReduceFor
     let mut keep = true;
     if let Some(results) = &form.results {
         window("Conversion Warnings").show(ctx, |ui| {
-            let warnings: Vec<&FileOutcome> = results.iter().filter(|r| r.warning.is_some()).collect();
+            let warnings: Vec<&FileOutcome> =
+                results.iter().filter(|r| r.warning.is_some()).collect();
             if warnings.is_empty() {
                 ui.label(format!("{} file(s) reduced.", results.len()));
             }
             for outcome in warnings {
-                ui.label(egui::RichText::new(outcome.input.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).strong());
-                ui.label(format!("    {}", outcome.warning.clone().unwrap_or_default()));
+                ui.label(
+                    egui::RichText::new(
+                        outcome
+                            .input
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    )
+                    .strong(),
+                );
+                ui.label(format!(
+                    "    {}",
+                    outcome.warning.clone().unwrap_or_default()
+                ));
             }
             if ui.button("OK").clicked() {
                 keep = false;
@@ -1309,25 +1576,34 @@ fn reduce_dialog(app: &mut CarbideApp, ctx: &egui::Context, form: &mut ReduceFor
         }
 
         ui.label("Add documents to the list below.");
-        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-            let mut remove = None;
-            for (i, file) in form.files.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-                    if let Ok(meta) = std::fs::metadata(file) {
-                        ui.weak(format_size(meta.len()));
-                    }
-                    if ui.small_button("Delete").clicked() {
-                        remove = Some(i);
-                    }
-                });
-            }
-            if let Some(i) = remove {
-                form.files.remove(i);
-            }
-        });
+        egui::ScrollArea::vertical()
+            .max_height(140.0)
+            .show(ui, |ui| {
+                let mut remove = None;
+                for (i, file) in form.files.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            file.file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                        );
+                        if let Ok(meta) = std::fs::metadata(file) {
+                            ui.weak(format_size(meta.len()));
+                        }
+                        if ui.small_button("Delete").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    form.files.remove(i);
+                }
+            });
         if ui.button("Add Files...").clicked() {
-            if let Some(paths) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).pick_files() {
+            if let Some(paths) = rfd::FileDialog::new()
+                .add_filter("PDF Files", &["pdf"])
+                .pick_files()
+            {
                 for path in paths {
                     if !form.files.contains(&path) {
                         form.files.push(path);
@@ -1341,7 +1617,10 @@ fn reduce_dialog(app: &mut CarbideApp, ctx: &egui::Context, form: &mut ReduceFor
         ui.horizontal(|ui| {
             ui.radio_value(&mut form.same_folder, false, "Specific folder");
             if !form.same_folder && ui.button("Browse").clicked() {
-                if let Some(folder) = rfd::FileDialog::new().set_title("Choose an output folder").pick_folder() {
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_title("Choose an output folder")
+                    .pick_folder()
+                {
                     form.folder = Some(folder);
                 }
             }
@@ -1366,19 +1645,36 @@ fn reduce_dialog(app: &mut CarbideApp, ctx: &egui::Context, form: &mut ReduceFor
         }
         ui.checkbox(&mut form.overwrite, "Overwrite existing files");
         ui.horizontal(|ui| {
-            if ui.add_enabled(!form.files.is_empty(), egui::Button::new("OK")).clicked() {
+            if ui
+                .add_enabled(!form.files.is_empty(), egui::Button::new("OK"))
+                .clicked()
+            {
                 let output = OutputOptions {
                     folder: if form.same_folder {
                         TargetFolder::SameAsOriginal
                     } else {
                         TargetFolder::Specific(form.folder.clone().unwrap_or_default())
                     },
-                    prefix: if form.add_to_names { form.prefix.clone() } else { String::new() },
-                    suffix: if form.add_to_names { form.suffix.clone() } else { String::new() },
+                    prefix: if form.add_to_names {
+                        form.prefix.clone()
+                    } else {
+                        String::new()
+                    },
+                    suffix: if form.add_to_names {
+                        form.suffix.clone()
+                    } else {
+                        String::new()
+                    },
                     overwrite: form.overwrite,
                     replace_originals: form.replace_originals && !form.add_to_names,
                 };
-                form.results = Some(reduce_files(&form.files, &output, &ReduceOptions { image_factor: form.slider }));
+                form.results = Some(reduce_files(
+                    &form.files,
+                    &output,
+                    &ReduceOptions {
+                        image_factor: form.slider,
+                    },
+                ));
             }
             if ui.button("Cancel").clicked() {
                 keep = false;
@@ -1390,27 +1686,45 @@ fn reduce_dialog(app: &mut CarbideApp, ctx: &egui::Context, form: &mut ReduceFor
 
 /// Single-document flow: choose the output path, reduce, report. Returns `true` when finished.
 fn reduce_current(app: &mut CarbideApp, slider: u8) -> bool {
-    let Some(doc) = app.doc.as_ref() else { return true };
+    let Some(doc) = app.doc.as_ref() else {
+        return true;
+    };
     // The reduced copy is not encrypted, and its suggested name is the protected original's.
     if doc.saved.as_ref().is_some_and(|s| s.is_protected()) {
         app.alert("Reduce File Size is not available for password-protected documents.".into());
         return true;
     }
     // A new name by default, so the original is only replaced when the user picks it.
-    let stem = doc.title().strip_suffix(".pdf").map(str::to_owned).unwrap_or_else(|| doc.title());
+    let stem = doc
+        .title()
+        .strip_suffix(".pdf")
+        .map(str::to_owned)
+        .unwrap_or_else(|| doc.title());
     let name = format!("{stem}{}.pdf", carbide_engine::reduce::DEFAULT_SUFFIX);
-    let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name(name).save_file() else {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("PDF Files", &["pdf"])
+        .set_file_name(name)
+        .save_file()
+    else {
         return false;
     };
     let before = doc.saved.as_ref().map(|s| s.bytes().len());
     let mut copy = doc.pdf.clone();
-    match copy.reduce(&ReduceOptions { image_factor: slider }, before) {
+    match copy.reduce(
+        &ReduceOptions {
+            image_factor: slider,
+        },
+        before,
+    ) {
         // Over the document's own file, the document goes on from the reduced file.
         Ok((bytes, report)) => {
             if app.write_copy(&path, &bytes, None).is_some() {
                 app.status = format!(
                     "Reduced {} -> {} bytes ({} images re-encoded, {} streams merged).",
-                    report.size_before, report.size_after, report.images_recompressed, report.streams_merged
+                    report.size_before,
+                    report.size_after,
+                    report.images_recompressed,
+                    report.streams_merged
                 );
             }
             true
@@ -1466,10 +1780,19 @@ pub enum RecoveryAction {
 /// Carries out `action` in the Auto Recovery panel, whose pending question is `question`. Deleting
 /// a recovered copy, or all of them, only asks; it happens on `Confirm`. Returns whether the panel
 /// stays open.
-pub fn recovery_action(app: &mut CarbideApp, question: &mut Option<RecoveryQuestion>, action: RecoveryAction) -> bool {
+pub fn recovery_action(
+    app: &mut CarbideApp,
+    question: &mut Option<RecoveryQuestion>,
+    action: RecoveryAction,
+) -> bool {
     match action {
         RecoveryAction::Open(record, RowKind::Original) => {
-            let path = app.autosave.as_ref().and_then(|s| s.record(record)).and_then(|r| r.original.as_ref()).map(|o| o.path.clone());
+            let path = app
+                .autosave
+                .as_ref()
+                .and_then(|s| s.record(record))
+                .and_then(|r| r.original.as_ref())
+                .map(|o| o.path.clone());
             match path {
                 Some(path) if path.exists() => {
                     app.open_path(&path);
@@ -1494,7 +1817,12 @@ pub fn recovery_action(app: &mut CarbideApp, question: &mut Option<RecoveryQuest
             }
         }
         RecoveryAction::Delete(record, RowKind::Recovered) => {
-            let name = app.autosave.as_ref().and_then(|s| s.record(record)).map(|r| r.display_name()).unwrap_or_default();
+            let name = app
+                .autosave
+                .as_ref()
+                .and_then(|s| s.record(record))
+                .map(|r| r.display_name())
+                .unwrap_or_default();
             *question = Some(RecoveryQuestion::Delete { record, name });
         }
         RecoveryAction::ClearAll => *question = Some(RecoveryQuestion::ClearAll),
@@ -1517,7 +1845,11 @@ pub fn recovery_action(app: &mut CarbideApp, question: &mut Option<RecoveryQuest
 }
 
 /// Returns `false` when the panel should close.
-fn recovery_panel(app: &mut CarbideApp, ctx: &egui::Context, question: &mut Option<RecoveryQuestion>) -> bool {
+fn recovery_panel(
+    app: &mut CarbideApp,
+    ctx: &egui::Context,
+    question: &mut Option<RecoveryQuestion>,
+) -> bool {
     let mut keep = true;
     let mut action: Option<RecoveryAction> = None;
 
@@ -1540,7 +1872,11 @@ fn recovery_panel(app: &mut CarbideApp, ctx: &egui::Context, question: &mut Opti
         };
     }
 
-    let rows = app.autosave.as_ref().map(|s| s.panel_rows()).unwrap_or_default();
+    let rows = app
+        .autosave
+        .as_ref()
+        .map(|s| s.panel_rows())
+        .unwrap_or_default();
     window(autosave_messages::PANEL_TITLE).show(ctx, |ui| {
         if rows.is_empty() {
             ui.label("There are no recovered documents.");
@@ -1564,7 +1900,13 @@ fn recovery_panel(app: &mut CarbideApp, ctx: &egui::Context, question: &mut Opti
             }
         });
         ui.horizontal(|ui| {
-            if ui.add_enabled(!rows.is_empty(), egui::Button::new(autosave_messages::CLEAR_ALL)).clicked() {
+            if ui
+                .add_enabled(
+                    !rows.is_empty(),
+                    egui::Button::new(autosave_messages::CLEAR_ALL),
+                )
+                .clicked()
+            {
                 action = Some(RecoveryAction::ClearAll);
             }
             if ui.button("Close").clicked() {

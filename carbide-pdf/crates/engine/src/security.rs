@@ -61,7 +61,8 @@ impl Pdf {
         let mut copy = self.doc.clone();
 
         let mut key = [0u8; 32];
-        getrandom::fill(&mut key).map_err(|e| Error::Other(format!("no randomness available: {e}")))?;
+        getrandom::fill(&mut key)
+            .map_err(|e| Error::Other(format!("no randomness available: {e}")))?;
 
         let mut filters: BTreeMap<Vec<u8>, Arc<dyn CryptFilter>> = BTreeMap::new();
         filters.insert(b"StdCF".to_vec(), Arc::new(Aes256CryptFilter));
@@ -82,13 +83,20 @@ impl Pdf {
             .map_err(|e| Error::Other(format!("could not encrypt: {e}")))?;
         // Classic cross-reference table and no object streams: every consumer can read this, and
         // lopdf itself cannot expand object streams of an encrypted file.
-        let options = lopdf::SaveOptions::builder().use_object_streams(false).use_xref_streams(false).build();
+        let options = lopdf::SaveOptions::builder()
+            .use_object_streams(false)
+            .use_xref_streams(false)
+            .build();
         let mut out = Vec::new();
         copy.save_with_options(&mut out, options)?;
         Ok(out)
     }
 
-    pub fn save_encrypted(&mut self, path: impl AsRef<std::path::Path>, options: &ProtectionOptions) -> Result<()> {
+    pub fn save_encrypted(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        options: &ProtectionOptions,
+    ) -> Result<()> {
         let bytes = self.to_encrypted_bytes(options)?;
         crate::fs::write_replacing(path.as_ref(), &bytes)?;
         Ok(())

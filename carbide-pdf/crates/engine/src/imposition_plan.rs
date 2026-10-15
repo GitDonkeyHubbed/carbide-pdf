@@ -121,7 +121,10 @@ impl Plate {
 
     /// The source pages in row-major order as 1-based numbers (0 = blank): handy in tests.
     pub fn numbers(&self) -> Vec<usize> {
-        self.cells.iter().map(|c| c.page.map(|p| p + 1).unwrap_or(0)).collect()
+        self.cells
+            .iter()
+            .map(|c| c.page.map(|p| p + 1).unwrap_or(0))
+            .collect()
     }
 }
 
@@ -146,7 +149,9 @@ pub fn plan_plates(options: &PlanOptions, total_pages: usize) -> Result<Vec<Plat
     match options.layout {
         LayoutKind::Sequential => Ok(plan_sequential(options, total_pages)),
         LayoutKind::StepAndRepeat | LayoutKind::CutStacks => plan_tiled(options, total_pages),
-        LayoutKind::Booklet2Up | LayoutKind::Booklet4Up | LayoutKind::Booklet8Up => plan_booklet(options, total_pages),
+        LayoutKind::Booklet2Up | LayoutKind::Booklet4Up | LayoutKind::Booklet8Up => {
+            plan_booklet(options, total_pages)
+        }
     }
 }
 
@@ -160,7 +165,11 @@ fn plan_sequential(options: &PlanOptions, total: usize) -> Vec<Plate> {
             front: !options.double_sided || p % 2 == 0,
             rows: 1,
             cols: 1,
-            cells: vec![Cell { page: blank_if_over(p + 1, total), inverted: false, creep_steps: 0 }],
+            cells: vec![Cell {
+                page: blank_if_over(p + 1, total),
+                inverted: false,
+                creep_steps: 0,
+            }],
         })
         .collect()
 }
@@ -172,7 +181,11 @@ fn plan_tiled(options: &PlanOptions, total: usize) -> Result<Vec<Plate>> {
     }
     let cells = rows * cols;
     let d = options.double_sided;
-    let plates = if d { 2 * total.div_ceil(2 * cells) } else { total.div_ceil(cells) };
+    let plates = if d {
+        2 * total.div_ceil(2 * cells)
+    } else {
+        total.div_ceil(cells)
+    };
 
     let mut out = Vec::with_capacity(plates);
     for p in 0..plates {
@@ -195,10 +208,20 @@ fn plan_tiled(options: &PlanOptions, total: usize) -> Result<Vec<Plate>> {
                         p + 1 + plates * (a * cols + column)
                     }
                 };
-                list.push(Cell { page: blank_if_over(number, total), inverted: false, creep_steps: 0 });
+                list.push(Cell {
+                    page: blank_if_over(number, total),
+                    inverted: false,
+                    creep_steps: 0,
+                });
             }
         }
-        out.push(Plate { sheet: if d { p / 2 } else { p }, front: !d || p % 2 == 0, rows, cols, cells: list });
+        out.push(Plate {
+            sheet: if d { p / 2 } else { p },
+            front: !d || p % 2 == 0,
+            rows,
+            cols,
+            cells: list,
+        });
     }
     Ok(out)
 }
@@ -217,14 +240,31 @@ struct Block {
 impl Block {
     fn cell(&self, number: usize, inverted: bool) -> Cell {
         Cell {
-            page: if number >= self.first && number <= self.last { Some(number - 1) } else { None },
+            page: if number >= self.first && number <= self.last {
+                Some(number - 1)
+            } else {
+                None
+            },
             inverted,
             creep_steps: 0,
         }
     }
 
-    fn plate(&self, sheet: usize, front: bool, rows: usize, cols: usize, cells: Vec<Cell>) -> Plate {
-        Plate { sheet, front, rows, cols, cells }
+    fn plate(
+        &self,
+        sheet: usize,
+        front: bool,
+        rows: usize,
+        cols: usize,
+        cells: Vec<Cell>,
+    ) -> Plate {
+        Plate {
+            sheet,
+            front,
+            rows,
+            cols,
+            cells,
+        }
     }
 }
 
@@ -234,8 +274,26 @@ fn saddle_2up(b: &Block) -> Vec<Plate> {
     let padded = round_up(b.last - b.first + 1, 4);
     let mut plates = Vec::new();
     for k in 0..padded / 4 {
-        plates.push(b.plate(k, true, 1, 2, vec![b.cell(s + padded - 2 * k - 1, false), b.cell(s + 2 * k, false)]));
-        plates.push(b.plate(k, false, 1, 2, vec![b.cell(s + 2 * k + 1, false), b.cell(s + padded - 2 * k - 2, false)]));
+        plates.push(b.plate(
+            k,
+            true,
+            1,
+            2,
+            vec![
+                b.cell(s + padded - 2 * k - 1, false),
+                b.cell(s + 2 * k, false),
+            ],
+        ));
+        plates.push(b.plate(
+            k,
+            false,
+            1,
+            2,
+            vec![
+                b.cell(s + 2 * k + 1, false),
+                b.cell(s + padded - 2 * k - 2, false),
+            ],
+        ));
     }
     plates
 }
@@ -308,12 +366,56 @@ fn saddle_8up(b: &Block) -> Vec<Plate> {
     let mut plates = Vec::new();
     for t in 0..p / 16 {
         let row = |numbers: [usize; 4], inverted: bool| numbers.map(|n| b.cell(n, inverted));
-        let front_top = row([s + p - 8 - 8 * t, s + 8 * t + 7, s + 8 * t + 4, s + p - 5 - 8 * t], true);
-        let front_bottom = row([s + p - 1 - 8 * t, s + 8 * t, s + 8 * t + 3, s + p - 4 - 8 * t], false);
-        let back_top = row([s + p - 6 - 8 * t, s + 8 * t + 5, s + 8 * t + 6, s + p - 7 - 8 * t], true);
-        let back_bottom = row([s + p - 3 - 8 * t, s + 8 * t + 2, s + 8 * t + 1, s + p - 2 - 8 * t], false);
-        plates.push(b.plate(t, true, 2, 4, front_top.into_iter().chain(front_bottom).collect()));
-        plates.push(b.plate(t, false, 2, 4, back_top.into_iter().chain(back_bottom).collect()));
+        let front_top = row(
+            [
+                s + p - 8 - 8 * t,
+                s + 8 * t + 7,
+                s + 8 * t + 4,
+                s + p - 5 - 8 * t,
+            ],
+            true,
+        );
+        let front_bottom = row(
+            [
+                s + p - 1 - 8 * t,
+                s + 8 * t,
+                s + 8 * t + 3,
+                s + p - 4 - 8 * t,
+            ],
+            false,
+        );
+        let back_top = row(
+            [
+                s + p - 6 - 8 * t,
+                s + 8 * t + 5,
+                s + 8 * t + 6,
+                s + p - 7 - 8 * t,
+            ],
+            true,
+        );
+        let back_bottom = row(
+            [
+                s + p - 3 - 8 * t,
+                s + 8 * t + 2,
+                s + 8 * t + 1,
+                s + p - 2 - 8 * t,
+            ],
+            false,
+        );
+        plates.push(b.plate(
+            t,
+            true,
+            2,
+            4,
+            front_top.into_iter().chain(front_bottom).collect(),
+        ));
+        plates.push(b.plate(
+            t,
+            false,
+            2,
+            4,
+            back_top.into_iter().chain(back_bottom).collect(),
+        ));
     }
     plates
 }
@@ -327,14 +429,34 @@ fn work_and_turn_8up(b: &Block, tumble: bool) -> Vec<Plate> {
     (0..m)
         .map(|t| {
             let top = if tumble {
-                [s + p - 2 - 4 * t, s + 4 * t + 1, s + 4 * t + 2, s + p - 3 - 4 * t]
+                [
+                    s + p - 2 - 4 * t,
+                    s + 4 * t + 1,
+                    s + 4 * t + 2,
+                    s + p - 3 - 4 * t,
+                ]
             } else {
-                [s + p - 4 - 4 * t, s + 4 * t + 3, s + 4 * t + 2, s + p - 3 - 4 * t]
+                [
+                    s + p - 4 - 4 * t,
+                    s + 4 * t + 3,
+                    s + 4 * t + 2,
+                    s + p - 3 - 4 * t,
+                ]
             };
             let bottom = if tumble {
-                [s + p - 1 - 4 * t, s + 4 * t, s + 4 * t + 3, s + p - 4 - 4 * t]
+                [
+                    s + p - 1 - 4 * t,
+                    s + 4 * t,
+                    s + 4 * t + 3,
+                    s + p - 4 - 4 * t,
+                ]
             } else {
-                [s + p - 1 - 4 * t, s + 4 * t, s + 4 * t + 1, s + p - 2 - 4 * t]
+                [
+                    s + p - 1 - 4 * t,
+                    s + 4 * t,
+                    s + 4 * t + 1,
+                    s + p - 2 - 4 * t,
+                ]
             };
             let cells = top
                 .into_iter()
@@ -368,7 +490,11 @@ fn apply_creep(options: &PlanOptions, block: &Block, plates: &mut [Plate]) {
     let Some(first) = plates.first() else { return };
     let (cols, rows) = (first.cols, first.rows);
     let sheetwise = options.style == Style::Sheetwise || options.layout == LayoutKind::Booklet2Up;
-    let sheets = if sheetwise { plates.len().div_ceil(2) } else { plates.len() };
+    let sheets = if sheetwise {
+        plates.len().div_ceil(2)
+    } else {
+        plates.len()
+    };
     let k = match options.binding {
         Binding::Perfect => options.sheets_per_fold.max(1).min(sheets.max(1)),
         Binding::Saddle => sheets.max(1),
@@ -395,7 +521,10 @@ fn plan_booklet(options: &PlanOptions, total: usize) -> Result<Vec<Plate>> {
 
     match options.binding {
         Binding::Saddle => {
-            let block = Block { first: 1, last: total };
+            let block = Block {
+                first: 1,
+                last: total,
+            };
             let mut plates = layout_block(options, &block);
             apply_creep(options, &block, &mut plates);
             Ok(plates)
@@ -465,16 +594,33 @@ pub fn output_order(
 mod tests {
     use super::*;
 
-    fn booklet(layout: LayoutKind, binding: Binding, style: Style, pages: usize) -> Vec<Vec<usize>> {
+    fn booklet(
+        layout: LayoutKind,
+        binding: Binding,
+        style: Style,
+        pages: usize,
+    ) -> Vec<Vec<usize>> {
         let options = PlanOptions {
             layout,
             binding,
             style,
-            columns: if layout == LayoutKind::Booklet2Up { 2 } else { 2 },
-            rows: if layout == LayoutKind::Booklet2Up { 1 } else { 2 },
+            columns: if layout == LayoutKind::Booklet2Up {
+                2
+            } else {
+                2
+            },
+            rows: if layout == LayoutKind::Booklet2Up {
+                1
+            } else {
+                2
+            },
             ..Default::default()
         };
-        plan_plates(&options, pages).unwrap().iter().map(Plate::numbers).collect()
+        plan_plates(&options, pages)
+            .unwrap()
+            .iter()
+            .map(Plate::numbers)
+            .collect()
     }
 
     #[test]
@@ -496,7 +642,12 @@ mod tests {
     #[test]
     fn example_c_eight_pages_saddle_four_up() {
         let plates = plan_plates(
-            &PlanOptions { layout: LayoutKind::Booklet4Up, columns: 2, rows: 2, ..Default::default() },
+            &PlanOptions {
+                layout: LayoutKind::Booklet4Up,
+                columns: 2,
+                rows: 2,
+                ..Default::default()
+            },
             8,
         )
         .unwrap();
@@ -511,7 +662,12 @@ mod tests {
     #[test]
     fn example_c_six_page_variant() {
         let plates = plan_plates(
-            &PlanOptions { layout: LayoutKind::Booklet4Up, columns: 2, rows: 2, ..Default::default() },
+            &PlanOptions {
+                layout: LayoutKind::Booklet4Up,
+                columns: 2,
+                rows: 2,
+                ..Default::default()
+            },
             6,
         )
         .unwrap();
@@ -522,7 +678,12 @@ mod tests {
     #[test]
     fn example_d_perfect_bound_two_up() {
         assert_eq!(
-            booklet(LayoutKind::Booklet2Up, Binding::Perfect, Style::Sheetwise, 8),
+            booklet(
+                LayoutKind::Booklet2Up,
+                Binding::Perfect,
+                Style::Sheetwise,
+                8
+            ),
             vec![vec![4, 1], vec![2, 3], vec![8, 5], vec![6, 7]]
         );
     }
@@ -531,7 +692,13 @@ mod tests {
     fn example_e_work_and_turn_four_up() {
         for style in [Style::WorkAndTurn, Style::WorkAndTumble] {
             let plates = plan_plates(
-                &PlanOptions { layout: LayoutKind::Booklet4Up, style, columns: 2, rows: 2, ..Default::default() },
+                &PlanOptions {
+                    layout: LayoutKind::Booklet4Up,
+                    style,
+                    columns: 2,
+                    rows: 2,
+                    ..Default::default()
+                },
                 8,
             )
             .unwrap();
@@ -545,7 +712,11 @@ mod tests {
     #[test]
     fn every_source_page_is_placed_exactly_once() {
         for pages in 1..=70 {
-            for layout in [LayoutKind::Booklet2Up, LayoutKind::Booklet4Up, LayoutKind::Booklet8Up] {
+            for layout in [
+                LayoutKind::Booklet2Up,
+                LayoutKind::Booklet4Up,
+                LayoutKind::Booklet8Up,
+            ] {
                 for binding in [Binding::Saddle, Binding::Perfect] {
                     for style in [Style::Sheetwise, Style::WorkAndTurn, Style::WorkAndTumble] {
                         let options = PlanOptions {
@@ -553,15 +724,29 @@ mod tests {
                             binding,
                             style,
                             sheets_per_fold: 2,
-                            columns: if layout == LayoutKind::Booklet8Up { 4 } else { 2 },
-                            rows: if layout == LayoutKind::Booklet2Up { 1 } else { 2 },
+                            columns: if layout == LayoutKind::Booklet8Up {
+                                4
+                            } else {
+                                2
+                            },
+                            rows: if layout == LayoutKind::Booklet2Up {
+                                1
+                            } else {
+                                2
+                            },
                             ..Default::default()
                         };
                         let plates = plan_plates(&options, pages).unwrap();
-                        let mut seen: Vec<usize> =
-                            plates.iter().flat_map(|p| p.cells.iter().filter_map(|c| c.page)).collect();
+                        let mut seen: Vec<usize> = plates
+                            .iter()
+                            .flat_map(|p| p.cells.iter().filter_map(|c| c.page))
+                            .collect();
                         seen.sort_unstable();
-                        assert_eq!(seen, (0..pages).collect::<Vec<_>>(), "{layout:?} {binding:?} {style:?} N={pages}");
+                        assert_eq!(
+                            seen,
+                            (0..pages).collect::<Vec<_>>(),
+                            "{layout:?} {binding:?} {style:?} N={pages}"
+                        );
                     }
                 }
             }
@@ -579,24 +764,38 @@ mod tests {
             ..Default::default()
         };
         let plates = plan_plates(&step, 6).unwrap();
-        assert_eq!(plates.iter().map(Plate::numbers).collect::<Vec<_>>(), vec![vec![1, 2, 3, 4], vec![5, 6, 0, 0]]);
+        assert_eq!(
+            plates.iter().map(Plate::numbers).collect::<Vec<_>>(),
+            vec![vec![1, 2, 3, 4], vec![5, 6, 0, 0]]
+        );
 
         // Double sided: even pages on the back with columns mirrored.
-        let duplex = PlanOptions { double_sided: true, ..step };
+        let duplex = PlanOptions {
+            double_sided: true,
+            ..step
+        };
         let plates = plan_plates(&duplex, 8).unwrap();
         assert_eq!(plates[0].numbers(), vec![1, 3, 5, 7]);
         assert_eq!(plates[1].numbers(), vec![4, 2, 8, 6]);
         assert!(plates[0].front && !plates[1].front);
 
         // Cut stacks: each plate is a stack, so page p+1 repeats every `plates` pages.
-        let cut = PlanOptions { layout: LayoutKind::CutStacks, double_sided: false, ..step };
+        let cut = PlanOptions {
+            layout: LayoutKind::CutStacks,
+            double_sided: false,
+            ..step
+        };
         let plates = plan_plates(&cut, 8).unwrap();
         assert_eq!(plates.len(), 2);
         assert_eq!(plates[0].numbers(), vec![1, 3, 5, 7]);
         assert_eq!(plates[1].numbers(), vec![2, 4, 6, 8]);
 
         // Sequential: one page per plate, padded to an even count when double sided.
-        let seq = PlanOptions { layout: LayoutKind::Sequential, double_sided: true, ..step };
+        let seq = PlanOptions {
+            layout: LayoutKind::Sequential,
+            double_sided: true,
+            ..step
+        };
         assert_eq!(plan_plates(&seq, 5).unwrap().len(), 6);
     }
 
@@ -605,14 +804,29 @@ mod tests {
         let order = |mode| output_order(4, mode, true, Style::Sheetwise, false);
         assert_eq!(order(PrintingOrder::Interleaved), vec![0, 1, 2, 3]);
         assert_eq!(order(PrintingOrder::FrontsThenBacks), vec![0, 2, 1, 3]);
-        assert_eq!(order(PrintingOrder::FrontsThenBacksReversed), vec![0, 2, 3, 1]);
+        assert_eq!(
+            order(PrintingOrder::FrontsThenBacksReversed),
+            vec![0, 2, 3, 1]
+        );
         // Guard: work and turn without perfect folds, or single-sided output, keeps the order.
         assert_eq!(
-            output_order(4, PrintingOrder::FrontsThenBacks, true, Style::WorkAndTurn, false),
+            output_order(
+                4,
+                PrintingOrder::FrontsThenBacks,
+                true,
+                Style::WorkAndTurn,
+                false
+            ),
             vec![0, 1, 2, 3]
         );
         assert_eq!(
-            output_order(4, PrintingOrder::FrontsThenBacks, false, Style::Sheetwise, false),
+            output_order(
+                4,
+                PrintingOrder::FrontsThenBacks,
+                false,
+                Style::Sheetwise,
+                false
+            ),
             vec![0, 1, 2, 3]
         );
     }
@@ -623,10 +837,21 @@ mod tests {
     #[test]
     fn every_page_is_printed_exactly_once_in_every_printing_order() {
         use LayoutKind::*;
-        let orders = [PrintingOrder::Interleaved, PrintingOrder::FrontsThenBacks, PrintingOrder::FrontsThenBacksReversed];
+        let orders = [
+            PrintingOrder::Interleaved,
+            PrintingOrder::FrontsThenBacks,
+            PrintingOrder::FrontsThenBacksReversed,
+        ];
         let mut odd_counts = 0;
         for pages in 1..=100 {
-            for layout in [Booklet2Up, Booklet4Up, Booklet8Up, Sequential, StepAndRepeat, CutStacks] {
+            for layout in [
+                Booklet2Up,
+                Booklet4Up,
+                Booklet8Up,
+                Sequential,
+                StepAndRepeat,
+                CutStacks,
+            ] {
                 // Booklets have a fixed grid and vary the fold; the tiled layouts vary the grid.
                 let shapes: Vec<(usize, usize, usize)> = match layout {
                     Booklet2Up => (1..=3).map(|k| (2, 1, k)).collect(),
@@ -662,10 +887,16 @@ mod tests {
                                     );
                                     let mut sorted = order.clone();
                                     sorted.sort_unstable();
-                                    assert_eq!(sorted, (0..plates.len()).collect::<Vec<_>>(), "{what}: {order:?}");
+                                    assert_eq!(
+                                        sorted,
+                                        (0..plates.len()).collect::<Vec<_>>(),
+                                        "{what}: {order:?}"
+                                    );
                                     let mut seen: Vec<usize> = order
                                         .iter()
-                                        .flat_map(|&p| plates[p].cells.iter().filter_map(|c| c.page))
+                                        .flat_map(|&p| {
+                                            plates[p].cells.iter().filter_map(|c| c.page)
+                                        })
                                         .collect();
                                     seen.sort_unstable();
                                     assert_eq!(seen, (0..pages).collect::<Vec<_>>(), "{what}");
@@ -682,19 +913,79 @@ mod tests {
     #[test]
     fn odd_plate_counts_keep_every_plate() {
         // Perfect-bound work and turn: one plate per fold, so 3 folds give 3 plates.
-        assert_eq!(output_order(3, PrintingOrder::FrontsThenBacks, true, Style::WorkAndTurn, true), vec![0, 2, 1]);
-        assert_eq!(output_order(3, PrintingOrder::FrontsThenBacksReversed, true, Style::WorkAndTurn, true), vec![0, 2, 1]);
-        assert_eq!(output_order(5, PrintingOrder::FrontsThenBacksReversed, true, Style::Sheetwise, false), vec![0, 2, 4, 3, 1]);
-        assert_eq!(output_order(1, PrintingOrder::FrontsThenBacks, true, Style::Sheetwise, true), vec![0]);
-        assert!(output_order(0, PrintingOrder::FrontsThenBacks, true, Style::Sheetwise, true).is_empty());
+        assert_eq!(
+            output_order(
+                3,
+                PrintingOrder::FrontsThenBacks,
+                true,
+                Style::WorkAndTurn,
+                true
+            ),
+            vec![0, 2, 1]
+        );
+        assert_eq!(
+            output_order(
+                3,
+                PrintingOrder::FrontsThenBacksReversed,
+                true,
+                Style::WorkAndTurn,
+                true
+            ),
+            vec![0, 2, 1]
+        );
+        assert_eq!(
+            output_order(
+                5,
+                PrintingOrder::FrontsThenBacksReversed,
+                true,
+                Style::Sheetwise,
+                false
+            ),
+            vec![0, 2, 4, 3, 1]
+        );
+        assert_eq!(
+            output_order(
+                1,
+                PrintingOrder::FrontsThenBacks,
+                true,
+                Style::Sheetwise,
+                true
+            ),
+            vec![0]
+        );
+        assert!(output_order(
+            0,
+            PrintingOrder::FrontsThenBacks,
+            true,
+            Style::Sheetwise,
+            true
+        )
+        .is_empty());
     }
 
     #[test]
     fn absurd_grids_and_folds_are_refused_before_planning() {
-        let base = PlanOptions { layout: LayoutKind::StepAndRepeat, ..Default::default() };
-        for (columns, rows) in [(0, 1), (1, 0), (MAX_GRID + 1, 1), (1, 1_000_000_000), (usize::MAX, usize::MAX)] {
-            let options = PlanOptions { columns, rows, ..base };
-            assert_eq!(plan_plates(&options, 10).unwrap_err().to_string(), messages::GRID, "{columns} x {rows}");
+        let base = PlanOptions {
+            layout: LayoutKind::StepAndRepeat,
+            ..Default::default()
+        };
+        for (columns, rows) in [
+            (0, 1),
+            (1, 0),
+            (MAX_GRID + 1, 1),
+            (1, 1_000_000_000),
+            (usize::MAX, usize::MAX),
+        ] {
+            let options = PlanOptions {
+                columns,
+                rows,
+                ..base
+            };
+            assert_eq!(
+                plan_plates(&options, 10).unwrap_err().to_string(),
+                messages::GRID,
+                "{columns} x {rows}"
+            );
         }
         let fold = PlanOptions {
             layout: LayoutKind::Booklet4Up,
@@ -703,22 +994,50 @@ mod tests {
             binding: Binding::Perfect,
             ..Default::default()
         };
-        for sheets_per_fold in [0, MAX_SHEETS_PER_FOLD + 1, 4_611_686_018_427_387_904, usize::MAX] {
-            let options = PlanOptions { sheets_per_fold, ..fold };
-            assert_eq!(plan_plates(&options, 10).unwrap_err().to_string(), messages::SHEETS_PER_FOLD);
+        for sheets_per_fold in [
+            0,
+            MAX_SHEETS_PER_FOLD + 1,
+            4_611_686_018_427_387_904,
+            usize::MAX,
+        ] {
+            let options = PlanOptions {
+                sheets_per_fold,
+                ..fold
+            };
+            assert_eq!(
+                plan_plates(&options, 10).unwrap_err().to_string(),
+                messages::SHEETS_PER_FOLD
+            );
         }
-        let largest = PlanOptions { sheets_per_fold: MAX_SHEETS_PER_FOLD, ..fold };
+        let largest = PlanOptions {
+            sheets_per_fold: MAX_SHEETS_PER_FOLD,
+            ..fold
+        };
         assert!(plan_plates(&largest, 3).is_ok());
     }
 
-    fn plan(layout: LayoutKind, binding: Binding, style: Style, k: usize, pages: usize) -> Vec<Plate> {
+    fn plan(
+        layout: LayoutKind,
+        binding: Binding,
+        style: Style,
+        k: usize,
+        pages: usize,
+    ) -> Vec<Plate> {
         let (columns, rows) = match layout {
             LayoutKind::Booklet2Up => (2, 1),
             LayoutKind::Booklet4Up => (2, 2),
             _ => (4, 2),
         };
         plan_plates(
-            &PlanOptions { layout, binding, style, sheets_per_fold: k, columns, rows, ..Default::default() },
+            &PlanOptions {
+                layout,
+                binding,
+                style,
+                sheets_per_fold: k,
+                columns,
+                rows,
+                ..Default::default()
+            },
             pages,
         )
         .unwrap()
@@ -726,12 +1045,29 @@ mod tests {
 
     #[test]
     fn four_up_saddle_larger_page_counts() {
-        let p16 = plan(LayoutKind::Booklet4Up, Binding::Saddle, Style::Sheetwise, 1, 16);
+        let p16 = plan(
+            LayoutKind::Booklet4Up,
+            Binding::Saddle,
+            Style::Sheetwise,
+            1,
+            16,
+        );
         assert_eq!(
             p16.iter().map(Plate::numbers).collect::<Vec<_>>(),
-            vec![vec![13, 4, 16, 1], vec![3, 14, 2, 15], vec![9, 8, 12, 5], vec![7, 10, 6, 11]]
+            vec![
+                vec![13, 4, 16, 1],
+                vec![3, 14, 2, 15],
+                vec![9, 8, 12, 5],
+                vec![7, 10, 6, 11]
+            ]
         );
-        let p24 = plan(LayoutKind::Booklet4Up, Binding::Saddle, Style::Sheetwise, 1, 24);
+        let p24 = plan(
+            LayoutKind::Booklet4Up,
+            Binding::Saddle,
+            Style::Sheetwise,
+            1,
+            24,
+        );
         assert_eq!(
             p24.iter().map(Plate::numbers).collect::<Vec<_>>(),
             vec![
@@ -744,43 +1080,90 @@ mod tests {
             ]
         );
         // Two plates per sheet.
-        assert_eq!(p24.iter().map(|p| p.sheet).collect::<Vec<_>>(), vec![0, 0, 1, 1, 2, 2]);
+        assert_eq!(
+            p24.iter().map(|p| p.sheet).collect::<Vec<_>>(),
+            vec![0, 0, 1, 1, 2, 2]
+        );
     }
 
     #[test]
     fn four_up_work_and_turn_larger_page_counts() {
-        let plates = plan(LayoutKind::Booklet4Up, Binding::Saddle, Style::WorkAndTurn, 1, 16);
+        let plates = plan(
+            LayoutKind::Booklet4Up,
+            Binding::Saddle,
+            Style::WorkAndTurn,
+            1,
+            16,
+        );
         assert_eq!(
             plates.iter().map(Plate::numbers).collect::<Vec<_>>(),
-            vec![vec![15, 2, 16, 1], vec![13, 4, 14, 3], vec![11, 6, 12, 5], vec![9, 8, 10, 7]]
+            vec![
+                vec![15, 2, 16, 1],
+                vec![13, 4, 14, 3],
+                vec![11, 6, 12, 5],
+                vec![9, 8, 10, 7]
+            ]
         );
         // Plates 2j and 2j+1 are the two faces of sheet j.
-        assert_eq!(plates.iter().map(|p| p.sheet).collect::<Vec<_>>(), vec![0, 0, 1, 1]);
+        assert_eq!(
+            plates.iter().map(|p| p.sheet).collect::<Vec<_>>(),
+            vec![0, 0, 1, 1]
+        );
     }
 
     #[test]
     fn eight_up_saddle_examples() {
-        let full = plan(LayoutKind::Booklet8Up, Binding::Saddle, Style::Sheetwise, 1, 16);
+        let full = plan(
+            LayoutKind::Booklet8Up,
+            Binding::Saddle,
+            Style::Sheetwise,
+            1,
+            16,
+        );
         assert_eq!(full.len(), 2);
         assert_eq!(full[0].numbers(), vec![9, 8, 5, 12, 16, 1, 4, 13]);
         assert_eq!(full[1].numbers(), vec![11, 6, 7, 10, 14, 3, 2, 15]);
         // Row 0 inverted, row 1 upright.
         assert!((0..4).all(|c| full[0].cell(0, c).inverted && !full[0].cell(1, c).inverted));
 
-        let twelve = plan(LayoutKind::Booklet8Up, Binding::Saddle, Style::Sheetwise, 1, 12);
+        let twelve = plan(
+            LayoutKind::Booklet8Up,
+            Binding::Saddle,
+            Style::Sheetwise,
+            1,
+            12,
+        );
         assert_eq!(twelve[0].numbers(), vec![9, 8, 5, 12, 0, 1, 4, 0]);
         assert_eq!(twelve[1].numbers(), vec![11, 6, 7, 10, 0, 3, 2, 0]);
     }
 
     #[test]
     fn eight_up_work_and_turn_and_tumble_examples() {
-        let turn = plan(LayoutKind::Booklet8Up, Binding::Saddle, Style::WorkAndTurn, 1, 16);
+        let turn = plan(
+            LayoutKind::Booklet8Up,
+            Binding::Saddle,
+            Style::WorkAndTurn,
+            1,
+            16,
+        );
         assert_eq!(turn[0].numbers(), vec![13, 4, 3, 14, 16, 1, 2, 15]);
         assert_eq!(turn[1].numbers(), vec![9, 8, 7, 10, 12, 5, 6, 11]);
-        let tumble = plan(LayoutKind::Booklet8Up, Binding::Saddle, Style::WorkAndTumble, 1, 16);
+        let tumble = plan(
+            LayoutKind::Booklet8Up,
+            Binding::Saddle,
+            Style::WorkAndTumble,
+            1,
+            16,
+        );
         assert_eq!(tumble[0].numbers(), vec![15, 2, 3, 14, 16, 1, 4, 13]);
         assert_eq!(tumble[1].numbers(), vec![11, 6, 7, 10, 12, 5, 8, 9]);
-        let short = plan(LayoutKind::Booklet8Up, Binding::Saddle, Style::WorkAndTurn, 1, 12);
+        let short = plan(
+            LayoutKind::Booklet8Up,
+            Binding::Saddle,
+            Style::WorkAndTurn,
+            1,
+            12,
+        );
         assert_eq!(short[0].numbers(), vec![0, 4, 3, 0, 0, 1, 2, 0]);
     }
 
@@ -788,13 +1171,25 @@ mod tests {
     fn perfect_bound_folds_and_short_last_fold() {
         // 8-up perfect bound, one sheet per fold (16 pages per fold), 20 pages: the last fold has
         // pages 17..20 in the two middle columns of row 1.
-        let plates = plan(LayoutKind::Booklet8Up, Binding::Perfect, Style::Sheetwise, 1, 20);
+        let plates = plan(
+            LayoutKind::Booklet8Up,
+            Binding::Perfect,
+            Style::Sheetwise,
+            1,
+            20,
+        );
         assert_eq!(plates.len(), 4);
         assert_eq!(plates[2].numbers(), vec![0, 0, 0, 0, 0, 17, 20, 0]);
         assert_eq!(plates[3].numbers(), vec![0, 0, 0, 0, 0, 19, 18, 0]);
 
         // 2-up perfect bound, 6 pages: fold 1 holds pages 5 and 6 only.
-        let two_up = plan(LayoutKind::Booklet2Up, Binding::Perfect, Style::Sheetwise, 1, 6);
+        let two_up = plan(
+            LayoutKind::Booklet2Up,
+            Binding::Perfect,
+            Style::Sheetwise,
+            1,
+            6,
+        );
         assert_eq!(
             two_up.iter().map(Plate::numbers).collect::<Vec<_>>(),
             vec![vec![4, 1], vec![2, 3], vec![0, 5], vec![6, 0]]
@@ -804,7 +1199,13 @@ mod tests {
     #[test]
     fn creep_is_zero_at_the_spine_and_grows_outward() {
         // 16-page 2-up saddle: 4 sheets, U = 4, block of 16 pages.
-        let plates = plan(LayoutKind::Booklet2Up, Binding::Saddle, Style::Sheetwise, 1, 16);
+        let plates = plan(
+            LayoutKind::Booklet2Up,
+            Binding::Saddle,
+            Style::Sheetwise,
+            1,
+            16,
+        );
         let steps: Vec<(usize, u32)> = plates
             .iter()
             .flat_map(|p| p.cells.iter())

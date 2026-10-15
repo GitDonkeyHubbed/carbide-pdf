@@ -57,7 +57,8 @@ pub mod messages {
     pub const TOO_DEEP: &str = "This document's page tree is nested too deeply to be read safely.";
     pub const SHARED_BRANCH: &str =
         "This document's page tree lists the same group of pages in two places, so its page order cannot be read safely.";
-    pub const TOO_MANY_COPIES: &str = "This document's page tree lists the same pages too many times to be read safely.";
+    pub const TOO_MANY_COPIES: &str =
+        "This document's page tree lists the same pages too many times to be read safely.";
     pub const UNREADABLE: &str =
         "Part of this document's page tree is damaged and could not be read, so pages would be lost if it were edited.";
 }
@@ -102,7 +103,12 @@ pub(crate) fn repair(doc: &mut Document) -> Result<()> {
         doc.get_dictionary_mut(catalog_id)?.set("Pages", wrapper);
         wrapper
     };
-    let mut walk = Walk { placed: HashSet::from([root]), path: vec![root], copied: 0, holders: HashMap::new() };
+    let mut walk = Walk {
+        placed: HashSet::from([root]),
+        path: vec![root],
+        copied: 0,
+        holders: HashMap::new(),
+    };
     set_type(doc, root, b"Pages")?;
     if doc.get_dictionary(root)?.has(b"Parent") {
         walk.reparent(doc, root, None)?;
@@ -206,7 +212,11 @@ impl Walk {
     /// A new page object showing what page `id` shows, for another place in the tree. Its values
     /// are shared with the original, not copied (see [`share`]).
     fn copy_page(&mut self, doc: &mut Document, id: ObjectId) -> Result<ObjectId> {
-        let keys: Vec<Vec<u8>> = doc.get_dictionary(id)?.iter().map(|(key, _)| key.clone()).collect();
+        let keys: Vec<Vec<u8>> = doc
+            .get_dictionary(id)?
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
         self.count_copies(keys.len() + 1)?;
         let mut copy = Dictionary::new();
         for key in keys {
@@ -226,10 +236,20 @@ impl Walk {
 
     /// Points `/Parent` of `id` at `parent` (removes it for the root). What the node inherited
     /// through its old `/Parent` is given to it first, so it shows exactly what it showed before.
-    fn reparent(&mut self, doc: &mut Document, id: ObjectId, parent: Option<ObjectId>) -> Result<()> {
+    fn reparent(
+        &mut self,
+        doc: &mut Document,
+        id: ObjectId,
+        parent: Option<ObjectId>,
+    ) -> Result<()> {
         let dict = doc.get_dictionary(id)?;
-        let missing: Vec<usize> = (0..INHERITABLE.len()).filter(|&i| !dict.has(INHERITABLE[i])).collect();
-        if let (false, Ok(old)) = (missing.is_empty(), dict.get(b"Parent").and_then(Object::as_reference)) {
+        let missing: Vec<usize> = (0..INHERITABLE.len())
+            .filter(|&i| !dict.has(INHERITABLE[i]))
+            .collect();
+        if let (false, Ok(old)) = (
+            missing.is_empty(),
+            dict.get(b"Parent").and_then(Object::as_reference),
+        ) {
             let holders = self.holders_above(doc, old);
             for i in missing {
                 if let Some(holder) = holders[i] {
@@ -261,7 +281,9 @@ impl Walk {
         let mut seen = HashSet::new();
         let mut next = Some(first);
         while let Some(id) = next.filter(|id| seen.len() <= MAX_DEPTH && seen.insert(*id)) {
-            let Ok(node) = doc.get_dictionary(id) else { break };
+            let Ok(node) = doc.get_dictionary(id) else {
+                break;
+            };
             for (slot, key) in found.iter_mut().zip(INHERITABLE) {
                 if slot.is_none() && node.has(key) {
                     *slot = Some(id);
@@ -282,7 +304,11 @@ fn target(doc: &Document, id: ObjectId) -> Result<Option<ObjectId>> {
     for _ in 0..16 {
         let found = match doc.objects.get(&current) {
             Some(_) => Some(current),
-            None => doc.objects.range((current.0, 0)..=(current.0, u16::MAX)).next().map(|(id, _)| *id),
+            None => doc
+                .objects
+                .range((current.0, 0)..=(current.0, u16::MAX))
+                .next()
+                .map(|(id, _)| *id),
         };
         match found.map(|id| (id, &doc.objects[&id])) {
             Some((_, Object::Reference(next))) => current = *next,
@@ -313,7 +339,10 @@ pub(crate) fn share(doc: &mut Document, holder: ObjectId, key: &[u8]) -> Result<
         },
         value if is_small(value) => Ok(value.clone()),
         _ => {
-            let value = doc.get_dictionary_mut(holder)?.remove(key).unwrap_or(Object::Null);
+            let value = doc
+                .get_dictionary_mut(holder)?
+                .remove(key)
+                .unwrap_or(Object::Null);
             let id = doc.add_object(value);
             doc.get_dictionary_mut(holder)?.set(key.to_vec(), id);
             Ok(Object::Reference(id))
@@ -362,7 +391,9 @@ fn set_type(doc: &mut Document, id: ObjectId, kind: &[u8]) -> Result<()> {
 /// Rewrites `/Rotate` of `id` as the plain integer PDFium reads from it, unless it already is a
 /// whole number of quarter turns that every reader takes the same way.
 fn plain_rotation(doc: &mut Document, id: ObjectId) -> Result<()> {
-    let Ok(value) = doc.get_dictionary(id)?.get(b"Rotate") else { return Ok(()) };
+    let Ok(value) = doc.get_dictionary(id)?.get(b"Rotate") else {
+        return Ok(());
+    };
     if matches!(value, Object::Integer(v) if v % 90 == 0 && i32::try_from(*v).is_ok()) {
         return Ok(());
     }
@@ -375,10 +406,20 @@ fn plain_rotation(doc: &mut Document, id: ObjectId) -> Result<()> {
 /// coordinate past it is rewritten, as the numbers PDFium reads from it, brought within the limit.
 fn plain_boxes(doc: &mut Document, id: ObjectId) -> Result<()> {
     for key in BOXES {
-        let Ok(value) = doc.get_dictionary(id)?.get(key) else { continue };
-        let Some(Object::Array(items)) = resolve(doc, Some(value)) else { continue };
-        let numbers: Vec<Option<f32>> = items.iter().map(|item| resolve(doc, Some(item)).and_then(|v| v.as_float().ok())).collect();
-        if numbers.iter().all(|n| n.is_none_or(|n| n.abs() <= MAX_COORDINATE)) {
+        let Ok(value) = doc.get_dictionary(id)?.get(key) else {
+            continue;
+        };
+        let Some(Object::Array(items)) = resolve(doc, Some(value)) else {
+            continue;
+        };
+        let numbers: Vec<Option<f32>> = items
+            .iter()
+            .map(|item| resolve(doc, Some(item)).and_then(|v| v.as_float().ok()))
+            .collect();
+        if numbers
+            .iter()
+            .all(|n| n.is_none_or(|n| n.abs() <= MAX_COORDINATE))
+        {
             continue;
         }
         let clamped: Vec<Object> = numbers
@@ -412,7 +453,9 @@ mod tests {
     }
 
     fn page(parent: u32) -> Object {
-        Object::Dictionary(dictionary! { "Type" => "Page", "Parent" => (parent, 0), "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()] })
+        Object::Dictionary(
+            dictionary! { "Type" => "Page", "Parent" => (parent, 0), "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()] },
+        )
     }
 
     fn pages(doc: &Document) -> Vec<ObjectId> {
@@ -422,9 +465,19 @@ mod tests {
     #[test]
     fn a_sound_tree_is_left_exactly_as_it_is() {
         let mut doc = document(vec![
-            (1, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![(2, 0).into(), (3, 0).into()], "Count" => 2 })),
+            (
+                1,
+                Object::Dictionary(
+                    dictionary! { "Type" => "Pages", "Kids" => vec![(2, 0).into(), (3, 0).into()], "Count" => 2 },
+                ),
+            ),
             (2, page(1)),
-            (3, Object::Dictionary(dictionary! { "Type" => "Pages", "Parent" => (1, 0), "Kids" => vec![(4, 0).into()], "Count" => 1 })),
+            (
+                3,
+                Object::Dictionary(
+                    dictionary! { "Type" => "Pages", "Parent" => (1, 0), "Kids" => vec![(4, 0).into()], "Count" => 1 },
+                ),
+            ),
             (4, page(3)),
         ]);
         let before = doc.objects.clone();
@@ -436,36 +489,73 @@ mod tests {
     fn loops_untyped_nodes_and_wrong_counts_are_repaired() {
         let mut doc = document(vec![
             // The root claims a million pages, lists itself, and has a /Parent of its own.
-            (1, Object::Dictionary(dictionary! {
-                "Type" => "Pages", "Parent" => (1, 0), "Count" => 1_000_000,
-                "Kids" => vec![(2, 0).into(), (1, 0).into(), (3, 0).into(), Object::Null, (9, 0).into()],
-            })),
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages", "Parent" => (1, 0), "Count" => 1_000_000,
+                    "Kids" => vec![(2, 0).into(), (1, 0).into(), (3, 0).into(), Object::Null, (9, 0).into()],
+                }),
+            ),
             // A page without /Type, and an untyped node whose kid loops back to the root.
-            (2, Object::Dictionary(dictionary! { "Parent" => (1, 0), "Rotate" => 90 })),
-            (3, Object::Dictionary(dictionary! { "Parent" => (3, 0), "Kids" => vec![(4, 0).into(), (1, 0).into(), (4, 0).into()], "Count" => 7 })),
+            (
+                2,
+                Object::Dictionary(dictionary! { "Parent" => (1, 0), "Rotate" => 90 }),
+            ),
+            (
+                3,
+                Object::Dictionary(
+                    dictionary! { "Parent" => (3, 0), "Kids" => vec![(4, 0).into(), (1, 0).into(), (4, 0).into()], "Count" => 7 },
+                ),
+            ),
             (4, page(3)),
         ]);
         repair(&mut doc).unwrap();
         let listed = pages(&doc);
-        assert_eq!(listed.len(), 3, "the untyped page and page 4 twice: {listed:?}");
+        assert_eq!(
+            listed.len(),
+            3,
+            "the untyped page and page 4 twice: {listed:?}"
+        );
         assert_eq!(listed[..2], [(2, 0), (4, 0)]);
         assert_ne!(listed[2], (4, 0), "the second listing is a page of its own");
         let root = doc.get_dictionary((1, 0)).unwrap();
         assert_eq!(root.get(b"Count").unwrap(), &Object::Integer(3));
         assert!(!root.has(b"Parent"));
         let node = doc.get_dictionary((3, 0)).unwrap();
-        assert_eq!((node.get_type().unwrap(), node.get(b"Count").unwrap()), (&b"Pages"[..], &Object::Integer(2)));
+        assert_eq!(
+            (node.get_type().unwrap(), node.get(b"Count").unwrap()),
+            (&b"Pages"[..], &Object::Integer(2))
+        );
         assert_eq!(node.get(b"Parent").unwrap(), &Object::Reference((1, 0)));
-        assert_eq!(doc.get_dictionary(listed[2]).unwrap().get(b"Parent").unwrap(), &Object::Reference((3, 0)));
+        assert_eq!(
+            doc.get_dictionary(listed[2])
+                .unwrap()
+                .get(b"Parent")
+                .unwrap(),
+            &Object::Reference((3, 0))
+        );
     }
 
     #[test]
     fn a_page_keeps_what_it_inherited_when_its_parent_is_corrected() {
         let mut doc = document(vec![
-            (1, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![(2, 0).into()], "Count" => 1 })),
+            (
+                1,
+                Object::Dictionary(
+                    dictionary! { "Type" => "Pages", "Kids" => vec![(2, 0).into()], "Count" => 1 },
+                ),
+            ),
             // Listed under the root, but its /Parent names a node that gives it a rotation.
-            (2, Object::Dictionary(dictionary! { "Type" => "Page", "Parent" => (3, 0) })),
-            (3, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => Vec::<Object>::new(), "Count" => 0, "Rotate" => 270, "Parent" => (3, 0) })),
+            (
+                2,
+                Object::Dictionary(dictionary! { "Type" => "Page", "Parent" => (3, 0) }),
+            ),
+            (
+                3,
+                Object::Dictionary(
+                    dictionary! { "Type" => "Pages", "Kids" => Vec::<Object>::new(), "Count" => 0, "Rotate" => 270, "Parent" => (3, 0) },
+                ),
+            ),
         ]);
         repair(&mut doc).unwrap();
         let page = doc.get_dictionary((2, 0)).unwrap();
@@ -475,16 +565,31 @@ mod tests {
 
     #[test]
     fn rotations_are_rewritten_as_the_turn_viewers_read() {
-        let turned = |rotate: Object| Object::Dictionary(dictionary! { "Type" => "Page", "Parent" => (1, 0), "Rotate" => rotate });
+        let turned = |rotate: Object| {
+            Object::Dictionary(
+                dictionary! { "Type" => "Page", "Parent" => (1, 0), "Rotate" => rotate },
+            )
+        };
         let mut doc = document(vec![
-            (1, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![(2, 0).into(), (3, 0).into(), (4, 0).into(), (5, 0).into()], "Count" => 4, "Rotate" => Object::Real(180.0) })),
+            (
+                1,
+                Object::Dictionary(
+                    dictionary! { "Type" => "Pages", "Kids" => vec![(2, 0).into(), (3, 0).into(), (4, 0).into(), (5, 0).into()], "Count" => 4, "Rotate" => Object::Real(180.0) },
+                ),
+            ),
             (2, turned(Object::Integer(-90))),
             (3, turned(Object::Real(90.5))),
             (4, turned(Object::Integer(i64::MAX))),
             (5, turned(Object::Integer(45))),
         ]);
         repair(&mut doc).unwrap();
-        let rotate = |id: u32| doc.get_dictionary((id, 0)).unwrap().get(b"Rotate").unwrap().clone();
+        let rotate = |id: u32| {
+            doc.get_dictionary((id, 0))
+                .unwrap()
+                .get(b"Rotate")
+                .unwrap()
+                .clone()
+        };
         // A plain quarter turn is left as written; the rest become the turn PDFium reads.
         let expected = [(1, 180), (2, -90), (3, 90), (4, 0), (5, 0)];
         for (id, turn) in expected {
@@ -499,21 +604,45 @@ mod tests {
             objects.push((n, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![(n + 1, 0).into()], "Count" => 1 })));
         }
         objects.push((MAX_DEPTH as u32 + 3, page(MAX_DEPTH as u32 + 2)));
-        assert_eq!(repair(&mut document(objects)).unwrap_err().to_string(), messages::TOO_DEEP);
+        assert_eq!(
+            repair(&mut document(objects)).unwrap_err().to_string(),
+            messages::TOO_DEEP
+        );
 
         let mut doc = document(vec![
-            (1, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![(2, 0).into(), (2, 0).into()], "Count" => 2 })),
-            (2, Object::Dictionary(dictionary! { "Type" => "Pages", "Parent" => (1, 0), "Kids" => vec![(3, 0).into()], "Count" => 1 })),
+            (
+                1,
+                Object::Dictionary(
+                    dictionary! { "Type" => "Pages", "Kids" => vec![(2, 0).into(), (2, 0).into()], "Count" => 2 },
+                ),
+            ),
+            (
+                2,
+                Object::Dictionary(
+                    dictionary! { "Type" => "Pages", "Parent" => (1, 0), "Kids" => vec![(3, 0).into()], "Count" => 1 },
+                ),
+            ),
             (3, page(2)),
         ]);
-        assert_eq!(repair(&mut doc).unwrap_err().to_string(), messages::SHARED_BRANCH);
+        assert_eq!(
+            repair(&mut doc).unwrap_err().to_string(),
+            messages::SHARED_BRANCH
+        );
     }
 
     #[test]
     fn a_root_without_kids_becomes_the_only_page() {
-        let mut doc = document(vec![(1, Object::Dictionary(dictionary! { "Type" => "Pages", "MediaBox" => vec![0.into(), 0.into(), 10.into(), 10.into()] }))]);
+        let mut doc = document(vec![(
+            1,
+            Object::Dictionary(
+                dictionary! { "Type" => "Pages", "MediaBox" => vec![0.into(), 0.into(), 10.into(), 10.into()] },
+            ),
+        )]);
         repair(&mut doc).unwrap();
         assert_eq!(pages(&doc), vec![(1, 0)]);
-        assert_eq!(doc.get_dictionary((1, 0)).unwrap().get_type().unwrap(), b"Page");
+        assert_eq!(
+            doc.get_dictionary((1, 0)).unwrap().get_type().unwrap(),
+            b"Page"
+        );
     }
 }

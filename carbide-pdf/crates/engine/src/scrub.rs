@@ -16,7 +16,15 @@ use crate::limits::DecodeBudget;
 use crate::pdf::Pdf;
 
 /// Resource categories whose entries content refers to by name.
-const NAMED_RESOURCES: [&[u8]; 7] = [b"Font", b"XObject", b"ExtGState", b"ColorSpace", b"Pattern", b"Shading", b"Properties"];
+const NAMED_RESOURCES: [&[u8]; 7] = [
+    b"Font",
+    b"XObject",
+    b"ExtGState",
+    b"ColorSpace",
+    b"Pattern",
+    b"Shading",
+    b"Properties",
+];
 
 /// Deeper nesting than this is treated as damaged and left alone.
 const MAX_DEPTH: usize = 64;
@@ -26,18 +34,35 @@ impl Pdf {
     fn annotations_on(&self, pages: &HashSet<ObjectId>) -> HashMap<ObjectId, ObjectId> {
         let mut found = HashMap::new();
         for page in pages {
-            let Ok(dict) = self.doc.get_dictionary(*page) else { continue };
-            let Some(Object::Array(annots)) = dict.get(b"Annots").ok().map(|a| self.resolve(a)) else { continue };
-            found.extend(annots.iter().filter_map(|a| a.as_reference().ok()).map(|a| (a, *page)));
+            let Ok(dict) = self.doc.get_dictionary(*page) else {
+                continue;
+            };
+            let Some(Object::Array(annots)) = dict.get(b"Annots").ok().map(|a| self.resolve(a))
+            else {
+                continue;
+            };
+            found.extend(
+                annots
+                    .iter()
+                    .filter_map(|a| a.as_reference().ok())
+                    .map(|a| (a, *page)),
+            );
         }
         found
     }
 
     /// The annotations on `pages` that are on no page in `staying` as well: those that leave the
     /// document with the pages.
-    pub(crate) fn annotations_leaving(&self, pages: &HashSet<ObjectId>, staying: &HashSet<ObjectId>) -> HashSet<ObjectId> {
+    pub(crate) fn annotations_leaving(
+        &self,
+        pages: &HashSet<ObjectId>,
+        staying: &HashSet<ObjectId>,
+    ) -> HashSet<ObjectId> {
         let kept = self.annotations_on(staying);
-        self.annotations_on(pages).into_keys().filter(|id| !kept.contains_key(id)).collect()
+        self.annotations_on(pages)
+            .into_keys()
+            .filter(|id| !kept.contains_key(id))
+            .collect()
     }
 
     /// Takes out the links other annotations have to `gone`, annotations that are leaving the
@@ -53,7 +78,11 @@ impl Pdf {
                 Object::Dictionary(dict) => {
                     if dict.has(b"Subtype") {
                         for key in [&b"IRT"[..], b"Parent", b"Popup"] {
-                            if dict.get(key).and_then(Object::as_reference).is_ok_and(|id| gone.contains(&id)) {
+                            if dict
+                                .get(key)
+                                .and_then(Object::as_reference)
+                                .is_ok_and(|id| gone.contains(&id))
+                            {
                                 dict.remove(key);
                             }
                         }
@@ -75,11 +104,28 @@ impl Pdf {
     /// so their values and appearances are no longer part of the document. `goes` decides for each
     /// widget, given its page, its dictionary and whether it belongs to a signature field. A field
     /// that still has a widget elsewhere keeps its value: it is still shown there.
-    pub(crate) fn drop_form_fields_on(&mut self, pages: &HashSet<ObjectId>, goes: &dyn Fn(ObjectId, &Dictionary, bool) -> bool) {
+    pub(crate) fn drop_form_fields_on(
+        &mut self,
+        pages: &HashSet<ObjectId>,
+        goes: &dyn Fn(ObjectId, &Dictionary, bool) -> bool,
+    ) {
         let annotations = self.annotations_on(pages);
-        let widgets = WidgetScope { pages, annotations: &annotations, goes };
-        let Ok(catalog_id) = self.doc.trailer.get(b"Root").and_then(Object::as_reference) else { return };
-        let Ok(form) = self.doc.get_dictionary(catalog_id).and_then(|c| c.get(b"AcroForm")).cloned() else { return };
+        let widgets = WidgetScope {
+            pages,
+            annotations: &annotations,
+            goes,
+        };
+        let Ok(catalog_id) = self.doc.trailer.get(b"Root").and_then(Object::as_reference) else {
+            return;
+        };
+        let Ok(form) = self
+            .doc
+            .get_dictionary(catalog_id)
+            .and_then(|c| c.get(b"AcroForm"))
+            .cloned()
+        else {
+            return;
+        };
         let (form_id, mut form) = match form {
             Object::Reference(id) => match self.doc.get_dictionary(id) {
                 Ok(dict) => (Some(id), dict.clone()),
@@ -88,11 +134,15 @@ impl Pdf {
             Object::Dictionary(dict) => (None, dict),
             _ => return,
         };
-        let Ok(mut fields) = form.get(b"Fields").cloned() else { return };
+        let Ok(mut fields) = form.get(b"Fields").cloned() else {
+            return;
+        };
         let mut removed = HashSet::new();
         let mut seen = HashSet::new();
         let left = edit_array(&mut self.doc, &mut fields, |doc, items| {
-            items.retain_mut(|item| !prune_field(doc, item, &widgets, None, &mut removed, &mut seen, 0));
+            items.retain_mut(|item| {
+                !prune_field(doc, item, &widgets, None, &mut removed, &mut seen, 0)
+            });
             items.len()
         });
         if removed.is_empty() {
@@ -127,14 +177,34 @@ impl Pdf {
     /// Takes the structure elements (tags) of `pages` out of the structure tree, with everything
     /// below them, and the tree's references to their marked content and annotations.
     pub(crate) fn drop_structure_of(&mut self, pages: &HashSet<ObjectId>) {
-        let Ok(catalog) = self.doc.catalog() else { return };
-        let Ok(root_id) = catalog.get(b"StructTreeRoot").and_then(Object::as_reference) else { return };
-        let Ok(mut root) = self.doc.get_dictionary(root_id).cloned() else { return };
+        let Ok(catalog) = self.doc.catalog() else {
+            return;
+        };
+        let Ok(root_id) = catalog
+            .get(b"StructTreeRoot")
+            .and_then(Object::as_reference)
+        else {
+            return;
+        };
+        let Ok(mut root) = self.doc.get_dictionary(root_id).cloned() else {
+            return;
+        };
         let annotations: HashSet<ObjectId> = self.annotations_on(pages).into_keys().collect();
         let mut removed = HashSet::new();
         if let Ok(mut kids) = root.get(b"K").cloned() {
-            let scope = Scope { pages, annotations: &annotations };
-            if prune_structure(&mut self.doc, &mut kids, None, &scope, &mut removed, &mut HashSet::new(), 0) {
+            let scope = Scope {
+                pages,
+                annotations: &annotations,
+            };
+            if prune_structure(
+                &mut self.doc,
+                &mut kids,
+                None,
+                &scope,
+                &mut removed,
+                &mut HashSet::new(),
+                0,
+            ) {
                 root.remove(b"K");
             } else {
                 root.set("K", kids);
@@ -143,7 +213,14 @@ impl Pdf {
         if !removed.is_empty() {
             for (tree, key) in [(&b"ParentTree"[..], &b"Nums"[..]), (b"IDTree", b"Names")] {
                 if let Ok(mut node) = root.get(tree).cloned() {
-                    prune_tree(&mut self.doc, &mut node, key, &removed, &mut HashSet::new(), 0);
+                    prune_tree(
+                        &mut self.doc,
+                        &mut node,
+                        key,
+                        &removed,
+                        &mut HashSet::new(),
+                        0,
+                    );
                     root.set(tree, node);
                 }
             }
@@ -195,17 +272,32 @@ impl Pdf {
         let mut shared = HashSet::new();
         let mut seen = HashSet::new();
         for page in &pages {
-            if let Ok(id) = self.doc.get_dictionary(*page).and_then(|d| d.get(b"Resources")).and_then(Object::as_reference) {
+            if let Ok(id) = self
+                .doc
+                .get_dictionary(*page)
+                .and_then(|d| d.get(b"Resources"))
+                .and_then(Object::as_reference)
+            {
                 if !seen.insert(id) {
                     shared.insert(id);
                 }
             }
         }
         let mut changes = Vec::new();
-        let mut scan = NameScan { budget: DecodeBudget::for_page(), names: HashMap::new() };
+        let mut scan = NameScan {
+            budget: DecodeBudget::for_page(),
+            names: HashMap::new(),
+        };
         for page in &pages {
-            let Some(Object::Dictionary(resources)) = self.inherited(*page, b"Resources") else { continue };
-            let own = self.doc.get_dictionary(*page)?.get(b"Resources").ok().cloned();
+            let Some(Object::Dictionary(resources)) = self.inherited(*page, b"Resources") else {
+                continue;
+            };
+            let own = self
+                .doc
+                .get_dictionary(*page)?
+                .get(b"Resources")
+                .ok()
+                .cloned();
             scan.budget = DecodeBudget::for_page();
             let kept = match self.names_used_by_page(*page, &resources, &mut scan)? {
                 Some(names) => self.keep_named(&resources, &names),
@@ -221,7 +313,9 @@ impl Pdf {
             }
         }
         for (page, resources) in changes {
-            self.doc.get_dictionary_mut(page)?.set("Resources", resources);
+            self.doc
+                .get_dictionary_mut(page)?
+                .set("Resources", resources);
         }
         let mut nodes = vec![self.pages_root()?];
         let mut visited = HashSet::new();
@@ -229,7 +323,9 @@ impl Pdf {
             if !visited.insert(node) {
                 continue;
             }
-            let Ok(dict) = self.doc.get_dictionary_mut(node) else { continue };
+            let Ok(dict) = self.doc.get_dictionary_mut(node) else {
+                continue;
+            };
             if !dict.has_type(b"Pages") {
                 continue;
             }
@@ -244,11 +340,20 @@ impl Pdf {
     /// The resource names the page's content refers to, following forms, patterns and Type 3
     /// fonts that use the page's resources instead of their own. `None` when some content cannot
     /// be read; an error when decoding it would go past the limits in [`crate::limits`].
-    fn names_used_by_page(&self, page: ObjectId, resources: &Dictionary, scan: &mut NameScan) -> Result<Option<HashSet<Vec<u8>>>> {
+    fn names_used_by_page(
+        &self,
+        page: ObjectId,
+        resources: &Dictionary,
+        scan: &mut NameScan,
+    ) -> Result<Option<HashSet<Vec<u8>>>> {
         let mut names = HashSet::new();
         for stream in self.doc.get_page_contents(page) {
-            let Ok(content) = self.doc.get_object(stream).and_then(Object::as_stream) else { return Ok(None) };
-            let Some(found) = scan.names_in(Some(stream), content)? else { return Ok(None) };
+            let Ok(content) = self.doc.get_object(stream).and_then(Object::as_stream) else {
+                return Ok(None);
+            };
+            let Some(found) = scan.names_in(Some(stream), content)? else {
+                return Ok(None);
+            };
             names.extend(found);
         }
         // Resources that are drawn without resources of their own use the page's.
@@ -256,28 +361,60 @@ impl Pdf {
         loop {
             let mut more = Vec::new();
             for category in NAMED_RESOURCES {
-                let Object::Dictionary(entries) = resources.get(category).map(|o| self.resolve(o)).unwrap_or(Object::Null) else {
+                let Object::Dictionary(entries) = resources
+                    .get(category)
+                    .map(|o| self.resolve(o))
+                    .unwrap_or(Object::Null)
+                else {
                     continue;
                 };
                 for (name, value) in entries.iter() {
                     if !names.contains(name) || !followed.insert((category, name.clone())) {
                         continue;
                     }
-                    let Some(resolved) = self.resolved(value) else { continue };
+                    let Some(resolved) = self.resolved(value) else {
+                        continue;
+                    };
                     // Names in the resource's own dictionary: an image's colour space, say.
-                    if let Some(dict) = resolved.as_dict().ok().or_else(|| resolved.as_stream().ok().map(|s| &s.dict)) {
-                        more.extend(dict.iter().filter_map(|(_, v)| v.as_name().ok().map(<[u8]>::to_vec)));
+                    if let Some(dict) = resolved
+                        .as_dict()
+                        .ok()
+                        .or_else(|| resolved.as_stream().ok().map(|s| &s.dict))
+                    {
+                        more.extend(
+                            dict.iter()
+                                .filter_map(|(_, v)| v.as_name().ok().map(<[u8]>::to_vec)),
+                        );
                     }
                     match resolved {
                         Object::Stream(stream) if !stream.dict.has(b"Resources") => {
-                            let Some(found) = scan.names_in(value.as_reference().ok(), stream)? else { return Ok(None) };
+                            let Some(found) = scan.names_in(value.as_reference().ok(), stream)?
+                            else {
+                                return Ok(None);
+                            };
                             more.extend(found);
                         }
-                        Object::Dictionary(font) if font.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Type3") && !font.has(b"Resources") => {
-                            let Object::Dictionary(procs) = font.get(b"CharProcs").map(|o| self.resolve(o)).unwrap_or(Object::Null) else { continue };
+                        Object::Dictionary(font)
+                            if font
+                                .get(b"Subtype")
+                                .and_then(Object::as_name)
+                                .is_ok_and(|s| s == b"Type3")
+                                && !font.has(b"Resources") =>
+                        {
+                            let Object::Dictionary(procs) = font
+                                .get(b"CharProcs")
+                                .map(|o| self.resolve(o))
+                                .unwrap_or(Object::Null)
+                            else {
+                                continue;
+                            };
                             for (_, glyph) in procs.iter() {
                                 if let Some(Object::Stream(stream)) = self.resolved(glyph) {
-                                    let Some(found) = scan.names_in(glyph.as_reference().ok(), stream)? else { return Ok(None) };
+                                    let Some(found) =
+                                        scan.names_in(glyph.as_reference().ok(), stream)?
+                                    else {
+                                        return Ok(None);
+                                    };
                                     more.extend(found);
                                 }
                             }
@@ -306,7 +443,11 @@ impl Pdf {
                 kept.set(key.clone(), value.clone());
                 continue;
             };
-            let used: Dictionary = entries.iter().filter(|(name, _)| names.contains(*name)).map(|(n, v)| (n.clone(), v.clone())).collect();
+            let used: Dictionary = entries
+                .iter()
+                .filter(|(name, _)| names.contains(*name))
+                .map(|(n, v)| (n.clone(), v.clone()))
+                .collect();
             if !used.is_empty() {
                 kept.set(key.clone(), used);
             }
@@ -339,7 +480,11 @@ struct NameScan {
 impl NameScan {
     /// The names `stream` (object `id`, when it is one of its own) uses as operands; `None` when
     /// it cannot be decoded, and an error when decoding it would go past the budget.
-    fn names_in(&mut self, id: Option<ObjectId>, stream: &lopdf::Stream) -> Result<Option<HashSet<Vec<u8>>>> {
+    fn names_in(
+        &mut self,
+        id: Option<ObjectId>,
+        stream: &lopdf::Stream,
+    ) -> Result<Option<HashSet<Vec<u8>>>> {
         if let Some(found) = id.and_then(|id| self.names.get(&id)) {
             return Ok(found.clone());
         }
@@ -359,7 +504,9 @@ impl NameScan {
 pub(crate) fn widget_area(widget: &Dictionary) -> Option<[f32; 4]> {
     let rect = widget.get(b"Rect").and_then(Object::as_array).ok()?;
     let values: Vec<f32> = rect.iter().filter_map(|v| v.as_float().ok()).collect();
-    let [x0, y0, x1, y1] = values[..] else { return None };
+    let [x0, y0, x1, y1] = values[..] else {
+        return None;
+    };
     let area = [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)];
     (area[2] > area[0] && area[3] > area[1]).then_some(area)
 }
@@ -381,7 +528,11 @@ fn names_in(content: &[u8]) -> HashSet<Vec<u8>> {
 
 /// Runs `edit` on the array `holder` is, or refers to, and stores the result where it came from.
 /// `None` when `holder` is not an array.
-fn edit_array<T>(doc: &mut Document, holder: &mut Object, edit: impl FnOnce(&mut Document, &mut Vec<Object>) -> T) -> Option<T> {
+fn edit_array<T>(
+    doc: &mut Document,
+    holder: &mut Object,
+    edit: impl FnOnce(&mut Document, &mut Vec<Object>) -> T,
+) -> Option<T> {
     match holder {
         Object::Array(items) => Some(edit(doc, items)),
         Object::Reference(id) => {
@@ -427,23 +578,45 @@ fn prune_field(
         Object::Dictionary(dict) => (None, dict.clone()),
         _ => return false,
     };
-    let field_type = dict.get(b"FT").and_then(Object::as_name).ok().map(<[u8]>::to_vec).or(field_type.map(<[u8]>::to_vec));
-    if dict.get(b"Subtype").and_then(Object::as_name).is_ok_and(|s| s == b"Widget") {
+    let field_type = dict
+        .get(b"FT")
+        .and_then(Object::as_name)
+        .ok()
+        .map(<[u8]>::to_vec)
+        .or(field_type.map(<[u8]>::to_vec));
+    if dict
+        .get(b"Subtype")
+        .and_then(Object::as_name)
+        .is_ok_and(|s| s == b"Widget")
+    {
         let page = dict
             .get(b"P")
             .and_then(Object::as_reference)
             .ok()
             .filter(|p| scope.pages.contains(p))
             .or_else(|| id.and_then(|id| scope.annotations.get(&id).copied()));
-        if page.is_some_and(|page| (scope.goes)(page, &dict, field_type.as_deref() == Some(b"Sig"))) {
+        if page.is_some_and(|page| (scope.goes)(page, &dict, field_type.as_deref() == Some(b"Sig")))
+        {
             removed.extend(id);
             return true;
         }
     }
-    let Ok(mut kids) = dict.get(b"Kids").cloned() else { return false };
+    let Ok(mut kids) = dict.get(b"Kids").cloned() else {
+        return false;
+    };
     let counts = edit_array(doc, &mut kids, |doc, items| {
         let before = items.len();
-        items.retain_mut(|kid| !prune_field(doc, kid, scope, field_type.as_deref(), removed, seen, depth + 1));
+        items.retain_mut(|kid| {
+            !prune_field(
+                doc,
+                kid,
+                scope,
+                field_type.as_deref(),
+                removed,
+                seen,
+                depth + 1,
+            )
+        });
         (before, items.len())
     });
     dict.set("Kids", kids);
@@ -500,7 +673,10 @@ fn prune_structure(
         return on_dropped_page;
     }
     if dict.has_type(b"OBJR") {
-        let annotation = dict.get(b"Obj").and_then(Object::as_reference).is_ok_and(|o| scope.annotations.contains(&o));
+        let annotation = dict
+            .get(b"Obj")
+            .and_then(Object::as_reference)
+            .is_ok_and(|o| scope.annotations.contains(&o));
         return on_dropped_page || annotation;
     }
     if on_dropped_page {
@@ -540,13 +716,17 @@ fn collect_elements(doc: &Document, item: &Object, removed: &mut HashSet<ObjectI
             }
             match doc.get_object(*id) {
                 Ok(Object::Dictionary(dict)) => dict,
-                Ok(other @ Object::Array(_)) => return collect_elements(doc, other, removed, depth + 1),
+                Ok(other @ Object::Array(_)) => {
+                    return collect_elements(doc, other, removed, depth + 1)
+                }
                 _ => return,
             }
         }
         Object::Dictionary(dict) => dict,
         Object::Array(items) => {
-            items.iter().for_each(|kid| collect_elements(doc, kid, removed, depth + 1));
+            items
+                .iter()
+                .for_each(|kid| collect_elements(doc, kid, removed, depth + 1));
             return;
         }
         _ => return,
@@ -559,7 +739,14 @@ fn collect_elements(doc: &Document, item: &Object, removed: &mut HashSet<ObjectI
 /// Drops the entries of a number tree (`key` = `Nums`) or name tree (`Names`) that refer to
 /// removed elements; in arrays of elements those become null. A node met again (in `seen`) is
 /// already done.
-fn prune_tree(doc: &mut Document, node: &mut Object, key: &[u8], removed: &HashSet<ObjectId>, seen: &mut HashSet<ObjectId>, depth: usize) {
+fn prune_tree(
+    doc: &mut Document,
+    node: &mut Object,
+    key: &[u8],
+    removed: &HashSet<ObjectId>,
+    seen: &mut HashSet<ObjectId>,
+    depth: usize,
+) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -573,7 +760,11 @@ fn prune_tree(doc: &mut Document, node: &mut Object, key: &[u8], removed: &HashS
         _ => return,
     };
     if let Ok(mut kids) = dict.get(b"Kids").cloned() {
-        edit_array(doc, &mut kids, |doc, items| items.iter_mut().for_each(|kid| prune_tree(doc, kid, key, removed, seen, depth + 1)));
+        edit_array(doc, &mut kids, |doc, items| {
+            items
+                .iter_mut()
+                .for_each(|kid| prune_tree(doc, kid, key, removed, seen, depth + 1))
+        });
         dict.set("Kids", kids);
     }
     if let Ok(mut pairs) = dict.get(key).cloned() {

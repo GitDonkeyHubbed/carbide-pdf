@@ -76,16 +76,63 @@ pub enum Glyph {
 
 impl Glyph {
     pub const ALL: [Glyph; 57] = [
-        Glyph::Open, Glyph::Save, Glyph::Print, Glyph::Undo, Glyph::Redo, Glyph::Hand, Glyph::Cursor,
-        Glyph::Sidebar, Glyph::PageInsert, Glyph::PageExtract, Glyph::PageDelete, Glyph::Merge, Glyph::Split,
-        Glyph::RotateLeft, Glyph::RotateRight, Glyph::MovePageUp, Glyph::MovePageDown, Glyph::Stamp,
-        Glyph::Number, Glyph::Reduce, Glyph::Compare, Glyph::Scan, Glyph::ImageExport, Glyph::TextExport,
-        Glyph::Note, Glyph::TextBox, Glyph::Highlight, Glyph::HighlightArea, Glyph::Underline,
-        Glyph::Strikeout, Glyph::Redact, Glyph::ApplyRedact, Glyph::Lock, Glyph::Sign, Glyph::Certify,
-        Glyph::TimeStamp, Glyph::Verify, Glyph::Trust, Glyph::ZoomIn, Glyph::ZoomOut, Glyph::FitWidth,
-        Glyph::FitPage, Glyph::ActualSize, Glyph::PrevPage, Glyph::NextPage, Glyph::FirstPage,
-        Glyph::LastPage, Glyph::Folder, Glyph::NewDocument, Glyph::Search, Glyph::Revision,
-        Glyph::Recovery, Glyph::Sanitize, Glyph::Settings, Glyph::Close, Glyph::Plus, Glyph::Document,
+        Glyph::Open,
+        Glyph::Save,
+        Glyph::Print,
+        Glyph::Undo,
+        Glyph::Redo,
+        Glyph::Hand,
+        Glyph::Cursor,
+        Glyph::Sidebar,
+        Glyph::PageInsert,
+        Glyph::PageExtract,
+        Glyph::PageDelete,
+        Glyph::Merge,
+        Glyph::Split,
+        Glyph::RotateLeft,
+        Glyph::RotateRight,
+        Glyph::MovePageUp,
+        Glyph::MovePageDown,
+        Glyph::Stamp,
+        Glyph::Number,
+        Glyph::Reduce,
+        Glyph::Compare,
+        Glyph::Scan,
+        Glyph::ImageExport,
+        Glyph::TextExport,
+        Glyph::Note,
+        Glyph::TextBox,
+        Glyph::Highlight,
+        Glyph::HighlightArea,
+        Glyph::Underline,
+        Glyph::Strikeout,
+        Glyph::Redact,
+        Glyph::ApplyRedact,
+        Glyph::Lock,
+        Glyph::Sign,
+        Glyph::Certify,
+        Glyph::TimeStamp,
+        Glyph::Verify,
+        Glyph::Trust,
+        Glyph::ZoomIn,
+        Glyph::ZoomOut,
+        Glyph::FitWidth,
+        Glyph::FitPage,
+        Glyph::ActualSize,
+        Glyph::PrevPage,
+        Glyph::NextPage,
+        Glyph::FirstPage,
+        Glyph::LastPage,
+        Glyph::Folder,
+        Glyph::NewDocument,
+        Glyph::Search,
+        Glyph::Revision,
+        Glyph::Recovery,
+        Glyph::Sanitize,
+        Glyph::Settings,
+        Glyph::Close,
+        Glyph::Plus,
+        Glyph::Document,
     ];
 }
 
@@ -134,23 +181,34 @@ impl Pen<'_> {
 
     /// Open polyline.
     fn line(&self, pts: &[P]) {
-        self.painter.add(egui::Shape::line(self.points(pts), self.stroke));
+        self.painter
+            .add(egui::Shape::line(self.points(pts), self.stroke));
     }
 
     /// Single straight stroke.
     fn seg(&self, a: P, b: P) {
-        self.painter.line_segment([self.pos(a), self.pos(b)], self.stroke);
+        self.painter
+            .line_segment([self.pos(a), self.pos(b)], self.stroke);
     }
 
     /// Closed outline with no fill. Works for concave outlines.
     fn closed(&self, pts: &[P]) {
-        self.painter.add(egui::Shape::closed_line(self.points(pts), self.stroke));
+        self.painter
+            .add(egui::Shape::closed_line(self.points(pts), self.stroke));
     }
 
     /// Convex region with a translucent fill, outlined when `outline` is set.
     fn shape(&self, pts: &[P], outline: bool) {
-        let stroke = if outline { self.stroke } else { egui::Stroke::NONE };
-        self.painter.add(egui::Shape::convex_polygon(self.points(pts), self.tint(), stroke));
+        let stroke = if outline {
+            self.stroke
+        } else {
+            egui::Stroke::NONE
+        };
+        self.painter.add(egui::Shape::convex_polygon(
+            self.points(pts),
+            self.tint(),
+            stroke,
+        ));
     }
 
     /// Solid rectangle in the icon colour.
@@ -162,7 +220,8 @@ impl Pen<'_> {
     /// Rounded rectangle outline. `radius` is measured in stroke widths.
     fn frame(&self, a: P, b: P, radius: f32) {
         let r = egui::Rect::from_min_max(self.pos(a), self.pos(b));
-        self.painter.rect_stroke(r, self.w * radius, self.stroke, egui::StrokeKind::Middle);
+        self.painter
+            .rect_stroke(r, self.w * radius, self.stroke, egui::StrokeKind::Middle);
     }
 
     /// Circle outline with a translucent fill.
@@ -174,12 +233,14 @@ impl Pen<'_> {
 
     /// Circle outline only.
     fn ring(&self, c: P, r: f32) {
-        self.painter.circle_stroke(self.pos(c), self.scale(r), self.stroke);
+        self.painter
+            .circle_stroke(self.pos(c), self.scale(r), self.stroke);
     }
 
     /// Solid dot.
     fn dot(&self, c: P, r: f32) {
-        self.painter.circle_filled(self.pos(c), self.scale(r), self.color);
+        self.painter
+            .circle_filled(self.pos(c), self.scale(r), self.color);
     }
 
     /// Open polyline ending in an arrow head.
@@ -223,7 +284,16 @@ fn flip_x(pts: Vec<P>, flip: bool) -> Vec<P> {
 
 /// Page with a folded top-right corner, spanning the box from `(x0, y0)` to `(x1, y1)`.
 fn sheet(p: &Pen, x0: f32, y0: f32, x1: f32, y1: f32, fold: f32) {
-    p.shape(&[(x0, y0), (x1 - fold, y0), (x1, y0 + fold), (x1, y1), (x0, y1)], true);
+    p.shape(
+        &[
+            (x0, y0),
+            (x1 - fold, y0),
+            (x1, y0 + fold),
+            (x1, y1),
+            (x0, y1),
+        ],
+        true,
+    );
     p.line(&[(x1 - fold, y0), (x1 - fold, y0 + fold), (x1, y0 + fold)]);
 }
 
@@ -339,7 +409,13 @@ fn scan(p: &Pen) {
 fn image_export(p: &Pen) {
     sheet(p, 0.14, 0.04, 0.86, 0.96, 0.22);
     p.frame((0.26, 0.36), (0.74, 0.76), 0.5);
-    p.line(&[(0.26, 0.7), (0.42, 0.52), (0.52, 0.62), (0.6, 0.54), (0.74, 0.7)]);
+    p.line(&[
+        (0.26, 0.7),
+        (0.42, 0.52),
+        (0.52, 0.62),
+        (0.6, 0.54),
+        (0.74, 0.7),
+    ]);
     p.dot((0.64, 0.46), 0.05);
 }
 
@@ -377,14 +453,29 @@ fn text_box(p: &Pen) {
 
 /// Marker pen over a line of text.
 fn highlight(p: &Pen) {
-    p.shape(&[(0.08, 0.66), (0.92, 0.66), (0.92, 0.84), (0.08, 0.84)], false);
+    p.shape(
+        &[(0.08, 0.66), (0.92, 0.66), (0.92, 0.84), (0.08, 0.84)],
+        false,
+    );
     p.seg((0.14, 0.75), (0.86, 0.75));
-    p.shape(&[(0.3, 0.66), (0.484, 0.618), (0.89, 0.21), (0.75, 0.07), (0.342, 0.476)], true);
+    p.shape(
+        &[
+            (0.3, 0.66),
+            (0.484, 0.618),
+            (0.89, 0.21),
+            (0.75, 0.07),
+            (0.342, 0.476),
+        ],
+        true,
+    );
 }
 
 /// Translucent rectangle with corner marks.
 fn highlight_area(p: &Pen) {
-    p.shape(&[(0.22, 0.22), (0.78, 0.22), (0.78, 0.78), (0.22, 0.78)], true);
+    p.shape(
+        &[(0.22, 0.22), (0.78, 0.22), (0.78, 0.78), (0.22, 0.78)],
+        true,
+    );
     p.line(&[(0.08, 0.3), (0.08, 0.08), (0.3, 0.08)]);
     p.line(&[(0.7, 0.08), (0.92, 0.08), (0.92, 0.3)]);
     p.line(&[(0.92, 0.7), (0.92, 0.92), (0.7, 0.92)]);
@@ -433,8 +524,25 @@ fn lock(p: &Pen) {
 
 /// Pen nib writing a squiggle.
 fn sign(p: &Pen) {
-    p.line(&[(0.08, 0.8), (0.2, 0.68), (0.3, 0.86), (0.42, 0.72), (0.54, 0.88), (0.7, 0.76), (0.9, 0.82)]);
-    p.shape(&[(0.36, 0.62), (0.557, 0.563), (0.91, 0.21), (0.77, 0.07), (0.417, 0.423)], true);
+    p.line(&[
+        (0.08, 0.8),
+        (0.2, 0.68),
+        (0.3, 0.86),
+        (0.42, 0.72),
+        (0.54, 0.88),
+        (0.7, 0.76),
+        (0.9, 0.82),
+    ]);
+    p.shape(
+        &[
+            (0.36, 0.62),
+            (0.557, 0.563),
+            (0.91, 0.21),
+            (0.77, 0.07),
+            (0.417, 0.423),
+        ],
+        true,
+    );
 }
 
 /// Ribbon seal with a check mark.
@@ -455,7 +563,16 @@ fn time_stamp(p: &Pen) {
 /// Shield with a check mark.
 fn verify(p: &Pen) {
     p.shape(
-        &[(0.5, 0.08), (0.84, 0.2), (0.84, 0.48), (0.74, 0.66), (0.5, 0.92), (0.26, 0.66), (0.16, 0.48), (0.16, 0.2)],
+        &[
+            (0.5, 0.08),
+            (0.84, 0.2),
+            (0.84, 0.48),
+            (0.74, 0.66),
+            (0.5, 0.92),
+            (0.26, 0.66),
+            (0.16, 0.48),
+            (0.16, 0.2),
+        ],
         true,
     );
     p.line(&[(0.34, 0.5), (0.46, 0.64), (0.68, 0.38)]);
@@ -528,7 +645,17 @@ fn last_page(p: &Pen) {
 
 /// Open palm with four fingers and a thumb.
 fn hand(p: &Pen) {
-    p.shape(&[(0.3, 0.5), (0.74, 0.5), (0.8, 0.6), (0.74, 0.9), (0.36, 0.9), (0.22, 0.66)], true);
+    p.shape(
+        &[
+            (0.3, 0.5),
+            (0.74, 0.5),
+            (0.8, 0.6),
+            (0.74, 0.9),
+            (0.36, 0.9),
+            (0.22, 0.66),
+        ],
+        true,
+    );
     for (x, top) in [(0.36, 0.22), (0.48, 0.1), (0.6, 0.16), (0.72, 0.3)] {
         p.seg((x, 0.5), (x, top));
     }
@@ -536,37 +663,76 @@ fn hand(p: &Pen) {
 }
 
 fn cursor(p: &Pen) {
-    p.closed(&[(0.26, 0.1), (0.26, 0.8), (0.42, 0.64), (0.54, 0.9), (0.66, 0.84), (0.54, 0.58), (0.76, 0.58)]);
+    p.closed(&[
+        (0.26, 0.1),
+        (0.26, 0.8),
+        (0.42, 0.64),
+        (0.54, 0.9),
+        (0.66, 0.84),
+        (0.54, 0.58),
+        (0.76, 0.58),
+    ]);
 }
 
 /// Window with a narrow left column.
 fn sidebar(p: &Pen) {
-    p.shape(&[(0.1, 0.16), (0.36, 0.16), (0.36, 0.84), (0.1, 0.84)], false);
+    p.shape(
+        &[(0.1, 0.16), (0.36, 0.16), (0.36, 0.84), (0.1, 0.84)],
+        false,
+    );
     p.frame((0.1, 0.16), (0.9, 0.84), 1.2);
     p.seg((0.36, 0.16), (0.36, 0.84));
 }
 
 fn folder(p: &Pen) {
-    p.shape(&[(0.08, 0.32), (0.92, 0.32), (0.92, 0.84), (0.08, 0.84)], false);
-    p.closed(&[(0.08, 0.22), (0.38, 0.22), (0.46, 0.32), (0.92, 0.32), (0.92, 0.84), (0.08, 0.84)]);
+    p.shape(
+        &[(0.08, 0.32), (0.92, 0.32), (0.92, 0.84), (0.08, 0.84)],
+        false,
+    );
+    p.closed(&[
+        (0.08, 0.22),
+        (0.38, 0.22),
+        (0.46, 0.32),
+        (0.92, 0.32),
+        (0.92, 0.84),
+        (0.08, 0.84),
+    ]);
 }
 
 /// Folder with its front flap opened.
 fn open_folder(p: &Pen) {
-    p.line(&[(0.08, 0.84), (0.08, 0.22), (0.38, 0.22), (0.46, 0.32), (0.7, 0.32)]);
+    p.line(&[
+        (0.08, 0.84),
+        (0.08, 0.22),
+        (0.38, 0.22),
+        (0.46, 0.32),
+        (0.7, 0.32),
+    ]);
     p.seg((0.08, 0.84), (0.18, 0.84));
     p.shape(&[(0.18, 0.84), (0.3, 0.5), (0.96, 0.5), (0.84, 0.84)], true);
 }
 
 fn floppy(p: &Pen) {
-    p.shape(&[(0.12, 0.12), (0.72, 0.12), (0.88, 0.28), (0.88, 0.88), (0.12, 0.88)], true);
+    p.shape(
+        &[
+            (0.12, 0.12),
+            (0.72, 0.12),
+            (0.88, 0.28),
+            (0.88, 0.88),
+            (0.12, 0.88),
+        ],
+        true,
+    );
     p.frame((0.3, 0.12), (0.68, 0.38), 0.5);
     p.frame((0.26, 0.58), (0.74, 0.82), 0.5);
 }
 
 fn printer(p: &Pen) {
     p.line(&[(0.28, 0.38), (0.28, 0.14), (0.72, 0.14), (0.72, 0.38)]);
-    p.shape(&[(0.12, 0.38), (0.88, 0.38), (0.88, 0.74), (0.12, 0.74)], true);
+    p.shape(
+        &[(0.12, 0.38), (0.88, 0.38), (0.88, 0.74), (0.12, 0.74)],
+        true,
+    );
     p.shape(&[(0.3, 0.6), (0.7, 0.6), (0.7, 0.9), (0.3, 0.9)], true);
     p.dot((0.76, 0.5), 0.04);
 }
@@ -590,7 +756,10 @@ fn recovery(p: &Pen) {
     for k in 0..4 {
         let a = PI / 4.0 + k as f32 * PI / 2.0;
         let (c, s) = (a.cos(), a.sin());
-        p.seg((0.5 + 0.14 * c, 0.5 + 0.14 * s), (0.5 + 0.36 * c, 0.5 + 0.36 * s));
+        p.seg(
+            (0.5 + 0.14 * c, 0.5 + 0.14 * s),
+            (0.5 + 0.36 * c, 0.5 + 0.36 * s),
+        );
     }
 }
 
@@ -599,7 +768,10 @@ fn sanitize(p: &Pen) {
     page(p);
     p.seg((0.24, 0.3), (0.5, 0.3));
     p.seg((0.24, 0.46), (0.5, 0.46));
-    p.shape(&[(0.56, 0.66), (0.8, 0.42), (0.96, 0.58), (0.72, 0.82)], true);
+    p.shape(
+        &[(0.56, 0.66), (0.8, 0.42), (0.96, 0.58), (0.72, 0.82)],
+        true,
+    );
     p.seg((0.64, 0.74), (0.88, 0.5));
     p.seg((0.5, 0.94), (0.92, 0.94));
 }

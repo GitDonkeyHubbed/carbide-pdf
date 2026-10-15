@@ -60,7 +60,9 @@ impl SignerInfo {
     /// the members; some signers hash them in the order they sent instead, so that form follows
     /// when it differs.
     pub(crate) fn signed_attribute_encodings(&self) -> Vec<Vec<u8>> {
-        let Some(attributes) = &self.signed_attributes else { return Vec::new() };
+        let Some(attributes) = &self.signed_attributes else {
+            return Vec::new();
+        };
         let mut sorted = attributes.clone();
         sorted.sort();
         let canonical = der::tlv(der::SET, &sorted.concat());
@@ -84,13 +86,18 @@ pub(crate) fn parse_signed_data(data: &[u8]) -> Option<SignedData> {
         return None;
     }
     let explicit = parts.get(1).filter(|e| e.tag == 0xA0)?;
-    let signed_data = der::children_ber(explicit.content).into_iter().next().filter(|e| e.tag == der::SEQUENCE)?;
+    let signed_data = der::children_ber(explicit.content)
+        .into_iter()
+        .next()
+        .filter(|e| e.tag == der::SEQUENCE)?;
     // version, digestAlgorithms, encapContentInfo, [0] certificates, [1] crls, signerInfos
     let fields = der::children_ber(signed_data.content);
     let encapsulated = der::children_ber(fields.get(2).filter(|e| e.tag == der::SEQUENCE)?.content);
     let content_type = oid_of(encapsulated.first()?)?;
     let content = match encapsulated.get(1) {
-        Some(explicit) if explicit.tag == 0xA0 => Some(der::string_value(der::children_ber(explicit.content).first()?)?),
+        Some(explicit) if explicit.tag == 0xA0 => Some(der::string_value(
+            der::children_ber(explicit.content).first()?,
+        )?),
         _ => None,
     };
     let mut certificates = Vec::new();
@@ -108,8 +115,15 @@ pub(crate) fn parse_signed_data(data: &[u8]) -> Option<SignedData> {
             _ => {}
         }
     }
-    let signer = der::children_ber(signer_infos?.content).into_iter().next()?;
-    Some(SignedData { certificates, content_type, content, signer: parse_signer_info(&signer)? })
+    let signer = der::children_ber(signer_infos?.content)
+        .into_iter()
+        .next()?;
+    Some(SignedData {
+        certificates,
+        content_type,
+        content,
+        signer: parse_signer_info(&signer)?,
+    })
 }
 
 /// The id-ct-TSTInfo content type carried by an RFC 3161 time-stamp token.
@@ -137,17 +151,38 @@ pub(crate) fn parse_tst_info(data: &[u8]) -> Option<TstInfo> {
     let fields = der::children_ber(tst.content);
     let imprint = der::children_ber(fields.get(2).filter(|e| e.tag == der::SEQUENCE)?.content);
     let (hash_algorithm, _) = algorithm(imprint.first()?)?;
-    let hashed_message = der::string_value(imprint.get(1).filter(|e| e.tag & !0x20 == der::OCTET_STRING)?)?;
-    let gen_time = fields.get(4).filter(|e| e.tag == 0x18).map(|e| String::from_utf8_lossy(e.content).into_owned())?;
+    let hashed_message = der::string_value(
+        imprint
+            .get(1)
+            .filter(|e| e.tag & !0x20 == der::OCTET_STRING)?,
+    )?;
+    let gen_time = fields
+        .get(4)
+        .filter(|e| e.tag == 0x18)
+        .map(|e| String::from_utf8_lossy(e.content).into_owned())?;
     // After genTime come the optional accuracy (a SEQUENCE) and ordering (a BOOLEAN), so the first
     // INTEGER is the nonce.
-    let nonce = fields.iter().skip(5).find(|e| e.tag == der::INTEGER).map(|e| e.content.to_vec());
-    Some(TstInfo { hash_algorithm, hashed_message, gen_time, nonce })
+    let nonce = fields
+        .iter()
+        .skip(5)
+        .find(|e| e.tag == der::INTEGER)
+        .map(|e| e.content.to_vec());
+    Some(TstInfo {
+        hash_algorithm,
+        hashed_message,
+        gen_time,
+        nonce,
+    })
 }
 
 /// The value of the first unsigned attribute of type `oid`, if present.
 pub(crate) fn unsigned_attribute<'a>(signer: &'a SignerInfo, oid: &str) -> Option<&'a [u8]> {
-    signer.unsigned_attributes.iter().find(|(kind, _)| kind == oid).and_then(|(_, values)| values.first()).map(Vec::as_slice)
+    signer
+        .unsigned_attributes
+        .iter()
+        .find(|(kind, _)| kind == oid)
+        .and_then(|(_, values)| values.first())
+        .map(Vec::as_slice)
 }
 
 fn parse_signer_info(signer: &Element<'_>) -> Option<SignerInfo> {
@@ -157,7 +192,10 @@ fn parse_signer_info(signer: &Element<'_>) -> Option<SignerInfo> {
     let id = match sid.tag {
         der::SEQUENCE => {
             let kids = der::children_ber(sid.content);
-            SignerId::IssuerAndSerial { issuer: der::normalize(kids.first()?)?, serial: der::normalize(kids.get(1)?)? }
+            SignerId::IssuerAndSerial {
+                issuer: der::normalize(kids.first()?)?,
+                serial: der::normalize(kids.get(1)?)?,
+            }
         }
         0x80 | 0xA0 => SignerId::KeyIdentifier(der::string_value(sid)?),
         _ => return None,
@@ -175,8 +213,12 @@ fn parse_signer_info(signer: &Element<'_>) -> Option<SignerInfo> {
             match kind.as_str() {
                 OID_MESSAGE_DIGEST => message_digest = Some(der::string_value(values.first()?)?),
                 OID_CONTENT_TYPE => content_type = Some(oid_of(values.first()?)?),
-                OID_SIGNING_CERTIFICATE => signing_certificate = Some(ess_cert_id(values.first()?, OID_SHA1)?),
-                OID_SIGNING_CERTIFICATE_V2 => signing_certificate = Some(ess_cert_id(values.first()?, OID_SHA256)?),
+                OID_SIGNING_CERTIFICATE => {
+                    signing_certificate = Some(ess_cert_id(values.first()?, OID_SHA1)?)
+                }
+                OID_SIGNING_CERTIFICATE_V2 => {
+                    signing_certificate = Some(ess_cert_id(values.first()?, OID_SHA256)?)
+                }
                 _ => {}
             }
             attributes.push(der::normalize(&attribute)?);
@@ -185,7 +227,9 @@ fn parse_signer_info(signer: &Element<'_>) -> Option<SignerInfo> {
         index += 1;
     }
     let (signature_algorithm, signature_parameters) = algorithm(parts.get(index)?)?;
-    let signature = parts.get(index + 1).filter(|e| e.tag & !0x20 == der::OCTET_STRING)?;
+    let signature = parts
+        .get(index + 1)
+        .filter(|e| e.tag & !0x20 == der::OCTET_STRING)?;
     let signature = der::string_value(signature)?;
     let mut unsigned_attributes = Vec::new();
     if let Some(unsigned) = parts.get(index + 2).filter(|e| e.tag == 0xA1) {
@@ -211,15 +255,25 @@ fn parse_signer_info(signer: &Element<'_>) -> Option<SignerInfo> {
 /// The first ESSCertID(v2) of a SigningCertificate(V2) value: its hash algorithm (`default_hash`
 /// when the field is left out, as v2 allows and v1 always does) and the certificate hash.
 fn ess_cert_id(value: &Element<'_>, default_hash: &str) -> Option<(String, Vec<u8>)> {
-    let certs = der::children_ber(value.content).into_iter().next().filter(|e| e.tag == der::SEQUENCE)?;
-    let first = der::children_ber(certs.content).into_iter().next().filter(|e| e.tag == der::SEQUENCE)?;
+    let certs = der::children_ber(value.content)
+        .into_iter()
+        .next()
+        .filter(|e| e.tag == der::SEQUENCE)?;
+    let first = der::children_ber(certs.content)
+        .into_iter()
+        .next()
+        .filter(|e| e.tag == der::SEQUENCE)?;
     let fields = der::children_ber(first.content);
     match fields.first()? {
         algorithm_id if algorithm_id.tag == der::SEQUENCE => {
-            let hash = fields.get(1).filter(|e| e.tag & !0x20 == der::OCTET_STRING)?;
+            let hash = fields
+                .get(1)
+                .filter(|e| e.tag & !0x20 == der::OCTET_STRING)?;
             Some((algorithm(algorithm_id)?.0, der::string_value(hash)?))
         }
-        hash if hash.tag & !0x20 == der::OCTET_STRING => Some((default_hash.to_string(), der::string_value(hash)?)),
+        hash if hash.tag & !0x20 == der::OCTET_STRING => {
+            Some((default_hash.to_string(), der::string_value(hash)?))
+        }
         _ => None,
     }
 }
