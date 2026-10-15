@@ -97,7 +97,7 @@ impl SavedFile {
         let reachable = reachable(&pdf.doc);
         let content = reachable
             .iter()
-            .filter_map(|&id| Some((id, Fingerprint::of(pdf.doc.objects.get(&id)?)?)))
+            .filter_map(|&id| Some((id, Fingerprint::of(&pdf.doc, pdf.doc.objects.get(&id)?)?)))
             .collect();
         let structure = file_structure(&pdf.doc);
         let unused = pdf
@@ -168,7 +168,7 @@ impl SavedFile {
         self.content
             .iter()
             .any(|(id, held)| match pdf.doc.objects.get(id) {
-                Some(object) if reachable.contains(id) => !held.kept_by(object),
+                Some(object) if reachable.contains(id) => !held.kept_by(&pdf.doc, object),
                 _ => true,
             })
     }
@@ -521,7 +521,8 @@ struct Fingerprint {
 
 impl Fingerprint {
     /// `None` for an object that holds neither strings nor stream data and is not an annotation.
-    fn of(object: &Object) -> Option<Fingerprint> {
+    /// `doc` resolves the references an annotation's drawing data may sit behind.
+    fn of(doc: &Document, object: &Object) -> Option<Fingerprint> {
         fn strings(object: &Object, out: &mut Vec<u64>) {
             match object {
                 Object::String(bytes, _) => out.push(hash(bytes)),
@@ -540,7 +541,7 @@ impl Fingerprint {
         let stream = object.as_stream().ok().map(|s| hash(&s.content));
         let drawing = is_annotation(object).then(|| {
             let mut hasher = DefaultHasher::new();
-            hash_values(object, &mut hasher);
+            hash_values(doc, object, &mut hasher, &mut HashSet::new(), 0);
             hasher.finish()
         });
         (stream.is_some() || !found.is_empty() || drawing.is_some()).then_some(Fingerprint {
@@ -551,8 +552,8 @@ impl Fingerprint {
     }
 
     /// True when `object` still carries all of this content; added strings do not matter.
-    fn kept_by(&self, object: &Object) -> bool {
-        let Some(now) = Fingerprint::of(object) else {
+    fn kept_by(&self, doc: &Document, object: &Object) -> bool {
+        let Some(now) = Fingerprint::of(doc, object) else {
             return false;
         };
         self.stream == now.stream
@@ -564,10 +565,28 @@ impl Fingerprint {
     }
 }
 
-/// Hashes the numbers, names and booleans of `object` with their place in it; strings and
-/// references are left to the rest of the fingerprint. Numbers count by value, so `1` and `1.0`
-/// are the same.
-fn hash_values(object: &Object, hasher: &mut DefaultHasher) {
+/// How many references in a row are followed when hashing an annotation's values.
+const MAX_REFERENCE_DEPTH: usize = 8;
+
+/// Keys that lead from an annotation to the rest of the document rather than to its own drawing
+/// data: following them would count a change to a page, a reply thread or a popup as a change to
+/// the annotation.
+const STRUCTURAL_KEYS: [&[u8]; 8] = [
+    b"P", b"Parent", b"Popup", b"IRT", b"Dest", b"Next", b"Prev", b"Kids",
+];
+
+/// Hashes the numbers, names and booleans of `object` with their place in it; strings are left to
+/// the rest of the fingerprint. Numbers count by value, so `1` and `1.0` are the same. A
+/// reference to an object that is not a stream is followed, since drawing data (an ink list, say)
+/// can sit in an object of its own; a stream keeps its own content hash instead. `seen` and
+/// `depth` bound the walk when objects refer back to each other.
+fn hash_values(
+    doc: &Document,
+    object: &Object,
+    hasher: &mut DefaultHasher,
+    seen: &mut HashSet<ObjectId>,
+    depth: usize,
+) {
     match object {
         Object::Integer(_) | Object::Real(_) => {
             let value = object.as_float().unwrap_or_default();
@@ -578,15 +597,36 @@ fn hash_values(object: &Object, hasher: &mut DefaultHasher) {
         Object::Name(name) => (3u8, name).hash(hasher),
         Object::Array(items) => {
             (4u8, items.len()).hash(hasher);
-            items.iter().for_each(|item| hash_values(item, hasher));
+            items
+                .iter()
+                .for_each(|item| hash_values(doc, item, hasher, seen, depth));
         }
         Object::Dictionary(dict) => {
-            let mut entries: Vec<_> = dict.iter().collect();
+            let mut entries: Vec<_> = dict
+                .iter()
+                .filter(|(key, _)| !STRUCTURAL_KEYS.contains(&key.as_slice()))
+                .collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
             (5u8, entries.len()).hash(hasher);
             for (key, value) in entries {
                 key.hash(hasher);
-                hash_values(value, hasher);
+                hash_values(doc, value, hasher, seen, depth);
+            }
+        }
+        Object::Reference(id) => {
+            let target = doc.objects.get(id).filter(|target| {
+                !matches!(target, Object::Stream(_))
+                    && !target
+                        .as_dict()
+                        .is_ok_and(|dict| dict.has_type(b"Page") || dict.has_type(b"Pages"))
+            });
+            match target {
+                Some(target) if depth < MAX_REFERENCE_DEPTH && seen.insert(*id) => {
+                    6u8.hash(hasher);
+                    hash_values(doc, target, hasher, seen, depth + 1);
+                    seen.remove(id);
+                }
+                _ => 0u8.hash(hasher),
             }
         }
         _ => 0u8.hash(hasher),
