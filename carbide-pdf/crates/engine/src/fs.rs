@@ -104,6 +104,22 @@ fn link_new(temp: &Path, path: &Path) -> io::Result<()> {
         // Looking first and renaming after would replace a file made in between.
         Err(_) => match rename_no_replace(temp, path) {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(taken()),
+            // Nor that (FAT and exFAT drives, for one): claim the name with an empty file made
+            // only if nothing has it, then rename over that claim, which is ours to replace.
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                {
+                    Ok(claim) => drop(claim),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(taken()),
+                    Err(e) => return Err(e),
+                }
+                fs::rename(temp, path).inspect_err(|_| {
+                    let _ = fs::remove_file(path);
+                })
+            }
             other => other,
         },
     }
@@ -111,7 +127,7 @@ fn link_new(temp: &Path, path: &Path) -> io::Result<()> {
 
 /// Renames `from` to `to` in one step, and fails with `AlreadyExists` instead of replacing
 /// whatever is at `to`, a link included. Where the system or the file system cannot do that, it
-/// fails with `Unsupported`: a name is never given up to a rename that might replace a file.
+/// fails with `Unsupported` rather than risk replacing a file.
 pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
