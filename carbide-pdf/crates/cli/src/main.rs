@@ -10,7 +10,7 @@ use carbide_engine::imposition::{ImpositionOptions, Margins, Media, Registration
 use carbide_engine::imposition_plan::{Binding, LayoutKind, PlanOptions, PrintingOrder, Style};
 use carbide_engine::reduce::{reduce_files, OutputOptions, ReduceOptions, TargetFolder, DEFAULT_SUFFIX};
 use carbide_engine::signature::{
-    notice_text, CertifyLevel, HttpTimestampSource, Identity, SignOptions, SubFilter, TrustStore, Validity,
+    notice_text, CertifyLevel, HttpTimestampSource, Identity, SignOptions, SignatureReport, SubFilter, TrustStore, Validity,
 };
 use carbide_engine::fs::{write_file, write_replacing, Existing};
 use carbide_engine::{
@@ -21,6 +21,42 @@ use carbide_engine::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 type Failure = Box<dyn std::error::Error>;
+
+/// A command that ran to the end with an outcome other than success, which its exit status gives
+/// (see `carbide verify`).
+#[derive(Debug)]
+struct Outcome {
+    status: u8,
+    message: &'static str,
+}
+
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for Outcome {}
+
+/// Exit statuses of `carbide verify` past 0 (every signature valid), 1 (the file could not be
+/// checked) and 2 (the command line is wrong).
+mod verify_status {
+    pub const INVALID: u8 = 3;
+    pub const NOT_PROVEN: u8 = 4;
+    pub const UNSIGNED: u8 = 5;
+}
+
+const VERIFY_EXIT_STATUS: &str = "Exit status:
+  0  The file is signed, and every signature and time stamp in it is valid: intact, from a
+     certificate that is trusted (given with --trust, or issued through a chain of certificates
+     that leads to one), valid and allowed to sign. Nothing was added after the last signature.
+  1  The file could not be checked: it cannot be read, or it needs --password.
+  2  The command line is wrong.
+  3  At least one signature is invalid: it is damaged, or what it signed was changed.
+  4  No signature is invalid, but not all of them are proven valid: a signer or time stamp
+     authority is not trusted, a certificate has expired or may not sign, an algorithm cannot
+     be checked, or the file was changed after the last signature.
+  5  The file has no signatures.";
 
 #[derive(Parser)]
 #[command(name = "carbide", version, about = "Carbide PDF: edit, protect, impose and reduce PDF files")]
@@ -267,6 +303,9 @@ enum Command {
         tsa_password: Option<String>,
     },
     /// Validate every signature in a file. --password reads a file that needs its open password.
+    ///
+    /// The exit status is 0 only when the file is signed and every signature is valid.
+    #[command(after_help = VERIFY_EXIT_STATUS)]
     Verify {
         input: PathBuf,
         /// PEM certificate(s) to treat as trusted; repeatable.
@@ -1063,8 +1102,8 @@ fn run(cli: Cli) -> Result<(), Failure> {
             if let Some(text) = notice_text(&reports) {
                 println!("{text}");
             }
-            if reports.iter().any(|r| r.validity == Validity::Invalid) {
-                return Err("at least one signature is invalid".into());
+            if let Some(outcome) = verify_outcome(&reports) {
+                return Err(outcome.into());
             }
         }
         Command::Revision { action } => match action {
@@ -1098,6 +1137,27 @@ fn run(cli: Cli) -> Result<(), Failure> {
         },
     }
     Ok(())
+}
+
+/// What `verify` exits with when not every signature is valid (see [`VERIFY_EXIT_STATUS`]);
+/// `None` when the file is signed and every signature and time stamp holds, is trusted, and the
+/// last one covers the whole file.
+fn verify_outcome(reports: &[SignatureReport]) -> Option<Outcome> {
+    let signed: Vec<&SignatureReport> = reports.iter().filter(|r| r.validity != Validity::Blank).collect();
+    let outcome = |status, message| Some(Outcome { status, message });
+    if signed.iter().any(|r| r.validity == Validity::Invalid) {
+        return outcome(verify_status::INVALID, "at least one signature is invalid");
+    }
+    let Some(last) = signed.iter().max_by_key(|r| r.revision_end) else {
+        return outcome(verify_status::UNSIGNED, "the file has no signatures");
+    };
+    if signed.iter().any(|r| r.validity != Validity::Valid) {
+        return outcome(verify_status::NOT_PROVEN, "not every signature is proven valid");
+    }
+    if last.modified_after_signing {
+        return outcome(verify_status::NOT_PROVEN, "the file was changed after the last signature");
+    }
+    None
 }
 
 fn impose_options(a: &ImposeArgs) -> Result<ImpositionOptions, Failure> {
@@ -1160,9 +1220,15 @@ fn impose_options(a: &ImposeArgs) -> Result<ImpositionOptions, Failure> {
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("error: {error}");
-            ExitCode::FAILURE
-        }
+        Err(error) => match error.downcast_ref::<Outcome>() {
+            Some(outcome) => {
+                eprintln!("{outcome}");
+                ExitCode::from(outcome.status)
+            }
+            None => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }

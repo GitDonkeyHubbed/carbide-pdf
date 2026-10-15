@@ -117,6 +117,17 @@ carbide verify contract-signed.pdf --trust ca.pem
 carbide ocr scan.pdf scan-searchable.pdf --dpi 300 --pages 1-4
 ```
 
+`verify` prints a report for each signature, and its exit status says what it found, so a script can rely on it:
+
+| Status | Meaning |
+|---|---|
+| 0 | The file is signed, and every signature and time stamp in it is valid: intact, from a certificate that is trusted (given with `--trust`, or issued through a chain that leads to one), valid and allowed to sign. Nothing was added after the last signature. |
+| 1 | The file could not be checked: it cannot be read, or it needs `--password`. |
+| 2 | The command line is wrong. |
+| 3 | At least one signature is invalid: it is damaged, or what it signed was changed. |
+| 4 | No signature is invalid, but not all are proven valid: a signer or time stamp authority is not trusted, a certificate has expired or may not sign, an algorithm cannot be checked, or the file was changed after the last signature. |
+| 5 | The file has no signatures. |
+
 ## Known limits and deviations
 
 - Redaction rasterizes the affected pages (those pages lose selectable text).
