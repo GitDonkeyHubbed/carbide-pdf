@@ -2486,36 +2486,36 @@ impl CarbideApp {
         }
         // What only the file on disk holds is reported too; the save that has to follow leaves it out.
         let file = self.doc.as_ref().and_then(|d| d.saved.clone());
-        let was_dirty = self.doc.as_ref().is_some_and(|d| d.dirty);
+        // Looked for on a copy first: when nothing is found this is no edit, and the document, its
+        // undo and redo steps and its unsaved state stay exactly as they were (a save then has
+        // nothing to rewrite, which could cost a signature).
+        let found = self.doc.as_ref().map(|d| {
+            d.pdf
+                .clone()
+                .remove_hidden_information_from(&items, file.as_ref())
+        });
+        match found {
+            None => return,
+            Some(Err(e)) => return self.alert(format!("Remove hidden information failed: {e}")),
+            Some(Ok(report)) if report.is_empty() => {
+                self.status = "No hidden information was found.".into();
+                return;
+            }
+            Some(Ok(_)) => {}
+        }
         let mut report = None;
-        // Removing content always counts as an edit, so an empty report is undone below.
         self.edit_removing("Remove hidden information", |pdf| {
             report = Some(pdf.remove_hidden_information_from(&items, file.as_ref())?);
             Ok(())
         });
-        match report {
-            Some(report) if report.is_empty() => {
-                // Nothing was found, so this was no edit: the document is put back exactly as it was,
-                // and a save has nothing to rewrite (which could cost a signature).
-                if let Some(doc) = self.doc.as_mut() {
-                    if let Some(snapshot) = doc.undo.pop() {
-                        let _ = doc.restore(&snapshot.bytes);
-                        doc.content_removed = snapshot.content_removed;
-                    }
-                    doc.dirty = was_dirty;
-                }
-                self.status = "No hidden information was found.".into();
-            }
-            Some(report) => {
-                let lines = report
-                    .lines()
-                    .iter()
-                    .map(|l| format!("  {l}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.alert(format!("Removed from the document:\n{lines}\n\nSave the document to write it without them."));
-            }
-            None => {}
+        if let Some(report) = report {
+            let lines = report
+                .lines()
+                .iter()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.alert(format!("Removed from the document:\n{lines}\n\nSave the document to write it without them."));
         }
     }
 

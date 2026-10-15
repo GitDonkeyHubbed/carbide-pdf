@@ -1932,3 +1932,29 @@ fn files_made_from_a_document_never_replace_an_open_one() {
     app.extract_page_to(1, &c);
     assert_eq!(Pdf::open(&c).unwrap().page_count(), 1);
 }
+
+#[test]
+fn finding_no_hidden_information_keeps_the_undone_steps_to_redo() {
+    let dir = scratch();
+    let path = plain(&dir, "a.pdf", &["A"]);
+    let mut app = app(&dir);
+    app.open_path(&path);
+    assert!(app.edit("Rotate", |pdf| pdf.rotate_pages(&[0], 90)));
+    app.run(Cmd::Undo);
+    assert_eq!(app.doc.as_ref().unwrap().redo.len(), 1);
+
+    // Nothing to find: the document, its dirty state and the step to redo stay as they were.
+    let before = app.doc.as_ref().unwrap().bytes.clone();
+    let dirty = app.doc.as_ref().unwrap().dirty;
+    app.remove_hidden_information(
+        active_id(&app),
+        vec![carbide_engine::HiddenItem::Thumbnails],
+    );
+    assert_eq!(app.status, "No hidden information was found.");
+    let open = app.doc.as_ref().unwrap();
+    assert_eq!(open.redo.len(), 1, "the step to redo was lost");
+    assert!(open.bytes == before && open.dirty == dirty);
+
+    app.run(Cmd::Redo);
+    assert_eq!(app.doc.as_ref().unwrap().geometries[0].rotation, 90);
+}
