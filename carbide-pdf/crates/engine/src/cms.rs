@@ -44,15 +44,25 @@ pub(crate) struct SignerInfo {
     pub message_digest: Option<Vec<u8>>,
     /// The signed contentType attribute.
     pub content_type: Option<String>,
-    /// The signed ESS signing-certificate attribute (v1 or v2): the hash algorithm and the hash of
-    /// the certificate the signer says it used.
-    pub signing_certificate: Option<(String, Vec<u8>)>,
+    /// The signed ESS signing-certificate attribute (v1 or v2): the certificate the signer says it
+    /// used.
+    pub signing_certificate: Option<SigningCertificate>,
     pub signature_algorithm: String,
     /// DER of the signature algorithm's parameters, when it has any (RSASSA-PSS carries them).
     pub signature_parameters: Option<Vec<u8>>,
     pub signature: Vec<u8>,
     /// Unsigned attributes: the type and the encoding of each value.
     pub unsigned_attributes: Vec<(String, Vec<Vec<u8>>)>,
+}
+
+/// The first ESSCertID(v2) of a signing-certificate attribute.
+#[derive(Debug)]
+pub(crate) struct SigningCertificate {
+    pub hash_algorithm: String,
+    pub hash: Vec<u8>,
+    /// The optional IssuerSerial: the DER of each directoryName given for the issuer, and of the
+    /// serial number INTEGER.
+    pub issuer_serial: Option<(Vec<Vec<u8>>, Vec<u8>)>,
 }
 
 impl SignerInfo {
@@ -253,8 +263,9 @@ fn parse_signer_info(signer: &Element<'_>) -> Option<SignerInfo> {
 }
 
 /// The first ESSCertID(v2) of a SigningCertificate(V2) value: its hash algorithm (`default_hash`
-/// when the field is left out, as v2 allows and v1 always does) and the certificate hash.
-fn ess_cert_id(value: &Element<'_>, default_hash: &str) -> Option<(String, Vec<u8>)> {
+/// when the field is left out, as v2 allows and v1 always does), the certificate hash, and the
+/// issuer and serial number when it names them.
+fn ess_cert_id(value: &Element<'_>, default_hash: &str) -> Option<SigningCertificate> {
     let certs = der::children_ber(value.content)
         .into_iter()
         .next()
@@ -264,18 +275,42 @@ fn ess_cert_id(value: &Element<'_>, default_hash: &str) -> Option<(String, Vec<u
         .next()
         .filter(|e| e.tag == der::SEQUENCE)?;
     let fields = der::children_ber(first.content);
-    match fields.first()? {
+    let (hash_algorithm, rest) = match fields.first()? {
         algorithm_id if algorithm_id.tag == der::SEQUENCE => {
-            let hash = fields
-                .get(1)
-                .filter(|e| e.tag & !0x20 == der::OCTET_STRING)?;
-            Some((algorithm(algorithm_id)?.0, der::string_value(hash)?))
+            (algorithm(algorithm_id)?.0, &fields[1..])
         }
-        hash if hash.tag & !0x20 == der::OCTET_STRING => {
-            Some((default_hash.to_string(), der::string_value(hash)?))
-        }
-        _ => None,
+        _ => (default_hash.to_string(), &fields[..]),
+    };
+    let hash = rest
+        .first()
+        .filter(|e| e.tag & !0x20 == der::OCTET_STRING)?;
+    let issuer_serial = match rest.get(1) {
+        Some(issuer_serial) => Some(issuer_and_serial(issuer_serial)?),
+        None => None,
+    };
+    Some(SigningCertificate {
+        hash_algorithm,
+        hash: der::string_value(hash)?,
+        issuer_serial,
+    })
+}
+
+/// An IssuerSerial: the directoryNames among its GeneralNames, and its serial number.
+fn issuer_and_serial(element: &Element<'_>) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
+    if element.tag != der::SEQUENCE {
+        return None;
     }
+    let parts = der::children_ber(element.content);
+    let names = parts.first().filter(|e| e.tag == der::SEQUENCE)?;
+    let serial = parts.get(1).filter(|e| e.tag == der::INTEGER)?;
+    let mut directory_names = Vec::new();
+    for name in der::children_ber(names.content) {
+        // directoryName is [4], explicitly tagged: it holds the Name itself.
+        if name.tag == 0xA4 {
+            directory_names.push(der::normalize(der::children_ber(name.content).first()?)?);
+        }
+    }
+    Some((directory_names, der::normalize(serial)?))
 }
 
 /// An attribute's type and values.

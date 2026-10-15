@@ -1932,3 +1932,196 @@ fn files_made_from_a_document_never_replace_an_open_one() {
     app.extract_page_to(1, &c);
     assert_eq!(Pdf::open(&c).unwrap().page_count(), 1);
 }
+
+#[test]
+fn finding_no_hidden_information_keeps_the_undone_steps_to_redo() {
+    let dir = scratch();
+    let path = plain(&dir, "a.pdf", &["A"]);
+    let mut app = app(&dir);
+    app.open_path(&path);
+    assert!(app.edit("Rotate", |pdf| pdf.rotate_pages(&[0], 90)));
+    app.run(Cmd::Undo);
+    assert_eq!(app.doc.as_ref().unwrap().redo.len(), 1);
+
+    // Nothing to find: the document, its dirty state and the step to redo stay as they were.
+    let before = app.doc.as_ref().unwrap().bytes.clone();
+    let dirty = app.doc.as_ref().unwrap().dirty;
+    app.remove_hidden_information(
+        active_id(&app),
+        vec![carbide_engine::HiddenItem::Thumbnails],
+    );
+    assert_eq!(app.status, "No hidden information was found.");
+    let open = app.doc.as_ref().unwrap();
+    assert_eq!(open.redo.len(), 1, "the step to redo was lost");
+    assert!(open.bytes == before && open.dirty == dirty);
+
+    app.run(Cmd::Redo);
+    assert_eq!(app.doc.as_ref().unwrap().geometries[0].rotation, 90);
+}
+
+#[test]
+fn a_signature_is_not_written_over_a_file_another_program_changed() {
+    let dir = scratch();
+    let mut app = app(&dir);
+    let path = plain(&dir, "a.pdf", &["ORIGINAL"]);
+    app.open_path(&path);
+    let doc = app.doc.as_ref().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.sign_job = Some(SignJob {
+        doc: doc.id,
+        version: doc.version,
+        path: path.clone(),
+        done: "Signed".into(),
+        receiver,
+        result: None,
+    });
+
+    // The file is replaced while the authority answers: it stays as the other program left it.
+    let other = document(&["OTHER PROGRAM"]).to_bytes().unwrap();
+    std::fs::write(&path, &other).unwrap();
+    sender
+        .send(Ok(document(&["STAMPED"]).to_bytes().unwrap()))
+        .unwrap();
+    app.poll_sign();
+    assert!(app.sign_job.is_none());
+    assert!(
+        std::fs::read(&path).unwrap() == other,
+        "a file another program changed was replaced"
+    );
+    assert!(
+        matches!(&app.dialog, Some(Dialog::Message(m)) if m.contains("changed by another program"))
+    );
+}
+
+#[test]
+fn a_protected_file_asked_for_twice_opens_in_one_tab() {
+    let dir = scratch();
+    let locked = protected(&dir, "locked.pdf", &["LOCKED"], "user pw");
+    let mut app = app(&dir);
+
+    // Opening it again while its question is up does not queue a second question.
+    app.open_path(&locked);
+    app.open_path(&locked);
+    assert!(
+        app.queued_dialogs.is_empty(),
+        "the question was asked twice"
+    );
+
+    // And questions that did queue up for the same file open it once.
+    let bytes = std::fs::read(&locked).unwrap();
+    let Some(Dialog::Password { path, .. }) = app.dialog.take() else {
+        panic!("no password question")
+    };
+    assert!(app.open_with_password(path.clone(), bytes.clone(), "user pw".into()));
+    assert!(app.open_with_password(path, bytes, "user pw".into()));
+    assert_eq!(app.tabs.len(), 1, "the file was opened twice");
+}
+
+#[test]
+fn a_failed_recovery_copy_is_tried_again_soon() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["A"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+
+    // The recovery folder cannot be written to.
+    let away = dir.join("Away");
+    std::fs::rename(dir.join("AutoSave"), &away).unwrap();
+    overdue(&mut app);
+    app.autosave_tick();
+    assert!(
+        app.status.starts_with("Auto Recovery failed"),
+        "{}",
+        app.status
+    );
+
+    // It is not retried at once...
+    std::fs::rename(&away, dir.join("AutoSave")).unwrap();
+    app.autosave_tick();
+    assert_eq!(recovery_copies(&dir), 0);
+    // ...but soon, not after the whole interval.
+    let open = app.doc.as_mut().unwrap();
+    open.autosaved_at -= crate::AUTOSAVE_RETRY;
+    app.autosave_tick();
+    assert_eq!(
+        recovery_copies(&dir),
+        1,
+        "the retry waited a whole interval"
+    );
+}
+
+#[test]
+fn batch_reduce_leaves_unsaved_tabs_alone_and_refreshes_the_clean_ones() {
+    use carbide_engine::reduce::{OutputOptions, ReduceOptions};
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["A", "A2", "A3"]);
+    let b = plain(&dir, "b.pdf", &["B", "B2", "B3"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    app.open_path(&b);
+    // a.pdf has unsaved changes, b.pdf has none.
+    app.activate(Some(0));
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    let a_before = std::fs::read(&a).unwrap();
+    let b_before = std::fs::read(&b).unwrap();
+
+    let outcomes = app.reduce_files(
+        &[a.clone(), b.clone()],
+        &OutputOptions::in_place(),
+        &ReduceOptions::default(),
+    );
+    assert!(
+        outcomes[0]
+            .warning
+            .as_deref()
+            .is_some_and(|w| w.contains("not saved")),
+        "{:?}",
+        outcomes[0]
+    );
+    assert_eq!(
+        std::fs::read(&a).unwrap(),
+        a_before,
+        "an unsaved tab's file was replaced"
+    );
+    assert!(outcomes[1].warning.is_none(), "{:?}", outcomes[1]);
+    let b_after = std::fs::read(&b).unwrap();
+    assert!(b_after != b_before && b_after.len() < b_before.len());
+
+    // The tab on b.pdf shows the file as it is now, so a save cannot put the old bytes back.
+    let tab = app.tab_on(&b).unwrap();
+    let open = app.doc_at(tab).unwrap();
+    assert!(!open.dirty);
+    assert!(open.saved.as_ref().unwrap().bytes() == b_after);
+    // And the unsaved one is untouched.
+    assert!(app.doc_at(0).unwrap().dirty);
+}
+
+#[test]
+fn batch_reduce_refreshes_the_signature_notice_of_a_tab_in_the_background() {
+    use carbide_engine::reduce::{OutputOptions, ReduceOptions};
+    let dir = scratch();
+    let b = plain(&dir, "b.pdf", &["B", "B2", "B3"]);
+    let other = plain(&dir, "other.pdf", &["OTHER"]);
+    let mut app = app(&dir);
+    app.open_path(&b);
+    app.open_path(&other);
+    // b.pdf is in the background, with a notice about the file as it was.
+    let tab = app.tab_on(&b).unwrap();
+    assert_ne!(app.active_tab, Some(tab));
+    app.doc_at_mut(tab).unwrap().view_notice = Some("The signature is valid.".into());
+
+    let outcomes = app.reduce_files(
+        std::slice::from_ref(&b),
+        &OutputOptions::in_place(),
+        &ReduceOptions::default(),
+    );
+    assert!(outcomes[0].warning.is_none(), "{:?}", outcomes[0]);
+    assert_eq!(
+        app.doc_at(tab).unwrap().view_notice,
+        None,
+        "the old file's notice was kept for the rewritten file"
+    );
+    app.activate(Some(tab));
+    assert_eq!(app.notice, None);
+}

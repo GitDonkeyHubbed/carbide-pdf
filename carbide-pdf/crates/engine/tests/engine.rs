@@ -7433,13 +7433,13 @@ fn a_signer_named_by_subject_key_identifier_verifies() {
     assert_eq!(report.signer.as_deref(), Some("Key Identifier Signer"));
     assert!(!report.modified_after_signing);
 
-    // A key identifier that names no embedded certificate does not verify against the decoy.
+    // A key identifier that names no embedded certificate names no signer: the decoy is not tried.
     let mut other = key_id.clone();
     other[0] ^= 0xFF;
     let report = check(&other);
     assert_eq!(
         (report.validity, report.detail),
-        (Validity::Invalid, Detail::DigestMismatch)
+        (Validity::Invalid, Detail::Corrupt)
     );
 }
 
@@ -8981,7 +8981,8 @@ fn openssl(args: &[std::ffi::OsString]) -> Option<bool> {
         .arg("version")
         .output()
         .ok()?;
-    if !String::from_utf8_lossy(&version.stdout).starts_with("OpenSSL 3") {
+    let version = String::from_utf8_lossy(&version.stdout);
+    if !(version.starts_with("OpenSSL 3") || version.starts_with("OpenSSL 4")) {
         return None;
     }
     let output = std::process::Command::new("openssl")
@@ -9102,6 +9103,8 @@ fn signatures_agree_with_openssl_both_ways() {
             arg("-sign"),
             arg("-binary"),
             arg("-nosmimecap"),
+            // The document says ETSI.CAdES.detached, which needs the signing-certificate attribute.
+            arg("-cades"),
             arg("-outform"),
             arg("DER"),
             arg("-in"),

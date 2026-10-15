@@ -276,12 +276,16 @@ pub struct HttpTimestampSource {
 }
 
 /// A time-stamp request, and the content of the random nonce INTEGER it carries (checked against
-/// the response).
-fn timestamp_request(digest: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
+/// the response). Fails when the system cannot supply random bytes.
+fn timestamp_request(digest: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>)> {
     let sha256 = der::sequence(&[&der::oid(OID_SHA256), &der::null()]);
     let imprint = der::sequence(&[&sha256, &der::octet_string(digest)]);
     let mut nonce = [0u8; 16];
-    getrandom::fill(&mut nonce).expect("system randomness");
+    getrandom::fill(&mut nonce).map_err(|e| {
+        Error::Other(format!(
+            "could not make a time stamp request: no system randomness ({e})"
+        ))
+    })?;
     nonce[0] &= 0x7F; // a positive INTEGER
     let nonce = der::integer_unsigned(&nonce);
     let request = der::sequence(&[
@@ -293,7 +297,7 @@ fn timestamp_request(digest: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
     let content = der::read(&nonce)
         .map(|(e, _)| e.content.to_vec())
         .unwrap_or_default();
-    (request, content)
+    Ok((request, content))
 }
 
 /// Extracts the token from a `TimeStampResp`; status 0 and 1 are "granted".
@@ -374,15 +378,9 @@ fn timestamp_signature(cms: &cms::SignedData, econtent: &[u8]) -> Verified {
         Some(_) => return Verified::Bad,
         None => return Verified::Unsupported,
     }
-    if let Some((hash_oid, hash)) = &signer_info.signing_certificate {
-        let Ok(der) = signer.to_der() else {
-            return Verified::Bad;
-        };
-        match sigcrypto::digest(hash_oid, &[&der]) {
-            Some(expected) if &expected == hash => {}
-            Some(_) => return Verified::Bad,
-            None => return Verified::Unsupported,
-        }
+    match names_certificate(signer_info, signer) {
+        Verified::Ok => {}
+        other => return other,
     }
     let mut outcome = Verified::Bad;
     for set in signer_info.signed_attribute_encodings() {
@@ -401,6 +399,34 @@ fn timestamp_signature(cms: &cms::SignedData, econtent: &[u8]) -> Verified {
     outcome
 }
 
+/// Whether the ESS signing-certificate attribute, when there is one, names `certificate`: by its
+/// hash, and by its issuer and serial number when it gives them.
+fn names_certificate(signer_info: &cms::SignerInfo, certificate: &Certificate) -> Verified {
+    let Some(named) = &signer_info.signing_certificate else {
+        return Verified::Ok;
+    };
+    let Ok(der) = certificate.to_der() else {
+        return Verified::Bad;
+    };
+    match sigcrypto::digest(&named.hash_algorithm, &[&der]) {
+        Some(expected) if expected == named.hash => {}
+        Some(_) => return Verified::Bad,
+        None => return Verified::Unsupported,
+    }
+    if let Some((issuers, serial)) = &named.issuer_serial {
+        let issuer = certificate.tbs_certificate.issuer.to_der().ok();
+        let own_serial = certificate.tbs_certificate.serial_number.to_der().ok();
+        if own_serial.as_ref() != Some(serial)
+            || !issuer
+                .as_ref()
+                .is_some_and(|issuer| issuers.iter().any(|n| der::names_match(n, issuer)))
+        {
+            return Verified::Bad;
+        }
+    }
+    Verified::Ok
+}
+
 impl TimestampSource for HttpTimestampSource {
     fn token_for_digest(&self, digest: &[u8; 32]) -> Result<Vec<u8>> {
         use base64::Engine;
@@ -417,7 +443,7 @@ impl TimestampSource for HttpTimestampSource {
                 "refusing to send time stamp credentials over an insecure connection: use an https:// URL".into(),
             ));
         }
-        let (body, nonce) = timestamp_request(digest);
+        let (body, nonce) = timestamp_request(digest)?;
         // An authority that accepts the connection and never answers must not hang the caller.
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(30)))
@@ -805,7 +831,7 @@ impl Pdf {
     pub fn has_signatures(&self) -> bool {
         self.doc.objects.values().any(|o| match o {
             Object::Dictionary(d) => {
-                is_signature_dictionary(d) || signature_field_value(d).is_some()
+                is_signature_dictionary(d) || signature_field_value(self, d).is_some()
             }
             _ => false,
         })
@@ -1072,10 +1098,28 @@ fn is_signature_dictionary(d: &Dictionary) -> bool {
     d.has(b"ByteRange") && d.has(b"Contents") && d.has(b"SubFilter")
 }
 
+/// How many `/Parent` levels a field's inherited type is looked for in.
+const MAX_FIELD_DEPTH: usize = 32;
+
 /// The object a signature field's `/V` names, for a field (or merged field and widget) of type
-/// `/Sig`.
-fn signature_field_value(d: &Dictionary) -> Option<ObjectId> {
-    let is_signature = d.get(b"FT").ok().and_then(|o| o.as_name().ok()) == Some(b"Sig".as_slice());
+/// `/Sig`. The type is inheritable: a field without its own `/FT` takes its nearest ancestor's.
+fn signature_field_value(pdf: &Pdf, d: &Dictionary) -> Option<ObjectId> {
+    let mut field = d;
+    let mut field_type = None;
+    for _ in 0..MAX_FIELD_DEPTH {
+        if let Ok(kind) = field.get(b"FT") {
+            field_type = kind.as_name().ok();
+            break;
+        }
+        match field.get(b"Parent") {
+            Ok(Object::Reference(parent)) => match pdf.doc.objects.get(parent) {
+                Some(Object::Dictionary(parent)) => field = parent,
+                _ => break,
+            },
+            _ => break,
+        }
+    }
+    let is_signature = field_type == Some(b"Sig".as_slice());
     match d.get(b"V") {
         Ok(Object::Reference(value)) if is_signature => Some(*value),
         _ => None,
@@ -1321,32 +1365,42 @@ const MAX_CHAIN: usize = 8;
 /// Builds and trusts a chain from `signer` up to a certificate in `store`, trying every candidate
 /// issuer (a cross-signed intermediate has several). Each issuer must be a CA (basicConstraints
 /// cA=true, keyUsage keyCertSign when present), satisfy its pathLenConstraint, and be valid at
-/// `at`. A non-CA leaf can never act as an issuer, so one leaf cannot vouch for another. When no
-/// chain qualifies, the error says whether one reaches the store by names and signatures alone
+/// `at`. A non-CA leaf can never act as an issuer, so one leaf cannot vouch for another. No
+/// certificate on the path, the signer's included, may carry a critical extension this verifier
+/// does not process, and no CA on it may set name constraints, which are not enforced. A signer
+/// that is itself in the store is held to the same rule on critical extensions. When no chain
+/// qualifies, the error says whether one reaches the store by names and signatures alone
 /// (`ChainRejected`) or none does (`DigestOkUntrusted`).
 fn trust_level(
     signer: &Certificate,
     embedded: &[Certificate],
     store: &TrustStore,
     at: DateTime<Utc>,
+    purpose: Purpose,
 ) -> std::result::Result<Detail, Detail> {
     let in_store = |cert: &Certificate| {
         cert.to_der()
             .ok()
             .is_some_and(|der| store.certificates.contains(&der))
     };
-    // A certificate the user trusts outright needs nothing further: this is the "trust one
-    // person's certificate" flow, where that certificate may be an ordinary end-entity one.
+    // A certificate the user trusts outright needs no chain: this is the "trust one person's
+    // certificate" flow, where that certificate may be an ordinary end-entity one. It still may
+    // not carry a critical extension this verifier cannot honour.
+    let understood = critical_extensions_understood(signer);
     if in_store(signer) {
-        return Ok(Detail::TrustedDirectly);
+        return if understood {
+            Ok(Detail::TrustedDirectly)
+        } else {
+            Err(Detail::ChainRejected)
+        };
     }
     let trusted: Vec<Certificate> = store
         .certificates
         .iter()
         .filter_map(|d| Certificate::from_der(d).ok())
         .collect();
-    let mut search = ChainSearch::new(signer, trusted.iter().chain(embedded), &in_store);
-    if search.reaches_store(Some(at)) {
+    let mut search = ChainSearch::new(signer, trusted.iter().chain(embedded), &in_store, purpose);
+    if understood && search.reaches_store(Some(at)) {
         Ok(Detail::TrustedViaChain)
     } else if search.reaches_store(None) {
         Err(Detail::ChainRejected)
@@ -1360,6 +1414,8 @@ struct ChainSearch<'a> {
     /// The signer first, then every other distinct certificate on offer.
     certificates: Vec<&'a Certificate>,
     stored: Vec<bool>,
+    /// What the signer's certificate is used for, which every CA's purposes must allow.
+    purpose: Purpose,
     /// `issued_by` by (child, issuer) index, so each certificate signature is checked once.
     issued: HashMap<(usize, usize), bool>,
     /// (certificate, intermediates below its issuer) already searched without reaching the store.
@@ -1371,6 +1427,7 @@ impl<'a> ChainSearch<'a> {
         signer: &'a Certificate,
         others: impl Iterator<Item = &'a Certificate>,
         in_store: &dyn Fn(&Certificate) -> bool,
+        purpose: Purpose,
     ) -> Self {
         let mut certificates = vec![signer];
         let mut seen = vec![signer.to_der().unwrap_or_default()];
@@ -1385,6 +1442,7 @@ impl<'a> ChainSearch<'a> {
         ChainSearch {
             certificates,
             stored,
+            purpose,
             issued: HashMap::new(),
             dead_ends: HashSet::new(),
         }
@@ -1410,7 +1468,9 @@ impl<'a> ChainSearch<'a> {
         }
         for issuer in 0..self.certificates.len() {
             if path.contains(&issuer)
-                || rules.is_some_and(|at| !can_issue(self.certificates[issuer], intermediates, at))
+                || rules.is_some_and(|at| {
+                    !can_issue(self.certificates[issuer], intermediates, at, self.purpose)
+                })
             {
                 continue;
             }
@@ -1437,17 +1497,84 @@ impl<'a> ChainSearch<'a> {
     }
 }
 
-/// Whether `cert` may issue a certificate that has `intermediates` CA certificates below it, and is
-/// valid at `at`: it must be a CA (pathLen permitting), allow key-certificate signing, and be in
-/// its validity period.
-fn can_issue(cert: &Certificate, intermediates: usize, at: DateTime<Utc>) -> bool {
+/// What a certificate at the foot of a path is used for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// Signing documents.
+    Signing,
+    /// Issuing RFC 3161 time stamps.
+    TimeStamping,
+}
+
+/// Whether `cert` may issue a certificate that has `intermediates` CA certificates below it, for
+/// `purpose`, and is valid at `at`: it must be a CA (pathLen permitting), allow key-certificate
+/// signing, name no extended key usage that excludes `purpose`, and be in its validity period.
+fn can_issue(
+    cert: &Certificate,
+    intermediates: usize,
+    at: DateTime<Utc>,
+    purpose: Purpose,
+) -> bool {
+    // Name constraints limit the names a CA may vouch for. They are not enforced here, so a CA
+    // that sets them, whether marked critical or not, cannot confirm anyone.
+    if !critical_extensions_understood(cert) || has_extension(cert, "2.5.29.30") {
+        return false;
+    }
     let Some(path_len) = basic_constraints_ca(cert) else {
         return false;
     };
     if path_len.is_some_and(|limit| (limit as usize) < intermediates) {
         return false;
     }
-    key_usage_allows(cert, |usage| usage.key_cert_sign()) && valid_at(cert, at)
+    // A CA restricted to some purposes (TLS servers, say) does not vouch for certificates used
+    // for others. The document-signing purposes are those a signer's own certificate may carry.
+    let purposes = match purpose {
+        Purpose::Signing => &SIGNING_PURPOSES[..],
+        Purpose::TimeStamping => &TIME_STAMPING_PURPOSES[..],
+    };
+    key_usage_allows(cert, |usage| usage.key_cert_sign())
+        && purposes_allow(cert, purposes)
+        && valid_at(cert, at)
+}
+
+/// True when every extension `cert` marks critical is one this verifier processes, and its value
+/// decodes. RFC 5280 (4.2) says a certificate with a critical extension the verifier does not
+/// recognise must be rejected: the extension may restrict what the certificate is good for. One it
+/// recognises but cannot read is no better.
+fn critical_extensions_understood(cert: &Certificate) -> bool {
+    cert.tbs_certificate
+        .extensions
+        .as_ref()
+        .is_none_or(|extensions| {
+            extensions
+                .iter()
+                .all(|extension| !extension.critical || critical_extension_decodes(extension))
+        })
+}
+
+/// True when `extension` is one path validation here takes into account and its value is well
+/// formed: basic constraints, key usage, extended key usage, and the subject and authority key
+/// identifiers and subject alternative names, which only describe the certificate.
+fn critical_extension_decodes(extension: &x509_cert::ext::Extension) -> bool {
+    use x509_cert::ext::pkix;
+    let value = extension.extn_value.as_bytes();
+    match extension.extn_id.to_string().as_str() {
+        "2.5.29.19" => pkix::BasicConstraints::from_der(value).is_ok(),
+        "2.5.29.15" => pkix::KeyUsage::from_der(value).is_ok(),
+        "2.5.29.37" => pkix::ExtendedKeyUsage::from_der(value).is_ok(),
+        "2.5.29.14" => pkix::SubjectKeyIdentifier::from_der(value).is_ok(),
+        "2.5.29.35" => pkix::AuthorityKeyIdentifier::from_der(value).is_ok(),
+        "2.5.29.17" => pkix::SubjectAltName::from_der(value).is_ok(),
+        _ => false,
+    }
+}
+
+/// True when `cert` carries an extension `oid`.
+fn has_extension(cert: &Certificate, oid: &str) -> bool {
+    cert.tbs_certificate
+        .extensions
+        .as_ref()
+        .is_some_and(|extensions| extensions.iter().any(|e| e.extn_id.to_string() == oid))
 }
 
 /// `Some(pathLenConstraint)` when `cert` has basicConstraints with cA=true, else `None`.
@@ -1545,27 +1672,48 @@ fn signature_value_span(pdf: &Pdf, id: ObjectId, file: &[u8]) -> Option<(usize, 
         lexer.skip_space();
         let start = lexer.at;
         lexer.value()?;
-        if key == b"/Contents" {
+        if decoded_name(key).as_deref() == Some(b"/Contents".as_slice()) {
             let hex = file.get(start) == Some(&b'<') && file.get(start + 1) != Some(&b'<');
             span = hex.then_some((start, lexer.at));
         }
     }
 }
 
-/// The length of the `/Contents` string as the document was parsed.
-fn parsed_contents_length(v: &Dictionary) -> Option<usize> {
-    v.get(b"Contents").ok()?.as_str().ok().map(<[u8]>::len)
+/// A name token as written, with each `#xx` escape replaced by the byte it stands for, so
+/// `/#43ontents` reads as `/Contents`, as it does to the parser. `None` for a malformed escape.
+fn decoded_name(token: &[u8]) -> Option<Vec<u8>> {
+    let mut name = Vec::with_capacity(token.len());
+    let mut bytes = token.iter();
+    while let Some(&byte) = bytes.next() {
+        if byte == b'#' {
+            let mut digit = || (*bytes.next()? as char).to_digit(16);
+            name.push((digit()? << 4 | digit()?) as u8);
+        } else {
+            name.push(byte);
+        }
+    }
+    Some(name)
 }
 
-/// Hex digits only, an even number of them.
+/// The `/Contents` string as the document was parsed.
+fn parsed_contents(v: &Dictionary) -> Option<&[u8]> {
+    v.get(b"Contents").ok()?.as_str().ok()
+}
+
+/// The bytes of a hex string's digits, read as PDF does: white space between digits is ignored,
+/// and a last digit on its own is followed by an implied 0.
 fn hex_value(text: &[u8]) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
-    let digit = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
-    text.chunks(2)
-        .map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?))
-        .collect()
+    let digits = text
+        .iter()
+        .filter(|b| !b"\0\t\n\x0c\r ".contains(b))
+        .map(|b| (*b as char).to_digit(16).map(|d| d as u8))
+        .collect::<Option<Vec<u8>>>()?;
+    Some(
+        digits
+            .chunks(2)
+            .map(|pair| pair[0] << 4 | pair.get(1).copied().unwrap_or(0))
+            .collect(),
+    )
 }
 
 /// True when the revision ending at `end` names cross-reference data of its own in the signed
@@ -1764,7 +1912,7 @@ impl Pdf {
             let Object::Dictionary(field) = field else {
                 continue;
             };
-            let Some(value) = signature_field_value(field) else {
+            let Some(value) = signature_field_value(&pdf, field) else {
                 continue;
             };
             match pdf.doc.objects.get(&value) {
@@ -1909,10 +2057,14 @@ fn verify_one(
             return report;
         }
     };
-    let bound = signature_value_span(revision, id, file) == Some((b, c))
-        && (revision.doc.encryption_state.is_some()
-            || parsed_contents_length(signed).is_some_and(|len| 2 * len + 2 == c - b));
-    let Some(contents) = bound.then(|| hex_value(&file[b + 1..c - 1])).flatten() else {
+    let contents = (signature_value_span(revision, id, file) == Some((b, c)))
+        .then(|| hex_value(&file[b + 1..c - 1]))
+        .flatten()
+        .filter(|value| {
+            revision.doc.encryption_state.is_some()
+                || parsed_contents(signed) == Some(value.as_slice())
+        });
+    let Some(contents) = contents else {
         invalid(&mut report, Detail::BadByteRange);
         return report;
     };
@@ -1946,8 +2098,8 @@ fn verify_one(
         report.detail = detail;
     };
 
-    // Signer certificate: match issuer and serial, or subject key identifier, else the first
-    // embedded certificate.
+    // Signer certificate: the embedded one the SignerInfo names by issuer and serial, or by subject
+    // key identifier. Without it the signature names no signer here.
     let certificates: Vec<Certificate> = cms
         .certificates
         .iter()
@@ -1960,6 +2112,25 @@ fn verify_one(
     report.signer = Some(subject_name(signer));
     if report.claimed_name.as_deref() == Some(report.signer.as_deref().unwrap_or_default()) {
         report.claimed_name = None;
+    }
+    // The signed signing-certificate attribute ties the signature to one certificate, so another
+    // with the same key cannot be put in its place. CAdES requires it; when present it must name
+    // the signer certificate.
+    let cades = report.sub_filter.as_deref() == Some(SubFilter::CadesDetached.name());
+    if cades && signer_info.signing_certificate.is_none() {
+        invalid(&mut report, Detail::Corrupt);
+        return report;
+    }
+    match names_certificate(signer_info, signer) {
+        Verified::Ok => {}
+        Verified::Bad => {
+            invalid(&mut report, Detail::Corrupt);
+            return report;
+        }
+        Verified::Unsupported => {
+            unknown(&mut report, Detail::UnsupportedAlgorithm);
+            return report;
+        }
     }
 
     let digest_oid = &signer_info.digest_algorithm;
@@ -1975,6 +2146,12 @@ fn verify_one(
     let covered: [&[u8]; 2] = [&file[..b], &file[c..c + d]];
     let inputs: Vec<Vec<u8>> = match &signer_info.signed_attributes {
         Some(_) => {
+            // Signed attributes must say what kind of content they sign (RFC 5652, 11.1), and it
+            // must be the encapsulated type: id-data for a detached PDF signature.
+            if signer_info.content_type.as_deref() != Some(cms.content_type.as_str()) {
+                invalid(&mut report, Detail::Corrupt);
+                return report;
+            }
             let Some(content_digest) = sigcrypto::digest(digest_oid, &covered) else {
                 unknown(&mut report, Detail::UnsupportedAlgorithm);
                 return report;
@@ -2060,7 +2237,13 @@ fn verify_one(
         unknown(&mut report, Detail::NotPermitted);
         return report;
     }
-    match trust_level(signer, &certificates, trust, reference_time) {
+    match trust_level(
+        signer,
+        &certificates,
+        trust,
+        reference_time,
+        Purpose::Signing,
+    ) {
         Ok(level) => {
             report.validity = Validity::Valid;
             report.detail = level;
@@ -2196,8 +2379,8 @@ fn check_timestamp_token(
     {
         Detail::NotPermitted
     } else {
-        trust_level(signer, &certificates, trust, time)
-            .and_then(|_| trust_level(signer, &certificates, trust, now))
+        trust_level(signer, &certificates, trust, time, Purpose::TimeStamping)
+            .and_then(|_| trust_level(signer, &certificates, trust, now, Purpose::TimeStamping))
             .unwrap_or_else(|detail| detail)
     };
     TokenResult::Verified {
@@ -2207,18 +2390,21 @@ fn check_timestamp_token(
     }
 }
 
-/// Finds the certificate a SignerInfo names, by issuer and serial or by subject key identifier.
+/// Finds the certificate a SignerInfo names, by issuer and serial or by subject key identifier. The
+/// issuer matches as a distinguished name, not byte for byte; the serial number has to be exact.
+/// When none of the embedded certificates is the one named, there is no signer certificate: some
+/// other certificate that happens to verify the signature is not the one the signer chose.
 fn find_signer<'a>(certificates: &'a [Certificate], id: &cms::SignerId) -> Option<&'a Certificate> {
-    certificates
-        .iter()
-        .find(|c| match id {
-            cms::SignerId::IssuerAndSerial { issuer, serial } => {
-                c.tbs_certificate.issuer.to_der().ok().as_ref() == Some(issuer)
-                    && c.tbs_certificate.serial_number.to_der().ok().as_ref() == Some(serial)
-            }
-            cms::SignerId::KeyIdentifier(key_id) => subject_key_id(c).as_deref() == Some(key_id),
-        })
-        .or_else(|| certificates.first())
+    certificates.iter().find(|c| match id {
+        cms::SignerId::IssuerAndSerial { issuer, serial } => {
+            c.tbs_certificate
+                .issuer
+                .to_der()
+                .is_ok_and(|own| der::names_match(&own, issuer))
+                && c.tbs_certificate.serial_number.to_der().ok().as_ref() == Some(serial)
+        }
+        cms::SignerId::KeyIdentifier(key_id) => subject_key_id(c).as_deref() == Some(key_id),
+    })
 }
 
 /// True when `certificate` is for time stamping as RFC 3161 asks: a critical extended key usage
@@ -2251,10 +2437,19 @@ const SIGNING_PURPOSES: [&str; 5] = [
     "1.3.6.1.4.1.311.10.3.12",
 ];
 
+/// The extended key usages that allow a CA to vouch for a time stamp authority: any purpose, or
+/// time stamping.
+const TIME_STAMPING_PURPOSES: [&str; 2] = ["2.5.29.37.0", "1.3.6.1.5.5.7.3.8"];
+
 /// True when `certificate` names no extended key usage, or names one that allows signing
 /// documents. A certificate restricted to other purposes (time stamping, or a TLS server, say) is
 /// not a signer's, whoever trusts it.
 fn purposes_allow_signing(certificate: &Certificate) -> bool {
+    purposes_allow(certificate, &SIGNING_PURPOSES)
+}
+
+/// True when `certificate` names no extended key usage, or names one of `allowed`.
+fn purposes_allow(certificate: &Certificate, allowed: &[&str]) -> bool {
     let Some(extensions) = certificate.tbs_certificate.extensions.as_ref() else {
         return true;
     };
@@ -2272,21 +2467,38 @@ fn purposes_allow_signing(certificate: &Certificate) -> bool {
     usage
         .0
         .iter()
-        .any(|purpose| SIGNING_PURPOSES.contains(&purpose.to_string().as_str()))
+        .any(|purpose| allowed.contains(&purpose.to_string().as_str()))
 }
 
-/// A GeneralizedTime (`YYYYMMDDHHMMSS[.fff]Z`) as a UTC instant.
+/// A genTime as RFC 3161 writes it, `YYYYMMDDHHMMSS[.f...]Z`, as a UTC instant: seconds always
+/// given, any fraction without trailing zeros, and the time in UTC. Anything else (a local time,
+/// an offset, more digits, text after the `Z`) is not a time stamp's time.
 fn gentime_to_utc(text: &str) -> Option<DateTime<Utc>> {
-    let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.len() < 14 {
+    let rest = text.strip_suffix('Z')?;
+    let (digits, fraction) = match rest.split_once('.') {
+        Some((digits, fraction)) => (digits, Some(fraction)),
+        None => (rest, None),
+    };
+    if digits.len() != 14 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if fraction
+        .is_some_and(|f| f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) || f.ends_with('0'))
+    {
         return None;
     }
     let field = |from: usize, len: usize| digits[from..from + len].parse::<u32>().ok();
     let year = field(0, 4)? as i32;
     let (month, day) = (field(4, 2)?, field(6, 2)?);
     let (hour, minute, second) = (field(8, 2)?, field(10, 2)?, field(12, 2)?);
+    // Nanoseconds are as fine as the time can be; digits past them are dropped.
+    let nanos = fraction.map_or(0, |f| {
+        let f = &f[..f.len().min(9)];
+        f.parse::<u32>().unwrap_or(0) * 10u32.pow(9 - f.len() as u32)
+    });
     Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
-        .single()
+        .single()?
+        .checked_add_signed(chrono::Duration::nanoseconds(nanos.into()))
 }
 
 impl Pdf {
@@ -2302,5 +2514,19 @@ impl Pdf {
                     .and_then(|d| d.get(b"DocMDP").ok().cloned())
             })
             .is_some_and(|o| matches!(o, Object::Reference(r) if r == id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_time_stamp_time_keeps_its_fraction_of_a_second() {
+        let whole = gentime_to_utc("20260101000000Z").unwrap();
+        let quarter = gentime_to_utc("20260101000000.25Z").unwrap();
+        assert_eq!(quarter - whole, chrono::Duration::milliseconds(250));
+        let fine = gentime_to_utc("20260101000000.0000000019Z").unwrap();
+        assert_eq!(fine - whole, chrono::Duration::nanoseconds(1));
     }
 }

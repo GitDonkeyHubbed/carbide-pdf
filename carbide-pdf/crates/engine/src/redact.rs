@@ -76,7 +76,7 @@ impl Pdf {
         for &page in &pages {
             self.check_drawable(page)?;
         }
-        let snapshot = self.to_bytes()?;
+        let snapshot = self.serialized()?;
         self.check_pages_agree(renderer, &snapshot, &pages)?;
 
         // The rebuilt pages lose their annotations, and with them their form fields: the values

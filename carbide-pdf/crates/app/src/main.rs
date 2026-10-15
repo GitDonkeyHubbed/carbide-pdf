@@ -27,6 +27,9 @@ use eframe::egui;
 
 const MAX_UNDO: usize = 10;
 
+/// How long to wait before writing an Auto Recovery copy again after one could not be written.
+const AUTOSAVE_RETRY: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Select,
@@ -419,13 +422,7 @@ impl CarbideApp {
 
     pub fn open_path(&mut self, path: &Path) {
         // A file that is already open is brought forward instead of opened twice.
-        let wanted = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let open_at = (0..self.tabs.len()).find(|&i| {
-            self.doc_at(i)
-                .and_then(|d| d.path.as_ref())
-                .is_some_and(|p| p.canonicalize().unwrap_or_else(|_| p.clone()) == wanted)
-        });
-        if let Some(index) = open_at {
+        if let Some(index) = self.tab_on(path) {
             return self.activate(Some(index));
         }
         let bytes = match std::fs::read(path) {
@@ -438,6 +435,10 @@ impl CarbideApp {
                 self.install(pdf, Some(path.to_path_buf()), Some(saved));
             }
             Err(EngineError::PasswordRequired) => {
+                // One question per file: asking again would open it in two tabs.
+                if self.password_question_for(path) {
+                    return;
+                }
                 self.open_dialog(Dialog::Password {
                     path: path.to_path_buf(),
                     bytes,
@@ -509,8 +510,29 @@ impl CarbideApp {
         self.status = format!("{} - not saved yet", doc.title());
     }
 
-    /// Opens a protected file. The password is used exactly as typed, spaces included.
+    /// The tab whose document is the file `path`.
+    fn tab_on(&self, path: &Path) -> Option<usize> {
+        let wanted = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        (0..self.tabs.len()).find(|&i| {
+            self.doc_at(i)
+                .and_then(|d| d.path.as_ref())
+                .is_some_and(|p| p.canonicalize().unwrap_or_else(|_| p.clone()) == wanted)
+        })
+    }
+
+    /// True when a password question about the file `path` is on screen or waiting.
+    fn password_question_for(&self, path: &Path) -> bool {
+        let asks = |dialog: &Dialog| matches!(dialog, Dialog::Password { path: p, .. } if same_file(p, path));
+        self.dialog.as_ref().is_some_and(asks) || self.queued_dialogs.iter().any(asks)
+    }
+
+    /// Opens a protected file. The password is used exactly as typed, spaces included. A file that
+    /// has been opened since the question was asked is brought forward instead of opened twice.
     pub fn open_with_password(&mut self, path: PathBuf, bytes: Vec<u8>, password: String) -> bool {
+        if let Some(index) = self.tab_on(&path) {
+            self.activate(Some(index));
+            return true;
+        }
         match SavedFile::open(bytes, Some(password)) {
             Ok((pdf, saved)) => {
                 self.install(pdf, Some(path), Some(saved));
@@ -1129,6 +1151,133 @@ impl CarbideApp {
             .collect()
     }
 
+    /// The document in tab `index`, whether it is the active one or parked.
+    fn doc_at_mut(&mut self, index: usize) -> Option<&mut OpenDoc> {
+        if self.active_tab == Some(index) {
+            self.doc.as_mut()
+        } else {
+            self.tabs.get_mut(index).and_then(|slot| slot.as_mut())
+        }
+    }
+
+    /// Every tab, the active one included, whose document is the file `path`.
+    fn tabs_on(&self, path: &Path) -> Vec<usize> {
+        (0..self.tabs.len())
+            .filter(|&i| {
+                self.doc_at(i)
+                    .and_then(|d| d.path.as_deref())
+                    .is_some_and(|p| same_file(p, path))
+            })
+            .collect()
+    }
+
+    /// Reduces several files. A result is not written over a file that is open in a tab with
+    /// unsaved changes, which that tab would put back with its next save; that file says so in
+    /// its outcome. A tab with nothing unsaved that shows a file that was replaced is read from the
+    /// file again, so it does not go on showing the old one.
+    pub fn reduce_files(
+        &mut self,
+        inputs: &[PathBuf],
+        output: &carbide_engine::reduce::OutputOptions,
+        options: &carbide_engine::reduce::ReduceOptions,
+    ) -> Vec<carbide_engine::reduce::FileOutcome> {
+        use carbide_engine::reduce::{messages, reduce_files, FileOutcome};
+        let planned = output.plan(inputs);
+        // A batch whose results collide stops as a whole; reduce_files says so for every file.
+        let stopped = planned.contains(&Err(messages::OUTPUT_COLLIDES));
+        let blocked: Vec<bool> = planned
+            .iter()
+            .map(|target| match target {
+                Ok(target) if !stopped => self
+                    .tabs_on(target)
+                    .into_iter()
+                    .any(|i| self.doc_at(i).is_some_and(|d| d.dirty)),
+                _ => false,
+            })
+            .collect();
+        let allowed: Vec<PathBuf> = inputs
+            .iter()
+            .zip(&blocked)
+            .filter(|(_, blocked)| !**blocked)
+            .map(|(input, _)| input.clone())
+            .collect();
+        let mut done = reduce_files(&allowed, output, options).into_iter();
+        let outcomes: Vec<FileOutcome> = inputs
+            .iter()
+            .zip(blocked)
+            .filter_map(|(input, blocked)| match blocked {
+                true => Some(FileOutcome {
+                    input: input.clone(),
+                    output: None,
+                    warning: Some(
+                        "The file this would replace is open in a tab with changes that are not saved. \
+                         Save or close that tab first."
+                            .into(),
+                    ),
+                    report: None,
+                }),
+                false => done.next(),
+            })
+            .collect();
+        for path in outcomes.iter().filter_map(|o| o.output.as_deref()) {
+            self.reload_tabs_on(path);
+        }
+        outcomes
+    }
+
+    /// Reads the file `path`, just replaced by another program or operation, again into each tab
+    /// that shows it and has nothing unsaved. A tab that cannot read it is closed.
+    fn reload_tabs_on(&mut self, path: &Path) {
+        let mut failed = Vec::new();
+        for index in self.tabs_on(path) {
+            let Some(doc) = self.doc_at_mut(index).filter(|d| !d.dirty) else {
+                continue;
+            };
+            let password = doc
+                .saved
+                .as_ref()
+                .and_then(|s| s.password())
+                .map(str::to_owned);
+            let opened = std::fs::read(path)
+                .map_err(EngineError::from)
+                .and_then(|bytes| match SavedFile::open(bytes.clone(), None) {
+                    Err(EngineError::PasswordRequired) => SavedFile::open(bytes, password),
+                    other => other,
+                });
+            let reloaded = opened.and_then(|(pdf, saved)| {
+                doc.adopt(pdf, saved)?;
+                doc.forget_history();
+                let last = doc.pdf.page_count().saturating_sub(1);
+                doc.view_page = doc.view_page.min(last);
+                Ok(())
+            });
+            match reloaded {
+                Ok(()) if self.active_tab == Some(index) => {
+                    self.current_page = self.current_page.min(
+                        self.doc
+                            .as_ref()
+                            .map_or(0, |d| d.pdf.page_count().saturating_sub(1)),
+                    );
+                    self.after_writing(path);
+                }
+                Ok(()) => {
+                    // A background tab's signature notice was about the old file.
+                    if let Some(doc) = self.doc_at_mut(index) {
+                        doc.view_notice = signature_notice(doc);
+                    }
+                }
+                Err(e) => failed.push((index, e)),
+            }
+        }
+        for (index, e) in failed.into_iter().rev() {
+            self.close_tab(index);
+            self.alert(format!(
+                "{} was replaced, but could not be read again ({e}), so its tab was closed.",
+                path.display()
+            ));
+        }
+    }
+
     /// Writes `bytes`, a new file made from the active document (a protected or a reduced copy),
     /// to `path`, which the user chose, and returns whether it did; `Some(true)` when `path` was
     /// the document's own file. The document then is that file: it is read back from `bytes`
@@ -1428,7 +1577,14 @@ impl CarbideApp {
                 let mut copy = doc.pdf.clone();
                 match store.autosave(id, &mut copy, now_unix()) {
                     Ok(()) => saved += 1,
-                    Err(e) => failure = Some(e.to_string()),
+                    Err(e) => {
+                        failure = Some(e.to_string());
+                        // Try again soon, not after a whole interval without a copy.
+                        let wait = AUTOSAVE_RETRY.min(interval);
+                        doc.autosaved_at = Instant::now()
+                            .checked_sub(interval - wait)
+                            .unwrap_or_else(Instant::now);
+                    }
                 }
             }
         }
@@ -2008,8 +2164,31 @@ impl CarbideApp {
     /// Writes signed bytes over the active document's file and reloads the document from it.
     fn finish_signing(&mut self, path: &Path, done: String, signed: Result<Vec<u8>, String>) {
         let Some(doc) = self.doc.as_mut() else { return };
+        // The signature was made on the file as it was read. Another program may have changed it
+        // since (a time stamp can take a while), and writing over that would lose its changes.
+        // It is checked again just before the signed file takes the old one's place.
+        let changed = || {
+            format!(
+                "The document was not signed: {} was changed by another program in the meantime. Open it again and sign it then.",
+                path.display()
+            )
+        };
+        let saved = doc.saved.as_ref().map(|saved| saved.bytes().to_vec());
         let result = signed.and_then(|bytes| {
-            carbide_engine::fs::write_replacing(path, &bytes).map_err(|e| e.to_string())?;
+            let Some(saved) =
+                saved.filter(|saved| std::fs::read(path).is_ok_and(|disk| disk == *saved))
+            else {
+                return Err(changed());
+            };
+            carbide_engine::fs::write_replacing_if_unchanged(path, &saved, &bytes).map_err(
+                |e| {
+                    if std::fs::read(path).is_ok_and(|disk| disk != saved) {
+                        changed()
+                    } else {
+                        e.to_string()
+                    }
+                },
+            )?;
             doc.forget_history();
             Ok(doc
                 .adopt_saved(bytes)
@@ -2486,36 +2665,36 @@ impl CarbideApp {
         }
         // What only the file on disk holds is reported too; the save that has to follow leaves it out.
         let file = self.doc.as_ref().and_then(|d| d.saved.clone());
-        let was_dirty = self.doc.as_ref().is_some_and(|d| d.dirty);
+        // Looked for on a copy first: when nothing is found this is no edit, and the document, its
+        // undo and redo steps and its unsaved state stay exactly as they were (a save then has
+        // nothing to rewrite, which could cost a signature).
+        let found = self.doc.as_ref().map(|d| {
+            d.pdf
+                .clone()
+                .remove_hidden_information_from(&items, file.as_ref())
+        });
+        match found {
+            None => return,
+            Some(Err(e)) => return self.alert(format!("Remove hidden information failed: {e}")),
+            Some(Ok(report)) if report.is_empty() => {
+                self.status = "No hidden information was found.".into();
+                return;
+            }
+            Some(Ok(_)) => {}
+        }
         let mut report = None;
-        // Removing content always counts as an edit, so an empty report is undone below.
         self.edit_removing("Remove hidden information", |pdf| {
             report = Some(pdf.remove_hidden_information_from(&items, file.as_ref())?);
             Ok(())
         });
-        match report {
-            Some(report) if report.is_empty() => {
-                // Nothing was found, so this was no edit: the document is put back exactly as it was,
-                // and a save has nothing to rewrite (which could cost a signature).
-                if let Some(doc) = self.doc.as_mut() {
-                    if let Some(snapshot) = doc.undo.pop() {
-                        let _ = doc.restore(&snapshot.bytes);
-                        doc.content_removed = snapshot.content_removed;
-                    }
-                    doc.dirty = was_dirty;
-                }
-                self.status = "No hidden information was found.".into();
-            }
-            Some(report) => {
-                let lines = report
-                    .lines()
-                    .iter()
-                    .map(|l| format!("  {l}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.alert(format!("Removed from the document:\n{lines}\n\nSave the document to write it without them."));
-            }
-            None => {}
+        if let Some(report) = report {
+            let lines = report
+                .lines()
+                .iter()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.alert(format!("Removed from the document:\n{lines}\n\nSave the document to write it without them."));
         }
     }
 

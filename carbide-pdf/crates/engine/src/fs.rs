@@ -100,13 +100,105 @@ fn link_new(temp: &Path, path: &Path) -> io::Result<()> {
     match fs::hard_link(temp, path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(taken()),
-        // A file system without hard links: look first, then rename, which leaves a short window.
-        Err(_) => {
-            if fs::symlink_metadata(path).is_ok() {
-                return Err(taken());
+        // A file system without hard links: rename, in a way that fails if the name is taken.
+        // Looking first and renaming after would replace a file made in between.
+        Err(_) => match rename_no_replace(temp, path) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(taken()),
+            // Nor that (FAT and exFAT drives, for one): claim the name with an empty file made
+            // only if nothing has it, then rename over that claim, which is ours to replace.
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                let claim = match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                {
+                    Ok(claim) => claim.metadata()?,
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(taken()),
+                    Err(e) => return Err(e),
+                };
+                // Something may have taken the claim's place since; that is not ours to replace
+                // or remove.
+                if !still_the_claim(path, &claim) {
+                    return Err(taken());
+                }
+                fs::rename(temp, path).inspect_err(|_| {
+                    if still_the_claim(path, &claim) {
+                        let _ = fs::remove_file(path);
+                    }
+                })
             }
-            fs::rename(temp, path)
+            other => other,
+        },
+    }
+}
+
+/// True when `path` is still the empty file whose metadata, read when it was made, is `claim`.
+fn still_the_claim(path: &Path, claim: &fs::Metadata) -> bool {
+    let Ok(now) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (now.dev(), now.ino()) != (claim.dev(), claim.ino()) {
+            return false;
         }
+    }
+    now.is_file() && now.len() == 0 && now.modified().ok() == claim.modified().ok()
+}
+
+/// Renames `from` to `to` in one step, and fails with `AlreadyExists` instead of replacing
+/// whatever is at `to`, a link included. Where the system or the file system cannot do that, it
+/// fails with `Unsupported` rather than risk replacing a file.
+pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = |path: &Path| {
+            CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path holds a NUL"))
+        };
+        let (from_c, to_c) = (c_path(from)?, c_path(to)?);
+        #[cfg(target_os = "macos")]
+        // SAFETY: both are NUL-terminated paths that live through the call.
+        let result = unsafe { libc::renamex_np(from_c.as_ptr(), to_c.as_ptr(), libc::RENAME_EXCL) };
+        #[cfg(target_os = "linux")]
+        // SAFETY: both are NUL-terminated paths that live through the call. RENAME_NOREPLACE is 1.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from_c.as_ptr(),
+                libc::AT_FDCWD,
+                to_c.as_ptr(),
+                1 as libc::c_uint,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        Err(match error.raw_os_error() {
+            Some(code) if code == libc::ENOTSUP || code == libc::EINVAL || code == libc::ENOSYS => {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "{} cannot be given a new name without risk of replacing a file",
+                        to.display()
+                    ),
+                )
+            }
+            _ => error,
+        })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (from, to);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this system cannot give a file a new name without risk of replacing another",
+        ))
     }
 }
 
@@ -218,11 +310,35 @@ pub fn remove_private_temp_file(path: &Path) -> io::Result<()> {
 /// Other hard links to the file keep the old contents: replacing the file is what makes the write
 /// all-or-nothing, and writing into it in place would give that up.
 pub fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    replace_with(path, |file| file.write_all(bytes))
+    replace_with(path, |file| file.write_all(bytes), |_| Ok(()))
 }
 
-/// `write_replacing` with the new contents written by `write`.
-fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+/// [`write_replacing`], but only while the file still holds `expected`: it is read again once the
+/// new contents are ready, just before they take its place, and left alone if it changed. This narrows the time in which
+/// another program's save could be lost to that last moment; nothing short of every program
+/// taking part in a lock can close it.
+pub fn write_replacing_if_unchanged(path: &Path, expected: &[u8], bytes: &[u8]) -> io::Result<()> {
+    replace_with(
+        path,
+        |file| file.write_all(bytes),
+        |target| match fs::read(target) {
+            Ok(current) if current == expected => Ok(()),
+            Ok(_) => Err(io::Error::other(format!(
+                "{} was changed by another program",
+                target.display()
+            ))),
+            Err(e) => Err(e),
+        },
+    )
+}
+
+/// `write_replacing` with the new contents written by `write`, and `ready` asked about the file
+/// just before it is replaced.
+fn replace_with(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+    ready: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let target = resolve_links(path)?;
     let existing = match fs::metadata(&target) {
         Ok(metadata) => Some(metadata),
@@ -275,6 +391,7 @@ fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) ->
         }
         file.sync_all()?;
         drop(file);
+        ready(&target)?;
         fs::rename(&temp, &target)
     })();
     if let Err(e) = written {
@@ -650,13 +767,43 @@ mod tests {
         let dir = scratch("failed");
         let path = dir.join("doc.pdf");
         fs::write(&path, b"original").unwrap();
-        let result = replace_with(&path, |file| {
-            file.write_all(b"half")?;
-            Err(io::Error::other("disk full"))
-        });
+        let result = replace_with(
+            &path,
+            |file| {
+                file.write_all(b"half")?;
+                Err(io::Error::other("disk full"))
+            },
+            |_| Ok(()),
+        );
         assert!(result.is_err());
         assert_eq!(fs::read(&path).unwrap(), b"original");
         assert_eq!(names(&dir), ["doc.pdf"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_changed_while_its_replacement_was_written_is_left_alone() {
+        let dir = scratch("changed");
+        let path = dir.join("doc.pdf");
+        fs::write(&path, b"original").unwrap();
+        // Another program saves while the new contents are being written.
+        let result = replace_with(
+            &path,
+            |file| {
+                fs::write(&path, b"theirs")?;
+                file.write_all(b"ours")
+            },
+            |target| match fs::read(target) {
+                Ok(current) if current == b"original" => Ok(()),
+                Ok(_) => Err(io::Error::other("changed")),
+                Err(e) => Err(e),
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"theirs");
+        assert_eq!(names(&dir), ["doc.pdf"]);
+        write_replacing_if_unchanged(&path, b"theirs", b"ours").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"ours");
         let _ = fs::remove_dir_all(&dir);
     }
 

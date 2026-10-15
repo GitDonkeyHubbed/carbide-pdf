@@ -90,6 +90,12 @@ impl Pdf {
         Ok(out)
     }
 
+    /// The bytes [`Pdf::to_bytes`] gives, without pruning or otherwise changing this document: for
+    /// a check that has to leave it as it was when it refuses what it was asked.
+    pub(crate) fn serialized(&self) -> Result<Vec<u8>> {
+        self.clone().to_bytes()
+    }
+
     /// Writes the document to `path` as [`Pdf::to_file_bytes`] does, replacing a file there in one
     /// step: a document that carries a protection is written encrypted with it. One protected with
     /// an open password needs that password, given to `to_file_bytes`.
@@ -366,7 +372,7 @@ impl Pdf {
     /// Deletes pages. A document must keep at least one page. Nothing of a deleted page stays in
     /// the document: its form fields, its tags and the resources only it used go with it, and so do
     /// the outline items, named destinations and other entries that lead only to it. The pages that
-    /// stay keep their page labels.
+    /// stay keep their page labels. When this fails, the document is as it was.
     pub fn delete_pages(&mut self, pages: &[usize]) -> Result<()> {
         let count = self.page_count();
         let mut unique: Vec<usize> = pages.to_vec();
@@ -380,11 +386,17 @@ impl Pdf {
         }
         let ids = self.page_ids();
         let doomed: HashSet<ObjectId> = unique.iter().map(|&p| ids[p]).collect();
-        let staying: HashSet<ObjectId> = ids
+        let remaining: Vec<ObjectId> = ids
             .iter()
             .copied()
             .filter(|id| !doomed.contains(id))
             .collect();
+        // Taking pages out changes neither the content nor the resources of the pages that stay,
+        // so what those are trimmed to is worked out first, while the document is untouched and
+        // content too large to read can still be refused without copying the whole document.
+        let mut trim = self.plan_resource_trim(&remaining)?;
+        trim.drop_references_to(&doomed);
+        let staying: HashSet<ObjectId> = remaining.into_iter().collect();
         let doomed_annotations = self.annotations_leaving(&doomed, &staying);
         // What refers to the pages is found through them, so this comes first. An invisible
         // signature only sits on a page because every field has to; it is not the page's content.
@@ -401,11 +413,14 @@ impl Pdf {
         for id in &doomed {
             self.doc.objects.remove(id);
         }
+        // The tree was repaired when the document was opened, and taking pages out of it gives a
+        // repair nothing it refuses.
         crate::pagetree::repair(&mut self.doc)?;
         if let Some(labels) = labels {
             self.doc.catalog_mut()?.set("PageLabels", labels);
         }
-        self.trim_resources()
+        self.apply_resource_trim(trim);
+        Ok(())
     }
 
     /// Inserts a blank page so that it ends up at `index`. Size defaults to the neighbouring page.
@@ -468,7 +483,15 @@ impl Pdf {
         if to >= count {
             return Err(Error::PageOutOfRange { index: to, count });
         }
+        if from == to {
+            return Ok(());
+        }
         self.flatten_page_tree()?;
+        // Each page keeps its page label, so the labels are laid out again for the new order.
+        let mut order: Vec<usize> = (0..count).collect();
+        let moved = order.remove(from);
+        order.insert(to, moved);
+        let labels = self.page_labels_for(&order);
         let root_id = self.pages_root()?;
         let kids = self
             .doc
@@ -477,6 +500,9 @@ impl Pdf {
             .as_array_mut()?;
         let item = kids.remove(from);
         kids.insert(to, item);
+        if let Some(labels) = labels {
+            self.doc.catalog_mut()?.set("PageLabels", labels);
+        }
         Ok(())
     }
 

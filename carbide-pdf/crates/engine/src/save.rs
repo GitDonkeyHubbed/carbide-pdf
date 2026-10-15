@@ -10,7 +10,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use lopdf::xref::XrefEntry;
 use lopdf::{Document, EncryptionState, Object, ObjectId, SaveOptions};
 
 use crate::error::{Error, Result};
@@ -68,22 +70,16 @@ pub struct Protection {
 }
 
 impl Protection {
-    /// True when `other` is the same encryption: the same file key, encryption dictionary values
-    /// and permissions, so the same passwords open both and allow the same.
+    /// True when `other` is the same encryption: the same file key, encryption dictionary values,
+    /// crypt filters and permissions, so the same passwords open both, allow the same and leave
+    /// the same parts (metadata, say) unencrypted.
     pub fn same_as(&self, other: &Protection) -> bool {
-        let (a, b) = (&self.state, &other.state);
         let first_id = |p: &Protection| {
             p.id.as_ref()
                 .and_then(|id| id.as_array().ok()?.first().cloned())
         };
-        a.file_encryption_key() == b.file_encryption_key()
-            && (a.version(), a.revision()) == (b.version(), b.revision())
-            && a.permissions() == b.permissions()
-            && (a.owner_value(), a.user_value()) == (b.owner_value(), b.user_value())
-            && (a.owner_encrypted(), a.user_encrypted())
-                == (b.owner_encrypted(), b.user_encrypted())
-            && a.permission_encrypted() == b.permission_encrypted()
-            && (a.revision() >= 5 || first_id(self) == first_id(other))
+        same_encryption(&self.state, &other.state)
+            && (self.state.revision() >= 5 || first_id(self) == first_id(other))
     }
 }
 
@@ -102,7 +98,7 @@ impl SavedFile {
         let reachable = reachable(&pdf.doc);
         let content = reachable
             .iter()
-            .filter_map(|&id| Some((id, Fingerprint::of(pdf.doc.objects.get(&id)?)?)))
+            .filter_map(|&id| Some((id, Fingerprint::of(&pdf.doc, pdf.doc.objects.get(&id)?)?)))
             .collect();
         let structure = file_structure(&pdf.doc);
         let unused = pdf
@@ -112,7 +108,7 @@ impl SavedFile {
             .filter(|id| !reachable.contains(id) && !structure.contains(id))
             .copied()
             .collect();
-        let updates = appended_updates(&bytes, pdf.doc.xref_start);
+        let updates = appended_updates(&bytes, &pdf.doc);
         SavedFile {
             bytes,
             password,
@@ -173,7 +169,7 @@ impl SavedFile {
         self.content
             .iter()
             .any(|(id, held)| match pdf.doc.objects.get(id) {
-                Some(object) if reachable.contains(id) => !held.kept_by(object),
+                Some(object) if reachable.contains(id) => !held.kept_by(&pdf.doc, object),
                 _ => true,
             })
     }
@@ -372,19 +368,35 @@ fn check_encryption(bytes: &[u8], password: Option<&str>, protection: &Protectio
     let Some(state) = state else {
         return Err(Error::Other(NOT_ENCRYPTED.into()));
     };
-    let original = &protection.state;
-    let same = state.file_encryption_key() == original.file_encryption_key()
-        && (state.version(), state.revision()) == (original.version(), original.revision())
-        && state.permissions() == original.permissions()
-        && (state.owner_value(), state.user_value())
-            == (original.owner_value(), original.user_value())
-        && (state.owner_encrypted(), state.user_encrypted())
-            == (original.owner_encrypted(), original.user_encrypted());
+    let same = same_encryption(&state, &protection.state);
     if same {
         Ok(())
     } else {
         Err(Error::Other(NOT_ENCRYPTED.into()))
     }
+}
+
+/// True when `a` and `b` encrypt the same way: the same file key, encryption dictionary values
+/// and permissions, whether metadata is encrypted, and the same crypt filters for streams and
+/// strings. Otherwise a document written with one would not keep what the other protects.
+fn same_encryption(a: &EncryptionState, b: &EncryptionState) -> bool {
+    let filters = |state: &EncryptionState| -> Vec<(Vec<u8>, Vec<u8>)> {
+        state
+            .crypt_filters()
+            .iter()
+            .map(|(name, filter)| (name.clone(), filter.method().to_vec()))
+            .collect()
+    };
+    a.file_encryption_key() == b.file_encryption_key()
+        && (a.version(), a.revision()) == (b.version(), b.revision())
+        && a.permissions() == b.permissions()
+        && (a.owner_value(), a.user_value()) == (b.owner_value(), b.user_value())
+        && (a.owner_encrypted(), a.user_encrypted()) == (b.owner_encrypted(), b.user_encrypted())
+        && a.permission_encrypted() == b.permission_encrypted()
+        && a.encrypt_metadata() == b.encrypt_metadata()
+        && (a.default_stream_filter(), a.default_string_filter())
+            == (b.default_stream_filter(), b.default_string_filter())
+        && filters(a) == filters(b)
 }
 
 /// Every object reachable from the trailer.
@@ -433,13 +445,13 @@ pub(crate) fn prune(doc: &mut Document) -> Vec<ObjectId> {
     gone
 }
 
-/// How many updates were appended to the file `bytes`, whose last cross-reference section starts
-/// at `xref_start`. Counted by following the sections' /Prev links back to the first; the link from
-/// a linearized file's first-page section to its main section is not an update. A start of zero
+/// How many updates were appended to the file `bytes`, read as `doc`. Counted by following the
+/// cross-reference sections' /Prev links back from the last one to the first; the link from a
+/// linearized file's first-page section to its main section is not an update. A start of zero
 /// means the cross-reference table had to be rebuilt, which leaves nothing to follow.
-fn appended_updates(bytes: &[u8], xref_start: usize) -> usize {
+fn appended_updates(bytes: &[u8], doc: &Document) -> usize {
     let mut seen = HashSet::new();
-    let mut at = xref_start;
+    let mut at = doc.xref_start;
     let mut links = 0;
     while at != 0 && seen.insert(at) {
         match previous_section(bytes, at) {
@@ -450,8 +462,37 @@ fn appended_updates(bytes: &[u8], xref_start: usize) -> usize {
             _ => break,
         }
     }
-    let linearized = find(&bytes[..bytes.len().min(1024)], b"/Linearized").is_some();
-    links - usize::from(linearized && links > 0)
+    links - usize::from(is_linearized(doc) && links > 0)
+}
+
+/// True when the first object of the file is a linearization dictionary: one that starts within
+/// the first 1024 bytes and has the version and every entry the format requires. Text that merely
+/// reads `/Linearized` near the start of the file does not count, nor does a dictionary that
+/// names it without the rest.
+fn is_linearized(doc: &Document) -> bool {
+    let first = doc
+        .reference_table
+        .entries
+        .iter()
+        .filter_map(|(&number, entry)| match entry {
+            XrefEntry::Normal { offset, generation } => Some((*offset, (number, *generation))),
+            _ => None,
+        })
+        .min();
+    first.is_some_and(|(offset, id)| {
+        offset < 1024
+            && doc
+                .objects
+                .get(&id)
+                .and_then(|object| object.as_dict().ok())
+                .is_some_and(|dict| {
+                    let integer = |key: &[u8]| dict.get(key).is_ok_and(|v| v.as_i64().is_ok());
+                    dict.get(b"Linearized")
+                        .is_ok_and(|v| v.as_float().is_ok_and(|version| version > 0.0))
+                        && dict.get(b"H").is_ok_and(|v| v.as_array().is_ok())
+                        && [&b"L"[..], b"O", b"E", b"N", b"T"].into_iter().all(integer)
+                })
+    })
 }
 
 /// The /Prev entry of the cross-reference section at `at`: in the trailer that follows a table, or
@@ -478,16 +519,21 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// The text and data of one object: hashes of its strings and of its stream content.
+/// The text and data of one object: hashes of its strings and of its stream content, and for an
+/// annotation of everything else it holds.
 #[derive(Clone)]
 struct Fingerprint {
     strings: Vec<u64>,
     stream: Option<u64>,
+    /// An annotation's numbers, names and booleans, where they are: ink points, the rectangle,
+    /// colours. Ink points taken out in place change it.
+    drawing: Option<u64>,
 }
 
 impl Fingerprint {
     /// `None` for an object that holds neither strings nor stream data and is not an annotation.
-    fn of(object: &Object) -> Option<Fingerprint> {
+    /// `doc` resolves the references an annotation's drawing data may sit behind.
+    fn of(doc: &Document, object: &Object) -> Option<Fingerprint> {
         fn strings(object: &Object, out: &mut Vec<u64>) {
             match object {
                 Object::String(bytes, _) => out.push(hash(bytes)),
@@ -504,22 +550,112 @@ impl Fingerprint {
         strings(object, &mut found);
         found.sort_unstable();
         let stream = object.as_stream().ok().map(|s| hash(&s.content));
-        (stream.is_some() || !found.is_empty() || is_annotation(object)).then_some(Fingerprint {
+        let drawing = is_annotation(object).then(|| {
+            let mut hasher = DefaultHasher::new();
+            hash_values(doc, object, &mut hasher, &mut HashSet::new(), 0);
+            hasher.finish()
+        });
+        (stream.is_some() || !found.is_empty() || drawing.is_some()).then_some(Fingerprint {
             strings: found,
             stream,
+            drawing,
         })
     }
 
     /// True when `object` still carries all of this content; added strings do not matter.
-    fn kept_by(&self, object: &Object) -> bool {
-        let Some(now) = Fingerprint::of(object) else {
+    fn kept_by(&self, doc: &Document, object: &Object) -> bool {
+        let Some(now) = Fingerprint::of(doc, object) else {
             return false;
         };
         self.stream == now.stream
+            && self.drawing == now.drawing
             && self
                 .strings
                 .iter()
                 .all(|s| now.strings.binary_search(s).is_ok())
+    }
+}
+
+/// How many references in a row are followed when hashing an annotation's values.
+const MAX_REFERENCE_DEPTH: usize = 8;
+
+/// Hands out a different marker each time a reference is met beyond [`MAX_REFERENCE_DEPTH`].
+static UNCOMPARABLE: AtomicU64 = AtomicU64::new(0);
+
+/// Keys that lead from an annotation to the rest of the document rather than to its own drawing
+/// data: following them would count a change to a page, a reply thread or a popup as a change to
+/// the annotation.
+const STRUCTURAL_KEYS: [&[u8]; 8] = [
+    b"P", b"Parent", b"Popup", b"IRT", b"Dest", b"Next", b"Prev", b"Kids",
+];
+
+/// Hashes the numbers, names and booleans of `object` with their place in it; strings are left to
+/// the rest of the fingerprint. Numbers count by value, so `1` and `1.0` are the same. A
+/// reference to an object that is not a stream is followed, since drawing data (an ink list, say)
+/// can sit in an object of its own; a stream keeps its own content hash instead. `seen` and
+/// `depth` bound the walk when objects refer back to each other.
+fn hash_values(
+    doc: &Document,
+    object: &Object,
+    hasher: &mut DefaultHasher,
+    seen: &mut HashSet<ObjectId>,
+    depth: usize,
+) {
+    match object {
+        // A whole number hashes the same whether written as an integer or a real, and an
+        // integer keeps every digit: one past what a real can hold exactly is still different.
+        Object::Integer(value) => (1u8, *value).hash(hasher),
+        Object::Real(value) => {
+            // -0 and 0 are the same number.
+            let value = value + 0.0;
+            if value.fract() == 0.0 && value.abs() < 9.0e18 {
+                (1u8, value as i64).hash(hasher);
+            } else {
+                (8u8, value.to_bits()).hash(hasher);
+            }
+        }
+        Object::Boolean(value) => (2u8, value).hash(hasher),
+        Object::Name(name) => (3u8, name).hash(hasher),
+        Object::Array(items) => {
+            (4u8, items.len()).hash(hasher);
+            items
+                .iter()
+                .for_each(|item| hash_values(doc, item, hasher, seen, depth));
+        }
+        Object::Dictionary(dict) => {
+            let mut entries: Vec<_> = dict
+                .iter()
+                .filter(|(key, _)| !STRUCTURAL_KEYS.contains(&key.as_slice()))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            (5u8, entries.len()).hash(hasher);
+            for (key, value) in entries {
+                key.hash(hasher);
+                hash_values(doc, value, hasher, seen, depth);
+            }
+        }
+        Object::Reference(id) => {
+            let target = doc.objects.get(id).filter(|target| {
+                !matches!(target, Object::Stream(_))
+                    && !target
+                        .as_dict()
+                        .is_ok_and(|dict| dict.has_type(b"Page") || dict.has_type(b"Pages"))
+            });
+            match target {
+                // A chain too deep to follow cannot be compared, so it never matches: the
+                // annotation counts as changed rather than risk missing a change beyond the limit.
+                Some(_) if depth >= MAX_REFERENCE_DEPTH => {
+                    (7u8, UNCOMPARABLE.fetch_add(1, Ordering::Relaxed)).hash(hasher)
+                }
+                Some(target) if seen.insert(*id) => {
+                    6u8.hash(hasher);
+                    hash_values(doc, target, hasher, seen, depth + 1);
+                    seen.remove(id);
+                }
+                _ => 0u8.hash(hasher),
+            }
+        }
+        _ => 0u8.hash(hasher),
     }
 }
 

@@ -1214,15 +1214,30 @@ fn run(cli: Cli) -> Result<(), Failure> {
                     .collect(),
                 false => only.iter().map(|a| a.item()).collect(),
             };
+            if bookmarks && !items.contains(&HiddenItem::Bookmarks) {
+                items.push(HiddenItem::Bookmarks);
+            }
             items.retain(|item| !keep.iter().any(|k| k.item() == *item));
             let report = pdf.remove_hidden_information_from(&items, Some(&saved))?;
             if report.is_empty() {
+                // Nothing to take out, so nothing is rewritten: the file keeps its signatures.
                 println!("No hidden information was found.");
             }
             for line in report.lines() {
                 println!("removed {line}");
             }
-            save_edit(&mut pdf, &saved, true, &input, &output)?;
+            if report.is_empty() {
+                // An empty report does not mean the document in memory is untouched (clearing a
+                // button's state can still change it), so the file is copied as it was read.
+                if same_file(&input, &output) {
+                    println!("{} was left unchanged", output.display());
+                } else {
+                    write_replacing(&output, saved.bytes())?;
+                    println!("wrote {}", output.display());
+                }
+            } else {
+                save_edit(&mut pdf, &saved, !report.is_empty(), &input, &output)?;
+            }
         }
         Command::Ocr {
             input,
