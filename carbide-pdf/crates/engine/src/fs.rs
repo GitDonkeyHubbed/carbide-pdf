@@ -107,22 +107,44 @@ fn link_new(temp: &Path, path: &Path) -> io::Result<()> {
             // Nor that (FAT and exFAT drives, for one): claim the name with an empty file made
             // only if nothing has it, then rename over that claim, which is ours to replace.
             Err(e) if e.kind() == io::ErrorKind::Unsupported => {
-                match fs::OpenOptions::new()
+                let claim = match fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .open(path)
                 {
-                    Ok(claim) => drop(claim),
+                    Ok(claim) => claim.metadata()?,
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(taken()),
                     Err(e) => return Err(e),
+                };
+                // Something may have taken the claim's place since; that is not ours to replace
+                // or remove.
+                if !still_the_claim(path, &claim) {
+                    return Err(taken());
                 }
                 fs::rename(temp, path).inspect_err(|_| {
-                    let _ = fs::remove_file(path);
+                    if still_the_claim(path, &claim) {
+                        let _ = fs::remove_file(path);
+                    }
                 })
             }
             other => other,
         },
     }
+}
+
+/// True when `path` is still the empty file whose metadata, read when it was made, is `claim`.
+fn still_the_claim(path: &Path, claim: &fs::Metadata) -> bool {
+    let Ok(now) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (now.dev(), now.ino()) != (claim.dev(), claim.ino()) {
+            return false;
+        }
+    }
+    now.is_file() && now.len() == 0 && now.modified().ok() == claim.modified().ok()
 }
 
 /// Renames `from` to `to` in one step, and fails with `AlreadyExists` instead of replacing
