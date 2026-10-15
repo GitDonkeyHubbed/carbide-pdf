@@ -384,25 +384,19 @@ impl Pdf {
         if unique.len() >= count {
             return Err(Error::Other("a document needs at least one page".into()));
         }
-        // Reading what the remaining pages use can fail once the pages are gone.
-        let backup = self.doc.clone();
-        let result = self.remove_pages(&unique);
-        if result.is_err() {
-            self.doc = backup;
-        }
-        result
-    }
-
-    /// Removes the pages at the sorted, distinct, valid indices `unique` (see
-    /// [`Pdf::delete_pages`]), leaving the document half changed when it fails.
-    fn remove_pages(&mut self, unique: &[usize]) -> Result<()> {
         let ids = self.page_ids();
         let doomed: HashSet<ObjectId> = unique.iter().map(|&p| ids[p]).collect();
-        let staying: HashSet<ObjectId> = ids
+        let remaining: Vec<ObjectId> = ids
             .iter()
             .copied()
             .filter(|id| !doomed.contains(id))
             .collect();
+        // Taking pages out changes neither the content nor the resources of the pages that stay,
+        // so what those are trimmed to is worked out first, while the document is untouched and
+        // content too large to read can still be refused without copying the whole document.
+        let mut trim = self.plan_resource_trim(&remaining)?;
+        trim.drop_references_to(&doomed);
+        let staying: HashSet<ObjectId> = remaining.into_iter().collect();
         let doomed_annotations = self.annotations_leaving(&doomed, &staying);
         // What refers to the pages is found through them, so this comes first. An invisible
         // signature only sits on a page because every field has to; it is not the page's content.
@@ -411,7 +405,7 @@ impl Pdf {
         });
         self.drop_structure_of(&doomed);
         self.drop_navigation_to(&doomed);
-        let labels = self.page_labels_without(unique);
+        let labels = self.page_labels_without(&unique);
         // The pages leave every /Kids and everything else that names them in one pass, and the
         // counts are taken again from the tree itself; nothing follows /Parent, which can loop.
         self.drop_references_to(&doomed);
@@ -419,11 +413,14 @@ impl Pdf {
         for id in &doomed {
             self.doc.objects.remove(id);
         }
+        // The tree was repaired when the document was opened, and taking pages out of it gives a
+        // repair nothing it refuses.
         crate::pagetree::repair(&mut self.doc)?;
         if let Some(labels) = labels {
             self.doc.catalog_mut()?.set("PageLabels", labels);
         }
-        self.trim_resources()
+        self.apply_resource_trim(trim);
+        Ok(())
     }
 
     /// Inserts a blank page so that it ends up at `index`. Size defaults to the neighbouring page.

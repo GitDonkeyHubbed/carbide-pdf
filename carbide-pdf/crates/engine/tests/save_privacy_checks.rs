@@ -605,6 +605,38 @@ fn deleted_page_image_does_not_survive_in_a_soft_mask_form() {
     assert!(contains(&saved, b"Helvetica"), "the mask lost its font");
 }
 
+#[test]
+fn deleting_a_page_does_not_copy_the_images_of_the_pages_that_stay() {
+    // The page that stays draws a 16 MB image; deleting the other one need not copy it, as
+    // copying the document to put it back on failure would.
+    let size = 16 << 20;
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let image = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Image", "Width" => 2048, "Height" => 2048,
+                    "ColorSpace" => "DeviceCMYK", "BitsPerComponent" => 8,
+                },
+                vec![0x5a; size],
+            ));
+            dictionary! { "XObject" => dictionary! { "Im1" => image } }
+        },
+        &["q 100 0 0 100 0 0 cm /Im1 Do Q", "BT ET"],
+    );
+    LARGEST.with(|largest| largest.set(0));
+    pdf.delete_pages(&[1]).unwrap();
+    let largest = LARGEST.with(std::cell::Cell::get);
+    assert!(
+        largest < size / 4,
+        "deleting a page took a block of {largest} bytes"
+    );
+    assert_eq!(pdf.page_count(), 1);
+    assert!(
+        pdf.to_bytes().unwrap().len() > size,
+        "the page that stays lost its image"
+    );
+}
+
 // ---- legacy passwords ----------------------------------------------------------------------
 
 const PADDING: [u8; 32] = [

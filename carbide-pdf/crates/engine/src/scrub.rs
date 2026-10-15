@@ -253,32 +253,10 @@ impl Pdf {
     /// Removes every reference to `ids` from the document: array items and dictionary entries
     /// that point at them. Links to a dropped page lose their target, for instance.
     pub(crate) fn drop_references_to(&mut self, ids: &HashSet<ObjectId>) {
-        fn strip(object: &mut Object, ids: &HashSet<ObjectId>) {
-            match object {
-                Object::Array(items) => {
-                    items.retain(|item| !item.as_reference().is_ok_and(|id| ids.contains(&id)));
-                    items.iter_mut().for_each(|item| strip(item, ids));
-                }
-                Object::Dictionary(dict) => strip_dict(dict, ids),
-                Object::Stream(stream) => strip_dict(&mut stream.dict, ids),
-                _ => {}
-            }
-        }
-        fn strip_dict(dict: &mut Dictionary, ids: &HashSet<ObjectId>) {
-            let doomed: Vec<Vec<u8>> = dict
-                .iter()
-                .filter(|(_, value)| value.as_reference().is_ok_and(|id| ids.contains(&id)))
-                .map(|(key, _)| key.clone())
-                .collect();
-            for key in doomed {
-                dict.remove(&key);
-            }
-            dict.iter_mut().for_each(|(_, value)| strip(value, ids));
-        }
         for object in self.doc.objects.values_mut() {
-            strip(object, ids);
+            strip_references(object, ids);
         }
-        strip_dict(&mut self.doc.trailer, ids);
+        strip_dict_references(&mut self.doc.trailer, ids);
     }
 
     /// Gives every page a resource dictionary of its own that holds only what its content uses,
@@ -289,12 +267,22 @@ impl Pdf {
     /// Each page's content, with the forms it draws, is decoded within the limit for one page in
     /// [`crate::limits`]; past it, with forms nested deeper than a page may draw them, or with
     /// more different resource names than [`MAX_NAMES`], this fails with [`Error::TooLarge`]
-    /// rather than keep resources that may be what removed content alone used.
+    /// rather than keep resources that may be what removed content alone used, and the document
+    /// is left as it was.
     pub(crate) fn trim_resources(&mut self) -> Result<()> {
-        let pages = self.page_ids();
+        let trim = self.plan_resource_trim(&self.page_ids())?;
+        self.apply_resource_trim(trim);
+        Ok(())
+    }
+
+    /// What [`Self::trim_resources`] changes for `pages`, the pages the document is to be left
+    /// with, worked out without changing anything; it fails as that does. An edit that removes
+    /// pages without changing the content or resources of those that stay can work this out
+    /// first, while it can still refuse, and apply it once the pages are gone.
+    pub(crate) fn plan_resource_trim(&self, pages: &[ObjectId]) -> Result<ResourceTrim> {
         let mut shared = HashSet::new();
         let mut seen = HashSet::new();
-        for page in &pages {
+        for page in pages {
             if let Ok(id) = self
                 .doc
                 .get_dictionary(*page)
@@ -317,7 +305,7 @@ impl Pdf {
         // Forms, patterns, Type 3 fonts and annotation appearances with resources of their own,
         // trimmed in turn.
         let mut nested = HashMap::new();
-        for page in &pages {
+        for page in pages {
             let Some(Object::Dictionary(resources)) = self.inherited(*page, b"Resources") else {
                 continue;
             };
@@ -349,13 +337,31 @@ impl Pdf {
                 changes.push((*page, kept));
             }
         }
-        self.doc.objects.extend(nested);
-        for (page, resources) in changes {
-            self.doc
-                .get_dictionary_mut(page)?
-                .set("Resources", resources);
+        Ok(ResourceTrim {
+            pages: changes,
+            nested,
+        })
+    }
+
+    /// Makes the changes [`Self::plan_resource_trim`] worked out. Only resource dictionaries are
+    /// replaced, so nothing else is copied, and nothing here can fail.
+    pub(crate) fn apply_resource_trim(&mut self, trim: ResourceTrim) {
+        for (id, resources) in trim.nested {
+            match self.doc.get_object_mut(id) {
+                Ok(Object::Stream(stream)) => stream.dict.set("Resources", resources),
+                Ok(Object::Dictionary(dict)) => dict.set("Resources", resources),
+                _ => {}
+            }
         }
-        let mut nodes = vec![self.pages_root()?];
+        for (page, resources) in trim.pages {
+            if let Ok(dict) = self.doc.get_dictionary_mut(page) {
+                dict.set("Resources", resources);
+            }
+        }
+        let Ok(root) = self.pages_root() else {
+            return;
+        };
+        let mut nodes = vec![root];
         let mut visited = HashSet::new();
         while let Some(node) = nodes.pop() {
             if !visited.insert(node) {
@@ -372,7 +378,6 @@ impl Pdf {
                 nodes.extend(kids.iter().filter_map(|k| k.as_reference().ok()));
             }
         }
-        Ok(())
     }
 
     /// The resources the page's content uses, following forms, patterns and Type 3 fonts that use
@@ -527,14 +532,15 @@ impl Pdf {
     }
 
     /// Trims the resources of each form, tiling pattern and Type 3 font in `resources` that has
-    /// resources of its own to what its own content uses, and so on down. Objects that change go
-    /// into `changed`, entries written straight into `resources` change in place. An object is
-    /// trimmed once however often it is drawn, so shared and looping resources end too.
+    /// resources of its own to what its own content uses, and so on down. The resources of objects
+    /// that change go into `changed`, by object; entries written straight into `resources` change
+    /// in place. An object is trimmed once however often it is drawn, so shared and looping
+    /// resources end too.
     fn trim_nested(
         &self,
         resources: &mut Dictionary,
         scan: &mut NameScan,
-        changed: &mut HashMap<ObjectId, Object>,
+        changed: &mut HashMap<ObjectId, Dictionary>,
         depth: usize,
     ) -> Result<()> {
         for category in [XOBJECT, PATTERN, FONT] {
@@ -548,8 +554,15 @@ impl Pdf {
             for (_, entry) in entries.iter_mut() {
                 if let Object::Reference(id) = entry {
                     self.trim_referenced(*id, scan, changed, depth)?;
-                } else {
-                    edited |= self.trim_own_resources(None, entry, scan, changed, depth)?;
+                } else if let Some(kept) =
+                    self.trim_own_resources(None, entry, scan, changed, depth)?
+                {
+                    match entry {
+                        Object::Stream(stream) => stream.dict.set("Resources", kept),
+                        Object::Dictionary(dict) => dict.set("Resources", kept),
+                        _ => {}
+                    }
+                    edited = true;
                 }
             }
             if edited {
@@ -576,7 +589,7 @@ impl Pdf {
         &self,
         id: ObjectId,
         scan: &mut NameScan,
-        changed: &mut HashMap<ObjectId, Object>,
+        changed: &mut HashMap<ObjectId, Dictionary>,
         depth: usize,
     ) -> Result<()> {
         if !scan.trimmed.insert(id) {
@@ -585,9 +598,8 @@ impl Pdf {
         let Ok(object) = self.doc.get_object(id) else {
             return Ok(());
         };
-        let mut object = object.clone();
-        if self.trim_own_resources(Some(id), &mut object, scan, changed, depth)? {
-            changed.insert(id, object);
+        if let Some(kept) = self.trim_own_resources(Some(id), object, scan, changed, depth)? {
+            changed.insert(id, kept);
         }
         Ok(())
     }
@@ -605,31 +617,25 @@ impl Pdf {
         mask.get(b"G").and_then(Object::as_reference).ok()
     }
 
-    /// Trims the resources of the appearances of the annotations on `page` (normal, rollover and
-    /// down, one for each state of the annotation where it has several) as [`Self::trim_nested`]
-    /// trims those of the forms the page draws. An annotation that stays keeps its appearances,
-    /// and their resources can be shared with content that went.
-    fn trim_appearances(
-        &self,
-        page: ObjectId,
-        scan: &mut NameScan,
-        changed: &mut HashMap<ObjectId, Object>,
-    ) -> Result<()> {
+    /// The appearances of the annotations on `page`: normal, rollover and down, one for each state
+    /// of the annotation where it has several.
+    fn appearances_on(&self, page: ObjectId) -> Vec<ObjectId> {
+        let mut found = Vec::new();
         let Some(Object::Array(annotations)) = self
             .doc
-            .get_dictionary(page)?
-            .get(b"Annots")
+            .get_dictionary(page)
             .ok()
-            .map(|a| self.resolve(a))
+            .and_then(|p| p.get(b"Annots").ok())
+            .and_then(|a| self.resolved(a))
         else {
-            return Ok(());
+            return found;
         };
-        for annotation in &annotations {
-            let Object::Dictionary(annotation) = self.resolve(annotation) else {
+        for annotation in annotations {
+            let Some(Object::Dictionary(annotation)) = self.resolved(annotation) else {
                 continue;
             };
             let Some(Object::Dictionary(appearances)) =
-                annotation.get(b"AP").ok().map(|ap| self.resolve(ap))
+                annotation.get(b"AP").ok().and_then(|ap| self.resolved(ap))
             else {
                 continue;
             };
@@ -637,25 +643,37 @@ impl Pdf {
                 let Ok(appearance) = appearances.get(key) else {
                     continue;
                 };
-                let forms: Vec<ObjectId> = match self.resolve(appearance) {
-                    Object::Dictionary(states) => states
-                        .iter()
-                        .filter_map(|(_, state)| state.as_reference().ok())
-                        .collect(),
-                    _ => appearance.as_reference().into_iter().collect(),
-                };
-                for id in forms {
-                    if !scan.trimmed.insert(id) {
-                        continue;
-                    }
-                    let Ok(object) = self.doc.get_object(id) else {
-                        continue;
-                    };
-                    let mut object = object.clone();
-                    if self.trim_own_resources(Some(id), &mut object, scan, changed, 0)? {
-                        changed.insert(id, object);
-                    }
+                match self.resolved(appearance) {
+                    Some(Object::Dictionary(states)) => found.extend(
+                        states
+                            .iter()
+                            .filter_map(|(_, state)| state.as_reference().ok()),
+                    ),
+                    _ => found.extend(appearance.as_reference()),
                 }
+            }
+        }
+        found
+    }
+
+    /// Trims the resources of the appearances of the annotations on `page` as
+    /// [`Self::trim_nested`] trims those of the forms the page draws. An annotation that stays
+    /// keeps its appearances, and their resources can be shared with content that went.
+    fn trim_appearances(
+        &self,
+        page: ObjectId,
+        scan: &mut NameScan,
+        changed: &mut HashMap<ObjectId, Dictionary>,
+    ) -> Result<()> {
+        for id in self.appearances_on(page) {
+            if !scan.trimmed.insert(id) {
+                continue;
+            }
+            let Ok(object) = self.doc.get_object(id) else {
+                continue;
+            };
+            if let Some(kept) = self.trim_own_resources(Some(id), object, scan, changed, 0)? {
+                changed.insert(id, kept);
             }
         }
         Ok(())
@@ -663,30 +681,31 @@ impl Pdf {
 
     /// Trims the resources `owner` (a form, a tiling pattern or a Type 3 font; object `id` when
     /// it is one of its own) has of its own to what its content uses, and those of what they hold
-    /// in turn. True when `owner` changed. When its content cannot be read, its resources are kept
-    /// whole, but what they hold is still trimmed. `depth` is how many such owners enclose it;
-    /// one nested deeper than a page may draw forms (see [`MAX_FORM_DEPTH`]) is an error rather
-    /// than left with resources that may be what removed content alone used.
+    /// in turn. The resources `owner` is left with, when they change. When its content cannot be
+    /// read, its resources are kept whole, but what they hold is still trimmed. `depth` is how
+    /// many such owners enclose it; one nested deeper than a page may draw forms (see
+    /// [`MAX_FORM_DEPTH`]) is an error rather than left with resources that may be what removed
+    /// content alone used.
     fn trim_own_resources(
         &self,
         id: Option<ObjectId>,
-        owner: &mut Object,
+        owner: &Object,
         scan: &mut NameScan,
-        changed: &mut HashMap<ObjectId, Object>,
+        changed: &mut HashMap<ObjectId, Dictionary>,
         depth: usize,
-    ) -> Result<bool> {
+    ) -> Result<Option<Dictionary>> {
         let dict = match owner {
             Object::Stream(stream) => &stream.dict,
-            Object::Dictionary(dict) => &*dict,
-            _ => return Ok(false),
+            Object::Dictionary(dict) => dict,
+            _ => return Ok(None),
         };
         let Some(Object::Dictionary(resources)) =
             dict.get(b"Resources").ok().map(|r| self.resolve(r))
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let group = self.group_colour_space(dict);
-        let content = match &*owner {
+        let content = match owner {
             Object::Stream(stream) if is_content(&stream.dict) => scan.uses_in(id, stream)?,
             Object::Dictionary(font)
                 if font
@@ -696,7 +715,7 @@ impl Pdf {
             {
                 self.glyph_uses(font, scan)?
             }
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
         if depth >= MAX_FORM_DEPTH {
             return Err(Error::TooLarge(messages::TOO_COMPLEX.into()));
@@ -714,14 +733,9 @@ impl Pdf {
         };
         self.trim_nested(&mut kept, scan, changed, depth + 1)?;
         if kept == resources || kept == self.with_categories_resolved(&resources) {
-            return Ok(false);
+            return Ok(None);
         }
-        match owner {
-            Object::Stream(stream) => stream.dict.set("Resources", kept),
-            Object::Dictionary(dict) => dict.set("Resources", kept),
-            _ => {}
-        }
-        Ok(true)
+        Ok(Some(kept))
     }
 
     /// The colour space a transparency group (`/Group` of a page or form) names from its resources
@@ -769,6 +783,56 @@ impl Pdf {
             .filter(|(_, value)| !matches!(value, Object::Dictionary(d) if d.is_empty()))
             .collect()
     }
+}
+
+/// What [`Pdf::trim_resources`] changes, worked out by [`Pdf::plan_resource_trim`].
+pub(crate) struct ResourceTrim {
+    /// The resource dictionary each page that needs a new one gets.
+    pages: Vec<(ObjectId, Dictionary)>,
+    /// The resources each form, pattern, Type 3 font and annotation appearance with resources of
+    /// its own is left with, where they change.
+    nested: HashMap<ObjectId, Dictionary>,
+}
+
+impl ResourceTrim {
+    /// Takes the references to `ids` out of the resources this gives, as
+    /// [`Pdf::drop_references_to`] takes them out of the document.
+    pub(crate) fn drop_references_to(&mut self, ids: &HashSet<ObjectId>) {
+        let pages = self.pages.iter_mut().map(|(_, resources)| resources);
+        for resources in pages.chain(self.nested.values_mut()) {
+            strip_dict_references(resources, ids);
+        }
+    }
+}
+
+/// Removes the array items and dictionary entries that refer to `ids` from `object` and
+/// everything written straight into it.
+fn strip_references(object: &mut Object, ids: &HashSet<ObjectId>) {
+    match object {
+        Object::Array(items) => {
+            items.retain(|item| !item.as_reference().is_ok_and(|id| ids.contains(&id)));
+            items
+                .iter_mut()
+                .for_each(|item| strip_references(item, ids));
+        }
+        Object::Dictionary(dict) => strip_dict_references(dict, ids),
+        Object::Stream(stream) => strip_dict_references(&mut stream.dict, ids),
+        _ => {}
+    }
+}
+
+/// [`strip_references`] for a dictionary.
+fn strip_dict_references(dict: &mut Dictionary, ids: &HashSet<ObjectId>) {
+    let doomed: Vec<Vec<u8>> = dict
+        .iter()
+        .filter(|(_, value)| value.as_reference().is_ok_and(|id| ids.contains(&id)))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in doomed {
+        dict.remove(&key);
+    }
+    dict.iter_mut()
+        .for_each(|(_, value)| strip_references(value, ids));
 }
 
 /// The resources each content stream uses, found once per stream however many pages draw it,
