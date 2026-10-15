@@ -1214,6 +1214,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
                     .collect(),
                 false => only.iter().map(|a| a.item()).collect(),
             };
+            if bookmarks && !items.contains(&HiddenItem::Bookmarks) {
+                items.push(HiddenItem::Bookmarks);
+            }
             items.retain(|item| !keep.iter().any(|k| k.item() == *item));
             let report = pdf.remove_hidden_information_from(&items, Some(&saved))?;
             if report.is_empty() {

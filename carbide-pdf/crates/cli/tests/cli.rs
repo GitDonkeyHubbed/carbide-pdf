@@ -1007,3 +1007,50 @@ fn verify_succeeds_only_when_every_signature_is_valid() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn sanitize_removes_bookmarks_when_asked_together_with_only() {
+    let dir = scratch("sanitize-bookmarks");
+    let file = dir.join("marked.pdf");
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let destination = lopdf::Object::Array(vec![page.into(), "Fit".into()]);
+    doc.catalog_mut()
+        .unwrap()
+        .set("Dests", lopdf::dictionary! { "Intro" => destination });
+    std::fs::write(&file, pdf.to_bytes().unwrap()).unwrap();
+    let path = file.to_str().unwrap();
+    let has_destinations = |path: &Path| {
+        let pdf = Pdf::from_bytes(&std::fs::read(path).unwrap()).unwrap();
+        pdf.document().catalog().unwrap().has(b"Dests")
+    };
+    assert!(has_destinations(&file));
+
+    // Without --bookmarks the bookmarks stay, as --only names only the thumbnails.
+    let kept = dir.join("kept.pdf");
+    let output = carbide(&[
+        "sanitize",
+        path,
+        kept.to_str().unwrap(),
+        "--only",
+        "thumbnails",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(has_destinations(&kept));
+
+    let removed = dir.join("removed.pdf");
+    let output = carbide(&[
+        "sanitize",
+        path,
+        removed.to_str().unwrap(),
+        "--only",
+        "thumbnails",
+        "--bookmarks",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("removed Bookmarks and named destinations: 1"));
+    assert!(!has_destinations(&removed));
+    let _ = std::fs::remove_dir_all(dir);
+}
