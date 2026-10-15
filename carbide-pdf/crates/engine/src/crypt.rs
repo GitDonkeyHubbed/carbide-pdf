@@ -323,9 +323,10 @@ fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// `password` in PDFDocEncoding, which the older revisions derive their keys from. Characters the
-/// encoding does not have are left out, as other PDF software does. `None` when that is the same
-/// as the UTF-8 bytes.
+/// `password` in PDFDocEncoding, which the older revisions derive their keys from. The control
+/// characters U+0000 to U+0017 (tab, line feed, carriage return among them) are bytes of their own
+/// in it. Characters the encoding does not have are left out, as other PDF software does. `None`
+/// when that is the same as the UTF-8 bytes.
 fn pdf_doc_encoding(password: &str) -> Option<Vec<u8>> {
     if password.is_ascii() {
         return None;
@@ -375,7 +376,7 @@ fn pdf_doc_encoding(password: &str) -> Option<Vec<u8>> {
     let encoded = password
         .encode_utf16()
         .filter_map(|unit| match unit {
-            0x20..=0x7e | 0xa1..=0xac | 0xae..=0xff => Some(unit as u8),
+            0x00..=0x17 | 0x20..=0x7e | 0xa1..=0xac | 0xae..=0xff => Some(unit as u8),
             _ => SPECIAL
                 .iter()
                 .find(|(code, _)| *code == unit)

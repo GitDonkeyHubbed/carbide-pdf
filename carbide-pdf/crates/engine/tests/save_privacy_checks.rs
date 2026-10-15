@@ -129,3 +129,84 @@ fn deleted_page_image_does_not_survive_in_a_form_with_resources_of_its_own() {
         "the kept form lost its font"
     );
 }
+
+// ---- legacy passwords ----------------------------------------------------------------------
+
+const PADDING: [u8; 32] = [
+    0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
+    0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,
+];
+
+fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut state: [u8; 256] = std::array::from_fn(|i| i as u8);
+    let mut j = 0u8;
+    for i in 0..256 {
+        j = j.wrapping_add(state[i]).wrapping_add(key[i % key.len()]);
+        state.swap(i, j as usize);
+    }
+    let (mut i, mut j) = (0u8, 0u8);
+    data.iter()
+        .map(|byte| {
+            i = i.wrapping_add(1);
+            j = j.wrapping_add(state[i as usize]);
+            state.swap(i as usize, j as usize);
+            byte ^ state[state[i as usize].wrapping_add(state[j as usize]) as usize]
+        })
+        .collect()
+}
+
+/// A one-page RC4 (revision 2) file whose open password is `user`, as raw bytes.
+fn rc4_file(user: &[u8]) -> Vec<u8> {
+    use md5::{Digest, Md5};
+    let pad = |password: &[u8]| {
+        let mut padded = password[..password.len().min(32)].to_vec();
+        padded.extend_from_slice(&PADDING[..32 - padded.len()]);
+        padded
+    };
+    let id = b"0123456789abcdef".to_vec();
+    let permissions: i32 = -4;
+    let owner_key: [u8; 16] = Md5::digest(pad(b"owner")).into();
+    let o = rc4(&owner_key[..5], &pad(user));
+    let file_key: [u8; 16] = Md5::new()
+        .chain_update(pad(user))
+        .chain_update(&o)
+        .chain_update(permissions.to_le_bytes())
+        .chain_update(&id)
+        .finalize()
+        .into();
+    let u = rc4(&file_key[..5], &PADDING);
+
+    let mut doc = Document::with_version("1.4");
+    let pages_id = doc.new_object_id();
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(
+            dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 },
+        ),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    let encrypt = doc.add_object(dictionary! {
+        "Filter" => "Standard", "V" => 1, "R" => 2, "P" => permissions,
+        "O" => Object::String(o, lopdf::StringFormat::Hexadecimal),
+        "U" => Object::String(u, lopdf::StringFormat::Hexadecimal),
+    });
+    doc.trailer.set("Root", catalog);
+    doc.trailer.set("Encrypt", encrypt);
+    let id = Object::String(id, lopdf::StringFormat::Hexadecimal);
+    doc.trailer.set("ID", vec![id.clone(), id]);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn legacy_password_with_a_tab_and_an_accent_opens_the_file() {
+    // "é<tab>a" in PDFDocEncoding: é is 0xE9, the tab stays 0x09.
+    let file = rc4_file(&[0xe9, 0x09, b'a']);
+    let pdf = Pdf::from_bytes_with_password(&file, "é\ta").expect("the password is right");
+    assert_eq!(pdf.page_count(), 1);
+}
