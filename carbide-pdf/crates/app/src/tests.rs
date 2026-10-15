@@ -2096,3 +2096,32 @@ fn batch_reduce_leaves_unsaved_tabs_alone_and_refreshes_the_clean_ones() {
     // And the unsaved one is untouched.
     assert!(app.doc_at(0).unwrap().dirty);
 }
+
+#[test]
+fn batch_reduce_refreshes_the_signature_notice_of_a_tab_in_the_background() {
+    use carbide_engine::reduce::{OutputOptions, ReduceOptions};
+    let dir = scratch();
+    let b = plain(&dir, "b.pdf", &["B", "B2", "B3"]);
+    let other = plain(&dir, "other.pdf", &["OTHER"]);
+    let mut app = app(&dir);
+    app.open_path(&b);
+    app.open_path(&other);
+    // b.pdf is in the background, with a notice about the file as it was.
+    let tab = app.tab_on(&b).unwrap();
+    assert_ne!(app.active_tab, Some(tab));
+    app.doc_at_mut(tab).unwrap().view_notice = Some("The signature is valid.".into());
+
+    let outcomes = app.reduce_files(
+        std::slice::from_ref(&b),
+        &OutputOptions::in_place(),
+        &ReduceOptions::default(),
+    );
+    assert!(outcomes[0].warning.is_none(), "{:?}", outcomes[0]);
+    assert_eq!(
+        app.doc_at(tab).unwrap().view_notice,
+        None,
+        "the old file's notice was kept for the rewritten file"
+    );
+    app.activate(Some(tab));
+    assert_eq!(app.notice, None);
+}

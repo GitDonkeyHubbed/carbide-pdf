@@ -1260,7 +1260,12 @@ impl CarbideApp {
                     );
                     self.after_writing(path);
                 }
-                Ok(()) => {}
+                Ok(()) => {
+                    // A background tab's signature notice was about the old file.
+                    if let Some(doc) = self.doc_at_mut(index) {
+                        doc.view_notice = signature_notice(doc);
+                    }
+                }
                 Err(e) => failed.push((index, e)),
             }
         }
