@@ -318,6 +318,16 @@ fn signed_with(sub_filter: SubFilter, cms: impl Fn(&[u8]) -> Vec<u8>) -> Vec<u8>
     file
 }
 
+fn cert_params(cn: &str, is_ca: IsCa, usages: &[KeyUsagePurpose]) -> CertificateParams {
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(DnType::CommonName, cn);
+    params.is_ca = is_ca;
+    params.key_usages = usages.to_vec();
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2040, 1, 1);
+    params
+}
+
 // ---- signed attributes ---------------------------------------------------------------------
 
 #[test]
@@ -389,4 +399,91 @@ fn a_signer_identifier_that_names_no_embedded_certificate_is_not_valid() {
     let report = verify(&file, &trust_signer()).remove(0);
     assert_eq!(outcome(&report), (Validity::Invalid, Detail::Corrupt));
     assert_eq!(report.signer, None);
+}
+
+// ---- time stamps ---------------------------------------------------------------------------
+
+/// An RFC 3161 authority using the test signer's key, whose tokens give `gen_time`.
+struct Tsa {
+    cert: Vec<u8>,
+    gen_time: &'static str,
+}
+
+fn tsa_certificate() -> &'static [u8] {
+    static CERT: OnceLock<Vec<u8>> = OnceLock::new();
+    CERT.get_or_init(|| {
+        let pair = KeyPair::try_from(signer().pkcs8.as_slice()).unwrap();
+        let mut params = cert_params(
+            "Check TSA",
+            IsCa::ExplicitNoCa,
+            &[KeyUsagePurpose::DigitalSignature],
+        );
+        let mut purpose = rcgen::CustomExtension::from_oid_content(
+            &[2, 5, 29, 37],
+            seq(&[&oid(&[1, 3, 6, 1, 5, 5, 7, 3, 8])]),
+        );
+        purpose.set_criticality(true);
+        params.custom_extensions.push(purpose);
+        params.self_signed(&pair).unwrap().der().to_vec()
+    })
+}
+
+impl TimestampSource for Tsa {
+    fn token_for_digest(&self, digest: &[u8; 32]) -> carbide_engine::Result<Vec<u8>> {
+        let tst_info = seq(&[
+            &tlv(0x02, &[1]),
+            &oid(&[1, 2, 3, 4]),
+            &seq(&[&seq(&[&oid(SHA256_OID), &null()]), &tlv(0x04, digest)]),
+            &tlv(0x02, &[1]),
+            &tlv(0x18, self.gen_time.as_bytes()),
+        ]);
+        let attributes = [
+            content_type(TST_INFO_OID),
+            message_digest(&sha256(&tst_info)),
+            signing_certificate_v2(&sha256(&self.cert), None),
+        ];
+        Ok(signed_data(
+            &[&self.cert],
+            &signer_id(&self.cert, None),
+            &seq(&[&oid(TST_INFO_OID), &ctx(0, &tlv(0x04, &tst_info))]),
+            Some(&attributes),
+            &seq(&[&oid(SHA256_RSA_OID), &null()]),
+            &rsa_sign(&signer().key, &attribute_set(&attributes)),
+        ))
+    }
+}
+
+#[test]
+fn a_time_stamp_time_must_be_a_plain_utc_generalized_time() {
+    let stamped = |gen_time: &'static str| {
+        let tsa = Tsa {
+            cert: tsa_certificate().to_vec(),
+            gen_time,
+        };
+        let file = sign(&signer().identity, SubFilter::Pkcs7Detached, Some(&tsa));
+        let trust = TrustStore {
+            certificates: vec![signer().cert.clone(), tsa.cert.clone()],
+        };
+        let report = verify(&file, &trust).remove(0);
+        assert_ne!(
+            report.has_embedded_timestamp,
+            report.embedded_timestamp_failed
+        );
+        report.has_embedded_timestamp
+    };
+    assert!(stamped("20260101000000Z"));
+    assert!(stamped("20260101000000.25Z"));
+    for bad in [
+        "20260101000000+0100",
+        "20260101000000-0500",
+        "20260101000000",
+        "2026010100000099Z",
+        "20260101000000Zjunk",
+        "20260101000000.Z",
+        "20260101000000.250Z",
+        "20260101000000,5Z",
+        "202601010000Z",
+    ] {
+        assert!(!stamped(bad), "{bad} was taken as a time");
+    }
 }

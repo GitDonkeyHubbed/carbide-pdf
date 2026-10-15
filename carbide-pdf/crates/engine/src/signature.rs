@@ -2319,10 +2319,21 @@ fn purposes_allow_signing(certificate: &Certificate) -> bool {
         .any(|purpose| SIGNING_PURPOSES.contains(&purpose.to_string().as_str()))
 }
 
-/// A GeneralizedTime (`YYYYMMDDHHMMSS[.fff]Z`) as a UTC instant.
+/// A genTime as RFC 3161 writes it, `YYYYMMDDHHMMSS[.f...]Z`, as a UTC instant: seconds always
+/// given, any fraction without trailing zeros, and the time in UTC. Anything else (a local time,
+/// an offset, more digits, text after the `Z`) is not a time stamp's time.
 fn gentime_to_utc(text: &str) -> Option<DateTime<Utc>> {
-    let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.len() < 14 {
+    let rest = text.strip_suffix('Z')?;
+    let (digits, fraction) = match rest.split_once('.') {
+        Some((digits, fraction)) => (digits, Some(fraction)),
+        None => (rest, None),
+    };
+    if digits.len() != 14 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if fraction
+        .is_some_and(|f| f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) || f.ends_with('0'))
+    {
         return None;
     }
     let field = |from: usize, len: usize| digits[from..from + len].parse::<u32>().ok();
