@@ -130,6 +130,91 @@ fn deleted_page_image_does_not_survive_in_a_form_with_resources_of_its_own() {
     );
 }
 
+fn form(doc: &mut Document, res: Object, content: &str) -> Object {
+    Object::Reference(doc.add_object(Stream::new(
+        dictionary! { "Type" => "XObject", "Subtype" => "Form",
+        "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()], "Resources" => res },
+        content.as_bytes().to_vec(),
+    )))
+}
+fn type3(doc: &mut Document, res: Object) -> lopdf::Dictionary {
+    let glyph = doc.add_object(Stream::new(
+        dictionary! {},
+        b"0 0 d0 0 0 10 10 re f".to_vec(),
+    ));
+    dictionary! {"Type" => "Font", "Subtype" => "Type3", "FontBBox" => vec![0.into(),0.into(),10.into(),10.into()],
+    "FontMatrix" => vec![0.1.into(),0.into(),0.into(),0.1.into(),0.into(),0.into()],
+    "CharProcs" => dictionary!{"a" => glyph}, "Encoding" => dictionary!{"Differences" => vec![97.into(), Object::Name(b"a".to_vec())]},
+    "FirstChar" => 97, "LastChar" => 97, "Widths" => vec![10.into()], "Resources" => res}
+}
+
+#[test]
+fn deleted_page_image_does_not_survive_two_forms_down_through_a_shared_category() {
+    // The kept page draws a form whose forms are listed in a dictionary of their own; the form
+    // inside has resources of its own, among them an image nothing draws.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let font = helvetica(doc);
+            let image = secret_image(doc);
+            let inner = form(
+                doc,
+                Object::Dictionary(dictionary! {
+                    "Font" => dictionary! { "F1" => font },
+                    "XObject" => dictionary! { "ImS" => image },
+                }),
+                "BT /F1 9 Tf (inner) Tj ET",
+            );
+            let listed = doc.add_object(dictionary! { "G" => inner });
+            let outer = form(
+                doc,
+                Object::Dictionary(dictionary! { "XObject" => listed }),
+                "/G Do",
+            );
+            dictionary! { "XObject" => dictionary! { "F" => outer } }
+        },
+        &["/F Do", "BT ET"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the unused image is still in the file"
+    );
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the inner form lost its font"
+    );
+}
+
+#[test]
+fn unused_image_of_a_type3_font_written_into_a_shared_font_list_does_not_survive() {
+    // A form's fonts are listed in a dictionary of their own, which holds a Type 3 font written
+    // straight into it; the font's resources hold an image its glyphs never draw.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let image = secret_image(doc);
+            let font = type3(
+                doc,
+                Object::Dictionary(dictionary! { "XObject" => dictionary! { "ImS" => image } }),
+            );
+            let listed = doc.add_object(dictionary! { "T3" => font });
+            let outer = form(
+                doc,
+                Object::Dictionary(dictionary! { "Font" => listed }),
+                "BT /T3 12 Tf (a) Tj ET",
+            );
+            dictionary! { "XObject" => dictionary! { "F" => outer } }
+        },
+        &["/F Do", "BT ET"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the unused image is still in the file"
+    );
+}
+
 // ---- legacy passwords ----------------------------------------------------------------------
 
 const PADDING: [u8; 32] = [
