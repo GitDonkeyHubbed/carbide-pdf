@@ -408,3 +408,44 @@ fn removals_that_were_the_only_hidden_information_are_reported() {
         .unwrap();
     assert_eq!(report.count(HiddenItem::FormData), 2);
 }
+
+// ---- changes to annotations ----------------------------------------------------------------
+
+#[test]
+fn ink_points_taken_out_in_place_count_as_removed() {
+    let ink = std::cell::Cell::new((0, 0));
+    let bytes = {
+        let pdf = one_page(|doc, _, page| {
+            let id = doc.add_object(dictionary! {
+                "Type" => "Annot", "Subtype" => "Ink", "P" => page,
+                "Rect" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                "InkList" => vec![Object::Array(
+                    [10, 10, 50, 50, 90, 10].into_iter().map(Object::from).collect(),
+                )],
+            });
+            doc.get_dictionary_mut(page)
+                .unwrap()
+                .set("Annots", vec![id.into()]);
+            ink.set(id);
+        });
+        let mut copy = pdf.document().clone();
+        let mut bytes = Vec::new();
+        copy.save_to(&mut bytes).unwrap();
+        bytes
+    };
+    let (mut pdf, saved) = SavedFile::open(bytes, None).unwrap();
+    assert!(!saved.removed_from(&pdf));
+    pdf.document_mut()
+        .get_dictionary_mut(ink.get())
+        .unwrap()
+        .set(
+            "InkList",
+            vec![Object::Array(
+                [10, 10, 50, 50].into_iter().map(Object::from).collect(),
+            )],
+        );
+    assert!(
+        saved.removed_from(&pdf),
+        "the removed stroke points went unnoticed"
+    );
+}

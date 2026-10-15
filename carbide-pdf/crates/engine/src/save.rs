@@ -508,11 +508,15 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// The text and data of one object: hashes of its strings and of its stream content.
+/// The text and data of one object: hashes of its strings and of its stream content, and for an
+/// annotation of everything else it holds.
 #[derive(Clone)]
 struct Fingerprint {
     strings: Vec<u64>,
     stream: Option<u64>,
+    /// An annotation's numbers, names and booleans, where they are: ink points, the rectangle,
+    /// colours. Ink points taken out in place change it.
+    drawing: Option<u64>,
 }
 
 impl Fingerprint {
@@ -534,9 +538,15 @@ impl Fingerprint {
         strings(object, &mut found);
         found.sort_unstable();
         let stream = object.as_stream().ok().map(|s| hash(&s.content));
-        (stream.is_some() || !found.is_empty() || is_annotation(object)).then_some(Fingerprint {
+        let drawing = is_annotation(object).then(|| {
+            let mut hasher = DefaultHasher::new();
+            hash_values(object, &mut hasher);
+            hasher.finish()
+        });
+        (stream.is_some() || !found.is_empty() || drawing.is_some()).then_some(Fingerprint {
             strings: found,
             stream,
+            drawing,
         })
     }
 
@@ -546,10 +556,40 @@ impl Fingerprint {
             return false;
         };
         self.stream == now.stream
+            && self.drawing == now.drawing
             && self
                 .strings
                 .iter()
                 .all(|s| now.strings.binary_search(s).is_ok())
+    }
+}
+
+/// Hashes the numbers, names and booleans of `object` with their place in it; strings and
+/// references are left to the rest of the fingerprint. Numbers count by value, so `1` and `1.0`
+/// are the same.
+fn hash_values(object: &Object, hasher: &mut DefaultHasher) {
+    match object {
+        Object::Integer(_) | Object::Real(_) => {
+            let value = object.as_float().unwrap_or_default();
+            // -0 and 0 are the same number.
+            (1u8, (value + 0.0).to_bits()).hash(hasher);
+        }
+        Object::Boolean(value) => (2u8, value).hash(hasher),
+        Object::Name(name) => (3u8, name).hash(hasher),
+        Object::Array(items) => {
+            (4u8, items.len()).hash(hasher);
+            items.iter().for_each(|item| hash_values(item, hasher));
+        }
+        Object::Dictionary(dict) => {
+            let mut entries: Vec<_> = dict.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            (5u8, entries.len()).hash(hasher);
+            for (key, value) in entries {
+                key.hash(hasher);
+                hash_values(value, hasher);
+            }
+        }
+        _ => 0u8.hash(hasher),
     }
 }
 
