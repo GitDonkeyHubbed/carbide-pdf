@@ -34,6 +34,9 @@ const EARLIER_INDEX_QUIET: Duration = Duration::from_secs((MAX_INTERVAL_MINUTES 
 const OWN_PREFIX: &str = "AutoRecovery-";
 /// Held briefly while a store opens, so two stores never take over the same records.
 const FOLDER_LOCK: &str = "AutoRecovery.lock";
+/// How old a staging file of an unfinished write has to be before it is removed: no window takes
+/// anywhere near this long to write one.
+const STALE_STAGING: Duration = Duration::from_secs(3600);
 
 /// User-facing messages.
 pub mod messages {
@@ -209,9 +212,15 @@ impl AutoSaveStore {
     /// root element is not `AutoSave`, yields no records and is left alone.
     pub fn open(dir: impl Into<PathBuf>) -> Result<AutoSaveStore> {
         let dir = dir.into();
-        fs::create_dir_all(&dir)?;
+        // Created private, and made private when it is there already.
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir)?;
         private(&dir, 0o700);
         let _folder = lock_folder(&dir);
+        remove_stale_staging(&dir);
         let (owner, owner_lock) = create_owner(&dir)?;
         let token = owner.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
         let mut store = AutoSaveStore {
@@ -304,7 +313,7 @@ impl AutoSaveStore {
             Some(slot) => slot.path.clone(),
             None => self.reserve_file()?,
         };
-        replace_private(&path, &path.with_extension("asd.tmp"), &bytes)?;
+        replace_private(&path, &bytes)?;
 
         let record = self.records.iter_mut().find(|r| r.id == id).expect("record exists");
         match &mut record.recovered {
@@ -478,7 +487,7 @@ impl AutoSaveStore {
         }
         xml.push_str("</AutoSave>\n");
 
-        replace_private(&self.index, &self.index.with_extension("xml.tmp"), xml.as_bytes())
+        replace_private(&self.index, xml.as_bytes())
     }
 
     /// Takes over the records in the indexes of windows that are gone: an index whose lock file is
@@ -648,22 +657,18 @@ fn parse_index(text: &str) -> Option<Vec<IndexItem>> {
     Some(items)
 }
 
-/// Puts `bytes` at `path` in one step, through `temp`, a file only the user can read: written and
-/// flushed to disk, then renamed over `path`, and the folder flushed too. After a crash or a power
-/// loss `path` holds either what it held before or all of `bytes`, never an empty or torn file.
-fn replace_private(path: &Path, temp: &Path, bytes: &[u8]) -> Result<()> {
+/// Puts `bytes` at `path` in one step, through a new file next to it that only the user can read,
+/// under a name nobody can guess: written and flushed to disk, then renamed over `path`, and the
+/// folder flushed too. After a crash or a power loss `path` holds either what it held before or
+/// all of `bytes`, never an empty or torn file.
+fn replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let _ = fs::remove_file(temp);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let written = options.open(temp).and_then(|mut file| {
-        file.write_all(bytes)?;
-        file.sync_all()
-    });
-    if let Err(e) = written.and_then(|()| fs::rename(temp, path)) {
-        let _ = fs::remove_file(temp);
+    let dir = path.parent().ok_or_else(|| Error::Other(format!("{} has no folder", path.display())))?;
+    let (temp, mut file) = crate::fs::create_temp(dir, 0o600)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written.and_then(|()| fs::rename(&temp, path)) {
+        let _ = fs::remove_file(&temp);
         return Err(e.into());
     }
     // Makes the rename itself durable. Not every platform can flush a folder, so this is best effort.
@@ -671,6 +676,22 @@ fn replace_private(path: &Path, temp: &Path, bytes: &[u8]) -> Result<()> {
         let _ = folder.sync_all();
     }
     Ok(())
+}
+
+/// Removes the staging files of writes that never finished (the app ended halfway), once they
+/// are [`STALE_STAGING`] old. They hold what a recovery copy or an index would have held.
+fn remove_stale_staging(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with(".carbide-") && name.ends_with(".tmp")) {
+            continue;
+        }
+        let age = entry.metadata().and_then(|m| m.modified()).ok().and_then(|modified| modified.elapsed().ok());
+        if age.is_some_and(|age| age >= STALE_STAGING) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Restricts `path` to the user. Best effort: a folder that cannot be changed is used as it is.

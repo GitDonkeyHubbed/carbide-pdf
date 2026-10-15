@@ -1948,11 +1948,23 @@ fn recovery_copies_are_private_and_never_of_protected_documents() {
     let mut store = AutoSaveStore::open(&dir).unwrap();
     let draft = store.begin_document(None, 1);
     store.autosave(draft, &mut text_pdf(&[&["draft"]]), 2).unwrap();
+    store.autosave(draft, &mut text_pdf(&[&["draft, later"]]), 3).unwrap();
     assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
     for entry in std::fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0, "{}", path.display());
+        // Copies and the index are staged under names nobody can guess, and never left behind.
+        assert!(!path.to_string_lossy().ends_with(".tmp"), "{}", path.display());
     }
+    // A link where earlier versions staged the next copy is never written through.
+    let copy = store.record(draft).unwrap().recovered.clone().unwrap().path;
+    let victim = dir.join("..").join(format!("victim-{}", std::process::id()));
+    std::fs::write(&victim, b"untouched").unwrap();
+    std::os::unix::fs::symlink(&victim, copy.with_extension("asd.tmp")).unwrap();
+    store.autosave(draft, &mut text_pdf(&[&["draft, again"]]), 4).unwrap();
+    assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+    std::fs::remove_file(copy.with_extension("asd.tmp")).unwrap();
+    std::fs::remove_file(&victim).unwrap();
 
     // Opens without a password, so nothing else stops it.
     let protected = text_pdf(&[&["PROTECTEDTEXT"]]).to_encrypted_bytes(&ProtectionOptions::new("", "owner pw")).unwrap();

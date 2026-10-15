@@ -4,7 +4,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// What writing a new file does when a file is already at its path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,27 +270,36 @@ fn resolve_links(path: &Path) -> io::Result<PathBuf> {
     Err(io::Error::other(format!("too many symbolic links at {}", path.display())))
 }
 
-/// Creates a new, uniquely named file in `dir`. `mode` is the Unix permission mode it is created
-/// with (before the umask). The name is short, so it fits wherever the target's name does.
-fn create_temp(dir: &Path, mode: u32) -> io::Result<(PathBuf, File)> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut attempts = 0;
-    loop {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temp = dir.join(format!(".carbide-{}-{n}.tmp", std::process::id()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
-        #[cfg(not(unix))]
-        let _ = mode;
-        match options.open(&temp) {
+/// Creates a new file in `dir` for writing what is then renamed into place, under a name nobody
+/// can guess: `.carbide-` and 16 random hexadecimal digits. `mode` is the Unix permission mode it
+/// is created with (before the umask). The name is short, so it fits wherever the target's name
+/// does. See [`create_exclusive`] for what is at a name already.
+pub(crate) fn create_temp(dir: &Path, mode: u32) -> io::Result<(PathBuf, File)> {
+    for _ in 0..100 {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).map_err(|e| io::Error::other(format!("no randomness available: {e}")))?;
+        let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let temp = dir.join(format!(".carbide-{suffix}.tmp"));
+        match create_exclusive(&temp, mode) {
             Ok(file) => return Ok((temp, file)),
-            // Left over from another process, or a name someone else picked: try the next one.
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempts < 100 => attempts += 1,
+            // Left over from another process, or put there by someone else: try another name.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
     }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("no free temporary file name in {}", dir.display())))
+}
+
+/// Creates the file `path`, which must not exist: anything already there, a symbolic link
+/// included (which is never followed), fails with `AlreadyExists` and is left as it is.
+fn create_exclusive(path: &Path, mode: u32) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+    #[cfg(not(unix))]
+    let _ = mode;
+    options.open(path)
 }
 
 #[cfg(test)]
@@ -409,6 +417,38 @@ mod tests {
         remove_private_temp_file(&path).unwrap();
         remove_private_temp_file(&other).unwrap();
         assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_files_get_names_nobody_can_guess_and_never_follow_links() {
+        use std::os::unix::fs::symlink;
+        let dir = scratch("staging");
+        let victim = dir.join("victim");
+        fs::write(&victim, b"untouched").unwrap();
+        // Links at every name a counter of this process would give.
+        for n in 0..200 {
+            symlink(&victim, dir.join(format!(".carbide-{}-{n}.tmp", std::process::id()))).unwrap();
+        }
+        write_replacing(&dir.join("doc.pdf"), b"replaced").unwrap();
+        write_replacing(&dir.join("doc.pdf"), b"replaced again").unwrap();
+        write_new(&dir.join("new.pdf"), b"new").unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        assert_eq!(fs::read(dir.join("doc.pdf")).unwrap(), b"replaced again");
+
+        // Every name is new, and owes nothing to the process.
+        let (a, _) = create_temp(&dir, 0o600).unwrap();
+        let (b, _) = create_temp(&dir, 0o600).unwrap();
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.len() == ".carbide-.tmp".len() + 16 && !name.contains(&std::process::id().to_string()), "{name}");
+
+        // A link at the name itself fails the attempt rather than being written through.
+        let link = dir.join(".carbide-planted.tmp");
+        symlink(&victim, &link).unwrap();
+        assert_eq!(create_exclusive(&link, 0o600).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
