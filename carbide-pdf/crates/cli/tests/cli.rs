@@ -1054,3 +1054,38 @@ fn sanitize_removes_bookmarks_when_asked_together_with_only() {
     assert!(!has_destinations(&removed));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn sanitize_leaves_a_file_with_nothing_hidden_as_it_is() {
+    let dir = scratch("sanitize-nothing");
+    let file = dir.join("plain.pdf");
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    std::fs::write(&file, pdf.to_bytes().unwrap()).unwrap();
+    let before = std::fs::read(&file).unwrap();
+    let path = file.to_str().unwrap();
+
+    let copy = dir.join("copy.pdf");
+    let output = carbide(&[
+        "sanitize",
+        path,
+        copy.to_str().unwrap(),
+        "--only",
+        "thumbnails",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("No hidden information was found"));
+    assert!(
+        std::fs::read(&copy).unwrap() == before,
+        "the copy was rewritten"
+    );
+
+    let output = carbide(&["sanitize", path, path, "--only", "thumbnails"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("left unchanged"));
+    assert!(
+        std::fs::read(&file).unwrap() == before,
+        "the input was rewritten"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
