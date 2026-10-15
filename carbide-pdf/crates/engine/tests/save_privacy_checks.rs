@@ -1,7 +1,7 @@
 //! What saving keeps and what it leaves out: resources that only removed content used, and the
 //! file's own bytes read back as they were.
 
-use carbide_engine::Pdf;
+use carbide_engine::{Pdf, SavePlan, SavedFile};
 use lopdf::{dictionary, Document, Object, Stream};
 
 const SECRET: &[u8] = b"SECRET-PAYLOAD-7f3a";
@@ -209,4 +209,49 @@ fn legacy_password_with_a_tab_and_an_accent_opens_the_file() {
     let file = rc4_file(&[0xe9, 0x09, b'a']);
     let pdf = Pdf::from_bytes_with_password(&file, "é\ta").expect("the password is right");
     assert_eq!(pdf.page_count(), 1);
+}
+
+// ---- linearization -------------------------------------------------------------------------
+
+#[test]
+fn text_reading_linearized_near_the_start_does_not_hide_an_update() {
+    // The first object is the document information, whose title reads "/Linearized".
+    let mut doc = Document::with_version("1.7");
+    let info = doc.add_object(dictionary! {
+        "Title" => Object::string_literal("/Linearized"),
+    });
+    let pages_id = doc.new_object_id();
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(
+            dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 },
+        ),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    doc.trailer.set("Info", info);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    assert!(contains(&bytes[..1024.min(bytes.len())], b"/Linearized"));
+
+    let (mut pdf, saved) = SavedFile::open(bytes, None).unwrap();
+    assert_eq!(saved.appended_updates(), 0);
+    let catalog = pdf
+        .document()
+        .trailer
+        .get(b"Root")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    pdf.document_mut()
+        .get_dictionary_mut(catalog)
+        .unwrap()
+        .set("Lang", Object::string_literal("en"));
+    let updated = pdf.save_bytes(SavePlan::Incremental, Some(&saved)).unwrap();
+    let (_, saved) = SavedFile::open(updated, None).unwrap();
+    assert_eq!(saved.appended_updates(), 1);
 }

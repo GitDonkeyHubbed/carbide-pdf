@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+use lopdf::xref::XrefEntry;
 use lopdf::{Document, EncryptionState, Object, ObjectId, SaveOptions};
 
 use crate::error::{Error, Result};
@@ -112,7 +113,7 @@ impl SavedFile {
             .filter(|id| !reachable.contains(id) && !structure.contains(id))
             .copied()
             .collect();
-        let updates = appended_updates(&bytes, pdf.doc.xref_start);
+        let updates = appended_updates(&bytes, &pdf.doc);
         SavedFile {
             bytes,
             password,
@@ -433,13 +434,13 @@ pub(crate) fn prune(doc: &mut Document) -> Vec<ObjectId> {
     gone
 }
 
-/// How many updates were appended to the file `bytes`, whose last cross-reference section starts
-/// at `xref_start`. Counted by following the sections' /Prev links back to the first; the link from
-/// a linearized file's first-page section to its main section is not an update. A start of zero
+/// How many updates were appended to the file `bytes`, read as `doc`. Counted by following the
+/// cross-reference sections' /Prev links back from the last one to the first; the link from a
+/// linearized file's first-page section to its main section is not an update. A start of zero
 /// means the cross-reference table had to be rebuilt, which leaves nothing to follow.
-fn appended_updates(bytes: &[u8], xref_start: usize) -> usize {
+fn appended_updates(bytes: &[u8], doc: &Document) -> usize {
     let mut seen = HashSet::new();
-    let mut at = xref_start;
+    let mut at = doc.xref_start;
     let mut links = 0;
     while at != 0 && seen.insert(at) {
         match previous_section(bytes, at) {
@@ -450,8 +451,27 @@ fn appended_updates(bytes: &[u8], xref_start: usize) -> usize {
             _ => break,
         }
     }
-    let linearized = find(&bytes[..bytes.len().min(1024)], b"/Linearized").is_some();
-    links - usize::from(linearized && links > 0)
+    links - usize::from(is_linearized(doc) && links > 0)
+}
+
+/// True when the first object of the file is a linearization dictionary: text that merely reads
+/// `/Linearized` near the start of the file does not count.
+fn is_linearized(doc: &Document) -> bool {
+    let first = doc
+        .reference_table
+        .entries
+        .iter()
+        .filter_map(|(&number, entry)| match entry {
+            XrefEntry::Normal { offset, generation } => Some((*offset, (number, *generation))),
+            _ => None,
+        })
+        .min();
+    first.is_some_and(|(_, id)| {
+        doc.objects
+            .get(&id)
+            .and_then(|object| object.as_dict().ok())
+            .is_some_and(|dict| dict.get(b"Linearized").is_ok_and(|v| v.as_float().is_ok()))
+    })
 }
 
 /// The /Prev entry of the cross-reference section at `at`: in the trailer that follows a table, or
