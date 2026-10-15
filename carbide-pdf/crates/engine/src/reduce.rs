@@ -193,6 +193,10 @@ fn linear(m: [f32; 6]) -> Linear {
     [m[0], m[1], m[2], m[3]]
 }
 
+/// What a form draws: its images, each with the matrix it is drawn with relative to the space the
+/// form is drawn in.
+type FormDraws = Rc<Vec<(ObjectId, Linear)>>;
+
 /// The images some content draws, directly or through forms, each with the matrix it is drawn
 /// with relative to the content's own space. An image drawn at the same size twice is listed once.
 #[derive(Default)]
@@ -222,7 +226,7 @@ struct Scan {
     /// What each form draws, relative to the space it is drawn in, by the form and the page or form
     /// whose resources it is drawn with (its own, or those of what draws it). However often a form
     /// is drawn, its content is read once for each.
-    forms: HashMap<(ObjectId, ObjectId), Rc<Vec<(ObjectId, Linear)>>>,
+    forms: HashMap<(ObjectId, ObjectId), FormDraws>,
     /// The forms being drawn, outermost first. A form that draws itself is not followed again.
     path: Vec<ObjectId>,
     /// The work done so far (see [`MAX_SCAN_WORK`]), and the bytes of form content read.
@@ -363,7 +367,7 @@ impl Pdf {
         resources: &Dictionary,
         holder: ObjectId,
         scan: &mut Scan,
-    ) -> Result<Option<Rc<Vec<(ObjectId, Linear)>>>> {
+    ) -> Result<Option<FormDraws>> {
         if scan.path.contains(&id) || scan.work >= MAX_SCAN_WORK {
             return Ok(None);
         }
@@ -388,8 +392,7 @@ impl Pdf {
         scan.path.pop();
         let scanned = scanned?;
         let matrix = linear(matrix_from(stream.dict.get(b"Matrix").ok()));
-        let drawn: Rc<Vec<(ObjectId, Linear)>> =
-            Rc::new(scanned.list.into_iter().map(|(image, m)| (image, linear_product(m, matrix))).collect());
+        let drawn: FormDraws = Rc::new(scanned.list.into_iter().map(|(image, m)| (image, linear_product(m, matrix))).collect());
         if !scanned.partial {
             scan.forms.insert((id, holder), drawn.clone());
         }

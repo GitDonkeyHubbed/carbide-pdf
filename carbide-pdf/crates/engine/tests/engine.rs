@@ -1327,7 +1327,7 @@ fn replies_on_pages_that_stay_do_not_keep_annotations_of_pages_that_go() {
     };
     let source = replies_across_pages();
     check(source.extract_pages(&[1]).unwrap(), "extract");
-    check(source.split(&[1..=1]).unwrap().remove(0), "split");
+    check(source.split(&[0..=0, 1..=1]).unwrap().remove(1), "split");
     let mut deleted = source.clone();
     deleted.delete_pages(&[0]).unwrap();
     check(deleted, "delete");
