@@ -1365,7 +1365,7 @@ const MAX_CHAIN: usize = 8;
 /// cA=true, keyUsage keyCertSign when present), satisfy its pathLenConstraint, and be valid at
 /// `at`. A non-CA leaf can never act as an issuer, so one leaf cannot vouch for another. No
 /// certificate on the path, the signer's included, may carry a critical extension this verifier
-/// does not process. When no
+/// does not process, and no CA on it may set name constraints, which are not enforced. When no
 /// chain qualifies, the error says whether one reaches the store by names and signatures alone
 /// (`ChainRejected`) or none does (`DigestOkUntrusted`).
 fn trust_level(
@@ -1485,7 +1485,9 @@ impl<'a> ChainSearch<'a> {
 /// valid at `at`: it must be a CA (pathLen permitting), allow key-certificate signing, and be in
 /// its validity period.
 fn can_issue(cert: &Certificate, intermediates: usize, at: DateTime<Utc>) -> bool {
-    if !critical_extensions_understood(cert) {
+    // Name constraints limit the names a CA may vouch for. They are not enforced here, so a CA
+    // that sets them, whether marked critical or not, cannot confirm anyone.
+    if !critical_extensions_understood(cert) || has_extension(cert, "2.5.29.30") {
         return false;
     }
     let Some(path_len) = basic_constraints_ca(cert) else {
@@ -1522,6 +1524,14 @@ fn critical_extensions_understood(cert: &Certificate) -> bool {
                     || UNDERSTOOD_EXTENSIONS.contains(&extension.extn_id.to_string().as_str())
             })
         })
+}
+
+/// True when `cert` carries an extension `oid`.
+fn has_extension(cert: &Certificate, oid: &str) -> bool {
+    cert.tbs_certificate
+        .extensions
+        .as_ref()
+        .is_some_and(|extensions| extensions.iter().any(|e| e.extn_id.to_string() == oid))
 }
 
 /// `Some(pathLenConstraint)` when `cert` has basicConstraints with cA=true, else `None`.

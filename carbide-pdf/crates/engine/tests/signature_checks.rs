@@ -420,6 +420,42 @@ fn a_critical_extension_nothing_checks_leaves_the_identity_unconfirmed() {
     assert_eq!(chain_outcome(&identity, &root), VIA_CHAIN);
 }
 
+#[test]
+fn name_constraints_on_a_ca_leave_the_identity_unconfirmed() {
+    let (root, root_issuer) = ca("Constrained Root CA", None, |p| {
+        p.name_constraints = Some(rcgen::NameConstraints {
+            permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName("example.com".into())],
+            excluded_subtrees: Vec::new(),
+        });
+    });
+    assert_eq!(
+        chain_outcome(&leaf(&root_issuer, &[], |_| {}), &root),
+        REJECTED
+    );
+
+    let (root, root_issuer) = ca("Root CA", None, |_| {});
+    let (intermediate, intermediate_issuer) = ca("Intermediate CA", Some(&root_issuer), |p| {
+        p.name_constraints = Some(rcgen::NameConstraints {
+            permitted_subtrees: Vec::new(),
+            excluded_subtrees: vec![rcgen::GeneralSubtree::Rfc822Name("example.org".into())],
+        });
+    });
+    let identity = leaf(&intermediate_issuer, &[intermediate], |_| {});
+    assert_eq!(chain_outcome(&identity, &root), REJECTED);
+
+    // Name constraints should be critical, but are not always marked so.
+    let (root, root_issuer) = ca("Loosely Constrained Root CA", None, |p| {
+        let permitted = seq(&[&ctx(0, &seq(&[&tlv(0x82, b"example.com")]))]);
+        let mut extension = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 30], permitted);
+        extension.set_criticality(false);
+        p.custom_extensions.push(extension);
+    });
+    assert_eq!(
+        chain_outcome(&leaf(&root_issuer, &[], |_| {}), &root),
+        REJECTED
+    );
+}
+
 // ---- the signature value in the file -------------------------------------------------------
 
 #[test]
