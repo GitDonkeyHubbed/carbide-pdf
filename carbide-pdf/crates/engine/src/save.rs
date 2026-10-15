@@ -69,22 +69,16 @@ pub struct Protection {
 }
 
 impl Protection {
-    /// True when `other` is the same encryption: the same file key, encryption dictionary values
-    /// and permissions, so the same passwords open both and allow the same.
+    /// True when `other` is the same encryption: the same file key, encryption dictionary values,
+    /// crypt filters and permissions, so the same passwords open both, allow the same and leave
+    /// the same parts (metadata, say) unencrypted.
     pub fn same_as(&self, other: &Protection) -> bool {
-        let (a, b) = (&self.state, &other.state);
         let first_id = |p: &Protection| {
             p.id.as_ref()
                 .and_then(|id| id.as_array().ok()?.first().cloned())
         };
-        a.file_encryption_key() == b.file_encryption_key()
-            && (a.version(), a.revision()) == (b.version(), b.revision())
-            && a.permissions() == b.permissions()
-            && (a.owner_value(), a.user_value()) == (b.owner_value(), b.user_value())
-            && (a.owner_encrypted(), a.user_encrypted())
-                == (b.owner_encrypted(), b.user_encrypted())
-            && a.permission_encrypted() == b.permission_encrypted()
-            && (a.revision() >= 5 || first_id(self) == first_id(other))
+        same_encryption(&self.state, &other.state)
+            && (self.state.revision() >= 5 || first_id(self) == first_id(other))
     }
 }
 
@@ -373,19 +367,35 @@ fn check_encryption(bytes: &[u8], password: Option<&str>, protection: &Protectio
     let Some(state) = state else {
         return Err(Error::Other(NOT_ENCRYPTED.into()));
     };
-    let original = &protection.state;
-    let same = state.file_encryption_key() == original.file_encryption_key()
-        && (state.version(), state.revision()) == (original.version(), original.revision())
-        && state.permissions() == original.permissions()
-        && (state.owner_value(), state.user_value())
-            == (original.owner_value(), original.user_value())
-        && (state.owner_encrypted(), state.user_encrypted())
-            == (original.owner_encrypted(), original.user_encrypted());
+    let same = same_encryption(&state, &protection.state);
     if same {
         Ok(())
     } else {
         Err(Error::Other(NOT_ENCRYPTED.into()))
     }
+}
+
+/// True when `a` and `b` encrypt the same way: the same file key, encryption dictionary values
+/// and permissions, whether metadata is encrypted, and the same crypt filters for streams and
+/// strings. Otherwise a document written with one would not keep what the other protects.
+fn same_encryption(a: &EncryptionState, b: &EncryptionState) -> bool {
+    let filters = |state: &EncryptionState| -> Vec<(Vec<u8>, Vec<u8>)> {
+        state
+            .crypt_filters()
+            .iter()
+            .map(|(name, filter)| (name.clone(), filter.method().to_vec()))
+            .collect()
+    };
+    a.file_encryption_key() == b.file_encryption_key()
+        && (a.version(), a.revision()) == (b.version(), b.revision())
+        && a.permissions() == b.permissions()
+        && (a.owner_value(), a.user_value()) == (b.owner_value(), b.user_value())
+        && (a.owner_encrypted(), a.user_encrypted()) == (b.owner_encrypted(), b.user_encrypted())
+        && a.permission_encrypted() == b.permission_encrypted()
+        && a.encrypt_metadata() == b.encrypt_metadata()
+        && (a.default_stream_filter(), a.default_string_filter())
+            == (b.default_stream_filter(), b.default_string_filter())
+        && filters(a) == filters(b)
 }
 
 /// Every object reachable from the trailer.

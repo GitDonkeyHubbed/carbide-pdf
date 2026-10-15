@@ -255,3 +255,79 @@ fn text_reading_linearized_near_the_start_does_not_hide_an_update() {
     let (_, saved) = SavedFile::open(updated, None).unwrap();
     assert_eq!(saved.appended_updates(), 1);
 }
+
+// ---- comparing protections -----------------------------------------------------------------
+
+/// The encryption dictionary of an AES-128 (revision 4) file with an empty open password.
+fn r4_encryption() -> lopdf::Dictionary {
+    use lopdf::encryption::crypt_filters::Aes128CryptFilter;
+    use lopdf::{EncryptionState, EncryptionVersion, Permissions};
+    let mut doc = Document::with_version("1.6");
+    doc.trailer.set("ID", file_id());
+    let state = EncryptionState::try_from(EncryptionVersion::V4 {
+        document: &doc,
+        encrypt_metadata: true,
+        crypt_filters: [(
+            b"StdCF".to_vec(),
+            std::sync::Arc::new(Aes128CryptFilter) as std::sync::Arc<_>,
+        )]
+        .into_iter()
+        .collect(),
+        stream_filter: b"StdCF".to_vec(),
+        string_filter: b"StdCF".to_vec(),
+        owner_password: "owner",
+        user_password: "",
+        permissions: Permissions::all(),
+    })
+    .unwrap();
+    state.encode().unwrap()
+}
+
+fn file_id() -> Vec<Object> {
+    let id = Object::String(
+        b"0123456789abcdef".to_vec(),
+        lopdf::StringFormat::Hexadecimal,
+    );
+    vec![id.clone(), id]
+}
+
+/// A one-page file encrypted with `encryption`; it holds no strings or streams to encrypt.
+fn encrypted_file(encryption: lopdf::Dictionary) -> Pdf {
+    let mut doc = Document::with_version("1.6");
+    let pages_id = doc.new_object_id();
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(
+            dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 },
+        ),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    let encrypt = doc.add_object(encryption);
+    doc.trailer.set("Root", catalog);
+    doc.trailer.set("Encrypt", encrypt);
+    doc.trailer.set("ID", file_id());
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
+#[test]
+fn protections_that_encrypt_strings_differently_are_not_the_same() {
+    // Same passwords, file key and permissions; only one of them encrypts strings.
+    let encryption = r4_encryption();
+    let sealed = encrypted_file(encryption.clone());
+    let mut without = encryption;
+    without.set("StrF", Object::Name(b"Identity".to_vec()));
+    let clear = encrypted_file(without);
+    let (a, b) = (sealed.protection().unwrap(), clear.protection().unwrap());
+    assert!(
+        !a.same_as(&b),
+        "a merge would write the strings of one file in clear"
+    );
+    assert!(Pdf::shared_protection(&[&sealed, &clear]).is_err());
+    assert!(a.same_as(&sealed.protection().unwrap()));
+}
