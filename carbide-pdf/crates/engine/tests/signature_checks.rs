@@ -318,6 +318,8 @@ fn signed_with(sub_filter: SubFilter, cms: impl Fn(&[u8]) -> Vec<u8>) -> Vec<u8>
     file
 }
 
+// ---- certificate paths ---------------------------------------------------------------------
+
 fn cert_params(cn: &str, is_ca: IsCa, usages: &[KeyUsagePurpose]) -> CertificateParams {
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
     params.distinguished_name.push(DnType::CommonName, cn);
@@ -326,6 +328,96 @@ fn cert_params(cn: &str, is_ca: IsCa, usages: &[KeyUsagePurpose]) -> Certificate
     params.not_before = rcgen::date_time_ymd(2020, 1, 1);
     params.not_after = rcgen::date_time_ymd(2040, 1, 1);
     params
+}
+
+/// A CA certificate, self-signed or issued by `issuer`, adjusted by `adjust`.
+fn ca(
+    cn: &str,
+    issuer: Option<&Issuer<'_, KeyPair>>,
+    adjust: impl FnOnce(&mut CertificateParams),
+) -> (Vec<u8>, Issuer<'static, KeyPair>) {
+    let pair = KeyPair::generate().unwrap();
+    let mut params = cert_params(
+        cn,
+        IsCa::Ca(BasicConstraints::Unconstrained),
+        &[KeyUsagePurpose::KeyCertSign],
+    );
+    adjust(&mut params);
+    let cert = match issuer {
+        Some(issuer) => params.signed_by(&pair, issuer),
+        None => params.self_signed(&pair),
+    };
+    (cert.unwrap().der().to_vec(), Issuer::new(params, pair))
+}
+
+/// The test signer's key in a certificate `issuer` issues, adjusted by `adjust`, with the
+/// certificates in `above` embedded after it.
+fn leaf(
+    issuer: &Issuer<'_, KeyPair>,
+    above: &[Vec<u8>],
+    adjust: impl FnOnce(&mut CertificateParams),
+) -> Identity {
+    let pair = KeyPair::try_from(signer().pkcs8.as_slice()).unwrap();
+    let mut params = cert_params(
+        "Chain Signer",
+        IsCa::ExplicitNoCa,
+        &[KeyUsagePurpose::DigitalSignature],
+    );
+    adjust(&mut params);
+    let mut chain = vec![params.signed_by(&pair, issuer).unwrap().der().to_vec()];
+    chain.extend_from_slice(above);
+    Identity::new(chain, signer().key.clone()).unwrap()
+}
+
+/// How a signature by `identity` reads when only `root` is trusted.
+fn chain_outcome(identity: &Identity, root: &[u8]) -> (Validity, Detail) {
+    let signed = sign(identity, SubFilter::Pkcs7Detached, None);
+    let trust = TrustStore {
+        certificates: vec![root.to_vec()],
+    };
+    outcome(&verify(&signed, &trust)[0])
+}
+
+const REJECTED: (Validity, Detail) = (Validity::ValidityUnknown, Detail::ChainRejected);
+const VIA_CHAIN: (Validity, Detail) = (Validity::Valid, Detail::TrustedViaChain);
+
+/// A critical extension of a kind nothing here checks.
+fn unknown_critical_extension() -> rcgen::CustomExtension {
+    let mut extension =
+        rcgen::CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 55555, 1], null());
+    extension.set_criticality(true);
+    extension
+}
+
+#[test]
+fn a_critical_extension_nothing_checks_leaves_the_identity_unconfirmed() {
+    let (root, root_issuer) = ca("Root CA", None, |_| {});
+    assert_eq!(
+        chain_outcome(&leaf(&root_issuer, &[], |_| {}), &root),
+        VIA_CHAIN
+    );
+
+    // On the signer's certificate.
+    let identity = leaf(&root_issuer, &[], |p| {
+        p.custom_extensions.push(unknown_critical_extension())
+    });
+    assert_eq!(chain_outcome(&identity, &root), REJECTED);
+
+    // On a CA between the signer and the trusted root.
+    let (intermediate, intermediate_issuer) = ca("Intermediate CA", Some(&root_issuer), |p| {
+        p.custom_extensions.push(unknown_critical_extension())
+    });
+    let identity = leaf(&intermediate_issuer, &[intermediate], |_| {});
+    assert_eq!(chain_outcome(&identity, &root), REJECTED);
+
+    // The same extension, not marked critical, may be ignored.
+    let (intermediate, intermediate_issuer) = ca("Intermediate CA", Some(&root_issuer), |p| {
+        let mut extension = unknown_critical_extension();
+        extension.set_criticality(false);
+        p.custom_extensions.push(extension)
+    });
+    let identity = leaf(&intermediate_issuer, &[intermediate], |_| {});
+    assert_eq!(chain_outcome(&identity, &root), VIA_CHAIN);
 }
 
 // ---- the signature value in the file -------------------------------------------------------

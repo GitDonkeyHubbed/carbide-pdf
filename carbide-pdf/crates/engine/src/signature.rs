@@ -1363,7 +1363,9 @@ const MAX_CHAIN: usize = 8;
 /// Builds and trusts a chain from `signer` up to a certificate in `store`, trying every candidate
 /// issuer (a cross-signed intermediate has several). Each issuer must be a CA (basicConstraints
 /// cA=true, keyUsage keyCertSign when present), satisfy its pathLenConstraint, and be valid at
-/// `at`. A non-CA leaf can never act as an issuer, so one leaf cannot vouch for another. When no
+/// `at`. A non-CA leaf can never act as an issuer, so one leaf cannot vouch for another. No
+/// certificate on the path, the signer's included, may carry a critical extension this verifier
+/// does not process. When no
 /// chain qualifies, the error says whether one reaches the store by names and signatures alone
 /// (`ChainRejected`) or none does (`DigestOkUntrusted`).
 fn trust_level(
@@ -1388,7 +1390,7 @@ fn trust_level(
         .filter_map(|d| Certificate::from_der(d).ok())
         .collect();
     let mut search = ChainSearch::new(signer, trusted.iter().chain(embedded), &in_store);
-    if search.reaches_store(Some(at)) {
+    if critical_extensions_understood(signer) && search.reaches_store(Some(at)) {
         Ok(Detail::TrustedViaChain)
     } else if search.reaches_store(None) {
         Err(Detail::ChainRejected)
@@ -1483,6 +1485,9 @@ impl<'a> ChainSearch<'a> {
 /// valid at `at`: it must be a CA (pathLen permitting), allow key-certificate signing, and be in
 /// its validity period.
 fn can_issue(cert: &Certificate, intermediates: usize, at: DateTime<Utc>) -> bool {
+    if !critical_extensions_understood(cert) {
+        return false;
+    }
     let Some(path_len) = basic_constraints_ca(cert) else {
         return false;
     };
@@ -1490,6 +1495,33 @@ fn can_issue(cert: &Certificate, intermediates: usize, at: DateTime<Utc>) -> boo
         return false;
     }
     key_usage_allows(cert, |usage| usage.key_cert_sign()) && valid_at(cert, at)
+}
+
+/// The extensions path validation here takes into account: basic constraints, key usage, extended
+/// key usage, and the subject and authority key identifiers and subject alternative names, which
+/// only describe the certificate.
+const UNDERSTOOD_EXTENSIONS: [&str; 6] = [
+    "2.5.29.19",
+    "2.5.29.15",
+    "2.5.29.37",
+    "2.5.29.14",
+    "2.5.29.35",
+    "2.5.29.17",
+];
+
+/// True when every extension `cert` marks critical is one this verifier processes. RFC 5280 (4.2)
+/// says a certificate with a critical extension the verifier does not recognise must be rejected:
+/// the extension may restrict what the certificate is good for.
+fn critical_extensions_understood(cert: &Certificate) -> bool {
+    cert.tbs_certificate
+        .extensions
+        .as_ref()
+        .is_none_or(|extensions| {
+            extensions.iter().all(|extension| {
+                !extension.critical
+                    || UNDERSTOOD_EXTENSIONS.contains(&extension.extn_id.to_string().as_str())
+            })
+        })
 }
 
 /// `Some(pathLenConstraint)` when `cert` has basicConstraints with cA=true, else `None`.
