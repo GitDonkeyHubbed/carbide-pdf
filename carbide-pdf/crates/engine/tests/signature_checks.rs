@@ -328,6 +328,45 @@ fn cert_params(cn: &str, is_ca: IsCa, usages: &[KeyUsagePurpose]) -> Certificate
     params
 }
 
+// ---- the signature value in the file -------------------------------------------------------
+
+#[test]
+fn a_hex_signature_value_with_line_breaks_and_an_odd_last_digit_verifies() {
+    let mut file = sign(&signer().identity, SubFilter::Pkcs7Detached, None);
+    let [_, b, c, _] = byte_range(&file);
+    let slot = c - b - 2;
+    let cms_hex = std::str::from_utf8(&file[b + 1..c - 1])
+        .unwrap()
+        .to_string();
+    let used = cms_hex.trim_end_matches('0').len().div_ceil(2) * 2;
+    let mut spaced = String::new();
+    for (i, chunk) in cms_hex.as_bytes()[..used].chunks(64).enumerate() {
+        spaced.push_str(if i % 2 == 0 { "\r\n" } else { " \t" });
+        spaced.push_str(std::str::from_utf8(chunk).unwrap());
+    }
+    spaced.push('\n');
+    while spaced.len() < slot {
+        spaced.push('0');
+    }
+    // An odd number of digits: the last one stands for its high nibble alone.
+    let digits = spaced.bytes().filter(u8::is_ascii_hexdigit).count();
+    if digits % 2 == 0 {
+        spaced.pop();
+        spaced.push(' ');
+    }
+    assert_eq!(spaced.len(), slot);
+    file[b + 1..c - 1].copy_from_slice(spaced.as_bytes());
+    let report = verify(&file, &trust_signer()).remove(0);
+    assert_eq!(outcome(&report), (Validity::Valid, Detail::TrustedDirectly));
+
+    // Anything else between the digits is refused.
+    let mut broken = file.clone();
+    let at = b + 1 + spaced.find('\n').unwrap();
+    broken[at] = b'G';
+    let report = verify(&broken, &trust_signer()).remove(0);
+    assert_eq!(report.validity, Validity::Invalid);
+}
+
 // ---- signed attributes ---------------------------------------------------------------------
 
 #[test]

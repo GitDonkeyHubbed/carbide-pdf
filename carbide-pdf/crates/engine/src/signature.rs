@@ -1576,20 +1576,25 @@ fn signature_value_span(pdf: &Pdf, id: ObjectId, file: &[u8]) -> Option<(usize, 
     }
 }
 
-/// The length of the `/Contents` string as the document was parsed.
-fn parsed_contents_length(v: &Dictionary) -> Option<usize> {
-    v.get(b"Contents").ok()?.as_str().ok().map(<[u8]>::len)
+/// The `/Contents` string as the document was parsed.
+fn parsed_contents(v: &Dictionary) -> Option<&[u8]> {
+    v.get(b"Contents").ok()?.as_str().ok()
 }
 
-/// Hex digits only, an even number of them.
+/// The bytes of a hex string's digits, read as PDF does: white space between digits is ignored,
+/// and a last digit on its own is followed by an implied 0.
 fn hex_value(text: &[u8]) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
-    let digit = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
-    text.chunks(2)
-        .map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?))
-        .collect()
+    let digits = text
+        .iter()
+        .filter(|b| !b"\0\t\n\x0c\r ".contains(b))
+        .map(|b| (*b as char).to_digit(16).map(|d| d as u8))
+        .collect::<Option<Vec<u8>>>()?;
+    Some(
+        digits
+            .chunks(2)
+            .map(|pair| pair[0] << 4 | pair.get(1).copied().unwrap_or(0))
+            .collect(),
+    )
 }
 
 /// True when the revision ending at `end` names cross-reference data of its own in the signed
@@ -1933,10 +1938,14 @@ fn verify_one(
             return report;
         }
     };
-    let bound = signature_value_span(revision, id, file) == Some((b, c))
-        && (revision.doc.encryption_state.is_some()
-            || parsed_contents_length(signed).is_some_and(|len| 2 * len + 2 == c - b));
-    let Some(contents) = bound.then(|| hex_value(&file[b + 1..c - 1])).flatten() else {
+    let contents = (signature_value_span(revision, id, file) == Some((b, c)))
+        .then(|| hex_value(&file[b + 1..c - 1]))
+        .flatten()
+        .filter(|value| {
+            revision.doc.encryption_state.is_some()
+                || parsed_contents(signed) == Some(value.as_slice())
+        });
+    let Some(contents) = contents else {
         invalid(&mut report, Detail::BadByteRange);
         return report;
     };
