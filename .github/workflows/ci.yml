@@ -16,8 +16,10 @@ env:
   CARGO_TERM_COLOR: always
   # PDFium is loaded at run time. This is the release the tests are run against; it works with
   # pdfium-render 0.9. To move to another release, change the tag and the checksum together.
+  # The download matches the runner's architecture, so the job works on Apple silicon and Intel runners.
   PDFIUM_TAG: chromium/8086
-  PDFIUM_SHA256: e98679e052c07edbb5a627980902abb823d4b3f35744d877bd21668bd9fc13ab
+  PDFIUM_ARM64_SHA256: e98679e052c07edbb5a627980902abb823d4b3f35744d877bd21668bd9fc13ab
+  PDFIUM_X64_SHA256: 933a85a138f6027243c56bff8676375c33ceeb767401389415ffc44d689ca85d
   # OCR models, from the location the README gives. The files at that address are not versioned,
   # so they are checked against these checksums.
   OCR_MODELS_URL: https://ocrs-models.s3-accelerate.amazonaws.com
@@ -57,9 +59,14 @@ jobs:
           set -euo pipefail
           dir="$RUNNER_TEMP/pdfium"
           mkdir -p "$dir"
+          case "$(uname -m)" in
+            arm64) asset=pdfium-mac-arm64.tgz; sha="${PDFIUM_ARM64_SHA256}" ;;
+            x86_64) asset=pdfium-mac-x64.tgz; sha="${PDFIUM_X64_SHA256}" ;;
+            *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
           curl -fsSL --retry 3 -o "$dir/pdfium.tgz" \
-            "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_TAG}/pdfium-mac-arm64.tgz"
-          echo "${PDFIUM_SHA256}  $dir/pdfium.tgz" | shasum -a 256 -c -
+            "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_TAG}/${asset}"
+          echo "${sha}  $dir/pdfium.tgz" | shasum -a 256 -c -
           tar -xzf "$dir/pdfium.tgz" -C "$dir"
           test -f "$dir/lib/libpdfium.dylib"
           echo "CARBIDE_PDFIUM_LIB=$dir/lib/libpdfium.dylib" >> "$GITHUB_ENV"
