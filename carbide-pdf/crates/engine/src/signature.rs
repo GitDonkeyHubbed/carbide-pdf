@@ -1373,6 +1373,7 @@ fn trust_level(
     embedded: &[Certificate],
     store: &TrustStore,
     at: DateTime<Utc>,
+    purpose: Purpose,
 ) -> std::result::Result<Detail, Detail> {
     let in_store = |cert: &Certificate| {
         cert.to_der()
@@ -1389,7 +1390,7 @@ fn trust_level(
         .iter()
         .filter_map(|d| Certificate::from_der(d).ok())
         .collect();
-    let mut search = ChainSearch::new(signer, trusted.iter().chain(embedded), &in_store);
+    let mut search = ChainSearch::new(signer, trusted.iter().chain(embedded), &in_store, purpose);
     if critical_extensions_understood(signer) && search.reaches_store(Some(at)) {
         Ok(Detail::TrustedViaChain)
     } else if search.reaches_store(None) {
@@ -1404,6 +1405,8 @@ struct ChainSearch<'a> {
     /// The signer first, then every other distinct certificate on offer.
     certificates: Vec<&'a Certificate>,
     stored: Vec<bool>,
+    /// What the signer's certificate is used for, which every CA's purposes must allow.
+    purpose: Purpose,
     /// `issued_by` by (child, issuer) index, so each certificate signature is checked once.
     issued: HashMap<(usize, usize), bool>,
     /// (certificate, intermediates below its issuer) already searched without reaching the store.
@@ -1415,6 +1418,7 @@ impl<'a> ChainSearch<'a> {
         signer: &'a Certificate,
         others: impl Iterator<Item = &'a Certificate>,
         in_store: &dyn Fn(&Certificate) -> bool,
+        purpose: Purpose,
     ) -> Self {
         let mut certificates = vec![signer];
         let mut seen = vec![signer.to_der().unwrap_or_default()];
@@ -1429,6 +1433,7 @@ impl<'a> ChainSearch<'a> {
         ChainSearch {
             certificates,
             stored,
+            purpose,
             issued: HashMap::new(),
             dead_ends: HashSet::new(),
         }
@@ -1454,7 +1459,9 @@ impl<'a> ChainSearch<'a> {
         }
         for issuer in 0..self.certificates.len() {
             if path.contains(&issuer)
-                || rules.is_some_and(|at| !can_issue(self.certificates[issuer], intermediates, at))
+                || rules.is_some_and(|at| {
+                    !can_issue(self.certificates[issuer], intermediates, at, self.purpose)
+                })
             {
                 continue;
             }
@@ -1481,10 +1488,24 @@ impl<'a> ChainSearch<'a> {
     }
 }
 
-/// Whether `cert` may issue a certificate that has `intermediates` CA certificates below it, and is
-/// valid at `at`: it must be a CA (pathLen permitting), allow key-certificate signing, and be in
-/// its validity period.
-fn can_issue(cert: &Certificate, intermediates: usize, at: DateTime<Utc>) -> bool {
+/// What a certificate at the foot of a path is used for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// Signing documents.
+    Signing,
+    /// Issuing RFC 3161 time stamps.
+    TimeStamping,
+}
+
+/// Whether `cert` may issue a certificate that has `intermediates` CA certificates below it, for
+/// `purpose`, and is valid at `at`: it must be a CA (pathLen permitting), allow key-certificate
+/// signing, name no extended key usage that excludes `purpose`, and be in its validity period.
+fn can_issue(
+    cert: &Certificate,
+    intermediates: usize,
+    at: DateTime<Utc>,
+    purpose: Purpose,
+) -> bool {
     // Name constraints limit the names a CA may vouch for. They are not enforced here, so a CA
     // that sets them, whether marked critical or not, cannot confirm anyone.
     if !critical_extensions_understood(cert) || has_extension(cert, "2.5.29.30") {
@@ -1496,7 +1517,15 @@ fn can_issue(cert: &Certificate, intermediates: usize, at: DateTime<Utc>) -> boo
     if path_len.is_some_and(|limit| (limit as usize) < intermediates) {
         return false;
     }
-    key_usage_allows(cert, |usage| usage.key_cert_sign()) && valid_at(cert, at)
+    // A CA restricted to some purposes (TLS servers, say) does not vouch for certificates used
+    // for others. The document-signing purposes are those a signer's own certificate may carry.
+    let purposes = match purpose {
+        Purpose::Signing => &SIGNING_PURPOSES[..],
+        Purpose::TimeStamping => &TIME_STAMPING_PURPOSES[..],
+    };
+    key_usage_allows(cert, |usage| usage.key_cert_sign())
+        && purposes_allow(cert, purposes)
+        && valid_at(cert, at)
 }
 
 /// The extensions path validation here takes into account: basic constraints, key usage, extended
@@ -2194,7 +2223,13 @@ fn verify_one(
         unknown(&mut report, Detail::NotPermitted);
         return report;
     }
-    match trust_level(signer, &certificates, trust, reference_time) {
+    match trust_level(
+        signer,
+        &certificates,
+        trust,
+        reference_time,
+        Purpose::Signing,
+    ) {
         Ok(level) => {
             report.validity = Validity::Valid;
             report.detail = level;
@@ -2330,8 +2365,8 @@ fn check_timestamp_token(
     {
         Detail::NotPermitted
     } else {
-        trust_level(signer, &certificates, trust, time)
-            .and_then(|_| trust_level(signer, &certificates, trust, now))
+        trust_level(signer, &certificates, trust, time, Purpose::TimeStamping)
+            .and_then(|_| trust_level(signer, &certificates, trust, now, Purpose::TimeStamping))
             .unwrap_or_else(|detail| detail)
     };
     TokenResult::Verified {
@@ -2384,10 +2419,19 @@ const SIGNING_PURPOSES: [&str; 5] = [
     "1.3.6.1.4.1.311.10.3.12",
 ];
 
+/// The extended key usages that allow a CA to vouch for a time stamp authority: any purpose, or
+/// time stamping.
+const TIME_STAMPING_PURPOSES: [&str; 2] = ["2.5.29.37.0", "1.3.6.1.5.5.7.3.8"];
+
 /// True when `certificate` names no extended key usage, or names one that allows signing
 /// documents. A certificate restricted to other purposes (time stamping, or a TLS server, say) is
 /// not a signer's, whoever trusts it.
 fn purposes_allow_signing(certificate: &Certificate) -> bool {
+    purposes_allow(certificate, &SIGNING_PURPOSES)
+}
+
+/// True when `certificate` names no extended key usage, or names one of `allowed`.
+fn purposes_allow(certificate: &Certificate, allowed: &[&str]) -> bool {
     let Some(extensions) = certificate.tbs_certificate.extensions.as_ref() else {
         return true;
     };
@@ -2405,7 +2449,7 @@ fn purposes_allow_signing(certificate: &Certificate) -> bool {
     usage
         .0
         .iter()
-        .any(|purpose| SIGNING_PURPOSES.contains(&purpose.to_string().as_str()))
+        .any(|purpose| allowed.contains(&purpose.to_string().as_str()))
 }
 
 /// A genTime as RFC 3161 writes it, `YYYYMMDDHHMMSS[.f...]Z`, as a UTC instant: seconds always

@@ -456,6 +456,33 @@ fn name_constraints_on_a_ca_leave_the_identity_unconfirmed() {
     );
 }
 
+#[test]
+fn a_ca_restricted_to_other_purposes_cannot_vouch_for_a_signer() {
+    let restricted = |purposes: Vec<ExtendedKeyUsagePurpose>| {
+        let (root, root_issuer) = ca("Purpose Root CA", None, |p| {
+            p.extended_key_usages = purposes
+        });
+        chain_outcome(&leaf(&root_issuer, &[], |_| {}), &root)
+    };
+    assert_eq!(
+        restricted(vec![ExtendedKeyUsagePurpose::ServerAuth]),
+        REJECTED
+    );
+    assert_eq!(
+        restricted(vec![ExtendedKeyUsagePurpose::TimeStamping]),
+        REJECTED
+    );
+    // The purposes a signer's own certificate may carry are fine on its CA too.
+    assert_eq!(
+        restricted(vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::EmailProtection
+        ]),
+        VIA_CHAIN
+    );
+    assert_eq!(restricted(vec![ExtendedKeyUsagePurpose::Any]), VIA_CHAIN);
+}
+
 // ---- the signature value in the file -------------------------------------------------------
 
 #[test]
