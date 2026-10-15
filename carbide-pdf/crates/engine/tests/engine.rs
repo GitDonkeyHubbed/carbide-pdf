@@ -3563,6 +3563,94 @@ fn forms_drawn_over_and_over_are_worked_out_once() {
     assert!(widths.len() == 1 && widths[0] < 600 && widths[0] >= 300, "{widths:?}");
 }
 
+/// The widths of the images in the file `bytes`.
+fn image_widths(bytes: &[u8]) -> Vec<i64> {
+    let pdf = Pdf::from_bytes(bytes).unwrap();
+    pdf.document()
+        .objects
+        .values()
+        .filter_map(|o| match o {
+            Object::Stream(s) if s.dict.get(b"Subtype").and_then(|v| v.as_name()).ok() == Some(b"Image") => {
+                s.dict.get(b"Width").ok()?.as_i64().ok()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `photo_pdf` with its page's XObjects replaced by `xobjects` (the photo is `Im1`, which
+/// `xobjects` gets) and its content by `content`; `make` adds the forms, given the photo.
+fn photo_page(content: &[u8], make: impl FnOnce(&mut Document, lopdf::ObjectId) -> lopdf::Dictionary) -> Pdf {
+    let mut pdf = photo_pdf();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let resources = doc.get_dictionary(page).unwrap().get(b"Resources").unwrap().as_dict().unwrap();
+    let photo = resources.get(b"XObject").unwrap().as_dict().unwrap().get(b"Im1").unwrap().as_reference().unwrap();
+    let mut xobjects = make(doc, photo);
+    xobjects.set("Im1", photo);
+    let content = doc.add_object(Stream::new(lopdf::Dictionary::new(), content.to_vec()));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", dictionary! { "XObject" => xobjects });
+    page.set("Contents", content);
+    pdf
+}
+
+#[test]
+fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
+    // A form drawing itself, then the photo 170,000 times, drawn 1,000 times by the page.
+    let mut content = b"q 200 0 0 150 50 500 cm ".to_vec();
+    content.extend_from_slice(&b"/S Do ".repeat(1_000));
+    content.extend_from_slice(b"Q");
+    let mut pdf = photo_page(&content, |doc, photo| {
+        let form = doc.new_object_id();
+        let mut body = b"/S Do\n".to_vec();
+        body.extend_from_slice(&b"/I Do\n".repeat(170_000));
+        let dict = dictionary! {
+            "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+            "Resources" => dictionary! { "XObject" => dictionary! { "S" => form, "I" => photo } },
+        };
+        doc.objects.insert(form, Object::Stream(Stream::new(dict, body)));
+        dictionary! { "S" => form }
+    });
+    let started = std::time::Instant::now();
+    let (reduced, report) = finishes("reduce", move || pdf.reduce(&ReduceOptions::default(), None).unwrap());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+    // How large the photo is drawn cannot be told, so it keeps its size.
+    assert_eq!(report.images_downsampled, 0, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(!widths.is_empty() && widths.iter().all(|&w| w == 1200), "{widths:?}");
+}
+
+#[test]
+fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
+    // The photo drawn small on the page, and large through W, which draws X. A chain of seven
+    // forms also leads to W, so that through it X is nested too deep to be followed.
+    let widths = |content: &[u8]| {
+        let mut pdf = photo_page(content, |doc, photo| {
+            let form = |doc: &mut Document, name: &str, drawn: lopdf::ObjectId, body: &[u8]| {
+                let dict = dictionary! {
+                    "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "Resources" => dictionary! { "XObject" => dictionary! { name => drawn } },
+                };
+                doc.add_object(Stream::new(dict, body.to_vec()))
+            };
+            let x = form(doc, "I", photo, b"q 600 0 0 450 0 0 cm /I Do Q");
+            let w = form(doc, "X", x, b"/X Do");
+            let mut chain = w;
+            for _ in 0..7 {
+                chain = form(doc, "N", chain, b"/N Do");
+            }
+            dictionary! { "W" => w, "C" => chain }
+        });
+        image_widths(&pdf.reduce(&ReduceOptions::default(), None).unwrap().0)
+    };
+    let shallow_first = widths(b"q 20 0 0 15 0 0 cm /Im1 Do Q /W Do /C Do");
+    let deep_first = widths(b"q 20 0 0 15 0 0 cm /Im1 Do Q /C Do /W Do");
+    assert_eq!(shallow_first, deep_first);
+    // Drawn 600 points wide, the photo is not made smaller than that needs.
+    assert!(!shallow_first.is_empty() && shallow_first.iter().all(|&w| w >= 1200), "{shallow_first:?}");
+}
+
 #[test]
 fn slider_trades_size_for_quality() {
     let mut pdf = photo_pdf();

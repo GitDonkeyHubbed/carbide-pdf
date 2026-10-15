@@ -173,13 +173,17 @@ fn matrix_from(object: Option<&Object>) -> [f32; 6] {
 }
 
 /// The most work finding the sizes images are drawn at may take: one unit for each form drawn,
-/// and one for each image draw a form that was already worked out passes on. Images drawn only by
-/// forms past it are recompressed but not down-sampled.
+/// and one for each image draw a form that was already worked out passes on. Past it, or past any
+/// other limit below, or at a form that draws itself, the sizes some images are drawn at are not
+/// known, so no image is down-sampled; they are still recompressed.
 const MAX_SCAN_WORK: usize = 10_000_000;
-/// The most bytes of form content read while doing so.
-const MAX_FORM_BYTES_READ: usize = crate::limits::MAX_DECODED;
-/// The most different image draws remembered for one form.
+/// The most bytes of form content read while doing so. A form is read once for each set of
+/// resources it is drawn with, so this also bounds how often one is read again.
+const MAX_FORM_BYTES_READ: usize = 64 << 20;
+/// The most different image draws remembered for one form or page.
 const MAX_FORM_DRAWS: usize = 100_000;
+/// The most forms followed inside one another.
+const MAX_FORM_DEPTH: usize = 8;
 
 /// The linear part `[a, b, c, d]` of a PDF matrix: all that decides the size something is drawn at.
 type Linear = [f32; 4];
@@ -203,15 +207,14 @@ type FormDraws = Rc<Vec<(ObjectId, Linear)>>;
 struct Draws {
     list: Vec<(ObjectId, Linear)>,
     seen: HashSet<(ObjectId, [u32; 4])>,
-    /// Something drawn was left out: a form past the limits, one that draws itself, or one nested
-    /// too deep. Such a list is not kept for the next time the form is drawn.
-    partial: bool,
+    /// More different draws than [`MAX_FORM_DRAWS`] were left out.
+    overflowed: bool,
 }
 
 impl Draws {
     fn add(&mut self, image: ObjectId, matrix: Linear) {
         if self.list.len() >= MAX_FORM_DRAWS {
-            self.partial = true;
+            self.overflowed = true;
         } else if self.seen.insert((image, matrix.map(f32::to_bits))) {
             self.list.push((image, matrix));
         }
@@ -232,20 +235,37 @@ struct Scan {
     /// The work done so far (see [`MAX_SCAN_WORK`]), and the bytes of form content read.
     work: usize,
     read: usize,
+    /// Something drawn was left out (see [`MAX_SCAN_WORK`]): nothing more is read, and no size
+    /// found is used.
+    incomplete: bool,
 }
 
 impl Pdf {
     /// Largest drawn size, in points, of every image XObject (page content and nested forms).
-    /// Content is decoded within one budget for the whole document (see [`crate::limits`]).
+    /// Content is decoded within one budget for the whole document (see [`crate::limits`]). Empty
+    /// when what some content draws could not be worked out (see [`MAX_SCAN_WORK`]): an image
+    /// drawn small in one place may be drawn large there.
     fn drawn_sizes(&self) -> Result<HashMap<ObjectId, (f32, f32)>> {
         let mut sizes: HashMap<ObjectId, (f32, f32)> = HashMap::new();
-        let mut scan = Scan { budget: DecodeBudget::new(), bodies: HashMap::new(), forms: HashMap::new(), path: Vec::new(), work: 0, read: 0 };
+        let mut scan = Scan {
+            budget: DecodeBudget::new(),
+            bodies: HashMap::new(),
+            forms: HashMap::new(),
+            path: Vec::new(),
+            work: 0,
+            read: 0,
+            incomplete: false,
+        };
         let no_resources = Dictionary::new();
         for page_id in self.page_ids() {
             let holder = self.inherited_from(page_id, b"Resources").unwrap_or(page_id);
             let resources = self.page_resources(page_id).unwrap_or(&no_resources);
             let content = scan.budget.page_content(&self.doc, page_id)?;
-            for (image, m) in self.scan_content(&content, resources, holder, &mut scan)?.list {
+            let draws = self.scan_content(&content, resources, holder, &mut scan)?;
+            if draws.overflowed || scan.incomplete {
+                return Ok(HashMap::new());
+            }
+            for (image, m) in draws.list {
                 let slot = sizes.entry(image).or_insert((0.0, 0.0));
                 slot.0 = slot.0.max((m[0] * m[0] + m[1] * m[1]).sqrt());
                 slot.1 = slot.1.max((m[2] * m[2] + m[3] * m[3]).sqrt());
@@ -258,8 +278,10 @@ impl Pdf {
     /// matrices relative to its own space they are drawn with.
     fn scan_content(&self, content: &[u8], resources: &Dictionary, holder: ObjectId, scan: &mut Scan) -> Result<Draws> {
         let mut draws = Draws::default();
-        if scan.path.len() > 8 {
-            draws.partial = true;
+        if scan.path.len() > MAX_FORM_DEPTH {
+            scan.incomplete = true;
+        }
+        if scan.incomplete {
             return Ok(draws);
         }
         let Some(xobjects) = resources.get(b"XObject").ok().and_then(|o| self.resolved(o)).and_then(|o| o.as_dict().ok()) else {
@@ -294,7 +316,7 @@ impl Pdf {
                 b"cm" if operands == 6 && numbers.len() == 6 => {
                     ctm = multiply([numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], numbers[5]], ctm);
                 }
-                b"Do" if operands == 1 && failure.is_none() => {
+                b"Do" if operands == 1 && failure.is_none() && !scan.incomplete => {
                     if let Some(name) = name {
                         let drawn = self.draw(xobjects, &crate::content::name(name), (resources, holder), linear(ctm), &mut draws, scan);
                         if let Err(error) = drawn {
@@ -338,14 +360,14 @@ impl Pdf {
                     None => match self.work_out_form(id, stream, form_resources, form_holder, scan)? {
                         Some(drawn) => drawn,
                         None => {
-                            draws.partial = true;
+                            scan.incomplete = true;
                             return Ok(());
                         }
                     },
                 };
                 scan.work = scan.work.saturating_add(drawn.len() + 1);
                 if scan.work > MAX_SCAN_WORK {
-                    draws.partial = true;
+                    scan.incomplete = true;
                     return Ok(());
                 }
                 for &(image, matrix) in drawn.iter() {
@@ -358,8 +380,8 @@ impl Pdf {
     }
 
     /// What the form `id` (`stream`) draws with `resources`, those of `holder`, relative to the
-    /// space it is drawn in: read once and kept, unless something in it was left out. `None` when
-    /// it cannot be followed: it draws itself, or the limits are reached.
+    /// space it is drawn in: read once and kept. `None` when it cannot be worked out: it draws
+    /// itself, or something in it is past the limits.
     fn work_out_form(
         &self,
         id: ObjectId,
@@ -391,11 +413,12 @@ impl Pdf {
         let scanned = self.scan_content(&body, resources, holder, scan);
         scan.path.pop();
         let scanned = scanned?;
+        if scanned.overflowed || scan.incomplete {
+            return Ok(None);
+        }
         let matrix = linear(matrix_from(stream.dict.get(b"Matrix").ok()));
         let drawn: FormDraws = Rc::new(scanned.list.into_iter().map(|(image, m)| (image, linear_product(m, matrix))).collect());
-        if !scanned.partial {
-            scan.forms.insert((id, holder), drawn.clone());
-        }
+        scan.forms.insert((id, holder), drawn.clone());
         Ok(Some(drawn))
     }
 
