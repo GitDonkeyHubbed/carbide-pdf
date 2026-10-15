@@ -329,8 +329,12 @@ impl Pdf {
                 .cloned();
             scan.budget = DecodeBudget::for_page();
             scan.names_left = MAX_NAMES;
+            let group = self.group_colour_space(self.doc.get_dictionary(*page)?);
             let mut kept = match self.names_used_by_page(*page, &resources, &mut scan)? {
-                Some(uses) => self.keep_named(&resources, &uses),
+                Some(mut uses) => {
+                    uses.extend(group);
+                    self.keep_named(&resources, &uses)
+                }
                 None => resources.clone(),
             };
             self.trim_nested(&mut kept, &mut scan, &mut nested, 0)?;
@@ -633,6 +637,7 @@ impl Pdf {
         else {
             return Ok(false);
         };
+        let group = self.group_colour_space(dict);
         let content = match &*owner {
             Object::Stream(stream) if is_content(&stream.dict) => scan.uses_in(id, stream)?,
             Object::Dictionary(font)
@@ -649,7 +654,10 @@ impl Pdf {
             return Err(Error::TooLarge(messages::TOO_COMPLEX.into()));
         }
         let uses = match content {
-            Some(uses) => self.scope_uses(uses, &resources, scan)?,
+            Some(mut uses) => {
+                uses.extend(group);
+                self.scope_uses(uses, &resources, scan)?
+            }
             None => None,
         };
         let mut kept = match &uses {
@@ -666,6 +674,16 @@ impl Pdf {
             _ => {}
         }
         Ok(true)
+    }
+
+    /// The colour space a transparency group (`/Group` of a page or form) names from its resources
+    /// as its blending space, which its content need not use.
+    fn group_colour_space(&self, owner: &Dictionary) -> Option<(&'static [u8], Vec<u8>)> {
+        let Object::Dictionary(group) = owner.get(b"Group").map(|g| self.resolve(g)).ok()? else {
+            return None;
+        };
+        let name = group.get(b"CS").and_then(Object::as_name).ok()?;
+        Some((COLOR_SPACE, name.to_vec()))
     }
 
     /// The resources the glyphs of the Type 3 font `font` use; `None` when one cannot be read.
