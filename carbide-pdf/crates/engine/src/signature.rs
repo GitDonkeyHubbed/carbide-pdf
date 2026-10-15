@@ -46,8 +46,8 @@ pub mod messages {
     pub const CHAIN_REJECTED: &str = "The signer's certificate leads to your trusted list, but through a certificate that may not issue it or was not valid at the time";
     pub const SIGNER_NOT_PERMITTED: &str = "The signer's certificate is not allowed to sign documents";
     pub const TIMESTAMP_AUTHORITY_UNKNOWN: &str = "The time stamp authority is not confirmed: neither its certificate nor any certificate above it is in your trusted list";
-    pub const TIMESTAMP_AUTHORITY_EXPIRED: &str = "The time stamp authority's certificate was not valid at the time it gives";
-    pub const TIMESTAMP_CHAIN_REJECTED: &str = "The time stamp authority's certificate leads to your trusted list, but through a certificate that may not issue it or was not valid at the time";
+    pub const TIMESTAMP_AUTHORITY_EXPIRED: &str = "The time stamp authority's certificate was not valid at the time it gives, or is no longer valid, so nothing shows its key was not misused";
+    pub const TIMESTAMP_CHAIN_REJECTED: &str = "The time stamp authority's certificate leads to your trusted list, but through a certificate that may not issue it, or that was not valid at the time it gives or is no longer valid";
     pub const TIMESTAMP_AUTHORITY_NOT_PERMITTED: &str = "The time stamp authority's certificate is not for time stamping";
     pub const DOCUMENT_TIME_STAMPED: &str = "A trusted time stamp authority confirms this version of the document existed at the time given.";
     pub const DOCUMENT_ALTERED: &str = "The document is damaged or was changed after signing.";
@@ -844,7 +844,7 @@ pub enum Detail {
     UnsupportedAlgorithm = 10,
     /// Certificates lead to a trusted one by name and signature, but break the issuing rules.
     ChainRejected = 11,
-    /// The certificate's key usage does not allow what it was used for.
+    /// The certificate's key usage or purposes do not allow what it was used for.
     NotPermitted = 12,
     /// The time the signature claims is in the future.
     SignedInFuture = 13,
@@ -961,7 +961,7 @@ impl SignatureReport {
     }
 
     /// True when the time stamp that gives `time_stamp_time` comes from a trusted authority whose
-    /// certificate was valid and for time stamping at that time.
+    /// certificate is for time stamping, and was valid at that time and still is.
     pub fn time_stamp_trusted(&self) -> bool {
         if self.document_time_stamp {
             self.validity == Validity::Valid
@@ -1701,8 +1701,8 @@ fn verify_one(
         unknown(&mut report, Detail::Expired);
         return report;
     }
-    // The signer certificate, when it declares a key usage, must allow signing.
-    if !key_usage_allows(signer, |usage| usage.digital_signature() || usage.non_repudiation()) {
+    // The signer certificate, when it declares a key usage or purposes, must allow signing.
+    if !key_usage_allows(signer, |usage| usage.digital_signature() || usage.non_repudiation()) || !purposes_allow_signing(signer) {
         unknown(&mut report, Detail::NotPermitted);
         return report;
     }
@@ -1769,9 +1769,11 @@ enum TokenResult {
 }
 
 /// Verifies an RFC 3161 time-stamp token: its message imprint must cover `imprint` and its own
-/// signature must hold. For a trusted result its authority certificate must also be valid at the
-/// token's time (which may not be in the future), be for time stamping alone, and chain to a
-/// trusted certificate.
+/// signature must hold. For a trusted result its authority certificate must also be for time
+/// stamping alone, and be valid and chain to a trusted certificate both at the token's time (which
+/// may not be in the future) and now. Without long-term validation data nothing in the file shows
+/// that an authority whose certificate has since expired still kept its key: whoever holds it now
+/// could make a token with any earlier time.
 fn check_timestamp_token(token: &[u8], imprint: &[&[u8]], trust: &TrustStore, now: DateTime<Utc>) -> TokenResult {
     let Some(cms) = cms::parse_signed_data(token) else { return TokenResult::NotAToken };
     if cms.content_type != cms::OID_TST_INFO {
@@ -1799,12 +1801,14 @@ fn check_timestamp_token(token: &[u8], imprint: &[&[u8]], trust: &TrustStore, no
     let Some(signer) = find_signer(&certificates, &cms.signer.id) else { return TokenResult::BadSignature };
     let standing = if time > now + chrono::Duration::minutes(5) {
         Detail::SignedInFuture
-    } else if !valid_at(signer, time) {
+    } else if !valid_at(signer, time) || !valid_at(signer, now) {
         Detail::Expired
     } else if !(has_timestamping_eku(signer) && key_usage_allows(signer, |u| u.digital_signature() || u.non_repudiation())) {
         Detail::NotPermitted
     } else {
-        trust_level(signer, &certificates, trust, time).unwrap_or_else(|detail| detail)
+        trust_level(signer, &certificates, trust, time)
+            .and_then(|_| trust_level(signer, &certificates, trust, now))
+            .unwrap_or_else(|detail| detail)
     };
     TokenResult::Verified { time, signer: Some(subject_name(signer)), standing }
 }
@@ -1832,6 +1836,23 @@ fn has_timestamping_eku(certificate: &Certificate) -> bool {
         return false;
     };
     extension.critical && usage.0.len() == 1 && usage.0[0].to_string() == "1.3.6.1.5.5.7.3.8"
+}
+
+/// The extended key usages that allow signing documents: any purpose, e-mail protection, document
+/// signing (RFC 9336), Adobe Authentic Documents Trust and Microsoft Document Signing.
+const SIGNING_PURPOSES: [&str; 5] =
+    ["2.5.29.37.0", "1.3.6.1.5.5.7.3.4", "1.3.6.1.5.5.7.3.36", "1.2.840.113583.1.1.5", "1.3.6.1.4.1.311.10.3.12"];
+
+/// True when `certificate` names no extended key usage, or names one that allows signing
+/// documents. A certificate restricted to other purposes (time stamping, or a TLS server, say) is
+/// not a signer's, whoever trusts it.
+fn purposes_allow_signing(certificate: &Certificate) -> bool {
+    let Some(extensions) = certificate.tbs_certificate.extensions.as_ref() else { return true };
+    let Some(extension) = extensions.iter().find(|e| e.extn_id.to_string() == "2.5.29.37") else { return true };
+    let Ok(usage) = x509_cert::ext::pkix::ExtendedKeyUsage::from_der(extension.extn_value.as_bytes()) else {
+        return false;
+    };
+    usage.0.iter().any(|purpose| SIGNING_PURPOSES.contains(&purpose.to_string().as_str()))
 }
 
 /// A GeneralizedTime (`YYYYMMDDHHMMSS[.fff]Z`) as a UTC instant.

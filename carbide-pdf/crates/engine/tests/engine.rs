@@ -4641,7 +4641,23 @@ struct TestTsa {
 impl TestTsa {
     /// An authority whose certificate is valid from 1 January of `from` to 1 January of `until`,
     /// with its time-stamping purpose marked critical or not.
-    fn new(name: &str, (from, until): (i32, i32), critical: bool, gen_time: &'static str) -> TestTsa {
+    fn new(name: &str, years: (i32, i32), critical: bool, gen_time: &'static str) -> TestTsa {
+        TestTsa::made(name, years, critical, gen_time, None)
+    }
+
+    /// An authority like [`TestTsa::new`], with its purpose critical, whose certificate `issuer`
+    /// issues.
+    fn issued_by(name: &str, years: (i32, i32), gen_time: &'static str, issuer: &Issuer<'_, KeyPair>) -> TestTsa {
+        TestTsa::made(name, years, true, gen_time, Some(issuer))
+    }
+
+    fn made(
+        name: &str,
+        (from, until): (i32, i32),
+        critical: bool,
+        gen_time: &'static str,
+        issuer: Option<&Issuer<'_, KeyPair>>,
+    ) -> TestTsa {
         use rsa::pkcs8::EncodePrivateKey;
         let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
         let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
@@ -4650,12 +4666,14 @@ impl TestTsa {
         params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
         params.not_before = rcgen::date_time_ymd(from, 1, 1);
         params.not_after = rcgen::date_time_ymd(until, 1, 1);
-        let purposes = algo::seq(&[&algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 8])]); // id-kp-timeStamping
-        let mut eku = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], purposes);
+        let mut eku = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], timestamping_purpose());
         eku.set_criticality(critical);
         params.custom_extensions.push(eku);
-        let cert = params.self_signed(&pair).unwrap().der().to_vec();
-        TestTsa { key, cert, gen_time }
+        let cert = match issuer {
+            Some(issuer) => params.signed_by(&pair, issuer),
+            None => params.self_signed(&pair),
+        };
+        TestTsa { key, cert: cert.unwrap().der().to_vec(), gen_time }
     }
 
     /// A TimeStampToken over `imprint` (hashed with `hash_oid`), echoing `nonce` (the content of
@@ -4711,6 +4729,11 @@ impl TestTsa {
     fn token(&self, hash_oid: &[u32], imprint: &[u8], nonce: Option<&[u8]>) -> Vec<u8> {
         self.token_with(hash_oid, imprint, nonce, &self.cert)
     }
+}
+
+/// The content of an extended key usage extension naming id-kp-timeStamping alone.
+fn timestamping_purpose() -> Vec<u8> {
+    algo::seq(&[&algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 8])])
 }
 
 fn test_tsa() -> &'static TestTsa {
@@ -4802,6 +4825,89 @@ fn only_a_trusted_time_stamp_moves_the_certificate_validity_check() {
     let trusted = TestTsa::new("Trusted TSA", (2019, 2040), true, "20200601000000Z");
     let report = verify(&sign(&trusted), &TrustStore { certificates: vec![cert, trusted.cert.clone()] }).remove(0);
     assert_eq!((report.validity, report.detail), (Validity::Valid, Detail::TrustedDirectly));
+}
+
+#[test]
+fn a_time_stamp_counts_only_while_its_authority_is_still_valid_and_trusted() {
+    let mut doc = text_pdf(&[&["backdated by a token"]]);
+    let base = file_bytes(&mut doc);
+    let expired_signer = |pair: &KeyPair, key: rsa::RsaPrivateKey, is_ca: IsCa, usages: &[KeyUsagePurpose]| {
+        let mut params = cert_params("Expired Signer", is_ca, usages);
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+        let cert = params.self_signed(pair).unwrap().der().to_vec();
+        (Identity::new(vec![cert.clone()], key).unwrap(), cert, params)
+    };
+    let sign = |identity: &Identity, tsa: &TestTsa| {
+        let options = SignOptions { identity: Some(identity), timestamp: Some(tsa), ..Default::default() };
+        doc.sign(&base, &options).unwrap()
+    };
+
+    // An authority whose certificate expired, and a signer whose certificate expired, both
+    // trusted: whoever holds the authority's key now can give any time from when it was valid.
+    let (pair, key) = rsa_key();
+    let (identity, cert, _) = expired_signer(&pair, key, IsCa::ExplicitNoCa, &[KeyUsagePurpose::DigitalSignature]);
+    let old_tsa = TestTsa::new("Old TSA", (2019, 2021), true, "20200601000000Z");
+    let reports = verify(&sign(&identity, &old_tsa), &TrustStore { certificates: vec![cert, old_tsa.cert.clone()] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::ValidityUnknown, Detail::Expired));
+    assert!(reports[0].has_embedded_timestamp && !reports[0].embedded_timestamp_trusted && !reports[0].time_stamp_trusted());
+    assert_ne!(notice_text(&reports), Some(sig_messages::NOTICE_ALL_VALID));
+
+    // A trusted certificate that may issue others, and has expired, makes itself an authority and
+    // a token from when it was valid.
+    let (pair, key) = rsa_key();
+    let usages = [KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyCertSign];
+    let (identity, cert, params) = expired_signer(&pair, key, IsCa::Ca(BasicConstraints::Unconstrained), &usages);
+    let issuer = Issuer::new(params, pair);
+    let minted = TestTsa::issued_by("Minted TSA", (2020, 2021), "20200601000000Z", &issuer);
+    let reports = verify(&sign(&identity, &minted), &TrustStore { certificates: vec![cert] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::ValidityUnknown, Detail::Expired));
+    assert!(!reports[0].time_stamp_trusted());
+
+    // A document time stamp from an authority whose certificate has expired: its time is shown
+    // as not confirmed, and the time stamp is not called valid.
+    let options = SignOptions { sub_filter: SubFilter::DocumentTimeStamp, timestamp: Some(&old_tsa), ..Default::default() };
+    let stamped = doc.sign(&base, &options).unwrap();
+    let report = verify(&stamped, &TrustStore { certificates: vec![old_tsa.cert.clone()] }).remove(0);
+    assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::Expired));
+    assert!(report.time_stamp_time.is_some() && !report.time_stamp_trusted());
+    let lines = report.description_lines();
+    assert!(lines.contains(&sig_messages::TIMESTAMP_AUTHORITY_EXPIRED) && !lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED), "{lines:?}");
+}
+
+#[test]
+fn a_certificate_for_other_purposes_cannot_sign_documents() {
+    let mut doc = text_pdf(&[&["purposes"]]);
+    let base = file_bytes(&mut doc);
+    let signer = |purposes: Option<Vec<u8>>| {
+        let (pair, key) = rsa_key();
+        let mut params = cert_params("Purposeful Signer", IsCa::ExplicitNoCa, &[KeyUsagePurpose::DigitalSignature]);
+        if let Some(purposes) = purposes {
+            params.custom_extensions.push(rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], purposes));
+        }
+        let cert = params.self_signed(&pair).unwrap().der().to_vec();
+        let identity = Identity::new(vec![cert.clone()], key).unwrap();
+        let signed = doc.sign(&base, &SignOptions { identity: Some(&identity), ..Default::default() }).unwrap();
+        verify(&signed, &TrustStore { certificates: vec![cert] }).remove(0)
+    };
+    // A time stamp authority's certificate, and one for TLS servers.
+    for (label, purposes) in [
+        ("time stamping", timestamping_purpose()),
+        ("server", algo::seq(&[&algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 1])])),
+    ] {
+        let report = signer(Some(purposes));
+        assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::NotPermitted), "{label}");
+        assert!(report.description_lines().contains(&sig_messages::SIGNER_NOT_PERMITTED), "{label}");
+    }
+    // No purposes at all, e-mail protection, or document signing among others, may sign.
+    for (label, purposes) in [
+        ("none", None),
+        ("e-mail", Some(algo::seq(&[&algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 4])]))),
+        ("document signing", Some(algo::seq(&[&algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 1]), &algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 36])]))),
+    ] {
+        let report = signer(purposes);
+        assert_eq!((report.validity, report.detail), (Validity::Valid, Detail::TrustedDirectly), "{label}");
+    }
 }
 
 #[test]
