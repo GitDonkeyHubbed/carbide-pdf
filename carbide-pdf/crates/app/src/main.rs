@@ -419,13 +419,7 @@ impl CarbideApp {
 
     pub fn open_path(&mut self, path: &Path) {
         // A file that is already open is brought forward instead of opened twice.
-        let wanted = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let open_at = (0..self.tabs.len()).find(|&i| {
-            self.doc_at(i)
-                .and_then(|d| d.path.as_ref())
-                .is_some_and(|p| p.canonicalize().unwrap_or_else(|_| p.clone()) == wanted)
-        });
-        if let Some(index) = open_at {
+        if let Some(index) = self.tab_on(path) {
             return self.activate(Some(index));
         }
         let bytes = match std::fs::read(path) {
@@ -438,6 +432,10 @@ impl CarbideApp {
                 self.install(pdf, Some(path.to_path_buf()), Some(saved));
             }
             Err(EngineError::PasswordRequired) => {
+                // One question per file: asking again would open it in two tabs.
+                if self.password_question_for(path) {
+                    return;
+                }
                 self.open_dialog(Dialog::Password {
                     path: path.to_path_buf(),
                     bytes,
@@ -509,8 +507,29 @@ impl CarbideApp {
         self.status = format!("{} - not saved yet", doc.title());
     }
 
-    /// Opens a protected file. The password is used exactly as typed, spaces included.
+    /// The tab whose document is the file `path`.
+    fn tab_on(&self, path: &Path) -> Option<usize> {
+        let wanted = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        (0..self.tabs.len()).find(|&i| {
+            self.doc_at(i)
+                .and_then(|d| d.path.as_ref())
+                .is_some_and(|p| p.canonicalize().unwrap_or_else(|_| p.clone()) == wanted)
+        })
+    }
+
+    /// True when a password question about the file `path` is on screen or waiting.
+    fn password_question_for(&self, path: &Path) -> bool {
+        let asks = |dialog: &Dialog| matches!(dialog, Dialog::Password { path: p, .. } if same_file(p, path));
+        self.dialog.as_ref().is_some_and(asks) || self.queued_dialogs.iter().any(asks)
+    }
+
+    /// Opens a protected file. The password is used exactly as typed, spaces included. A file that
+    /// has been opened since the question was asked is brought forward instead of opened twice.
     pub fn open_with_password(&mut self, path: PathBuf, bytes: Vec<u8>, password: String) -> bool {
+        if let Some(index) = self.tab_on(&path) {
+            self.activate(Some(index));
+            return true;
+        }
         match SavedFile::open(bytes, Some(password)) {
             Ok((pdf, saved)) => {
                 self.install(pdf, Some(path), Some(saved));

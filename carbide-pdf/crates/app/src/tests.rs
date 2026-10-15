@@ -1992,3 +1992,27 @@ fn a_signature_is_not_written_over_a_file_another_program_changed() {
         matches!(&app.dialog, Some(Dialog::Message(m)) if m.contains("changed by another program"))
     );
 }
+
+#[test]
+fn a_protected_file_asked_for_twice_opens_in_one_tab() {
+    let dir = scratch();
+    let locked = protected(&dir, "locked.pdf", &["LOCKED"], "user pw");
+    let mut app = app(&dir);
+
+    // Opening it again while its question is up does not queue a second question.
+    app.open_path(&locked);
+    app.open_path(&locked);
+    assert!(
+        app.queued_dialogs.is_empty(),
+        "the question was asked twice"
+    );
+
+    // And questions that did queue up for the same file open it once.
+    let bytes = std::fs::read(&locked).unwrap();
+    let Some(Dialog::Password { path, .. }) = app.dialog.take() else {
+        panic!("no password question")
+    };
+    assert!(app.open_with_password(path.clone(), bytes.clone(), "user pw".into()));
+    assert!(app.open_with_password(path, bytes, "user pw".into()));
+    assert_eq!(app.tabs.len(), 1, "the file was opened twice");
+}
