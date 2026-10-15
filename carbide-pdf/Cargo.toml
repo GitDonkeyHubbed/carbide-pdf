@@ -5,6 +5,7 @@ members = ["crates/engine", "crates/cli", "crates/app"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/GitDonkeyHubbed/carbide-pdf"
 homepage = "https://github.com/GitDonkeyHubbed/carbide-pdf"
