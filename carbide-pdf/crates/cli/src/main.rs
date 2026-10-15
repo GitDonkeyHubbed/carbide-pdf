@@ -1226,8 +1226,15 @@ fn run(cli: Cli) -> Result<(), Failure> {
             for line in report.lines() {
                 println!("removed {line}");
             }
-            if report.is_empty() && same_file(&input, &output) {
-                println!("{} was left unchanged", output.display());
+            if report.is_empty() {
+                // An empty report does not mean the document in memory is untouched (clearing a
+                // button's state can still change it), so the file is copied as it was read.
+                if same_file(&input, &output) {
+                    println!("{} was left unchanged", output.display());
+                } else {
+                    write_replacing(&output, saved.bytes())?;
+                    println!("wrote {}", output.display());
+                }
             } else {
                 save_edit(&mut pdf, &saved, !report.is_empty(), &input, &output)?;
             }

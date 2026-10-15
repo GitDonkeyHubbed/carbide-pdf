@@ -1089,3 +1089,44 @@ fn sanitize_leaves_a_file_with_nothing_hidden_as_it_is() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn sanitize_copies_the_input_as_it_is_when_nothing_hidden_is_found() {
+    use lopdf::dictionary;
+    let dir = scratch("sanitize-nothing-widget");
+    let file = dir.join("form.pdf");
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    // A button with no state and no value: clearing the form adds /AS /Off but removes nothing.
+    let button = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Btn",
+        "T" => lopdf::Object::string_literal("b"), "P" => page,
+        "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+    });
+    doc.get_dictionary_mut(page)
+        .unwrap()
+        .set("Annots", vec![button.into()]);
+    doc.catalog_mut()
+        .unwrap()
+        .set("AcroForm", dictionary! { "Fields" => vec![button.into()] });
+    std::fs::write(&file, pdf.to_bytes().unwrap()).unwrap();
+    let before = std::fs::read(&file).unwrap();
+
+    let copy = dir.join("copy.pdf");
+    let output = carbide(&[
+        "sanitize",
+        file.to_str().unwrap(),
+        copy.to_str().unwrap(),
+        "--only",
+        "form-data",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("No hidden information was found"));
+    assert!(
+        std::fs::read(&copy).unwrap() == before,
+        "the copy was a recomputed save, not the input's bytes"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
