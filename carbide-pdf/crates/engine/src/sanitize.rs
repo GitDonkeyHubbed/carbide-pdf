@@ -183,13 +183,15 @@ impl Pdf {
                     .filter(|&page| self.remove_from(page, b"Thumb"))
                     .count(),
                 HiddenItem::PrivateData => {
-                    remove_key_everywhere(&mut self.doc, b"LastModified");
+                    let modified = remove_key_everywhere(&mut self.doc, b"LastModified");
                     let spider = self
                         .doc
                         .catalog_mut()
                         .map(|c| c.remove(b"SpiderInfo").is_some())
                         .unwrap_or(false);
-                    remove_key_everywhere(&mut self.doc, b"PieceInfo") + usize::from(spider)
+                    modified
+                        + remove_key_everywhere(&mut self.doc, b"PieceInfo")
+                        + usize::from(spider)
                 }
                 HiddenItem::Bookmarks => self.remove_bookmarks(),
                 HiddenItem::UnusedObjects => 0,
@@ -254,7 +256,7 @@ impl Pdf {
         count += self.remove_annotations(&|subtype| subtype == b"FileAttachment");
         count += remove_key_everywhere(&mut self.doc, b"AF");
         if let Ok(catalog) = self.doc.catalog_mut() {
-            catalog.remove(b"Collection");
+            count += usize::from(catalog.remove(b"Collection").is_some());
         }
         count
     }
@@ -368,20 +370,25 @@ impl Pdf {
                 .into_iter()
                 .filter(|key| dict.remove(key).is_some())
                 .count();
-            count += usize::from(cleared > 0);
             let is_widget = dict
                 .get(b"Subtype")
                 .and_then(Object::as_name)
                 .is_ok_and(|s| s == b"Widget");
-            if is_widget {
-                match field_type.as_deref() {
+            // A widget can show a value its field no longer holds; clearing that counts too.
+            let shown = is_widget
+                && match field_type.as_deref() {
                     // A check box or radio button shows its state through /AS.
-                    Some(b"Btn") => dict.set("AS", Object::Name(b"Off".to_vec())),
-                    _ => {
-                        dict.remove(b"AP");
+                    Some(b"Btn") => {
+                        let on = dict
+                            .get(b"AS")
+                            .and_then(Object::as_name)
+                            .is_ok_and(|state| state != b"Off");
+                        dict.set("AS", Object::Name(b"Off".to_vec()));
+                        on
                     }
-                }
-            }
+                    _ => dict.remove(b"AP").is_some(),
+                };
+            count += usize::from(cleared > 0 || shown);
         }
         if let Ok(Object::Array(kids)) = dict.get(b"Kids").map(|k| self.resolve(k)) {
             for kid in &kids {

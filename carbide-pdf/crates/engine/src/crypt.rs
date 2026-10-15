@@ -104,15 +104,30 @@ pub(crate) fn load_bounded(bytes: &[u8]) -> Result<Document> {
 }
 
 /// `bytes`, in which `renamed` names were already hidden from the loader, read as a document with
-/// its object streams left packed: `/ObjStm` is hidden too, so that lopdf takes them for plain
-/// streams.
+/// its object streams left packed. The file's bytes are read as they are: each object stream is
+/// set aside in an array while lopdf reads the file, which it then does not unpack, and put back
+/// afterwards. A stream cannot stand in an array in a file, so nothing else is taken for one.
 fn load_packed(bytes: &[u8], renamed: usize) -> Result<Document> {
-    let (hidden, renamed) = match rename_key(bytes, OBJECT_STREAM, HIDDEN_OBJECT_STREAM) {
-        Some((hidden, more)) => (Some(hidden), renamed + more),
-        None => (None, renamed),
-    };
-    let options = LoadOptions::with_max_decompressed_size(MAX_STREAM_ON_LOAD);
-    let mut doc = Document::load_mem_with_options(hidden.as_deref().unwrap_or(bytes), options)?;
+    fn set_aside(id: ObjectId, object: &mut Object) -> Option<(ObjectId, Object)> {
+        if object.as_stream().is_ok_and(|s| s.dict.has_type(b"ObjStm")) {
+            let stream = std::mem::replace(object, Object::Null);
+            *object = Object::Array(vec![stream]);
+        }
+        // lopdf keeps `object` as it is now; it only looks at whether this is `None`.
+        Some((id, Object::Null))
+    }
+    let mut options = LoadOptions::with_max_decompressed_size(MAX_STREAM_ON_LOAD);
+    options.filter = Some(set_aside);
+    let mut doc = Document::load_mem_with_options(bytes, options)?;
+    for object in doc.objects.values_mut() {
+        if let Object::Array(items) = object {
+            if let [Object::Stream(stream)] = items.as_slice() {
+                if stream.dict.has_type(b"ObjStm") {
+                    *object = items.remove(0);
+                }
+            }
+        }
+    }
     if renamed > 0 {
         restore_all(&mut doc, renamed);
     }
@@ -121,8 +136,6 @@ fn load_packed(bytes: &[u8], renamed: usize) -> Result<Document> {
 
 const ENCRYPT: &[u8] = b"/Encrypt";
 const HIDDEN_ENCRYPT: &[u8] = b"/Cb-Encr";
-const OBJECT_STREAM: &[u8] = b"/ObjStm";
-const HIDDEN_OBJECT_STREAM: &[u8] = b"/Cb-ObS";
 
 /// `bytes` with every name `key` (followed by whitespace or a delimiter, so `/EncryptMetadata` is
 /// left alone) replaced by `hidden`, which has the same length so no offset moves, and how many
@@ -189,10 +202,6 @@ fn restore_all(doc: &mut Document, renamed: usize) {
 /// Undoes the renaming in the names and dictionary keys of `object`, counting them in `found`.
 fn restore(object: &mut Object, found: &mut usize) {
     match object {
-        Object::Name(name) if name.as_slice() == &HIDDEN_OBJECT_STREAM[1..] => {
-            *name = OBJECT_STREAM[1..].to_vec();
-            *found += 1;
-        }
         Object::Name(name) if name.as_slice() == &HIDDEN_ENCRYPT[1..] => {
             *name = ENCRYPT[1..].to_vec();
             *found += 1;
@@ -232,13 +241,8 @@ fn restore_data(object: &mut Object) {
 }
 
 fn restore_bytes(bytes: &mut Vec<u8>) {
-    for (hidden, key) in [
-        (HIDDEN_ENCRYPT, ENCRYPT),
-        (HIDDEN_OBJECT_STREAM, OBJECT_STREAM),
-    ] {
-        if let Some((restored, _)) = rename_key(bytes, hidden, key) {
-            *bytes = restored;
-        }
+    if let Some((restored, _)) = rename_key(bytes, HIDDEN_ENCRYPT, ENCRYPT) {
+        *bytes = restored;
     }
 }
 
@@ -323,9 +327,10 @@ fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// `password` in PDFDocEncoding, which the older revisions derive their keys from. Characters the
-/// encoding does not have are left out, as other PDF software does. `None` when that is the same
-/// as the UTF-8 bytes.
+/// `password` in PDFDocEncoding, which the older revisions derive their keys from. The control
+/// characters U+0000 to U+0017 (tab, line feed, carriage return among them) are bytes of their own
+/// in it. Characters the encoding does not have are left out, as other PDF software does. `None`
+/// when that is the same as the UTF-8 bytes.
 fn pdf_doc_encoding(password: &str) -> Option<Vec<u8>> {
     if password.is_ascii() {
         return None;
@@ -375,7 +380,7 @@ fn pdf_doc_encoding(password: &str) -> Option<Vec<u8>> {
     let encoded = password
         .encode_utf16()
         .filter_map(|unit| match unit {
-            0x20..=0x7e | 0xa1..=0xac | 0xae..=0xff => Some(unit as u8),
+            0x00..=0x17 | 0x20..=0x7e | 0xa1..=0xac | 0xae..=0xff => Some(unit as u8),
             _ => SPECIAL
                 .iter()
                 .find(|(code, _)| *code == unit)

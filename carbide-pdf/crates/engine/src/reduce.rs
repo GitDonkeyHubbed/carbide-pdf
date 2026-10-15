@@ -583,6 +583,9 @@ fn image_budget(stored: usize) -> usize {
 
 /// Decodes an 8-bit gray or RGB image, or `None` when this image should be left alone. What it
 /// decodes to is taken from `budget`; an image that would take more than is left is not decoded.
+/// An image of a kind that is never decoded (another colour space, filter or depth) takes
+/// nothing. Once decoding is tried the charge stays even when it fails, so that data which
+/// inflates and then turns out to be unusable cannot be tried over and over past the limit.
 fn decode_image(doc: &Document, stream: &Stream, budget: &mut usize) -> Option<Decoded> {
     let dict = &stream.dict;
     if matches!(dict.get(b"ImageMask"), Ok(Object::Boolean(true))) {
@@ -614,7 +617,6 @@ fn decode_image(doc: &Document, stream: &Stream, budget: &mut usize) -> Option<D
         return None;
     }
     let expected = expected as usize;
-    *budget = budget.checked_sub(expected)?;
 
     let filter: Vec<Vec<u8>> = match dict.get(b"Filter") {
         Ok(Object::Name(n)) => vec![n.clone()],
@@ -625,16 +627,23 @@ fn decode_image(doc: &Document, stream: &Stream, budget: &mut usize) -> Option<D
         Ok(_) => return None,
         Err(_) => Vec::new(),
     };
+    let source = match filter.as_slice() {
+        [] if bpc == 8 && stream.content.len() == expected => Source::Raw,
+        [f] if f == b"FlateDecode" && bpc == 8 && !dict.has(b"DecodeParms") => Source::Flate,
+        [f] if f == b"DCTDecode" && bpc == 8 => Source::Jpeg,
+        _ => return None,
+    };
+    *budget = budget.checked_sub(expected)?;
 
-    match filter.as_slice() {
-        [] if bpc == 8 => (stream.content.len() == expected).then(|| Decoded {
+    match source {
+        Source::Raw => Some(Decoded {
             width,
             height,
             components,
             samples: stream.content.clone(),
-            source: Source::Raw,
+            source,
         }),
-        [f] if f == b"FlateDecode" && bpc == 8 && !dict.has(b"DecodeParms") => {
+        Source::Flate => {
             // The samples of an image this size, and no more.
             let samples = stream.get_plain_content_with_limit(expected).ok()?;
             (samples.len() == expected).then_some(Decoded {
@@ -642,10 +651,10 @@ fn decode_image(doc: &Document, stream: &Stream, budget: &mut usize) -> Option<D
                 height,
                 components,
                 samples,
-                source: Source::Flate,
+                source,
             })
         }
-        [f] if f == b"DCTDecode" && bpc == 8 => {
+        Source::Jpeg => {
             // The JPEG data says its own size, which may not be the one in the dictionary.
             let mut reader =
                 image::ImageReader::with_format(Cursor::new(&stream.content), ImageFormat::Jpeg);
@@ -665,10 +674,9 @@ fn decode_image(doc: &Document, stream: &Stream, budget: &mut usize) -> Option<D
                 height: h,
                 components: n,
                 samples,
-                source: Source::Jpeg,
+                source,
             })
         }
-        _ => None,
     }
 }
 
@@ -1177,6 +1185,37 @@ mod tests {
         assert_eq!(budget, 15_000);
         // Real images, which compress a few dozen times at most, always fit.
         assert!(image_budget(100 << 20) > crate::limits::MAX_DECODED + 3000 * (1 << 20));
+    }
+
+    #[test]
+    fn images_that_fail_after_decoding_was_tried_keep_their_charge() {
+        let doc = Document::with_version("1.5");
+        let image = |filter: &str, data: Vec<u8>| {
+            Stream::new(
+                dictionary! {
+                    "Subtype" => "Image", "Width" => 100, "Height" => 100, "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8, "Filter" => filter,
+                },
+                data,
+            )
+        };
+        // Data that inflates but is not the size the dictionary says: it was worked on, so what it
+        // was charged stays spent.
+        let mut budget = 25_000;
+        let short = image("FlateDecode", flate(&[0u8; 9_999]));
+        assert!(decode_image(&doc, &short, &mut budget).is_none());
+        assert_eq!(budget, 15_000);
+        // Repeating it runs the budget out, so later images are left alone.
+        assert!(decode_image(&doc, &short, &mut budget).is_none());
+        assert_eq!(budget, 5_000);
+        let fine = image("FlateDecode", flate(&[0u8; 10_000]));
+        assert!(decode_image(&doc, &fine, &mut budget).is_none());
+        assert_eq!(budget, 5_000);
+        // A filter that is never decoded takes nothing.
+        let mut budget = 25_000;
+        let other = image("LZWDecode", vec![1, 2, 3]);
+        assert!(decode_image(&doc, &other, &mut budget).is_none());
+        assert_eq!(budget, 25_000);
     }
 
     #[test]

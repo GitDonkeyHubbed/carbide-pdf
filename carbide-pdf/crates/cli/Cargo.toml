@@ -24,6 +24,7 @@ chrono.workspace = true
 
 [dev-dependencies]
 # Tests sign files with certificates of their own to check what `verify` reports.
+lopdf.workspace = true
 rcgen = "0.14"
 rand = "0.8"
 rsa.workspace = true

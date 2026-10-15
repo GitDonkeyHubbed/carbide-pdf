@@ -161,6 +161,13 @@ fn rsa_pss(
     let Some(key) = rsa_public_key(certificate, true) else {
         return Verified::Unsupported;
     };
+    match key_pss_restrictions(certificate) {
+        None => return Verified::Unsupported,
+        Some(Some((key_hash, least_salt))) if key_hash != hash || salt_len < least_salt => {
+            return Verified::Bad;
+        }
+        Some(_) => {}
+    }
     let Some(hashed) = digest(hash, parts) else {
         return Verified::Unsupported;
     };
@@ -172,6 +179,27 @@ fn rsa_pss(
         _ => return Verified::Unsupported,
     };
     bool_result(key.verify(scheme, &hashed, signature).is_ok())
+}
+
+/// What an RSASSA-PSS key's own parameters allow (RFC 4055, 3.1): the one hash, for the message
+/// and for MGF1, its signatures may use, and the least salt length. `Some(None)` for a key that
+/// sets none (or an rsaEncryption key), `None` for parameters this build cannot read, NULL
+/// among them.
+fn key_pss_restrictions(certificate: &Certificate) -> Option<Option<(&'static str, usize)>> {
+    let algorithm = &certificate
+        .tbs_certificate
+        .subject_public_key_info
+        .algorithm;
+    if algorithm.oid.to_string() != RSA_PSS {
+        return Some(None);
+    }
+    let Some(parameters) = algorithm.parameters.as_ref() else {
+        return Some(None);
+    };
+    // NULL is not RSASSA-PSS-params: RFC 4055 allows the parameters of this key to be absent, and
+    // only absent leaves it unrestricted. It falls to `pss_parameters`, which cannot read it.
+    let parameters = parameters.to_der().ok()?;
+    pss_parameters(Some(&parameters)).map(Some)
 }
 
 /// `RSASSA-PSS-params` this build can check: the hash (default SHA-1) and salt length (default

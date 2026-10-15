@@ -42,11 +42,15 @@ impl Rect {
         self.width <= 0.0 || self.height <= 0.0
     }
 
-    /// True when every coordinate is a finite number.
+    /// True when every coordinate is a finite number, and so is the size of the area once it is
+    /// [normalized](Rect::normalized): a corner too far away to be a number makes it neither.
     pub fn is_finite(&self) -> bool {
-        [self.x, self.y, self.width, self.height]
-            .iter()
-            .all(|v| v.is_finite())
+        let finite = |rect: &Rect| {
+            [rect.x, rect.y, rect.width, rect.height]
+                .iter()
+                .all(|v| v.is_finite())
+        };
+        finite(self) && finite(&self.normalized())
     }
 
     /// The same area with a non-negative width and height: a rect given with a negative width

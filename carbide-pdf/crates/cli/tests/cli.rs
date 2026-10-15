@@ -1007,3 +1007,126 @@ fn verify_succeeds_only_when_every_signature_is_valid() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn sanitize_removes_bookmarks_when_asked_together_with_only() {
+    let dir = scratch("sanitize-bookmarks");
+    let file = dir.join("marked.pdf");
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let destination = lopdf::Object::Array(vec![page.into(), "Fit".into()]);
+    doc.catalog_mut()
+        .unwrap()
+        .set("Dests", lopdf::dictionary! { "Intro" => destination });
+    std::fs::write(&file, pdf.to_bytes().unwrap()).unwrap();
+    let path = file.to_str().unwrap();
+    let has_destinations = |path: &Path| {
+        let pdf = Pdf::from_bytes(&std::fs::read(path).unwrap()).unwrap();
+        pdf.document().catalog().unwrap().has(b"Dests")
+    };
+    assert!(has_destinations(&file));
+
+    // Without --bookmarks the bookmarks stay, as --only names only the thumbnails.
+    let kept = dir.join("kept.pdf");
+    let output = carbide(&[
+        "sanitize",
+        path,
+        kept.to_str().unwrap(),
+        "--only",
+        "thumbnails",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(has_destinations(&kept));
+
+    let removed = dir.join("removed.pdf");
+    let output = carbide(&[
+        "sanitize",
+        path,
+        removed.to_str().unwrap(),
+        "--only",
+        "thumbnails",
+        "--bookmarks",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("removed Bookmarks and named destinations: 1"));
+    assert!(!has_destinations(&removed));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn sanitize_leaves_a_file_with_nothing_hidden_as_it_is() {
+    let dir = scratch("sanitize-nothing");
+    let file = dir.join("plain.pdf");
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    std::fs::write(&file, pdf.to_bytes().unwrap()).unwrap();
+    let before = std::fs::read(&file).unwrap();
+    let path = file.to_str().unwrap();
+
+    let copy = dir.join("copy.pdf");
+    let output = carbide(&[
+        "sanitize",
+        path,
+        copy.to_str().unwrap(),
+        "--only",
+        "thumbnails",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("No hidden information was found"));
+    assert!(
+        std::fs::read(&copy).unwrap() == before,
+        "the copy was rewritten"
+    );
+
+    let output = carbide(&["sanitize", path, path, "--only", "thumbnails"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("left unchanged"));
+    assert!(
+        std::fs::read(&file).unwrap() == before,
+        "the input was rewritten"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn sanitize_copies_the_input_as_it_is_when_nothing_hidden_is_found() {
+    use lopdf::dictionary;
+    let dir = scratch("sanitize-nothing-widget");
+    let file = dir.join("form.pdf");
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    // A button with no state and no value: clearing the form adds /AS /Off but removes nothing.
+    let button = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Btn",
+        "T" => lopdf::Object::string_literal("b"), "P" => page,
+        "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+    });
+    doc.get_dictionary_mut(page)
+        .unwrap()
+        .set("Annots", vec![button.into()]);
+    doc.catalog_mut()
+        .unwrap()
+        .set("AcroForm", dictionary! { "Fields" => vec![button.into()] });
+    std::fs::write(&file, pdf.to_bytes().unwrap()).unwrap();
+    let before = std::fs::read(&file).unwrap();
+
+    let copy = dir.join("copy.pdf");
+    let output = carbide(&[
+        "sanitize",
+        file.to_str().unwrap(),
+        copy.to_str().unwrap(),
+        "--only",
+        "form-data",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("No hidden information was found"));
+    assert!(
+        std::fs::read(&copy).unwrap() == before,
+        "the copy was a recomputed save, not the input's bytes"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

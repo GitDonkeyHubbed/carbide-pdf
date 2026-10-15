@@ -160,7 +160,7 @@ impl Pdf {
         for &page in &wanted {
             self.check_drawable(page)?;
         }
-        let snapshot = self.to_bytes()?;
+        let snapshot = self.serialized()?;
         self.check_pages_agree(renderer, &snapshot, &wanted)?;
         let mut report = OcrReport::default();
 

@@ -12,22 +12,44 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 
 use crate::content::{name, tokens, Token};
 use crate::error::{Error, Result};
-use crate::limits::DecodeBudget;
+use crate::limits::{messages, DecodeBudget, MAX_FORM_DEPTH};
 use crate::pdf::Pdf;
+
+const FONT: &[u8] = b"Font";
+const XOBJECT: &[u8] = b"XObject";
+const EXT_G_STATE: &[u8] = b"ExtGState";
+const COLOR_SPACE: &[u8] = b"ColorSpace";
+const PATTERN: &[u8] = b"Pattern";
+const SHADING: &[u8] = b"Shading";
+const PROPERTIES: &[u8] = b"Properties";
 
 /// Resource categories whose entries content refers to by name.
 const NAMED_RESOURCES: [&[u8]; 7] = [
-    b"Font",
-    b"XObject",
-    b"ExtGState",
-    b"ColorSpace",
-    b"Pattern",
-    b"Shading",
-    b"Properties",
+    FONT,
+    XOBJECT,
+    EXT_G_STATE,
+    COLOR_SPACE,
+    PATTERN,
+    SHADING,
+    PROPERTIES,
 ];
+
+/// Colour spaces that stand in for the device ones (`rg`, `g`, `k`, an image in `/DeviceRGB`)
+/// without content naming them; kept wherever they are.
+const DEFAULT_SPACES: [&[u8]; 3] = [b"DefaultGray", b"DefaultRGB", b"DefaultCMYK"];
+
+/// The resources content uses: each name with the category it is looked up in. A font `/R1`
+/// does not keep an image that is also called `/R1`.
+type Uses = HashSet<(&'static [u8], Vec<u8>)>;
 
 /// Deeper nesting than this is treated as damaged and left alone.
 const MAX_DEPTH: usize = 64;
+
+/// The most different names one page's content, with the forms, patterns, glyphs and
+/// appearances it draws, may give the operators that look a resource up. Real pages give a few
+/// hundred; each name is kept while the page is read, so without a limit millions of names in
+/// content within the limit for one page in [`crate::limits`] could take gigabytes.
+const MAX_NAMES: usize = 100_000;
 
 impl Pdf {
     /// The annotations placed on `pages`, with the page each is on.
@@ -265,8 +287,9 @@ impl Pdf {
     /// one resource dictionary. A page whose content cannot be read keeps all of its resources.
     ///
     /// Each page's content, with the forms it draws, is decoded within the limit for one page in
-    /// [`crate::limits`]; past it this fails with [`Error::TooLarge`] rather than keep resources
-    /// that may be what removed content alone used.
+    /// [`crate::limits`]; past it, with forms nested deeper than a page may draw them, or with
+    /// more different resource names than [`MAX_NAMES`], this fails with [`Error::TooLarge`]
+    /// rather than keep resources that may be what removed content alone used.
     pub(crate) fn trim_resources(&mut self) -> Result<()> {
         let pages = self.page_ids();
         let mut shared = HashSet::new();
@@ -286,8 +309,14 @@ impl Pdf {
         let mut changes = Vec::new();
         let mut scan = NameScan {
             budget: DecodeBudget::for_page(),
+            names_left: MAX_NAMES,
             names: HashMap::new(),
+            joined: HashMap::new(),
+            trimmed: HashSet::new(),
         };
+        // Forms, patterns, Type 3 fonts and annotation appearances with resources of their own,
+        // trimmed in turn.
+        let mut nested = HashMap::new();
         for page in &pages {
             let Some(Object::Dictionary(resources)) = self.inherited(*page, b"Resources") else {
                 continue;
@@ -299,19 +328,28 @@ impl Pdf {
                 .ok()
                 .cloned();
             scan.budget = DecodeBudget::for_page();
-            let kept = match self.names_used_by_page(*page, &resources, &mut scan)? {
-                Some(names) => self.keep_named(&resources, &names),
+            scan.names_left = MAX_NAMES;
+            let group = self.group_colour_space(self.doc.get_dictionary(*page)?);
+            let mut kept = match self.names_used_by_page(*page, &resources, &mut scan)? {
+                Some(mut uses) => {
+                    uses.extend(group);
+                    self.keep_named(&resources, &uses)
+                }
                 None => resources.clone(),
             };
+            self.trim_nested(&mut kept, &mut scan, &mut nested, 0)?;
+            self.trim_appearances(*page, &mut scan, &mut nested)?;
             let independent = match &own {
                 Some(Object::Reference(id)) => !shared.contains(id),
                 Some(_) => true,
                 None => false,
             };
-            if !(independent && kept == self.with_categories_resolved(&resources)) {
+            let unchanged = kept == resources || kept == self.with_categories_resolved(&resources);
+            if !(independent && unchanged) {
                 changes.push((*page, kept));
             }
         }
+        self.doc.objects.extend(nested);
         for (page, resources) in changes {
             self.doc
                 .get_dictionary_mut(page)?
@@ -337,26 +375,31 @@ impl Pdf {
         Ok(())
     }
 
-    /// The resource names the page's content refers to, following forms, patterns and Type 3
-    /// fonts that use the page's resources instead of their own. `None` when some content cannot
-    /// be read; an error when decoding it would go past the limits in [`crate::limits`].
+    /// The resources the page's content uses, following forms, patterns and Type 3 fonts that use
+    /// the page's resources instead of their own. `None` when some content cannot be read; an
+    /// error when decoding it would go past the limits in [`crate::limits`].
     fn names_used_by_page(
         &self,
         page: ObjectId,
         resources: &Dictionary,
         scan: &mut NameScan,
-    ) -> Result<Option<HashSet<Vec<u8>>>> {
-        let mut names = HashSet::new();
-        for stream in self.doc.get_page_contents(page) {
-            let Ok(content) = self.doc.get_object(stream).and_then(Object::as_stream) else {
-                return Ok(None);
-            };
-            let Some(found) = scan.names_in(Some(stream), content)? else {
-                return Ok(None);
-            };
-            names.extend(found);
-        }
-        // Resources that are drawn without resources of their own use the page's.
+    ) -> Result<Option<Uses>> {
+        let streams = self.doc.get_page_contents(page);
+        let Some(uses) = scan.page_uses(&self.doc, streams)? else {
+            return Ok(None);
+        };
+        self.scope_uses(uses, resources, scan)
+    }
+
+    /// `uses`, the resources some content uses directly, together with what the forms, patterns
+    /// and Type 3 fonts among them that have no resources of their own use from `resources`.
+    fn scope_uses(
+        &self,
+        mut uses: Uses,
+        resources: &Dictionary,
+        scan: &mut NameScan,
+    ) -> Result<Option<Uses>> {
+        // Resources that are drawn without resources of their own use the enclosing ones.
         let mut followed = HashSet::new();
         loop {
             let mut more = Vec::new();
@@ -369,26 +412,50 @@ impl Pdf {
                     continue;
                 };
                 for (name, value) in entries.iter() {
-                    if !names.contains(name) || !followed.insert((category, name.clone())) {
+                    let key = (category, name.clone());
+                    if !uses.contains(&key) || !followed.insert(key) {
                         continue;
                     }
                     let Some(resolved) = self.resolved(value) else {
                         continue;
                     };
-                    // Names in the resource's own dictionary: an image's colour space, say.
-                    if let Some(dict) = resolved
-                        .as_dict()
-                        .ok()
-                        .or_else(|| resolved.as_stream().ok().map(|s| &s.dict))
-                    {
+                    // Names in the resource's own dictionary or array can only stand for colour
+                    // spaces: an image's, or the base of an indexed colour space.
+                    let values: Vec<&Object> = match resolved {
+                        Object::Dictionary(dict) => dict.iter().map(|(_, v)| v).collect(),
+                        Object::Stream(stream) => stream.dict.iter().map(|(_, v)| v).collect(),
+                        Object::Array(items) => items.iter().collect(),
+                        _ => Vec::new(),
+                    };
+                    for value in values {
+                        let items = match value {
+                            Object::Array(items) => items.iter().collect(),
+                            other => vec![other],
+                        };
                         more.extend(
-                            dict.iter()
-                                .filter_map(|(_, v)| v.as_name().ok().map(<[u8]>::to_vec)),
+                            items
+                                .into_iter()
+                                .filter_map(|v| v.as_name().ok())
+                                .map(|n| (COLOR_SPACE, n.to_vec())),
                         );
                     }
+                    if category == EXT_G_STATE {
+                        if let Some(id) = self.soft_mask_form(value) {
+                            if let Ok(Object::Stream(mask)) = self.doc.get_object(id) {
+                                if !mask.dict.has(b"Resources") && is_content(&mask.dict) {
+                                    let Some(found) = scan.uses_in(Some(id), mask)? else {
+                                        return Ok(None);
+                                    };
+                                    more.extend(found);
+                                }
+                            }
+                        }
+                    }
                     match resolved {
-                        Object::Stream(stream) if !stream.dict.has(b"Resources") => {
-                            let Some(found) = scan.names_in(value.as_reference().ok(), stream)?
+                        Object::Stream(stream)
+                            if !stream.dict.has(b"Resources") && is_content(&stream.dict) =>
+                        {
+                            let Some(found) = scan.uses_in(value.as_reference().ok(), stream)?
                             else {
                                 return Ok(None);
                             };
@@ -411,7 +478,7 @@ impl Pdf {
                             for (_, glyph) in procs.iter() {
                                 if let Some(Object::Stream(stream)) = self.resolved(glyph) {
                                     let Some(found) =
-                                        scan.names_in(glyph.as_reference().ok(), stream)?
+                                        scan.uses_in(glyph.as_reference().ok(), stream)?
                                     else {
                                         return Ok(None);
                                     };
@@ -423,29 +490,33 @@ impl Pdf {
                     }
                 }
             }
-            let before = names.len();
-            names.extend(more);
-            if names.len() == before {
-                return Ok(Some(names));
+            let before = uses.len();
+            uses.extend(more);
+            if uses.len() == before {
+                return Ok(Some(uses));
             }
         }
     }
 
-    /// `resources` with only the named entries in `names`, as a direct dictionary.
-    fn keep_named(&self, resources: &Dictionary, names: &HashSet<Vec<u8>>) -> Dictionary {
+    /// `resources` with only the named entries in `uses` and the default colour spaces, as a
+    /// direct dictionary.
+    fn keep_named(&self, resources: &Dictionary, uses: &Uses) -> Dictionary {
         let mut kept = Dictionary::new();
         for (key, value) in resources.iter() {
-            if !NAMED_RESOURCES.contains(&key.as_slice()) {
+            let Some(category) = NAMED_RESOURCES.into_iter().find(|c| *c == key.as_slice()) else {
                 kept.set(key.clone(), value.clone());
                 continue;
-            }
+            };
             let Object::Dictionary(entries) = self.resolve(value) else {
                 kept.set(key.clone(), value.clone());
                 continue;
             };
             let used: Dictionary = entries
                 .iter()
-                .filter(|(name, _)| names.contains(*name))
+                .filter(|(name, _)| {
+                    uses.contains(&(category, name.to_vec()))
+                        || (category == COLOR_SPACE && DEFAULT_SPACES.contains(&name.as_slice()))
+                })
                 .map(|(n, v)| (n.clone(), v.clone()))
                 .collect();
             if !used.is_empty() {
@@ -453,6 +524,236 @@ impl Pdf {
             }
         }
         kept
+    }
+
+    /// Trims the resources of each form, tiling pattern and Type 3 font in `resources` that has
+    /// resources of its own to what its own content uses, and so on down. Objects that change go
+    /// into `changed`, entries written straight into `resources` change in place. An object is
+    /// trimmed once however often it is drawn, so shared and looping resources end too.
+    fn trim_nested(
+        &self,
+        resources: &mut Dictionary,
+        scan: &mut NameScan,
+        changed: &mut HashMap<ObjectId, Object>,
+        depth: usize,
+    ) -> Result<()> {
+        for category in [XOBJECT, PATTERN, FONT] {
+            let Ok(value) = resources.get(category) else {
+                continue;
+            };
+            let Object::Dictionary(mut entries) = self.resolve(value) else {
+                continue;
+            };
+            let mut edited = false;
+            for (_, entry) in entries.iter_mut() {
+                if let Object::Reference(id) = entry {
+                    self.trim_referenced(*id, scan, changed, depth)?;
+                } else {
+                    edited |= self.trim_own_resources(None, entry, scan, changed, depth)?;
+                }
+            }
+            if edited {
+                resources.set(category, entries);
+            }
+        }
+        // A soft mask's form is drawn through the graphics state that names it.
+        if let Some(Object::Dictionary(states)) = resources
+            .get(EXT_G_STATE)
+            .ok()
+            .and_then(|s| self.resolved(s))
+        {
+            for (_, state) in states.iter() {
+                if let Some(id) = self.soft_mask_form(state) {
+                    self.trim_referenced(id, scan, changed, depth)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::trim_own_resources`] for the object `id`, once however often it is reached.
+    fn trim_referenced(
+        &self,
+        id: ObjectId,
+        scan: &mut NameScan,
+        changed: &mut HashMap<ObjectId, Object>,
+        depth: usize,
+    ) -> Result<()> {
+        if !scan.trimmed.insert(id) {
+            return Ok(());
+        }
+        let Ok(object) = self.doc.get_object(id) else {
+            return Ok(());
+        };
+        let mut object = object.clone();
+        if self.trim_own_resources(Some(id), &mut object, scan, changed, depth)? {
+            changed.insert(id, object);
+        }
+        Ok(())
+    }
+
+    /// The form a graphics state's soft mask (`/SMask` `/G`) draws, if it has one.
+    fn soft_mask_form(&self, state: &Object) -> Option<ObjectId> {
+        let Some(Object::Dictionary(state)) = self.resolved(state) else {
+            return None;
+        };
+        let Some(Object::Dictionary(mask)) =
+            state.get(b"SMask").ok().and_then(|m| self.resolved(m))
+        else {
+            return None;
+        };
+        mask.get(b"G").and_then(Object::as_reference).ok()
+    }
+
+    /// Trims the resources of the appearances of the annotations on `page` (normal, rollover and
+    /// down, one for each state of the annotation where it has several) as [`Self::trim_nested`]
+    /// trims those of the forms the page draws. An annotation that stays keeps its appearances,
+    /// and their resources can be shared with content that went.
+    fn trim_appearances(
+        &self,
+        page: ObjectId,
+        scan: &mut NameScan,
+        changed: &mut HashMap<ObjectId, Object>,
+    ) -> Result<()> {
+        let Some(Object::Array(annotations)) = self
+            .doc
+            .get_dictionary(page)?
+            .get(b"Annots")
+            .ok()
+            .map(|a| self.resolve(a))
+        else {
+            return Ok(());
+        };
+        for annotation in &annotations {
+            let Object::Dictionary(annotation) = self.resolve(annotation) else {
+                continue;
+            };
+            let Some(Object::Dictionary(appearances)) =
+                annotation.get(b"AP").ok().map(|ap| self.resolve(ap))
+            else {
+                continue;
+            };
+            for key in [&b"N"[..], b"R", b"D"] {
+                let Ok(appearance) = appearances.get(key) else {
+                    continue;
+                };
+                let forms: Vec<ObjectId> = match self.resolve(appearance) {
+                    Object::Dictionary(states) => states
+                        .iter()
+                        .filter_map(|(_, state)| state.as_reference().ok())
+                        .collect(),
+                    _ => appearance.as_reference().into_iter().collect(),
+                };
+                for id in forms {
+                    if !scan.trimmed.insert(id) {
+                        continue;
+                    }
+                    let Ok(object) = self.doc.get_object(id) else {
+                        continue;
+                    };
+                    let mut object = object.clone();
+                    if self.trim_own_resources(Some(id), &mut object, scan, changed, 0)? {
+                        changed.insert(id, object);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Trims the resources `owner` (a form, a tiling pattern or a Type 3 font; object `id` when
+    /// it is one of its own) has of its own to what its content uses, and those of what they hold
+    /// in turn. True when `owner` changed. When its content cannot be read, its resources are kept
+    /// whole, but what they hold is still trimmed. `depth` is how many such owners enclose it;
+    /// one nested deeper than a page may draw forms (see [`MAX_FORM_DEPTH`]) is an error rather
+    /// than left with resources that may be what removed content alone used.
+    fn trim_own_resources(
+        &self,
+        id: Option<ObjectId>,
+        owner: &mut Object,
+        scan: &mut NameScan,
+        changed: &mut HashMap<ObjectId, Object>,
+        depth: usize,
+    ) -> Result<bool> {
+        let dict = match owner {
+            Object::Stream(stream) => &stream.dict,
+            Object::Dictionary(dict) => &*dict,
+            _ => return Ok(false),
+        };
+        let Some(Object::Dictionary(resources)) =
+            dict.get(b"Resources").ok().map(|r| self.resolve(r))
+        else {
+            return Ok(false);
+        };
+        let group = self.group_colour_space(dict);
+        let content = match &*owner {
+            Object::Stream(stream) if is_content(&stream.dict) => scan.uses_in(id, stream)?,
+            Object::Dictionary(font)
+                if font
+                    .get(b"Subtype")
+                    .and_then(Object::as_name)
+                    .is_ok_and(|s| s == b"Type3") =>
+            {
+                self.glyph_uses(font, scan)?
+            }
+            _ => return Ok(false),
+        };
+        if depth >= MAX_FORM_DEPTH {
+            return Err(Error::TooLarge(messages::TOO_COMPLEX.into()));
+        }
+        let uses = match content {
+            Some(mut uses) => {
+                uses.extend(group);
+                self.scope_uses(uses, &resources, scan)?
+            }
+            None => None,
+        };
+        let mut kept = match &uses {
+            Some(uses) => self.keep_named(&resources, uses),
+            None => resources.clone(),
+        };
+        self.trim_nested(&mut kept, scan, changed, depth + 1)?;
+        if kept == resources || kept == self.with_categories_resolved(&resources) {
+            return Ok(false);
+        }
+        match owner {
+            Object::Stream(stream) => stream.dict.set("Resources", kept),
+            Object::Dictionary(dict) => dict.set("Resources", kept),
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    /// The colour space a transparency group (`/Group` of a page or form) names from its resources
+    /// as its blending space, which its content need not use.
+    fn group_colour_space(&self, owner: &Dictionary) -> Option<(&'static [u8], Vec<u8>)> {
+        let Object::Dictionary(group) = owner.get(b"Group").map(|g| self.resolve(g)).ok()? else {
+            return None;
+        };
+        let name = group.get(b"CS").and_then(Object::as_name).ok()?;
+        Some((COLOR_SPACE, name.to_vec()))
+    }
+
+    /// The resources the glyphs of the Type 3 font `font` use; `None` when one cannot be read.
+    fn glyph_uses(&self, font: &Dictionary, scan: &mut NameScan) -> Result<Option<Uses>> {
+        let mut uses = HashSet::new();
+        let Object::Dictionary(procs) = font
+            .get(b"CharProcs")
+            .map(|o| self.resolve(o))
+            .unwrap_or(Object::Null)
+        else {
+            return Ok(Some(uses));
+        };
+        for (_, glyph) in procs.iter() {
+            let Some(Object::Stream(stream)) = self.resolved(glyph) else {
+                continue;
+            };
+            let Some(found) = scan.uses_in(glyph.as_reference().ok(), stream)? else {
+                return Ok(None);
+            };
+            uses.extend(found);
+        }
+        Ok(Some(uses))
     }
 
     /// `resources` with its categories as direct dictionaries, for comparing with `keep_named`.
@@ -470,26 +771,74 @@ impl Pdf {
     }
 }
 
-/// The names each content stream uses, found once per stream however many pages draw it, each
-/// page's streams decoded within the budget of one page.
+/// The resources each content stream uses, found once per stream however many pages draw it,
+/// each page's streams decoded within the budget of one page.
 struct NameScan {
     budget: DecodeBudget,
-    names: HashMap<ObjectId, Option<HashSet<Vec<u8>>>>,
+    /// How many more different names the page being read may use (see [`MAX_NAMES`]).
+    names_left: usize,
+    names: HashMap<ObjectId, Option<Uses>>,
+    /// What the content of pages split over several streams uses, by the streams, in order.
+    joined: HashMap<Vec<ObjectId>, Option<Uses>>,
+    /// Forms, patterns and fonts whose own resources were already trimmed.
+    trimmed: HashSet<ObjectId>,
 }
 
 impl NameScan {
-    /// The names `stream` (object `id`, when it is one of its own) uses as operands; `None` when
-    /// it cannot be decoded, and an error when decoding it would go past the budget.
-    fn names_in(
-        &mut self,
-        id: Option<ObjectId>,
-        stream: &lopdf::Stream,
-    ) -> Result<Option<HashSet<Vec<u8>>>> {
+    /// The resources a page's content, the streams `streams`, uses; `None` when one cannot be
+    /// decoded, and an error when decoding them would go past the budget. The streams are read
+    /// as one, as the page's content is: an operator can take its operands from the stream
+    /// before its own, so what one stream uses on its own is not what it uses on a page.
+    fn page_uses(&mut self, doc: &Document, streams: Vec<ObjectId>) -> Result<Option<Uses>> {
+        if let [id] = streams[..] {
+            let Ok(content) = doc.get_object(id).and_then(Object::as_stream) else {
+                return Ok(None);
+            };
+            return self.uses_in(Some(id), content);
+        }
+        if let Some(found) = self.joined.get(&streams) {
+            let found = found.clone();
+            self.count(&found)?;
+            return Ok(found);
+        }
+        let mut joined = Vec::new();
+        let mut readable = true;
+        for id in &streams {
+            let Ok(content) = doc.get_object(*id).and_then(Object::as_stream) else {
+                readable = false;
+                break;
+            };
+            match self.budget.stream(content) {
+                Ok(mut plain) => {
+                    joined.append(&mut plain);
+                    joined.push(b'\n');
+                }
+                Err(error @ Error::TooLarge(_)) => return Err(error),
+                Err(_) => {
+                    readable = false;
+                    break;
+                }
+            }
+        }
+        let found = if readable {
+            Some(uses_in(&joined, &mut self.names_left)?)
+        } else {
+            None
+        };
+        self.joined.insert(streams, found.clone());
+        Ok(found)
+    }
+
+    /// The resources `stream` (object `id`, when it is one of its own) uses; `None` when it
+    /// cannot be decoded, and an error when decoding it would go past the budget.
+    fn uses_in(&mut self, id: Option<ObjectId>, stream: &lopdf::Stream) -> Result<Option<Uses>> {
         if let Some(found) = id.and_then(|id| self.names.get(&id)) {
-            return Ok(found.clone());
+            let found = found.clone();
+            self.count(&found)?;
+            return Ok(found);
         }
         let found = match self.budget.stream(stream) {
-            Ok(plain) => Some(names_in(&plain)),
+            Ok(plain) => Some(uses_in(&plain, &mut self.names_left)?),
             Err(error @ Error::TooLarge(_)) => return Err(error),
             Err(_) => None,
         };
@@ -497,6 +846,17 @@ impl NameScan {
             self.names.insert(id, found.clone());
         }
         Ok(found)
+    }
+
+    /// Counts the names in `found`, found before, against those the page being read may use: the
+    /// copy of them it is given takes as much memory as reading them did.
+    fn count(&mut self, found: &Option<Uses>) -> Result<()> {
+        let used = found.as_ref().map_or(0, HashSet::len);
+        self.names_left = self
+            .names_left
+            .checked_sub(used)
+            .ok_or_else(|| Error::TooLarge(messages::TOO_COMPLEX.into()))?;
+        Ok(())
     }
 }
 
@@ -511,19 +871,65 @@ pub(crate) fn widget_area(widget: &Dictionary) -> Option<[f32; 4]> {
     (area[2] > area[0] && area[3] > area[1]).then_some(area)
 }
 
-/// Every name `content` uses as an operand, including inside dictionaries (marked-content
-/// properties, inline images).
-fn names_in(content: &[u8]) -> HashSet<Vec<u8>> {
-    let mut names = HashSet::new();
-    tokens(content, |token| {
-        if let Token::Name(written) = token {
-            let name = name(written);
-            if !names.contains(name.as_ref()) {
-                names.insert(name.into_owned());
-            }
+/// The resources `content` uses: the names given to the operators that look a resource up, each
+/// in the category that operator looks in. Names inside an inline image's dictionary count as
+/// colour spaces, and every name given to a marked-content operator as properties.
+///
+/// `left` is how many more different names may be kept, and goes down by those this content
+/// uses; past it, or with more different names before one operator than [`MAX_NAMES`], this
+/// fails with [`Error::TooLarge`].
+fn uses_in(content: &[u8], left: &mut usize) -> Result<Uses> {
+    let mut uses = HashSet::new();
+    // Which operand a name is, or how often it is given, does not matter: each is kept once, so
+    // a name given millions of times before an operator takes no more memory than one.
+    let mut operands: HashSet<&[u8]> = HashSet::new();
+    let mut over = false;
+    tokens(content, |token| match token {
+        _ if over => {}
+        Token::Name(written) => {
+            over = operands.insert(written) && operands.len() > MAX_NAMES;
         }
+        Token::Operator(operator) => {
+            let category = match operator {
+                b"Tf" => Some(FONT),
+                b"Do" => Some(XOBJECT),
+                b"gs" => Some(EXT_G_STATE),
+                b"cs" | b"CS" | b"ID" => Some(COLOR_SPACE),
+                b"scn" | b"SCN" => Some(PATTERN),
+                b"sh" => Some(SHADING),
+                b"BDC" | b"DP" => Some(PROPERTIES),
+                _ => None,
+            };
+            if let Some(category) = category {
+                for written in &operands {
+                    if uses.insert((category, name(written).into_owned())) {
+                        match left.checked_sub(1) {
+                            Some(fewer) => *left = fewer,
+                            None => {
+                                over = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            operands.clear();
+        }
+        _ => {}
     });
-    names
+    if over {
+        return Err(Error::TooLarge(messages::TOO_COMPLEX.into()));
+    }
+    Ok(uses)
+}
+
+/// Whether `dict` is that of a stream that holds content: a form or a tiling pattern.
+fn is_content(dict: &Dictionary) -> bool {
+    dict.has(b"PatternType")
+        || dict
+            .get(b"Subtype")
+            .and_then(Object::as_name)
+            .is_ok_and(|s| s == b"Form")
 }
 
 /// Runs `edit` on the array `holder` is, or refers to, and stores the result where it came from.
