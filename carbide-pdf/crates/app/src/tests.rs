@@ -1958,3 +1958,37 @@ fn finding_no_hidden_information_keeps_the_undone_steps_to_redo() {
     app.run(Cmd::Redo);
     assert_eq!(app.doc.as_ref().unwrap().geometries[0].rotation, 90);
 }
+
+#[test]
+fn a_signature_is_not_written_over_a_file_another_program_changed() {
+    let dir = scratch();
+    let mut app = app(&dir);
+    let path = plain(&dir, "a.pdf", &["ORIGINAL"]);
+    app.open_path(&path);
+    let doc = app.doc.as_ref().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.sign_job = Some(SignJob {
+        doc: doc.id,
+        version: doc.version,
+        path: path.clone(),
+        done: "Signed".into(),
+        receiver,
+        result: None,
+    });
+
+    // The file is replaced while the authority answers: it stays as the other program left it.
+    let other = document(&["OTHER PROGRAM"]).to_bytes().unwrap();
+    std::fs::write(&path, &other).unwrap();
+    sender
+        .send(Ok(document(&["STAMPED"]).to_bytes().unwrap()))
+        .unwrap();
+    app.poll_sign();
+    assert!(app.sign_job.is_none());
+    assert!(
+        std::fs::read(&path).unwrap() == other,
+        "a file another program changed was replaced"
+    );
+    assert!(
+        matches!(&app.dialog, Some(Dialog::Message(m)) if m.contains("changed by another program"))
+    );
+}

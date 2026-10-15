@@ -2008,7 +2008,19 @@ impl CarbideApp {
     /// Writes signed bytes over the active document's file and reloads the document from it.
     fn finish_signing(&mut self, path: &Path, done: String, signed: Result<Vec<u8>, String>) {
         let Some(doc) = self.doc.as_mut() else { return };
+        // The signature was made on the file as it was read. Another program may have changed it
+        // since (a time stamp can take a while), and writing over that would lose its changes.
+        let unchanged = doc
+            .saved
+            .as_ref()
+            .is_some_and(|saved| std::fs::read(path).is_ok_and(|disk| disk == saved.bytes()));
         let result = signed.and_then(|bytes| {
+            if !unchanged {
+                return Err(format!(
+                    "The document was not signed: {} was changed by another program in the meantime. Open it again and sign it then.",
+                    path.display()
+                ));
+            }
             carbide_engine::fs::write_replacing(path, &bytes).map_err(|e| e.to_string())?;
             doc.forget_history();
             Ok(doc
