@@ -15,7 +15,8 @@
 //! PDFium has no limits of its own, so a page is checked before it is rendered or its text read
 //! ([`Pdf::check_drawable`]): its content and the forms it draws may decode to no more than
 //! [`MAX_DECODED_AT_ONCE`] and hold no more than [`MAX_DRAWN_OPERATORS`] operators, counting a
-//! form each time it is drawn, and no form may draw itself. The size of rendered images is limited
+//! form each time it is drawn, no form may draw itself, and forms nest no deeper than
+//! [`MAX_FORM_DEPTH`]. The size of rendered images is limited
 //! in [`crate::render`].
 
 use std::collections::HashMap;
@@ -40,6 +41,10 @@ pub const MAX_DECODED: usize = 1 << 30;
 /// this keeps what it needs for a page well under a gigabyte, and real pages far below it.
 pub const MAX_DRAWN_OPERATORS: usize = 4_000_000;
 
+/// The most forms that may be drawn inside one another. Real documents nest a handful; the limit
+/// keeps checking a page from taking more stack than a thread has.
+pub const MAX_FORM_DEPTH: usize = 128;
+
 pub mod messages {
     pub const TOO_LARGE: &str =
         "This document's content is too large to process safely: it decompresses to more than \
@@ -49,7 +54,7 @@ pub mod messages {
 memory than a file of its size can need.";
     pub const TOO_COMPLEX: &str =
         "This page is too complex to show safely: drawing it would take more than 256 MB of \
-content or 4 million operations, or part of it draws itself.";
+content or 4 million operations, or part of it draws itself or nests forms too deeply.";
 }
 
 /// What the object streams of a file of `file_size` bytes may unpack to, objects parsed: 256
@@ -115,12 +120,15 @@ pub(crate) fn too_large(error: lopdf::Error) -> Error {
 struct Cost {
     bytes: usize,
     operators: usize,
+    /// How many forms deep the deepest one drawn goes, this content being level 0.
+    depth: usize,
 }
 
 impl Cost {
     fn add(&mut self, other: Cost) -> Result<()> {
         self.bytes = self.bytes.saturating_add(other.bytes);
         self.operators = self.operators.saturating_add(other.operators);
+        self.depth = self.depth.max(other.depth);
         if self.bytes > MAX_DECODED_AT_ONCE || self.operators > MAX_DRAWN_OPERATORS {
             return Err(Error::TooLarge(messages::TOO_COMPLEX.into()));
         }
@@ -152,7 +160,7 @@ impl<'a> Drawing<'a> {
             .unwrap_or(&no_xobjects);
         let mut cost = Cost {
             bytes: data.len(),
-            operators: 0,
+            ..Cost::default()
         };
         let mut last_name: Option<Vec<u8>> = None;
         let mut failure = None;
@@ -175,8 +183,8 @@ impl<'a> Drawing<'a> {
                             ..form
                         }),
                         None => Ok(Cost {
-                            bytes: 0,
                             operators: 1,
+                            ..Cost::default()
                         }),
                     };
                     if let Err(error) = step.and_then(|step| cost.add(step)) {
@@ -214,10 +222,16 @@ impl<'a> Drawing<'a> {
             .and_then(|o| pdf.resolved(o))
             .and_then(|o| o.as_dict().ok());
         let holder = if own.is_some() { id } else { holder };
+        // A form found again is as deep below where it is drawn now as it was where it was first
+        // drawn, so its depth counts on top of the forms being drawn.
+        let too_deep = |levels: usize| self.path.len().saturating_add(levels) > MAX_FORM_DEPTH;
         if let Some(cost) = self.forms.get(&(id, holder)) {
+            if too_deep(cost.depth) {
+                return Err(Error::TooLarge(messages::TOO_COMPLEX.into()));
+            }
             return Ok(*cost);
         }
-        if self.path.contains(&id) {
+        if self.path.contains(&id) || too_deep(1) {
             return Err(Error::TooLarge(messages::TOO_COMPLEX.into()));
         }
         let data = match stream.get_plain_content_with_limit(MAX_DECODED_AT_ONCE) {
@@ -231,7 +245,8 @@ impl<'a> Drawing<'a> {
         self.path.push(id);
         let cost = self.content(&data, own.unwrap_or(resources), holder);
         self.path.pop();
-        let cost = cost?;
+        let mut cost = cost?;
+        cost.depth += 1;
         self.forms.insert((id, holder), cost);
         Ok(cost)
     }
