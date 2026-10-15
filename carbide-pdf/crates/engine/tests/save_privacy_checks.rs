@@ -407,6 +407,63 @@ fn names_repeated_before_an_operator_take_no_memory_each() {
     );
 }
 
+#[test]
+fn deleted_page_image_does_not_survive_in_the_appearance_of_a_kept_annotation() {
+    // The kept page has an annotation whose appearances, one for a state and a down one, use the
+    // resource dictionary the pages share; only the deleted page drew its image.
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let font = helvetica(&mut doc);
+    let image = secret_image(&mut doc);
+    let shared = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font },
+        "XObject" => dictionary! { "Im1" => image },
+    });
+    let on = form(&mut doc, shared.into(), "BT /F1 9 Tf (on) Tj ET");
+    let down = form(&mut doc, shared.into(), "BT /F1 9 Tf (down) Tj ET");
+    let annotation = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Stamp",
+        "Rect" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        "AP" => dictionary! { "N" => dictionary! { "On" => on }, "D" => down },
+        "AS" => "On",
+    });
+    let mut kids = Vec::new();
+    for (content, annots) in [
+        ("BT ET", vec![annotation.into()]),
+        ("q 100 0 0 100 0 0 cm /Im1 Do Q", vec![]),
+    ] {
+        let contents = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            content.as_bytes().to_vec(),
+        ));
+        kids.push(Object::Reference(doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+            "Contents" => contents, "Resources" => shared, "Annots" => annots,
+        })));
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 2 }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the annotation's appearances lost their font"
+    );
+}
+
 // ---- legacy passwords ----------------------------------------------------------------------
 
 const PADDING: [u8; 32] = [

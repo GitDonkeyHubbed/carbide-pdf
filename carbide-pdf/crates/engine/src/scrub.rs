@@ -307,7 +307,8 @@ impl Pdf {
             joined: HashMap::new(),
             trimmed: HashSet::new(),
         };
-        // Forms, patterns and Type 3 fonts with resources of their own, trimmed in turn.
+        // Forms, patterns, Type 3 fonts and annotation appearances with resources of their own,
+        // trimmed in turn.
         let mut nested = HashMap::new();
         for page in &pages {
             let Some(Object::Dictionary(resources)) = self.inherited(*page, b"Resources") else {
@@ -325,6 +326,7 @@ impl Pdf {
                 None => resources.clone(),
             };
             self.trim_nested(&mut kept, &mut scan, &mut nested, 0)?;
+            self.trim_appearances(*page, &mut scan, &mut nested)?;
             let independent = match &own {
                 Some(Object::Reference(id)) => !shared.contains(id),
                 Some(_) => true,
@@ -538,6 +540,62 @@ impl Pdf {
             }
             if edited {
                 resources.set(category, entries);
+            }
+        }
+        Ok(())
+    }
+
+    /// Trims the resources of the appearances of the annotations on `page` (normal, rollover and
+    /// down, one for each state of the annotation where it has several) as [`Self::trim_nested`]
+    /// trims those of the forms the page draws. An annotation that stays keeps its appearances,
+    /// and their resources can be shared with content that went.
+    fn trim_appearances(
+        &self,
+        page: ObjectId,
+        scan: &mut NameScan,
+        changed: &mut HashMap<ObjectId, Object>,
+    ) -> Result<()> {
+        let Some(Object::Array(annotations)) = self
+            .doc
+            .get_dictionary(page)?
+            .get(b"Annots")
+            .ok()
+            .map(|a| self.resolve(a))
+        else {
+            return Ok(());
+        };
+        for annotation in &annotations {
+            let Object::Dictionary(annotation) = self.resolve(annotation) else {
+                continue;
+            };
+            let Some(Object::Dictionary(appearances)) =
+                annotation.get(b"AP").ok().map(|ap| self.resolve(ap))
+            else {
+                continue;
+            };
+            for key in [&b"N"[..], b"R", b"D"] {
+                let Ok(appearance) = appearances.get(key) else {
+                    continue;
+                };
+                let forms: Vec<ObjectId> = match self.resolve(appearance) {
+                    Object::Dictionary(states) => states
+                        .iter()
+                        .filter_map(|(_, state)| state.as_reference().ok())
+                        .collect(),
+                    _ => appearance.as_reference().into_iter().collect(),
+                };
+                for id in forms {
+                    if !scan.trimmed.insert(id) {
+                        continue;
+                    }
+                    let Ok(object) = self.doc.get_object(id) else {
+                        continue;
+                    };
+                    let mut object = object.clone();
+                    if self.trim_own_resources(Some(id), &mut object, scan, changed, 0)? {
+                        changed.insert(id, object);
+                    }
+                }
             }
         }
         Ok(())
