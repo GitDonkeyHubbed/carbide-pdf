@@ -266,3 +266,34 @@ fn deleting_pages_that_cannot_be_finished_leaves_the_document_as_it_was() {
     );
 }
 
+// ---- areas ---------------------------------------------------------------------------------
+
+#[test]
+fn an_area_that_overflows_once_normalized_is_not_finite() {
+    assert!(Rect::new(1.0, 2.0, 3.0, 4.0).is_finite());
+    assert!(Rect::new(1.0, 2.0, -3.0, -4.0).is_finite());
+    assert!(!Rect::new(f32::MAX, 0.0, f32::MAX, 10.0).is_finite());
+    assert!(!Rect::new(-f32::MAX, 0.0, -f32::MAX, 10.0).is_finite());
+    assert!(!Rect::new(0.0, f32::MAX, 10.0, f32::MAX).is_finite());
+    assert!(!Rect::new(f32::NAN, 0.0, 1.0, 1.0).is_finite());
+}
+
+#[test]
+fn redaction_refuses_an_area_whose_far_corner_overflows() {
+    let mut pdf = text_pdf(&["SECRET"]);
+    let before = pdf.document().objects.clone();
+    for rect in [
+        Rect::new(f32::MAX, 0.0, f32::MAX, 10.0),
+        Rect::new(0.0, -f32::MAX, 10.0, -f32::MAX),
+    ] {
+        let refused = pdf.apply_redactions(renderer(), &[Redaction { page: 0, rect }], 150.0);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("redaction area")),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(pdf.document().objects, before);
+}
+
