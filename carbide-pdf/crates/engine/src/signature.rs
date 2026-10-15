@@ -1569,11 +1569,27 @@ fn signature_value_span(pdf: &Pdf, id: ObjectId, file: &[u8]) -> Option<(usize, 
         lexer.skip_space();
         let start = lexer.at;
         lexer.value()?;
-        if key == b"/Contents" {
+        if decoded_name(key).as_deref() == Some(b"/Contents".as_slice()) {
             let hex = file.get(start) == Some(&b'<') && file.get(start + 1) != Some(&b'<');
             span = hex.then_some((start, lexer.at));
         }
     }
+}
+
+/// A name token as written, with each `#xx` escape replaced by the byte it stands for, so
+/// `/#43ontents` reads as `/Contents`, as it does to the parser. `None` for a malformed escape.
+fn decoded_name(token: &[u8]) -> Option<Vec<u8>> {
+    let mut name = Vec::with_capacity(token.len());
+    let mut bytes = token.iter();
+    while let Some(&byte) = bytes.next() {
+        if byte == b'#' {
+            let mut digit = || (*bytes.next()? as char).to_digit(16);
+            name.push((digit()? << 4 | digit()?) as u8);
+        } else {
+            name.push(byte);
+        }
+    }
+    Some(name)
 }
 
 /// The `/Contents` string as the document was parsed.

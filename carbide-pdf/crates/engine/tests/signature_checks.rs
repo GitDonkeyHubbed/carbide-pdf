@@ -367,6 +367,35 @@ fn a_hex_signature_value_with_line_breaks_and_an_odd_last_digit_verifies() {
     assert_eq!(report.validity, Validity::Invalid);
 }
 
+#[test]
+fn an_escaped_contents_key_is_still_the_signature_value() {
+    let mut file = sign(&signer().identity, SubFilter::Pkcs7Detached, None);
+    let [_, b, ..] = byte_range(&file);
+    // Write the key as /#43ontents, two bytes longer, and take two of the leading zeros off the
+    // byte range's first number, written before it, so nothing else moves.
+    let key = file[..b]
+        .windows(9)
+        .rposition(|w| w == b"/Contents")
+        .unwrap();
+    let range = file[..b]
+        .windows(10)
+        .rposition(|w| w == b"/ByteRange")
+        .unwrap();
+    assert!(range < key, "the byte range is written before the value");
+    let open = range + file[range..].iter().position(|x| *x == b'[').unwrap();
+    assert_eq!(&file[open..open + 12], b"[0000000000 ");
+    let mut edited = file[..open + 1].to_vec();
+    edited.extend_from_slice(&file[open + 3..key]);
+    edited.extend_from_slice(b"/#43ontents");
+    edited.extend_from_slice(&file[key + 9..]);
+    assert_eq!(edited.len(), file.len());
+    file = edited;
+    let value = signer_cms(&covered_bytes(&file), None, None);
+    put_signature_value(&mut file, &value);
+    let report = verify(&file, &trust_signer()).remove(0);
+    assert_eq!(outcome(&report), (Validity::Valid, Detail::TrustedDirectly));
+}
+
 // ---- signed attributes ---------------------------------------------------------------------
 
 #[test]
