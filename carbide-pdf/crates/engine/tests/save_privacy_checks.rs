@@ -563,6 +563,48 @@ fn colour_spaces_a_transparency_group_blends_in_stay_with_it() {
     );
 }
 
+#[test]
+fn deleted_page_image_does_not_survive_in_a_soft_mask_form() {
+    // The kept page paints through a graphics state whose soft mask draws a form; the form's
+    // resources are shared with the image only the deleted page drew.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let font = helvetica(doc);
+            let image = secret_image(doc);
+            let shared = doc.add_object(dictionary! {
+                "Font" => dictionary! { "F1" => font },
+                "XObject" => dictionary! { "Im1" => image.clone() },
+            });
+            let mask = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                    "Group" => dictionary! { "S" => "Transparency", "CS" => "DeviceGray" },
+                    "Resources" => shared,
+                },
+                b"BT /F1 12 Tf (mask) Tj ET".to_vec(),
+            ));
+            dictionary! {
+                "ExtGState" => dictionary! {
+                    "GS1" => dictionary! {
+                        "Type" => "ExtGState",
+                        "SMask" => dictionary! { "Type" => "Mask", "S" => "Luminosity", "G" => mask },
+                    },
+                },
+                "XObject" => dictionary! { "Im1" => image.clone() },
+            }
+        },
+        &["/GS1 gs 0 0 10 10 re f", "q 100 0 0 100 0 0 cm /Im1 Do Q"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+    assert!(contains(&saved, b"Helvetica"), "the mask lost its font");
+}
+
 // ---- legacy passwords ----------------------------------------------------------------------
 
 const PADDING: [u8; 32] = [

@@ -439,6 +439,18 @@ impl Pdf {
                                 .map(|n| (COLOR_SPACE, n.to_vec())),
                         );
                     }
+                    if category == EXT_G_STATE {
+                        if let Some(id) = self.soft_mask_form(value) {
+                            if let Ok(Object::Stream(mask)) = self.doc.get_object(id) {
+                                if !mask.dict.has(b"Resources") && is_content(&mask.dict) {
+                                    let Some(found) = scan.uses_in(Some(id), mask)? else {
+                                        return Ok(None);
+                                    };
+                                    more.extend(found);
+                                }
+                            }
+                        }
+                    }
                     match resolved {
                         Object::Stream(stream)
                             if !stream.dict.has(b"Resources") && is_content(&stream.dict) =>
@@ -535,17 +547,7 @@ impl Pdf {
             let mut edited = false;
             for (_, entry) in entries.iter_mut() {
                 if let Object::Reference(id) = entry {
-                    let id = *id;
-                    if !scan.trimmed.insert(id) {
-                        continue;
-                    }
-                    let Ok(object) = self.doc.get_object(id) else {
-                        continue;
-                    };
-                    let mut object = object.clone();
-                    if self.trim_own_resources(Some(id), &mut object, scan, changed, depth)? {
-                        changed.insert(id, object);
-                    }
+                    self.trim_referenced(*id, scan, changed, depth)?;
                 } else {
                     edited |= self.trim_own_resources(None, entry, scan, changed, depth)?;
                 }
@@ -554,7 +556,53 @@ impl Pdf {
                 resources.set(category, entries);
             }
         }
+        // A soft mask's form is drawn through the graphics state that names it.
+        if let Some(Object::Dictionary(states)) = resources
+            .get(EXT_G_STATE)
+            .ok()
+            .and_then(|s| self.resolved(s))
+        {
+            for (_, state) in states.iter() {
+                if let Some(id) = self.soft_mask_form(state) {
+                    self.trim_referenced(id, scan, changed, depth)?;
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// [`Self::trim_own_resources`] for the object `id`, once however often it is reached.
+    fn trim_referenced(
+        &self,
+        id: ObjectId,
+        scan: &mut NameScan,
+        changed: &mut HashMap<ObjectId, Object>,
+        depth: usize,
+    ) -> Result<()> {
+        if !scan.trimmed.insert(id) {
+            return Ok(());
+        }
+        let Ok(object) = self.doc.get_object(id) else {
+            return Ok(());
+        };
+        let mut object = object.clone();
+        if self.trim_own_resources(Some(id), &mut object, scan, changed, depth)? {
+            changed.insert(id, object);
+        }
+        Ok(())
+    }
+
+    /// The form a graphics state's soft mask (`/SMask` `/G`) draws, if it has one.
+    fn soft_mask_form(&self, state: &Object) -> Option<ObjectId> {
+        let Some(Object::Dictionary(state)) = self.resolved(state) else {
+            return None;
+        };
+        let Some(Object::Dictionary(mask)) =
+            state.get(b"SMask").ok().and_then(|m| self.resolved(m))
+        else {
+            return None;
+        };
+        mask.get(b"G").and_then(Object::as_reference).ok()
     }
 
     /// Trims the resources of the appearances of the annotations on `page` (normal, rollover and
