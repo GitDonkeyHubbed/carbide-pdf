@@ -281,6 +281,126 @@ pub fn oid_to_string(content: &[u8]) -> String {
     parts.join(".")
 }
 
+/// The most attributes one relative distinguished name is matched over (the match is quadratic).
+const MAX_RDN_ATTRIBUTES: usize = 32;
+
+/// Whether two encoded X.501 Names are the same name: byte-for-byte equal, or equal as RFC 5280
+/// section 7.1 compares them (simplified RFC 4518). The same number of relative distinguished
+/// names, each with the same attribute types, and every value equal once a DirectoryString is
+/// decoded, trimmed, its inner runs of white space made one space and its case folded. Any other
+/// kind of value has to match exactly.
+pub fn names_match(a: &[u8], b: &[u8]) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some(a), Some(b)) = (name_rdns(a), name_rdns(b)) else {
+        return false;
+    };
+    a.len() == b.len() && a.iter().zip(&b).all(|(a, b)| rdns_match(a, b))
+}
+
+/// The attributes of one relative distinguished name: each one's type (OID content) and value.
+type Rdn<'a> = Vec<(&'a [u8], Element<'a>)>;
+
+/// The relative distinguished names of an encoded Name, each as its attributes' type and value.
+fn name_rdns(name: &[u8]) -> Option<Vec<Rdn<'_>>> {
+    let (name, rest) = read_ber(name)?;
+    if name.tag != SEQUENCE || !rest.is_empty() {
+        return None;
+    }
+    let mut rdns = Vec::new();
+    for rdn in children_ber(name.content) {
+        if rdn.tag != SET {
+            return None;
+        }
+        let mut attributes = Vec::new();
+        for attribute in children_ber(rdn.content) {
+            let kids = children_ber(attribute.content);
+            let (kind, value) = (kids.first()?, kids.get(1)?);
+            if attribute.tag != SEQUENCE || kind.tag != OID || kids.len() != 2 {
+                return None;
+            }
+            attributes.push((kind.content, *value));
+        }
+        if attributes.len() > MAX_RDN_ATTRIBUTES {
+            return None;
+        }
+        rdns.push(attributes);
+    }
+    Some(rdns)
+}
+
+/// Whether two relative distinguished names hold the same attributes, in any order.
+fn rdns_match(a: &Rdn<'_>, b: &Rdn<'_>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut taken = vec![false; b.len()];
+    a.iter().all(|(kind, value)| {
+        let found = b.iter().enumerate().position(|(i, (other, candidate))| {
+            !taken[i] && other == kind && values_match(value, candidate)
+        });
+        if let Some(i) = found {
+            taken[i] = true;
+        }
+        found.is_some()
+    })
+}
+
+fn values_match(a: &Element<'_>, b: &Element<'_>) -> bool {
+    if a.raw == b.raw {
+        return true;
+    }
+    match (directory_string(a), directory_string(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// A DirectoryString value as it is compared: decoded, trimmed, inner white space collapsed to one
+/// space and case folded. `None` for any other kind of value, or one that does not decode.
+fn directory_string(value: &Element<'_>) -> Option<String> {
+    let bytes = value.content;
+    let text = match value.tag {
+        // UTF8String, PrintableString, IA5String
+        0x0C | 0x13 | 0x16 => String::from_utf8(bytes.to_vec()).ok()?,
+        // TeletexString, taken as Latin-1
+        0x14 => bytes.iter().map(|b| *b as char).collect(),
+        // UniversalString: UTF-32BE
+        0x1C => {
+            if !bytes.len().is_multiple_of(4) {
+                return None;
+            }
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| char::from_u32(u32::from_be_bytes(*c)))
+                .collect::<Option<String>>()?
+        }
+        // BMPString: UTF-16BE
+        0x1E => {
+            if !bytes.len().is_multiple_of(2) {
+                return None;
+            }
+            let units: Vec<u16> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_be_bytes(*c))
+                .collect();
+            String::from_utf16(&units).ok()?
+        }
+        _ => return None,
+    };
+    Some(
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +482,52 @@ mod tests {
         assert_eq!(kids.len(), 2);
         assert_eq!(kids[0].tag, INTEGER);
         assert_eq!(children_ber(kids[1].content)[0].content, b"abc");
+    }
+
+    #[test]
+    fn names_match_by_value_not_by_encoding() {
+        let name = |attributes: &[(&[u32], u8, &[u8])]| {
+            let rdns: Vec<Vec<u8>> = attributes
+                .iter()
+                .map(|(kind, tag, value)| set(&[&sequence(&[&oid(kind), &tlv(*tag, value)])]))
+                .collect();
+            let refs: Vec<&[u8]> = rdns.iter().map(Vec::as_slice).collect();
+            sequence(&refs)
+        };
+        let cn: &[u32] = &[2, 5, 4, 3];
+        let org: &[u32] = &[2, 5, 4, 10];
+        let base = name(&[(org, 0x13, b"Acme"), (cn, 0x13, b"Root CA")]);
+        assert!(names_match(&base, &base));
+        assert!(names_match(
+            &base,
+            &name(&[(org, 0x0C, b" ACME "), (cn, 0x0C, b"root   ca")])
+        ));
+        let bmp: Vec<u8> = "Root CA"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        assert!(names_match(
+            &base,
+            &name(&[(org, 0x16, b"acme"), (cn, 0x1E, &bmp)])
+        ));
+        // Another order, type, value or length of name, or an odd BMPString.
+        assert!(!names_match(
+            &base,
+            &name(&[(cn, 0x13, b"Root CA"), (org, 0x13, b"Acme")])
+        ));
+        assert!(!names_match(&base, &name(&[(org, 0x13, b"Acme")])));
+        assert!(!names_match(
+            &base,
+            &name(&[(org, 0x13, b"Acme"), (cn, 0x13, b"RootCA")])
+        ));
+        assert!(!names_match(
+            &base,
+            &name(&[(org, 0x13, b"Acme"), (cn, 0x1E, &bmp[1..])])
+        ));
+        // A value that is not a DirectoryString matches only exactly.
+        let octets = name(&[(cn, 0x04, b"ABC")]);
+        assert!(names_match(&octets, &octets));
+        assert!(!names_match(&octets, &name(&[(cn, 0x04, b"abc")])));
+        assert!(!names_match(&base, &[0x30, 0x80]));
     }
 }

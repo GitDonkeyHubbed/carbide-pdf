@@ -831,3 +831,113 @@ fn a_signature_field_typed_by_its_parent_is_still_checked() {
     assert_eq!(reports[0].field_name, "Approval");
     assert_eq!(outcome(&reports[0]), (Validity::Invalid, Detail::Corrupt));
 }
+
+// ---- issuer names --------------------------------------------------------------------------
+
+/// A self-signed certificate for the test key whose name is a PrintableString "Check Signer".
+fn printable_signer_cert() -> &'static [u8] {
+    static CERT: OnceLock<Vec<u8>> = OnceLock::new();
+    CERT.get_or_init(|| {
+        let pair = KeyPair::try_from(signer().pkcs8.as_slice()).unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(
+            DnType::CommonName,
+            rcgen::DnValue::PrintableString("Check Signer".try_into().unwrap()),
+        );
+        params.self_signed(&pair).unwrap().der().to_vec()
+    })
+}
+
+/// A Name with one common name, its value encoded with `tag`.
+fn common_name(tag: u8, value: &[u8]) -> Vec<u8> {
+    seq(&[&set(&[&seq(&[&oid(&[2, 5, 4, 3]), &tlv(tag, value)])])])
+}
+
+fn utf16be(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_be_bytes).collect()
+}
+
+/// What verifying a signature by the printable-name certificate gives when the SignerInfo names
+/// its issuer as `issuer` (and its serial number as the certificate's own), with an ESS
+/// signing-certificate attribute naming the same issuer.
+fn outcome_naming_issuer(issuer: &[u8]) -> (Validity, Detail) {
+    let cert = printable_signer_cert();
+    let serial = x509_cert::Certificate::from_der(cert)
+        .unwrap()
+        .tbs_certificate
+        .serial_number
+        .to_der()
+        .unwrap();
+    let named = seq(&[&seq(&[&ctx(4, issuer)]), &serial]);
+    let file = signed_with(SubFilter::CadesDetached, |covered| {
+        let attributes = vec![
+            content_type(DATA_OID),
+            message_digest(&sha256(covered)),
+            signing_certificate_v2(&sha256(cert), Some(named.clone())),
+        ];
+        signed_data(
+            &[cert],
+            &seq(&[issuer, &serial]),
+            &seq(&[&oid(DATA_OID)]),
+            Some(&attributes),
+            &seq(&[&oid(SHA256_RSA_OID), &null()]),
+            &rsa_sign(&signer().key, &attribute_set(&attributes)),
+        )
+    });
+    let trust = TrustStore {
+        certificates: vec![cert.to_vec()],
+    };
+    outcome(&verify(&file, &trust)[0])
+}
+
+#[test]
+fn a_signer_issuer_spelled_another_way_still_names_the_certificate() {
+    let good = (Validity::Valid, Detail::TrustedDirectly);
+    // The certificate's own spelling.
+    assert_eq!(
+        outcome_naming_issuer(&common_name(0x13, b"Check Signer")),
+        good
+    );
+    // Another string type, upper case, stray and repeated white space.
+    assert_eq!(
+        outcome_naming_issuer(&common_name(0x0C, b"CHECK SIGNER")),
+        good
+    );
+    assert_eq!(
+        outcome_naming_issuer(&common_name(0x0C, b"  check \t signer ")),
+        good
+    );
+    assert_eq!(
+        outcome_naming_issuer(&common_name(0x1E, &utf16be("Check Signer"))),
+        good
+    );
+    assert_eq!(
+        outcome_naming_issuer(&common_name(0x14, b"CHECK SIGNER")),
+        good
+    );
+}
+
+#[test]
+fn a_different_issuer_with_the_same_serial_is_not_the_signer() {
+    let bad = (Validity::Invalid, Detail::Corrupt);
+    assert_eq!(
+        outcome_naming_issuer(&common_name(0x0C, b"Other Signer")),
+        bad
+    );
+    // The same words joined, or another attribute type holding the same text.
+    assert_eq!(
+        outcome_naming_issuer(&common_name(0x0C, b"CheckSigner")),
+        bad
+    );
+    let organization = seq(&[&set(&[&seq(&[
+        &oid(&[2, 5, 4, 10]),
+        &tlv(0x0C, b"Check Signer"),
+    ])])]);
+    assert_eq!(outcome_naming_issuer(&organization), bad);
+    // An extra name component.
+    let two = seq(&[
+        &set(&[&seq(&[&oid(&[2, 5, 4, 3]), &tlv(0x0C, b"Check Signer")])]),
+        &set(&[&seq(&[&oid(&[2, 5, 4, 10]), &tlv(0x0C, b"Extra")])]),
+    ]);
+    assert_eq!(outcome_naming_issuer(&two), bad);
+}

@@ -417,7 +417,9 @@ fn names_certificate(signer_info: &cms::SignerInfo, certificate: &Certificate) -
         let issuer = certificate.tbs_certificate.issuer.to_der().ok();
         let own_serial = certificate.tbs_certificate.serial_number.to_der().ok();
         if own_serial.as_ref() != Some(serial)
-            || !issuers.iter().any(|n| Some(n) == issuer.as_ref())
+            || !issuer
+                .as_ref()
+                .is_some_and(|issuer| issuers.iter().any(|n| der::names_match(n, issuer)))
         {
             return Verified::Bad;
         }
@@ -2376,13 +2378,17 @@ fn check_timestamp_token(
     }
 }
 
-/// Finds the certificate a SignerInfo names, by issuer and serial or by subject key identifier.
+/// Finds the certificate a SignerInfo names, by issuer and serial or by subject key identifier. The
+/// issuer matches as a distinguished name, not byte for byte; the serial number has to be exact.
 /// When none of the embedded certificates is the one named, there is no signer certificate: some
 /// other certificate that happens to verify the signature is not the one the signer chose.
 fn find_signer<'a>(certificates: &'a [Certificate], id: &cms::SignerId) -> Option<&'a Certificate> {
     certificates.iter().find(|c| match id {
         cms::SignerId::IssuerAndSerial { issuer, serial } => {
-            c.tbs_certificate.issuer.to_der().ok().as_ref() == Some(issuer)
+            c.tbs_certificate
+                .issuer
+                .to_der()
+                .is_ok_and(|own| der::names_match(&own, issuer))
                 && c.tbs_certificate.serial_number.to_der().ok().as_ref() == Some(serial)
         }
         cms::SignerId::KeyIdentifier(key_id) => subject_key_id(c).as_deref() == Some(key_id),
