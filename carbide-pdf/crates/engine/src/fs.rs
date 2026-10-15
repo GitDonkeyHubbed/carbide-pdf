@@ -288,11 +288,35 @@ pub fn remove_private_temp_file(path: &Path) -> io::Result<()> {
 /// Other hard links to the file keep the old contents: replacing the file is what makes the write
 /// all-or-nothing, and writing into it in place would give that up.
 pub fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    replace_with(path, |file| file.write_all(bytes))
+    replace_with(path, |file| file.write_all(bytes), |_| Ok(()))
 }
 
-/// `write_replacing` with the new contents written by `write`.
-fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+/// [`write_replacing`], but only while the file still holds `expected`: it is read again once the
+/// new contents are ready, just before they take its place, and left alone if it changed. This narrows the time in which
+/// another program's save could be lost to that last moment; nothing short of every program
+/// taking part in a lock can close it.
+pub fn write_replacing_if_unchanged(path: &Path, expected: &[u8], bytes: &[u8]) -> io::Result<()> {
+    replace_with(
+        path,
+        |file| file.write_all(bytes),
+        |target| match fs::read(target) {
+            Ok(current) if current == expected => Ok(()),
+            Ok(_) => Err(io::Error::other(format!(
+                "{} was changed by another program",
+                target.display()
+            ))),
+            Err(e) => Err(e),
+        },
+    )
+}
+
+/// `write_replacing` with the new contents written by `write`, and `ready` asked about the file
+/// just before it is replaced.
+fn replace_with(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+    ready: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let target = resolve_links(path)?;
     let existing = match fs::metadata(&target) {
         Ok(metadata) => Some(metadata),
@@ -345,6 +369,7 @@ fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) ->
         }
         file.sync_all()?;
         drop(file);
+        ready(&target)?;
         fs::rename(&temp, &target)
     })();
     if let Err(e) = written {
@@ -720,13 +745,43 @@ mod tests {
         let dir = scratch("failed");
         let path = dir.join("doc.pdf");
         fs::write(&path, b"original").unwrap();
-        let result = replace_with(&path, |file| {
-            file.write_all(b"half")?;
-            Err(io::Error::other("disk full"))
-        });
+        let result = replace_with(
+            &path,
+            |file| {
+                file.write_all(b"half")?;
+                Err(io::Error::other("disk full"))
+            },
+            |_| Ok(()),
+        );
         assert!(result.is_err());
         assert_eq!(fs::read(&path).unwrap(), b"original");
         assert_eq!(names(&dir), ["doc.pdf"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_changed_while_its_replacement_was_written_is_left_alone() {
+        let dir = scratch("changed");
+        let path = dir.join("doc.pdf");
+        fs::write(&path, b"original").unwrap();
+        // Another program saves while the new contents are being written.
+        let result = replace_with(
+            &path,
+            |file| {
+                fs::write(&path, b"theirs")?;
+                file.write_all(b"ours")
+            },
+            |target| match fs::read(target) {
+                Ok(current) if current == b"original" => Ok(()),
+                Ok(_) => Err(io::Error::other("changed")),
+                Err(e) => Err(e),
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"theirs");
+        assert_eq!(names(&dir), ["doc.pdf"]);
+        write_replacing_if_unchanged(&path, b"theirs", b"ours").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"ours");
         let _ = fs::remove_dir_all(&dir);
     }
 

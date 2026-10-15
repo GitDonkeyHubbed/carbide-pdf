@@ -2161,18 +2161,29 @@ impl CarbideApp {
         let Some(doc) = self.doc.as_mut() else { return };
         // The signature was made on the file as it was read. Another program may have changed it
         // since (a time stamp can take a while), and writing over that would lose its changes.
-        let unchanged = doc
-            .saved
-            .as_ref()
-            .is_some_and(|saved| std::fs::read(path).is_ok_and(|disk| disk == saved.bytes()));
+        // It is checked again just before the signed file takes the old one's place.
+        let changed = || {
+            format!(
+                "The document was not signed: {} was changed by another program in the meantime. Open it again and sign it then.",
+                path.display()
+            )
+        };
+        let saved = doc.saved.as_ref().map(|saved| saved.bytes().to_vec());
         let result = signed.and_then(|bytes| {
-            if !unchanged {
-                return Err(format!(
-                    "The document was not signed: {} was changed by another program in the meantime. Open it again and sign it then.",
-                    path.display()
-                ));
-            }
-            carbide_engine::fs::write_replacing(path, &bytes).map_err(|e| e.to_string())?;
+            let Some(saved) =
+                saved.filter(|saved| std::fs::read(path).is_ok_and(|disk| disk == *saved))
+            else {
+                return Err(changed());
+            };
+            carbide_engine::fs::write_replacing_if_unchanged(path, &saved, &bytes).map_err(
+                |e| {
+                    if std::fs::read(path).is_ok_and(|disk| disk != saved) {
+                        changed()
+                    } else {
+                        e.to_string()
+                    }
+                },
+            )?;
             doc.forget_history();
             Ok(doc
                 .adopt_saved(bytes)
