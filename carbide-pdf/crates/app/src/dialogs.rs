@@ -185,6 +185,8 @@ pub enum AfterSave {
 /// document other than the one it was opened for.
 pub enum Dialog {
     Sign(Box<SignRequest>),
+    /// The signatures of document `doc`'s file as last saved or opened, and their summary. The
+    /// heading says so while the document has unsaved changes; writing the file closes it.
     Signatures { doc: u64, reports: Vec<SignatureReport>, notice: String },
     Message(String),
     Password { path: PathBuf, bytes: Vec<u8>, input: String, failed: bool },
@@ -508,8 +510,10 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
         }
 
         Dialog::Signatures { reports, notice, .. } => {
+            // Edits made while the results are on screen are not covered either.
+            let heading = app.about_saved_file(notice);
             window("Signatures").show(ctx, |ui| {
-                ui.strong(notice.as_str());
+                ui.strong(heading);
                 egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                     for report in reports.iter() {
                         ui.group(|ui| {
@@ -523,8 +527,15 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                                 let role = if report.document_time_stamp { "Time stamp authority" } else { "Signer" };
                                 ui.label(format!("{role}: {who}"));
                             }
-                            if let Some(time) = time_stamp_time(report) {
-                                ui.label(format!("Time stamp: {time}"));
+                            if let Some(time) = local_time(report.time_stamp_time.as_deref()) {
+                                ui.label(if report.time_stamp_trusted() {
+                                    format!("Time stamp: {time}")
+                                } else {
+                                    format!("Time stamp (authority not confirmed): {time}")
+                                });
+                            }
+                            if let Some(time) = local_time(report.signing_time.as_deref()) {
+                                ui.weak(format!("Signing time in signature (unverified): {time}"));
                             }
                             if let Some(claimed) = &report.claimed_name {
                                 ui.weak(format!("Name in signature (unverified): {claimed}"));
@@ -815,19 +826,14 @@ pub fn show(app: &mut CarbideApp, ctx: &egui::Context) {
                 });
                 ui.checkbox(&mut f.print, "Allow printing");
                 ui.checkbox(&mut f.copy, "Allow copying text");
-                ui.weak("The open document is not changed; an AES-256 encrypted copy is written.");
+                ui.weak("An AES-256 encrypted copy is written. Saved over this document's own file, it protects that file, and the document goes on from it.");
                 let (ok, cancel) = buttons(ui, "Save...", !f.owner.is_empty());
                 if ok {
                     if let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name("document-protected.pdf").save_file() {
                         let mut options = ProtectionOptions::new(f.user.clone(), f.owner.clone());
                         options.allow_printing = f.print;
                         options.allow_copying = f.copy;
-                        let result = app.doc.as_mut().map(|d| d.pdf.save_encrypted(&path, &options));
-                        match result {
-                            Some(Ok(())) => app.status = format!("Saved protected copy {}", path.display()),
-                            Some(Err(e)) => app.alert(format!("Could not protect the document: {e}")),
-                            None => {}
-                        }
+                        app.protect_to(&path, &options);
                     }
                     open = false;
                 }
@@ -1247,14 +1253,10 @@ fn impose_form(ui: &mut egui::Ui, form: &mut ImposeForm) {
 
 fn run_imposition(app: &mut CarbideApp, form: &ImposeForm) -> Result<(), String> {
     form.options.validate().map_err(|e| e.to_string())?;
-    let doc = app.doc.as_ref().ok_or("No document is open.")?;
     let Some(path) = rfd::FileDialog::new().add_filter("PDF Files", &["pdf"]).set_file_name("New Imposition.pdf").save_file() else {
         return Err("No output file was chosen.".into());
     };
-    // The sheets are protected like the document.
-    let mut imposed = doc.pdf.impose(&form.options, None).map_err(|e| e.to_string())?;
-    let bytes = doc.derived_bytes(&mut imposed).map_err(|e| e.to_string())?;
-    carbide_engine::fs::write_replacing(&path, &bytes).map_err(|e| e.to_string())?;
+    app.impose_to(&form.options, &path)?;
     app.spawn_window(&path);
     Ok(())
 }
@@ -1403,19 +1405,16 @@ fn reduce_current(app: &mut CarbideApp, slider: u8) -> bool {
     let before = doc.saved.as_ref().map(|s| s.bytes().len());
     let mut copy = doc.pdf.clone();
     match copy.reduce(&ReduceOptions { image_factor: slider }, before) {
-        Ok((bytes, report)) => match carbide_engine::fs::write_replacing(&path, &bytes) {
-            Ok(()) => {
+        // Over the document's own file, the document goes on from the reduced file.
+        Ok((bytes, report)) => {
+            if app.write_copy(&path, &bytes, None).is_some() {
                 app.status = format!(
                     "Reduced {} -> {} bytes ({} images re-encoded, {} streams merged).",
                     report.size_before, report.size_after, report.images_recompressed, report.streams_merged
                 );
-                true
             }
-            Err(e) => {
-                app.alert(format!("{}\n{e}", reduce_messages::SAVE_ERROR));
-                true
-            }
-        },
+            true
+        }
         Err(e) => {
             app.alert(e.to_string());
             true
@@ -1579,8 +1578,7 @@ fn recovery_panel(app: &mut CarbideApp, ctx: &egui::Context, question: &mut Opti
     }
 }
 
-/// The time a document time stamp gives, in local time.
-fn time_stamp_time(report: &SignatureReport) -> Option<String> {
-    let time = report.signing_time.as_deref().filter(|_| report.document_time_stamp)?;
-    Some(carbide_engine::revisions::pdf_date_to_local(time)).filter(|t| !t.is_empty())
+/// A PDF date from a signature report, in local time.
+fn local_time(date: Option<&str>) -> Option<String> {
+    Some(carbide_engine::revisions::pdf_date_to_local(date?)).filter(|t| !t.is_empty())
 }

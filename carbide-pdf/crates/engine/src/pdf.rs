@@ -179,6 +179,26 @@ impl Pdf {
     }
 
     /// Follows references until a direct object is reached (bounded to avoid cycles).
+    /// `object`, or what it refers to through up to 16 references, without copying it; `None` for a
+    /// reference to nothing.
+    pub(crate) fn resolved<'a>(&'a self, object: &'a Object) -> Option<&'a Object> {
+        let mut current = object;
+        for _ in 0..16 {
+            match current {
+                Object::Reference(id) => current = self.doc.get_object(*id).ok()?,
+                other => return Some(other),
+            }
+        }
+        None
+    }
+
+    /// The resource dictionary page `page_id` uses, its own or one it inherits, without copying it.
+    pub(crate) fn page_resources(&self, page_id: ObjectId) -> Option<&Dictionary> {
+        let holder = self.inherited_from(page_id, b"Resources")?;
+        let resources = self.doc.get_dictionary(holder).ok()?.get(b"Resources").ok()?;
+        self.resolved(resources)?.as_dict().ok()
+    }
+
     pub(crate) fn resolve(&self, object: &Object) -> Object {
         let mut current = object.clone();
         for _ in 0..16 {
@@ -317,6 +337,8 @@ impl Pdf {
         }
         let ids = self.page_ids();
         let doomed: HashSet<ObjectId> = unique.iter().map(|&p| ids[p]).collect();
+        let staying: HashSet<ObjectId> = ids.iter().copied().filter(|id| !doomed.contains(id)).collect();
+        let doomed_annotations = self.annotations_leaving(&doomed, &staying);
         // What refers to the pages is found through them, so this comes first. An invisible
         // signature only sits on a page because every field has to; it is not the page's content.
         self.drop_form_fields_on(&doomed, &|_, widget, signature| !signature || widget_area(widget).is_some());
@@ -326,6 +348,7 @@ impl Pdf {
         // The pages leave every /Kids and everything else that names them in one pass, and the
         // counts are taken again from the tree itself; nothing follows /Parent, which can loop.
         self.drop_references_to(&doomed);
+        self.drop_annotation_links_to(&doomed_annotations);
         for id in &doomed {
             self.doc.objects.remove(id);
         }
@@ -405,7 +428,10 @@ impl Pdf {
         let ids = copy.page_ids();
         let kept: HashSet<ObjectId> = pages.iter().map(|&p| ids[p]).collect();
         let dropped: HashSet<ObjectId> = ids.iter().copied().filter(|id| !kept.contains(id)).collect();
+        let dropped_annotations = copy.annotations_leaving(&dropped, &kept);
         copy.drop_form_fields_on(&dropped, &|_, _, _| true);
+        // Article threads that run only through other pages, with their titles, go too.
+        copy.prune_threads(&dropped);
         let root_id = copy.pages_root()?;
         let kids: Vec<Object> = pages.iter().map(|&p| Object::Reference(ids[p])).collect();
         let root = copy.doc.get_dictionary_mut(root_id)?;
@@ -420,8 +446,10 @@ impl Pdf {
                 }
             }
         }
-        // Links, beads and anything else that still points at a dropped page loses that target.
+        // Links, beads and anything else that still points at a dropped page loses that target,
+        // and replies and pop-ups the annotations of a dropped page.
         copy.drop_references_to(&dropped);
+        copy.drop_annotation_links_to(&dropped_annotations);
         for id in &dropped {
             copy.doc.objects.remove(id);
         }

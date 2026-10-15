@@ -72,6 +72,8 @@ impl Pdf {
             redacted.entry(ids[item.page]).or_default().push(geometry.map_rect(item.rect));
         }
         let rebuilt: HashSet<ObjectId> = redacted.keys().copied().collect();
+        let others: HashSet<ObjectId> = ids.iter().copied().filter(|id| !rebuilt.contains(id)).collect();
+        let lost_annotations = self.annotations_leaving(&rebuilt, &others);
         self.drop_form_fields_on(&rebuilt, &|page, widget, signature| {
             !signature
                 || widget_area(widget).is_some_and(|[x0, y0, x1, y1]| {
@@ -146,6 +148,9 @@ impl Pdf {
             );
         }
 
+        // A reply or pop-up on another page would keep an annotation of a rebuilt page, and the
+        // text it holds, in the file.
+        self.drop_annotation_links_to(&lost_annotations);
         // Tagged-PDF structure can carry copies of the redacted text.
         if let Ok(root) = self.doc.trailer.get(b"Root").and_then(|o| o.as_reference()) {
             if let Ok(catalog) = self.doc.get_dictionary_mut(root) {

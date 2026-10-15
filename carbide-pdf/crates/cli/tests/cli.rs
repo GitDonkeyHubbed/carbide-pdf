@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use carbide_engine::signature::{Identity, SignOptions, TimestampSource};
 use carbide_engine::{Error, Pdf, ProtectionOptions};
 
 fn carbide(args: &[&str]) -> Output {
@@ -414,7 +415,8 @@ fn verify_reads_files_that_need_their_open_password() {
     let output = carbide(&["verify", path]);
     assert!(!output.status.success() && stderr(&output).contains("password"), "{}", stderr(&output));
     let output = carbide(&["verify", path, "--password", "user pw"]);
-    assert!(output.status.success(), "{}", stderr(&output));
+    // Read, and found to have no signatures, which is no success for a check of signatures.
+    assert_eq!(output.status.code(), Some(5), "{}", stderr(&output));
     assert!(String::from_utf8_lossy(&output.stdout).contains("No signatures found."));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -482,5 +484,130 @@ fn inputs_that_cannot_work_are_refused_with_messages_that_say_why() {
     if !output.status.success() {
         assert_eq!(stderr(&output).matches("rendering backend").count(), 1, "{}", stderr(&output));
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ---- verify ------------------------------------------------------------------------------------
+
+/// A signing identity named `name` whose certificate is valid from 1 January of `from` to 1 January
+/// of `until`, and that certificate as PEM.
+fn identity(name: &str, (from, until): (i32, i32)) -> (Identity, String) {
+    use rsa::pkcs8::EncodePrivateKey;
+    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(rcgen::DnType::CommonName, name);
+    params.not_before = rcgen::date_time_ymd(from, 1, 1);
+    params.not_after = rcgen::date_time_ymd(until, 1, 1);
+    let cert = params.self_signed(&pair).unwrap();
+    (Identity::new(vec![cert.der().to_vec()], key).unwrap(), cert.pem())
+}
+
+/// A one-page file showing `label`, signed by `identity` with the signing time `time`.
+fn signed(identity: &Identity, label: &str, time: &str) -> Vec<u8> {
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    pdf.add_text_box(0, 72.0, 720.0, label, 18.0).unwrap();
+    let base = pdf.to_bytes().unwrap();
+    let pdf = Pdf::from_bytes(&base).unwrap();
+    pdf.sign(&base, &SignOptions { identity: Some(identity), signing_time: Some(time.into()), ..Default::default() }).unwrap()
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn verify_shows_a_time_stamp_time_only_from_a_time_stamp_that_verifies() {
+    let dir = scratch("time-stamp-time");
+    let (identity, _) = identity("Some Signer", (2020, 2040));
+    // An ordinary signature relabelled as a document time stamp: its /M is no time stamp's time.
+    let mut bytes = signed(&identity, "stamped", "D:20000101000000Z");
+    let at = bytes.windows(19).rposition(|w| w == b"adbe.pkcs7.detached").unwrap();
+    bytes[at..at + 19].copy_from_slice(b"ETSI.RFC3161       ");
+    let file = dir.join("stamped.pdf");
+    std::fs::write(&file, bytes).unwrap();
+    let output = carbide(&["verify", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(stdout(&output).contains("The time stamp is not valid"), "{}", stdout(&output));
+    assert!(!stdout(&output).contains("  time stamp") && !stdout(&output).contains("2000"), "{}", stdout(&output));
+
+    // An ordinary signature's own time is shown as what it claims.
+    let file = dir.join("signed.pdf");
+    std::fs::write(&file, signed(&identity, "signed", "D:20200601120000Z")).unwrap();
+    let output = carbide(&["verify", file.to_str().unwrap()]);
+    assert!(stdout(&output).contains("signing time in signature (unverified): 2020-06-0"), "{}", stdout(&output));
+    assert!(!stdout(&output).contains("  time stamp"), "{}", stdout(&output));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn verify_succeeds_only_when_every_signature_is_valid() {
+    let dir = scratch("verify-status");
+    let write = |name: &str, bytes: &[u8]| {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    let (signer, signer_pem) = identity("Trusted Signer", (2020, 2040));
+    let (_, other_pem) = identity("Someone Else", (2020, 2040));
+    let (expired, expired_pem) = identity("Expired Signer", (2020, 2021));
+    let trusted = write("signer.pem", signer_pem.as_bytes());
+    let other = write("other.pem", other_pem.as_bytes());
+    let expired_trust = write("expired.pem", expired_pem.as_bytes());
+
+    let good = signed(&signer, "agreed terms", "D:20261001000000Z");
+    let mut tampered = good.clone();
+    let at = tampered.windows(7).position(|w| w == b"%PDF-1.").unwrap() + 7;
+    tampered[at] = if tampered[at] == b'4' { b'5' } else { b'4' };
+    let mut later = Pdf::from_bytes(&good).unwrap();
+    later.rotate_pages(&[0], 90).unwrap();
+    let changed = later.incremental_update(&good).unwrap();
+    let mut unsigned = Pdf::new();
+    unsigned.insert_blank_page(0, None).unwrap();
+
+    let good = write("good.pdf", &good);
+    let cases = [
+        ("trusted signer", good.clone(), Some(&trusted), 0),
+        ("signer not trusted", good.clone(), None, 4),
+        ("another certificate trusted", good.clone(), Some(&other), 4),
+        // Signed now with a key that expired: the date in the signature does not help.
+        ("expired signer", write("expired.pdf", &signed(&expired, "late", "D:20200601000000Z")), Some(&expired_trust), 4),
+        ("changed after signing", write("changed.pdf", &changed), Some(&trusted), 4),
+        ("altered", write("altered.pdf", &tampered), Some(&trusted), 3),
+        ("no signatures", write("unsigned.pdf", &unsigned.to_bytes().unwrap()), Some(&trusted), 5),
+        ("missing file", dir.join("missing.pdf"), Some(&trusted), 1),
+    ];
+    for (label, file, trust, status) in cases {
+        let mut args = vec!["verify".to_string(), file.to_string_lossy().into_owned()];
+        if let Some(trust) = trust {
+            args.extend(["--trust".to_string(), trust.to_string_lossy().into_owned()]);
+        }
+        let output = carbide(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(output.status.code(), Some(status), "{label}: {}{}", stdout(&output), stderr(&output));
+    }
+    // A time stamp inside a signature that does not verify is said not to, and not used: the
+    // status is that of the signature.
+    struct Damaged;
+    impl TimestampSource for Damaged {
+        fn token_for_digest(&self, _digest: &[u8; 32]) -> carbide_engine::Result<Vec<u8>> {
+            Ok(vec![0x30, 0x03, 0x02, 0x01, 0x01])
+        }
+    }
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    let base = pdf.to_bytes().unwrap();
+    let options = SignOptions { identity: Some(&signer), timestamp: Some(&Damaged), ..Default::default() };
+    let stamped = write("damaged-stamp.pdf", &Pdf::from_bytes(&base).unwrap().sign(&base, &options).unwrap());
+    let output = carbide(&["verify", stamped.to_str().unwrap(), "--trust", trusted.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{}{}", stdout(&output), stderr(&output));
+    assert!(stdout(&output).contains("time stamp that could not be verified"), "{}", stdout(&output));
+    assert!(!stdout(&output).contains("  time stamp"), "{}", stdout(&output));
+
+    // A command line that is wrong.
+    assert_eq!(carbide(&["verify"]).status.code(), Some(2));
+    // The statuses are described in the help.
+    let help = stdout(&carbide(&["verify", "--help"]));
+    assert!(help.contains("Exit status") && help.contains("5  The file has no signatures."), "{help}");
     let _ = std::fs::remove_dir_all(dir);
 }

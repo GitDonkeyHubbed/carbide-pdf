@@ -10,9 +10,10 @@
 //! CMYK images are left unchanged, an image is only replaced if the new data is smaller, and the
 //! output is not linearized.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use flate2::{write::ZlibEncoder, Compression};
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, ExtendedColorType, ImageFormat};
@@ -171,58 +172,122 @@ fn matrix_from(object: Option<&Object>) -> [f32; 6] {
     [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
 }
 
-/// The most forms followed while looking for the sizes images are drawn at, and the most bytes of
-/// their content read, each counted every time a form is drawn. Images drawn only by forms past
-/// these are recompressed but not down-sampled.
-const MAX_FORMS_FOLLOWED: usize = 100_000;
-const MAX_FORM_BYTES_READ: usize = crate::limits::MAX_DECODED;
+/// The most work finding the sizes images are drawn at may take: one unit for each form drawn,
+/// and one for each image draw a form that was already worked out passes on. Past it, or past any
+/// other limit below, or at a form that draws itself, the sizes some images are drawn at are not
+/// known, so no image is down-sampled; they are still recompressed.
+const MAX_SCAN_WORK: usize = 10_000_000;
+/// The most bytes of form content read while doing so. A form is read once for each set of
+/// resources it is drawn with, so this also bounds how often one is read again.
+const MAX_FORM_BYTES_READ: usize = 64 << 20;
+/// The most different image draws remembered for one form or page.
+const MAX_FORM_DRAWS: usize = 100_000;
+/// The most forms followed inside one another.
+const MAX_FORM_DEPTH: usize = 8;
 
-/// What scanning the content of a document for drawn image sizes has decoded and followed so far.
+/// The linear part `[a, b, c, d]` of a PDF matrix: all that decides the size something is drawn at.
+type Linear = [f32; 4];
+
+/// `a` applied first, then `b`.
+fn linear_product(a: Linear, b: Linear) -> Linear {
+    [a[0] * b[0] + a[1] * b[2], a[0] * b[1] + a[1] * b[3], a[2] * b[0] + a[3] * b[2], a[2] * b[1] + a[3] * b[3]]
+}
+
+fn linear(m: [f32; 6]) -> Linear {
+    [m[0], m[1], m[2], m[3]]
+}
+
+/// What a form draws: its images, each with the matrix it is drawn with relative to the space the
+/// form is drawn in.
+type FormDraws = Rc<Vec<(ObjectId, Linear)>>;
+
+/// The images some content draws, directly or through forms, each with the matrix it is drawn
+/// with relative to the content's own space. An image drawn at the same size twice is listed once.
+#[derive(Default)]
+struct Draws {
+    list: Vec<(ObjectId, Linear)>,
+    seen: HashSet<(ObjectId, [u32; 4])>,
+    /// More different draws than [`MAX_FORM_DRAWS`] were left out.
+    overflowed: bool,
+}
+
+impl Draws {
+    fn add(&mut self, image: ObjectId, matrix: Linear) {
+        if self.list.len() >= MAX_FORM_DRAWS {
+            self.overflowed = true;
+        } else if self.seen.insert((image, matrix.map(f32::to_bits))) {
+            self.list.push((image, matrix));
+        }
+    }
+}
+
+/// What scanning the content of a document for drawn image sizes has decoded and worked out so far.
 struct Scan {
     budget: DecodeBudget,
-    forms: HashMap<ObjectId, std::rc::Rc<Vec<u8>>>,
+    /// Decoded content of forms, by form.
+    bodies: HashMap<ObjectId, Rc<Vec<u8>>>,
+    /// What each form draws, relative to the space it is drawn in, by the form and the page or form
+    /// whose resources it is drawn with (its own, or those of what draws it). However often a form
+    /// is drawn, its content is read once for each.
+    forms: HashMap<(ObjectId, ObjectId), FormDraws>,
     /// The forms being drawn, outermost first. A form that draws itself is not followed again.
     path: Vec<ObjectId>,
-    /// How many forms have been followed, and how many bytes of their content read.
-    followed: usize,
+    /// The work done so far (see [`MAX_SCAN_WORK`]), and the bytes of form content read.
+    work: usize,
     read: usize,
+    /// Something drawn was left out (see [`MAX_SCAN_WORK`]): nothing more is read, and no size
+    /// found is used.
+    incomplete: bool,
 }
 
 impl Pdf {
     /// Largest drawn size, in points, of every image XObject (page content and nested forms).
-    /// Content is decoded within one budget for the whole document (see [`crate::limits`]).
+    /// Content is decoded within one budget for the whole document (see [`crate::limits`]). Empty
+    /// when what some content draws could not be worked out (see [`MAX_SCAN_WORK`]): an image
+    /// drawn small in one place may be drawn large there.
     fn drawn_sizes(&self) -> Result<HashMap<ObjectId, (f32, f32)>> {
         let mut sizes: HashMap<ObjectId, (f32, f32)> = HashMap::new();
-        let mut scan = Scan { budget: DecodeBudget::new(), forms: HashMap::new(), path: Vec::new(), followed: 0, read: 0 };
+        let mut scan = Scan {
+            budget: DecodeBudget::new(),
+            bodies: HashMap::new(),
+            forms: HashMap::new(),
+            path: Vec::new(),
+            work: 0,
+            read: 0,
+            incomplete: false,
+        };
+        let no_resources = Dictionary::new();
         for page_id in self.page_ids() {
-            let resources = self
-                .inherited(page_id, b"Resources")
-                .and_then(|o| o.as_dict().ok().cloned())
-                .unwrap_or_default();
+            let holder = self.inherited_from(page_id, b"Resources").unwrap_or(page_id);
+            let resources = self.page_resources(page_id).unwrap_or(&no_resources);
             let content = scan.budget.page_content(&self.doc, page_id)?;
-            self.scan_content(&content, &resources, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], &mut sizes, &mut scan)?;
+            let draws = self.scan_content(&content, resources, holder, &mut scan)?;
+            if draws.overflowed || scan.incomplete {
+                return Ok(HashMap::new());
+            }
+            for (image, m) in draws.list {
+                let slot = sizes.entry(image).or_insert((0.0, 0.0));
+                slot.0 = slot.0.max((m[0] * m[0] + m[1] * m[1]).sqrt());
+                slot.1 = slot.1.max((m[2] * m[2] + m[3] * m[3]).sqrt());
+            }
         }
         Ok(sizes)
     }
 
-    /// Records the size each image `content` draws is drawn at, `base` being the matrix the
-    /// content is drawn with, and follows the forms it draws.
-    fn scan_content(
-        &self,
-        content: &[u8],
-        resources: &Dictionary,
-        base: [f32; 6],
-        sizes: &mut HashMap<ObjectId, (f32, f32)>,
-        scan: &mut Scan,
-    ) -> Result<()> {
-        if scan.path.len() > 8 {
-            return Ok(());
+    /// The images `content` draws with `resources`, those of the page or form `holder`, and the
+    /// matrices relative to its own space they are drawn with.
+    fn scan_content(&self, content: &[u8], resources: &Dictionary, holder: ObjectId, scan: &mut Scan) -> Result<Draws> {
+        let mut draws = Draws::default();
+        if scan.path.len() > MAX_FORM_DEPTH {
+            scan.incomplete = true;
         }
-        let xobjects = match resources.get(b"XObject").map(|o| self.resolve(o)) {
-            Ok(Object::Dictionary(d)) => d,
-            _ => return Ok(()),
+        if scan.incomplete {
+            return Ok(draws);
+        }
+        let Some(xobjects) = resources.get(b"XObject").ok().and_then(|o| self.resolved(o)).and_then(|o| o.as_dict().ok()) else {
+            return Ok(draws);
         };
-        let mut ctm = base;
+        let mut ctm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
         let mut stack: Vec<[f32; 6]> = Vec::new();
         // The operands since the last operator: how many, the numbers among the first six, and the
         // last name.
@@ -251,9 +316,10 @@ impl Pdf {
                 b"cm" if operands == 6 && numbers.len() == 6 => {
                     ctm = multiply([numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], numbers[5]], ctm);
                 }
-                b"Do" if operands == 1 && failure.is_none() => {
+                b"Do" if operands == 1 && failure.is_none() && !scan.incomplete => {
                     if let Some(name) = name {
-                        if let Err(error) = self.draw(&xobjects, &crate::content::name(name), resources, ctm, sizes, scan) {
+                        let drawn = self.draw(xobjects, &crate::content::name(name), (resources, holder), linear(ctm), &mut draws, scan);
+                        if let Err(error) = drawn {
                             failure = Some(error);
                         }
                     }
@@ -263,60 +329,97 @@ impl Pdf {
             (operands, name) = (0, None);
             numbers.clear();
         });
-        failure.map_or(Ok(()), Err)
+        failure.map_or(Ok(draws), Err)
     }
 
-    /// Records what drawing the XObject `name` of `xobjects` with the matrix `ctm` draws.
+    /// Adds to `draws` what drawing the XObject `name` of `xobjects` with the matrix `ctm` draws,
+    /// in content that uses `resources`, those of the page or form given with them.
     fn draw(
         &self,
         xobjects: &Dictionary,
         name: &[u8],
-        resources: &Dictionary,
-        ctm: [f32; 6],
-        sizes: &mut HashMap<ObjectId, (f32, f32)>,
+        (resources, holder): (&Dictionary, ObjectId),
+        ctm: Linear,
+        draws: &mut Draws,
         scan: &mut Scan,
     ) -> Result<()> {
         let Ok(id) = xobjects.get(name).and_then(Object::as_reference) else { return Ok(()) };
         let Ok(Object::Stream(stream)) = self.doc.get_object(id) else { return Ok(()) };
         match stream.dict.get(b"Subtype").and_then(|o| o.as_name()) {
-            Ok(b"Image") => {
-                let w = (ctm[0] * ctm[0] + ctm[1] * ctm[1]).sqrt();
-                let h = (ctm[2] * ctm[2] + ctm[3] * ctm[3]).sqrt();
-                let slot = sizes.entry(id).or_insert((0.0, 0.0));
-                slot.0 = slot.0.max(w);
-                slot.1 = slot.1.max(h);
-            }
-            Ok(b"Form") if !scan.path.contains(&id) && scan.followed < MAX_FORMS_FOLLOWED => {
-                scan.followed += 1;
-                let form_resources = match stream.dict.get(b"Resources").map(|o| self.resolve(o)) {
-                    Ok(Object::Dictionary(d)) => d,
-                    _ => resources.clone(),
+            Ok(b"Image") => draws.add(id, ctm),
+            Ok(b"Form") => {
+                // A form without resources of its own uses those of what draws it.
+                let own = stream.dict.get(b"Resources").ok().and_then(|o| self.resolved(o)).and_then(|o| o.as_dict().ok());
+                let (form_resources, form_holder) = match own {
+                    Some(own) => (own, id),
+                    None => (resources, holder),
                 };
-                let matrix = matrix_from(stream.dict.get(b"Matrix").ok());
-                // A form drawn on every page is decoded once.
-                let body = match scan.forms.get(&id) {
-                    Some(body) => body.clone(),
-                    None => {
-                        let body = match scan.budget.stream(stream) {
-                            Err(Error::TooLarge(message)) => return Err(Error::TooLarge(message)),
-                            other => std::rc::Rc::new(other.unwrap_or_default()),
-                        };
-                        scan.forms.insert(id, body.clone());
-                        body
-                    }
+                let known = scan.forms.get(&(id, form_holder)).cloned();
+                let drawn = match known {
+                    Some(known) => known,
+                    None => match self.work_out_form(id, stream, form_resources, form_holder, scan)? {
+                        Some(drawn) => drawn,
+                        None => {
+                            scan.incomplete = true;
+                            return Ok(());
+                        }
+                    },
                 };
-                if scan.read.saturating_add(body.len()) > MAX_FORM_BYTES_READ {
+                scan.work = scan.work.saturating_add(drawn.len() + 1);
+                if scan.work > MAX_SCAN_WORK {
+                    scan.incomplete = true;
                     return Ok(());
                 }
-                scan.read += body.len();
-                scan.path.push(id);
-                let scanned = self.scan_content(&body, &form_resources, multiply(matrix, ctm), sizes, scan);
-                scan.path.pop();
-                scanned?;
+                for &(image, matrix) in drawn.iter() {
+                    draws.add(image, linear_product(matrix, ctm));
+                }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// What the form `id` (`stream`) draws with `resources`, those of `holder`, relative to the
+    /// space it is drawn in: read once and kept. `None` when it cannot be worked out: it draws
+    /// itself, or something in it is past the limits.
+    fn work_out_form(
+        &self,
+        id: ObjectId,
+        stream: &Stream,
+        resources: &Dictionary,
+        holder: ObjectId,
+        scan: &mut Scan,
+    ) -> Result<Option<FormDraws>> {
+        if scan.path.contains(&id) || scan.work >= MAX_SCAN_WORK {
+            return Ok(None);
+        }
+        // A form drawn on every page is decoded once.
+        let body = match scan.bodies.get(&id) {
+            Some(body) => body.clone(),
+            None => {
+                let body = match scan.budget.stream(stream) {
+                    Err(Error::TooLarge(message)) => return Err(Error::TooLarge(message)),
+                    other => Rc::new(other.unwrap_or_default()),
+                };
+                scan.bodies.insert(id, body.clone());
+                body
+            }
+        };
+        if scan.read.saturating_add(body.len()) > MAX_FORM_BYTES_READ {
+            return Ok(None);
+        }
+        scan.read += body.len();
+        scan.path.push(id);
+        let scanned = self.scan_content(&body, resources, holder, scan);
+        scan.path.pop();
+        let scanned = scanned?;
+        if scanned.overflowed || scan.incomplete {
+            return Ok(None);
+        }
+        let matrix = linear(matrix_from(stream.dict.get(b"Matrix").ok()));
+        let drawn: FormDraws = Rc::new(scanned.list.into_iter().map(|(image, m)| (image, linear_product(m, matrix))).collect());
+        scan.forms.insert((id, holder), drawn.clone());
+        Ok(Some(drawn))
     }
 
     /// Objects used as soft masks or stencil masks. They are only re-Flated, never JPEG-encoded

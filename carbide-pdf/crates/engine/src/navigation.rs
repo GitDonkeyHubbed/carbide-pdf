@@ -253,7 +253,7 @@ impl Pdf {
 
     /// Takes the article beads on `doomed` pages out of their threads, and threads left without a
     /// bead out of the document.
-    fn prune_threads(&mut self, doomed: &HashSet<ObjectId>) {
+    pub(crate) fn prune_threads(&mut self, doomed: &HashSet<ObjectId>) {
         let Ok(catalog_id) = self.doc.trailer.get(b"Root").and_then(Object::as_reference) else { return };
         let Ok(threads) = self.doc.get_dictionary(catalog_id).and_then(|c| c.get(b"Threads")).cloned() else { return };
         let Object::Array(list) = self.resolve(&threads) else { return };

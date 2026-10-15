@@ -1268,6 +1268,78 @@ fn extracted_pages_carry_nothing_of_the_other_pages() {
     assert!(page_text(r, &mut last, 0).contains("FORM-CHARLIE"));
 }
 
+#[test]
+fn extracted_and_split_pages_carry_no_article_threads_of_the_other_pages() {
+    // The article runs through the second and third pages only.
+    let source = navigable_pdf();
+    for part in [source.extract_pages(&[0, 3]).unwrap(), source.split(&[0..=0, 3..=3]).unwrap().remove(1)] {
+        let mut part = part;
+        let bytes = file_bytes(&mut part);
+        assert_gone(&bytes, "Secret Article");
+        assert!(!part.document().catalog().unwrap().has(b"Threads"));
+    }
+    // A page it runs through keeps it.
+    let mut part = source.extract_pages(&[2]).unwrap();
+    assert!(holds_string(&file_bytes(&mut part), "Secret Article"));
+}
+
+/// True when some string in the file `bytes`, as read back, holds `needle`.
+fn holds_string(bytes: &[u8], needle: &str) -> bool {
+    fn find(object: &Object, needle: &[u8]) -> bool {
+        match object {
+            Object::String(text, _) => contains(text, needle),
+            Object::Array(items) => items.iter().any(|item| find(item, needle)),
+            Object::Dictionary(dict) => dict.iter().any(|(_, value)| find(value, needle)),
+            Object::Stream(stream) => stream.dict.iter().any(|(_, value)| find(value, needle)),
+            _ => false,
+        }
+    }
+    Pdf::from_bytes(bytes).unwrap().document().objects.values().any(|object| find(object, needle.as_bytes()))
+}
+
+/// Two pages: a note on the first whose text is a secret, and on the second two replies to it
+/// (one written straight into the page's annotation list) and a highlight whose pop-up is on the
+/// first page.
+fn replies_across_pages() -> Pdf {
+    let mut pdf = numbered_pages(2);
+    let ids = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let rect = || vec![10.into(), 10.into(), 50.into(), 50.into()];
+    let text = Object::string_literal;
+    let note = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Text", "Rect" => rect(), "P" => ids[0], "Contents" => text("NOTESECRET on page one") });
+    let popup = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Popup", "Rect" => rect(), "P" => ids[0] });
+    let reply = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Text", "Rect" => rect(), "P" => ids[1], "IRT" => note, "Contents" => text("a reply") });
+    let highlight = doc.add_object(dictionary! { "Type" => "Annot", "Subtype" => "Highlight", "Rect" => rect(), "P" => ids[1], "Popup" => popup, "Contents" => text("highlighted") });
+    doc.get_dictionary_mut(popup).unwrap().set("Parent", highlight);
+    let direct = dictionary! { "Type" => "Annot", "Subtype" => "Text", "Rect" => rect(), "IRT" => note, "Contents" => text("a direct reply") };
+    doc.get_dictionary_mut(ids[0]).unwrap().set("Annots", vec![note.into(), popup.into()]);
+    doc.get_dictionary_mut(ids[1]).unwrap().set("Annots", vec![reply.into(), highlight.into(), direct.into()]);
+    let bytes = pdf.to_bytes().unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
+#[test]
+fn replies_on_pages_that_stay_do_not_keep_annotations_of_pages_that_go() {
+    let check = |mut pdf: Pdf, what: &str| {
+        let bytes = file_bytes(&mut pdf);
+        assert_gone(&bytes, "NOTESECRET");
+        assert!(["a reply", "a direct reply", "highlighted"].iter().all(|text| holds_string(&bytes, text)), "{what}");
+    };
+    let source = replies_across_pages();
+    check(source.extract_pages(&[1]).unwrap(), "extract");
+    check(source.split(&[0..=0, 1..=1]).unwrap().remove(1), "split");
+    let mut deleted = source.clone();
+    deleted.delete_pages(&[0]).unwrap();
+    check(deleted, "delete");
+    let mut redacted = source.clone();
+    redacted.apply_redactions(renderer(), &[Redaction { page: 0, rect: Rect::new(0.0, 0.0, 20.0, 20.0) }], 72.0).unwrap();
+    check(redacted, "redact");
+    // Annotations that only go with their own pages are left alone.
+    let mut kept = source.clone();
+    kept.delete_pages(&[1]).unwrap();
+    assert!(holds_string(&file_bytes(&mut kept), "NOTESECRET"));
+}
+
 /// A signed one-page file whose page carries an ink drawing: numbers only, no appearance stream.
 fn signed_with_ink() -> (Vec<u8>, Vec<Object>) {
     let mut doc = text_pdf(&[&["contract body"]]);
@@ -1948,11 +2020,23 @@ fn recovery_copies_are_private_and_never_of_protected_documents() {
     let mut store = AutoSaveStore::open(&dir).unwrap();
     let draft = store.begin_document(None, 1);
     store.autosave(draft, &mut text_pdf(&[&["draft"]]), 2).unwrap();
+    store.autosave(draft, &mut text_pdf(&[&["draft, later"]]), 3).unwrap();
     assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
     for entry in std::fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0, "{}", path.display());
+        // Copies and the index are staged under names nobody can guess, and never left behind.
+        assert!(!path.to_string_lossy().ends_with(".tmp"), "{}", path.display());
     }
+    // A link where earlier versions staged the next copy is never written through.
+    let copy = store.record(draft).unwrap().recovered.clone().unwrap().path;
+    let victim = dir.join("..").join(format!("victim-{}", std::process::id()));
+    std::fs::write(&victim, b"untouched").unwrap();
+    std::os::unix::fs::symlink(&victim, copy.with_extension("asd.tmp")).unwrap();
+    store.autosave(draft, &mut text_pdf(&[&["draft, again"]]), 4).unwrap();
+    assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+    std::fs::remove_file(copy.with_extension("asd.tmp")).unwrap();
+    std::fs::remove_file(&victim).unwrap();
 
     // Opens without a password, so nothing else stops it.
     let protected = text_pdf(&[&["PROTECTEDTEXT"]]).to_encrypted_bytes(&ProtectionOptions::new("", "owner pw")).unwrap();
@@ -3420,6 +3504,154 @@ fn reduce_shrinks_photos_and_merges_duplicates() {
 }
 
 #[test]
+fn forms_drawn_over_and_over_are_worked_out_once() {
+    // A photo drawn through a form whose matrix halves it, and that form drawn once as it is and
+    // once twice as large: the photo is drawn at 200 x 150 pt at most, and sized for that.
+    let mut pdf = photo_pdf();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let page_xobjects = doc.get_dictionary(page).unwrap().get(b"Resources").unwrap().as_dict().unwrap().get(b"XObject").unwrap();
+    let photo = page_xobjects.as_dict().unwrap().get(b"Im1").unwrap().as_reference().unwrap();
+    let bbox = || vec![0.into(), 0.into(), 612.into(), 792.into()];
+    let half = vec![0.5.into(), 0.into(), 0.into(), 0.5.into(), 0.into(), 0.into()];
+    let photo_form = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form", "BBox" => bbox(), "Matrix" => half,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im" => photo } },
+        },
+        b"q 200 0 0 150 0 0 cm /Im Do Q".to_vec(),
+    ));
+    // Next to it, 20,000 names for one empty form, drawn 30,000 times, and 20,000 more forms
+    // without resources of their own, each drawn once.
+    let empty = doc.add_object(Stream::new(dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => bbox() }, Vec::new()));
+    let mut xobjects = lopdf::Dictionary::new();
+    xobjects.set("F", photo_form);
+    let mut content = b"q 1 0 0 1 50 500 cm /F Do Q q 2 0 0 2 50 100 cm /F Do Q\n".to_vec();
+    for i in 0..20_000 {
+        xobjects.set(format!("E{i}"), empty);
+        let own = doc.add_object(Stream::new(dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => bbox() }, b"0 0 m".to_vec()));
+        xobjects.set(format!("D{i}"), own);
+        content.extend_from_slice(format!("/D{i} Do\n").as_bytes());
+    }
+    for i in 0..30_000 {
+        content.extend_from_slice(format!("/E{} Do\n", i % 20_000).as_bytes());
+    }
+    let content = doc.add_object(Stream::new(lopdf::Dictionary::new(), content));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", dictionary! { "XObject" => xobjects });
+    page.set("Contents", content);
+
+    let started = std::time::Instant::now();
+    let checked = pdf.clone();
+    finishes("checking the page", move || checked.check_drawable(0)).unwrap();
+    let (reduced, report) = finishes("reduce", move || pdf.reduce(&ReduceOptions::default(), None).unwrap());
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let reduced = Pdf::from_bytes(&reduced).unwrap();
+    let widths: Vec<i64> = reduced
+        .document()
+        .objects
+        .values()
+        .filter_map(|o| match o {
+            Object::Stream(s) if s.dict.get(b"Subtype").and_then(|v| v.as_name()).ok() == Some(b"Image") => {
+                s.dict.get(b"Width").ok()?.as_i64().ok()
+            }
+            _ => None,
+        })
+        .collect();
+    // 200 pt at 150 ppi is about 417 pixels; the smaller drawing alone would have given half that.
+    assert!(widths.len() == 1 && widths[0] < 600 && widths[0] >= 300, "{widths:?}");
+}
+
+/// The widths of the images in the file `bytes`.
+fn image_widths(bytes: &[u8]) -> Vec<i64> {
+    let pdf = Pdf::from_bytes(bytes).unwrap();
+    pdf.document()
+        .objects
+        .values()
+        .filter_map(|o| match o {
+            Object::Stream(s) if s.dict.get(b"Subtype").and_then(|v| v.as_name()).ok() == Some(b"Image") => {
+                s.dict.get(b"Width").ok()?.as_i64().ok()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `photo_pdf` with its page's XObjects replaced by `xobjects` (the photo is `Im1`, which
+/// `xobjects` gets) and its content by `content`; `make` adds the forms, given the photo.
+fn photo_page(content: &[u8], make: impl FnOnce(&mut Document, lopdf::ObjectId) -> lopdf::Dictionary) -> Pdf {
+    let mut pdf = photo_pdf();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let resources = doc.get_dictionary(page).unwrap().get(b"Resources").unwrap().as_dict().unwrap();
+    let photo = resources.get(b"XObject").unwrap().as_dict().unwrap().get(b"Im1").unwrap().as_reference().unwrap();
+    let mut xobjects = make(doc, photo);
+    xobjects.set("Im1", photo);
+    let content = doc.add_object(Stream::new(lopdf::Dictionary::new(), content.to_vec()));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", dictionary! { "XObject" => xobjects });
+    page.set("Contents", content);
+    pdf
+}
+
+#[test]
+fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
+    // A form drawing itself, then the photo 170,000 times, drawn 1,000 times by the page.
+    let mut content = b"q 200 0 0 150 50 500 cm ".to_vec();
+    content.extend_from_slice(&b"/S Do ".repeat(1_000));
+    content.extend_from_slice(b"Q");
+    let mut pdf = photo_page(&content, |doc, photo| {
+        let form = doc.new_object_id();
+        let mut body = b"/S Do\n".to_vec();
+        body.extend_from_slice(&b"/I Do\n".repeat(170_000));
+        let dict = dictionary! {
+            "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+            "Resources" => dictionary! { "XObject" => dictionary! { "S" => form, "I" => photo } },
+        };
+        doc.objects.insert(form, Object::Stream(Stream::new(dict, body)));
+        dictionary! { "S" => form }
+    });
+    let started = std::time::Instant::now();
+    let (reduced, report) = finishes("reduce", move || pdf.reduce(&ReduceOptions::default(), None).unwrap());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+    // How large the photo is drawn cannot be told, so it keeps its size.
+    assert_eq!(report.images_downsampled, 0, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(!widths.is_empty() && widths.iter().all(|&w| w == 1200), "{widths:?}");
+}
+
+#[test]
+fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
+    // The photo drawn small on the page, and large through W, which draws X. A chain of seven
+    // forms also leads to W, so that through it X is nested too deep to be followed.
+    let widths = |content: &[u8]| {
+        let mut pdf = photo_page(content, |doc, photo| {
+            let form = |doc: &mut Document, name: &str, drawn: lopdf::ObjectId, body: &[u8]| {
+                let dict = dictionary! {
+                    "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "Resources" => dictionary! { "XObject" => dictionary! { name => drawn } },
+                };
+                doc.add_object(Stream::new(dict, body.to_vec()))
+            };
+            let x = form(doc, "I", photo, b"q 600 0 0 450 0 0 cm /I Do Q");
+            let w = form(doc, "X", x, b"/X Do");
+            let mut chain = w;
+            for _ in 0..7 {
+                chain = form(doc, "N", chain, b"/N Do");
+            }
+            dictionary! { "W" => w, "C" => chain }
+        });
+        image_widths(&pdf.reduce(&ReduceOptions::default(), None).unwrap().0)
+    };
+    let shallow_first = widths(b"q 20 0 0 15 0 0 cm /Im1 Do Q /W Do /C Do");
+    let deep_first = widths(b"q 20 0 0 15 0 0 cm /Im1 Do Q /C Do /W Do");
+    assert_eq!(shallow_first, deep_first);
+    // Drawn 600 points wide, the photo is not made smaller than that needs.
+    assert!(!shallow_first.is_empty() && shallow_first.iter().all(|&w| w >= 1200), "{shallow_first:?}");
+}
+
+#[test]
 fn slider_trades_size_for_quality() {
     let mut pdf = photo_pdf();
     let small = pdf.reduce(&ReduceOptions { image_factor: 0 }, None).unwrap().0.len();
@@ -4497,7 +4729,23 @@ struct TestTsa {
 impl TestTsa {
     /// An authority whose certificate is valid from 1 January of `from` to 1 January of `until`,
     /// with its time-stamping purpose marked critical or not.
-    fn new(name: &str, (from, until): (i32, i32), critical: bool, gen_time: &'static str) -> TestTsa {
+    fn new(name: &str, years: (i32, i32), critical: bool, gen_time: &'static str) -> TestTsa {
+        TestTsa::made(name, years, critical, gen_time, None)
+    }
+
+    /// An authority like [`TestTsa::new`], with its purpose critical, whose certificate `issuer`
+    /// issues.
+    fn issued_by(name: &str, years: (i32, i32), gen_time: &'static str, issuer: &Issuer<'_, KeyPair>) -> TestTsa {
+        TestTsa::made(name, years, true, gen_time, Some(issuer))
+    }
+
+    fn made(
+        name: &str,
+        (from, until): (i32, i32),
+        critical: bool,
+        gen_time: &'static str,
+        issuer: Option<&Issuer<'_, KeyPair>>,
+    ) -> TestTsa {
         use rsa::pkcs8::EncodePrivateKey;
         let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
         let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
@@ -4506,12 +4754,14 @@ impl TestTsa {
         params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
         params.not_before = rcgen::date_time_ymd(from, 1, 1);
         params.not_after = rcgen::date_time_ymd(until, 1, 1);
-        let purposes = algo::seq(&[&algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 8])]); // id-kp-timeStamping
-        let mut eku = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], purposes);
+        let mut eku = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], timestamping_purpose());
         eku.set_criticality(critical);
         params.custom_extensions.push(eku);
-        let cert = params.self_signed(&pair).unwrap().der().to_vec();
-        TestTsa { key, cert, gen_time }
+        let cert = match issuer {
+            Some(issuer) => params.signed_by(&pair, issuer),
+            None => params.self_signed(&pair),
+        };
+        TestTsa { key, cert: cert.unwrap().der().to_vec(), gen_time }
     }
 
     /// A TimeStampToken over `imprint` (hashed with `hash_oid`), echoing `nonce` (the content of
@@ -4569,6 +4819,11 @@ impl TestTsa {
     }
 }
 
+/// The content of an extended key usage extension naming id-kp-timeStamping alone.
+fn timestamping_purpose() -> Vec<u8> {
+    algo::seq(&[&algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 8])])
+}
+
 fn test_tsa() -> &'static TestTsa {
     static TSA: OnceLock<TestTsa> = OnceLock::new();
     TSA.get_or_init(|| TestTsa::new("Test TSA", (2020, 2040), true, "20260101000000Z"))
@@ -4607,26 +4862,32 @@ fn an_embedded_time_stamp_is_reported_only_when_it_verifies() {
     assert_eq!(reports[0].validity, Validity::Valid);
     assert!(reports[0].has_embedded_timestamp && reports[0].embedded_timestamp_trusted);
     assert!(reports[0].description_lines().contains(&sig_messages::TIME_STAMPED));
+    assert!(reports[0].time_stamp_time.as_deref().is_some_and(|t| t.contains("20260101")) && reports[0].time_stamp_trusted());
 
     // The same time stamp when its authority is not trusted: present, but not vouched for.
     let reports = verify(&signed, &trust_test_identity());
     assert!(reports[0].has_embedded_timestamp && !reports[0].embedded_timestamp_trusted);
+    assert!(reports[0].time_stamp_time.is_some() && !reports[0].time_stamp_trusted());
     let lines = reports[0].description_lines();
     assert!(lines.contains(&sig_messages::TIME_STAMP_UNCONFIRMED) && !lines.contains(&sig_messages::TIME_STAMPED));
 
-    // A token over something else says nothing about a time stamp.
+    // A token over something else gives no time stamp, and is said not to verify.
     let wrong = WrongImprint(tsa);
     let mut options = sign_options(SubFilter::Pkcs7Detached);
     options.timestamp = Some(&wrong);
     let reports = verify(&doc.sign(&base, &options).unwrap(), &tsa_trust());
     assert_eq!(reports[0].validity, Validity::Valid);
-    assert!(!reports[0].has_embedded_timestamp);
+    assert!(!reports[0].has_embedded_timestamp && reports[0].time_stamp_time.is_none());
+    assert!(reports[0].embedded_timestamp_failed);
     let lines = reports[0].description_lines();
     assert!(!lines.contains(&sig_messages::TIME_STAMPED) && !lines.contains(&sig_messages::TIME_STAMP_UNCONFIRMED));
+    assert!(lines.contains(&sig_messages::TIME_STAMP_NOT_VERIFIED), "{lines:?}");
 
     // A signature with no time stamp says nothing about one.
     let plain = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
-    assert!(!verify(&plain, &trust_test_identity())[0].has_embedded_timestamp);
+    let report = verify(&plain, &trust_test_identity()).remove(0);
+    assert!(!report.has_embedded_timestamp && !report.embedded_timestamp_failed);
+    assert!(!report.description_lines().contains(&sig_messages::TIME_STAMP_NOT_VERIFIED));
 }
 
 #[test]
@@ -4659,6 +4920,89 @@ fn only_a_trusted_time_stamp_moves_the_certificate_validity_check() {
 }
 
 #[test]
+fn a_time_stamp_counts_only_while_its_authority_is_still_valid_and_trusted() {
+    let mut doc = text_pdf(&[&["backdated by a token"]]);
+    let base = file_bytes(&mut doc);
+    let expired_signer = |pair: &KeyPair, key: rsa::RsaPrivateKey, is_ca: IsCa, usages: &[KeyUsagePurpose]| {
+        let mut params = cert_params("Expired Signer", is_ca, usages);
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+        let cert = params.self_signed(pair).unwrap().der().to_vec();
+        (Identity::new(vec![cert.clone()], key).unwrap(), cert, params)
+    };
+    let sign = |identity: &Identity, tsa: &TestTsa| {
+        let options = SignOptions { identity: Some(identity), timestamp: Some(tsa), ..Default::default() };
+        doc.sign(&base, &options).unwrap()
+    };
+
+    // An authority whose certificate expired, and a signer whose certificate expired, both
+    // trusted: whoever holds the authority's key now can give any time from when it was valid.
+    let (pair, key) = rsa_key();
+    let (identity, cert, _) = expired_signer(&pair, key, IsCa::ExplicitNoCa, &[KeyUsagePurpose::DigitalSignature]);
+    let old_tsa = TestTsa::new("Old TSA", (2019, 2021), true, "20200601000000Z");
+    let reports = verify(&sign(&identity, &old_tsa), &TrustStore { certificates: vec![cert, old_tsa.cert.clone()] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::ValidityUnknown, Detail::Expired));
+    assert!(reports[0].has_embedded_timestamp && !reports[0].embedded_timestamp_trusted && !reports[0].time_stamp_trusted());
+    assert_ne!(notice_text(&reports), Some(sig_messages::NOTICE_ALL_VALID));
+
+    // A trusted certificate that may issue others, and has expired, makes itself an authority and
+    // a token from when it was valid.
+    let (pair, key) = rsa_key();
+    let usages = [KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyCertSign];
+    let (identity, cert, params) = expired_signer(&pair, key, IsCa::Ca(BasicConstraints::Unconstrained), &usages);
+    let issuer = Issuer::new(params, pair);
+    let minted = TestTsa::issued_by("Minted TSA", (2020, 2021), "20200601000000Z", &issuer);
+    let reports = verify(&sign(&identity, &minted), &TrustStore { certificates: vec![cert] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::ValidityUnknown, Detail::Expired));
+    assert!(!reports[0].time_stamp_trusted());
+
+    // A document time stamp from an authority whose certificate has expired: its time is shown
+    // as not confirmed, and the time stamp is not called valid.
+    let options = SignOptions { sub_filter: SubFilter::DocumentTimeStamp, timestamp: Some(&old_tsa), ..Default::default() };
+    let stamped = doc.sign(&base, &options).unwrap();
+    let report = verify(&stamped, &TrustStore { certificates: vec![old_tsa.cert.clone()] }).remove(0);
+    assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::Expired));
+    assert!(report.time_stamp_time.is_some() && !report.time_stamp_trusted());
+    let lines = report.description_lines();
+    assert!(lines.contains(&sig_messages::TIMESTAMP_AUTHORITY_EXPIRED) && !lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED), "{lines:?}");
+}
+
+#[test]
+fn a_certificate_for_other_purposes_cannot_sign_documents() {
+    let mut doc = text_pdf(&[&["purposes"]]);
+    let base = file_bytes(&mut doc);
+    let signer = |purposes: Option<Vec<u8>>| {
+        let (pair, key) = rsa_key();
+        let mut params = cert_params("Purposeful Signer", IsCa::ExplicitNoCa, &[KeyUsagePurpose::DigitalSignature]);
+        if let Some(purposes) = purposes {
+            params.custom_extensions.push(rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], purposes));
+        }
+        let cert = params.self_signed(&pair).unwrap().der().to_vec();
+        let identity = Identity::new(vec![cert.clone()], key).unwrap();
+        let signed = doc.sign(&base, &SignOptions { identity: Some(&identity), ..Default::default() }).unwrap();
+        verify(&signed, &TrustStore { certificates: vec![cert] }).remove(0)
+    };
+    // A time stamp authority's certificate, and one for TLS servers.
+    for (label, purposes) in [
+        ("time stamping", timestamping_purpose()),
+        ("server", algo::seq(&[&algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 1])])),
+    ] {
+        let report = signer(Some(purposes));
+        assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::NotPermitted), "{label}");
+        assert!(report.description_lines().contains(&sig_messages::SIGNER_NOT_PERMITTED), "{label}");
+    }
+    // No purposes at all, e-mail protection, or document signing among others, may sign.
+    for (label, purposes) in [
+        ("none", None),
+        ("e-mail", Some(algo::seq(&[&algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 4])]))),
+        ("document signing", Some(algo::seq(&[&algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 1]), &algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 36])]))),
+    ] {
+        let report = signer(purposes);
+        assert_eq!((report.validity, report.detail), (Validity::Valid, Detail::TrustedDirectly), "{label}");
+    }
+}
+
+#[test]
 fn a_document_time_stamp_verifies_as_a_time_stamp() {
     let mut doc = text_pdf(&[&["stamped document"]]);
     let base = file_bytes(&mut doc);
@@ -4672,7 +5016,8 @@ fn a_document_time_stamp_verifies_as_a_time_stamp() {
     assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
     assert_eq!(reports[0].status_line(), sig_messages::TIMESTAMP_VALID);
     assert_eq!(reports[0].signer.as_deref(), Some("Test TSA"));
-    assert!(reports[0].signing_time.as_deref().is_some_and(|t| t.contains("20260101")));
+    assert!(reports[0].time_stamp_time.as_deref().is_some_and(|t| t.contains("20260101")) && reports[0].time_stamp_trusted());
+    assert_eq!(reports[0].signing_time, None);
     assert!(reports[0].description_lines().contains(&sig_messages::DOCUMENT_TIME_STAMPED));
     assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_ALL_VALID));
 
@@ -4681,6 +5026,7 @@ fn a_document_time_stamp_verifies_as_a_time_stamp() {
     let untrusted = verify(&stamped, &TrustStore::default());
     assert_eq!((untrusted[0].validity, untrusted[0].detail), (Validity::ValidityUnknown, Detail::DigestOkUntrusted));
     assert_eq!(untrusted[0].status_line(), sig_messages::TIMESTAMP_VALIDITY_UNKNOWN);
+    assert!(untrusted[0].time_stamp_time.is_some() && !untrusted[0].time_stamp_trusted());
     let lines = untrusted[0].description_lines();
     assert!(lines.contains(&sig_messages::TIMESTAMP_AUTHORITY_UNKNOWN) && !lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED));
     assert_eq!(notice_text(&untrusted), Some(sig_messages::NOTICE_TIMESTAMP_NOT_CONFIRMED));
@@ -4692,6 +5038,29 @@ fn a_document_time_stamp_verifies_as_a_time_stamp() {
     let reports = verify(&tampered, &tsa_trust());
     assert_eq!(reports[0].validity, Validity::Invalid);
     assert!(!reports[0].description_lines().contains(&sig_messages::DOCUMENT_TIME_STAMPED));
+}
+
+/// `signed`, which holds one ordinary signature, relabelled as a document time stamp. The name
+/// keeps its length, so the byte range still fits, but what the signature holds is no time-stamp
+/// token.
+fn as_document_time_stamp(signed: &[u8]) -> Vec<u8> {
+    let at = signed.windows(19).rposition(|w| w == b"adbe.pkcs7.detached").unwrap();
+    let mut relabelled = signed.to_vec();
+    relabelled[at..at + 19].copy_from_slice(b"ETSI.RFC3161       ");
+    relabelled
+}
+
+#[test]
+fn a_document_time_stamp_that_does_not_verify_gives_no_time() {
+    // The dictionary carries a /M, which is no time stamp's time.
+    let mut doc = text_pdf(&[&["no time"]]);
+    let base = file_bytes(&mut doc);
+    let options = SignOptions { signing_time: Some("D:20000101000000Z".into()), ..sign_options(SubFilter::Pkcs7Detached) };
+    let stamped = as_document_time_stamp(&doc.sign(&base, &options).unwrap());
+    let report = verify(&stamped, &tsa_trust()).remove(0);
+    assert!(report.document_time_stamp);
+    assert_eq!((report.validity, report.detail), (Validity::Invalid, Detail::Corrupt));
+    assert_eq!((report.signing_time, report.time_stamp_time), (None, None));
 }
 
 #[test]
@@ -4743,6 +5112,7 @@ fn time_stamp_tokens_that_cannot_be_checked_or_name_another_certificate_are_not_
     put_signature_value(&mut sha224, &tsa.token(SHA224_OID, &digest, None));
     let report = verify(&sha224, &tsa_trust()).remove(0);
     assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm));
+    assert_eq!(report.time_stamp_time, None);
     let lines = report.description_lines();
     assert!(!lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED) && !lines.contains(&sig_messages::CORRUPTED), "{lines:?}");
 
@@ -4763,6 +5133,46 @@ fn a_time_stamp_authority_refuses_credentials_over_plain_http() {
     };
     let err = insecure.token_for_digest(&[0u8; 32]).unwrap_err().to_string();
     assert!(err.contains("https") || err.contains("insecure"), "{err}");
+}
+
+#[test]
+fn credentials_written_into_a_time_stamp_url_never_go_over_plain_http() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    // A user and password in the URL itself are refused before anything is sent.
+    for url in [format!("http://user:secretpw@{address}/"), format!("HTTP://user@{address}/tsa?x=1")] {
+        let source = HttpTimestampSource { url: url.clone(), username: None, password: None };
+        let err = source.token_for_digest(&[0u8; 32]).unwrap_err().to_string();
+        assert!(err.contains("https://"), "{url}: {err}");
+    }
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "the authority was contacted"
+    );
+
+    // An "@" past the host is no user name: that request goes out, without credentials.
+    listener.set_nonblocking(false).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        let (mut request, mut chunk) = (Vec::new(), [0u8; 4096]);
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..n]);
+        }
+        let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        String::from_utf8_lossy(&request).to_ascii_lowercase()
+    });
+    let source = HttpTimestampSource { url: format!("http://{address}/stamp@here"), username: None, password: None };
+    assert!(source.token_for_digest(&[0u8; 32]).is_err());
+    let request = server.join().unwrap();
+    assert!(request.starts_with("post /stamp@here"), "{request}");
+    assert!(!request.contains("authorization") && !request.contains("secretpw"), "{request}");
 }
 
 /// Answers `requests` HTTP requests on localhost, each with the bytes `answer` gives for its body,
@@ -5137,6 +5547,56 @@ fn signer_key_usage_and_future_dates_are_named_as_such() {
     let report = verify(&doc.sign(&base, &options).unwrap(), &trust_test_identity()).remove(0);
     assert_eq!((report.validity, report.detail), (Validity::ValidityUnknown, Detail::SignedInFuture));
     assert!(report.description_lines().contains(&sig_messages::SIGNED_IN_FUTURE));
+}
+
+#[test]
+fn the_signing_time_a_signature_claims_does_not_bring_back_a_lapsed_certificate() {
+    let backdated = |identity: &Identity| {
+        let mut doc = text_pdf(&[&["backdated"]]);
+        let base = file_bytes(&mut doc);
+        let options = SignOptions { identity: Some(identity), signing_time: Some("D:20200601000000Z".into()), ..Default::default() };
+        doc.sign(&base, &options).unwrap()
+    };
+
+    // A trusted certificate that expired in 2021 signs now, writing a signing time from when it
+    // was still valid: expired, and the document is not called valid.
+    let (pair, key) = rsa_key();
+    let mut params = cert_params("Expired Signer", IsCa::ExplicitNoCa, &[KeyUsagePurpose::DigitalSignature]);
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+    let reports = verify(&backdated(&Identity::new(vec![cert.clone()], key).unwrap()), &TrustStore { certificates: vec![cert] });
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::ValidityUnknown, Detail::Expired));
+    assert!(reports[0].description_lines().contains(&sig_messages::IDENTITY_EXPIRED));
+    assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_NOT_CONFIRMED));
+    // The time is still reported, as what the signer claims.
+    assert_eq!(reports[0].signing_time.as_deref(), Some("D:20200601000000Z"));
+
+    // A signer certificate valid today, below a root and an intermediate that both lapsed in 2021:
+    // the chain is not accepted at the time the signature claims either.
+    let lapsed = |name: &str| {
+        let mut params = cert_params(name, IsCa::Ca(BasicConstraints::Unconstrained), &[KeyUsagePurpose::KeyCertSign]);
+        params.not_before = rcgen::date_time_ymd(2019, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+        params
+    };
+    let (root_pair, _) = rsa_key();
+    let root_params = lapsed("Lapsed Root");
+    let root = root_params.self_signed(&root_pair).unwrap().der().to_vec();
+    let root_issuer = Issuer::new(root_params, root_pair);
+    let (int_pair, _) = rsa_key();
+    let int_params = lapsed("Lapsed Intermediate");
+    let intermediate = int_params.signed_by(&int_pair, &root_issuer).unwrap().der().to_vec();
+    let (identity, _) = chain_identity(&Issuer::new(int_params, int_pair), &[intermediate]);
+    let report = verify(&backdated(&identity), &TrustStore { certificates: vec![root] }).remove(0);
+    assert_rejected(&report, "lapsed chain, backdated signing time");
+
+    // A certificate valid today with an old signing time is valid: the time only ever is a claim.
+    let options = SignOptions { signing_time: Some("D:19990101000000Z".into()), ..sign_options(SubFilter::Pkcs7Detached) };
+    let mut doc = text_pdf(&[&["old date"]]);
+    let base = file_bytes(&mut doc);
+    let reports = verify(&doc.sign(&base, &options).unwrap(), &trust_test_identity());
+    assert_eq!((reports[0].validity, reports[0].detail), (Validity::Valid, Detail::TrustedDirectly));
 }
 
 // ---- OpenSSL cross-checks ------------------------------------------------------------------

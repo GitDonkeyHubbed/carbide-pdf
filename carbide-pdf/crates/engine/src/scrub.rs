@@ -33,6 +33,44 @@ impl Pdf {
         found
     }
 
+    /// The annotations on `pages` that are on no page in `staying` as well: those that leave the
+    /// document with the pages.
+    pub(crate) fn annotations_leaving(&self, pages: &HashSet<ObjectId>, staying: &HashSet<ObjectId>) -> HashSet<ObjectId> {
+        let kept = self.annotations_on(staying);
+        self.annotations_on(pages).into_keys().filter(|id| !kept.contains_key(id)).collect()
+    }
+
+    /// Takes out the links other annotations have to `gone`, annotations that are leaving the
+    /// document: the note a reply answers (`/IRT`), the annotation a pop-up belongs to (`/Parent`)
+    /// and an annotation's pop-up (`/Popup`). A reply on a page that stays would otherwise keep the
+    /// note it answers in the file, text and all.
+    pub(crate) fn drop_annotation_links_to(&mut self, gone: &HashSet<ObjectId>) {
+        // Annotations can also be written straight into a page's /Annots, so every dictionary is
+        // looked at, wherever it is.
+        fn strip(object: &mut Object, gone: &HashSet<ObjectId>) {
+            match object {
+                Object::Array(items) => items.iter_mut().for_each(|item| strip(item, gone)),
+                Object::Dictionary(dict) => {
+                    if dict.has(b"Subtype") {
+                        for key in [&b"IRT"[..], b"Parent", b"Popup"] {
+                            if dict.get(key).and_then(Object::as_reference).is_ok_and(|id| gone.contains(&id)) {
+                                dict.remove(key);
+                            }
+                        }
+                    }
+                    dict.iter_mut().for_each(|(_, value)| strip(value, gone));
+                }
+                _ => {}
+            }
+        }
+        if gone.is_empty() {
+            return;
+        }
+        for object in self.doc.objects.values_mut() {
+            strip(object, gone);
+        }
+    }
+
     /// Takes widgets on `pages` out of the form, together with every field left without a widget,
     /// so their values and appearances are no longer part of the document. `goes` decides for each
     /// widget, given its page, its dictionary and whether it belongs to a signature field. A field
@@ -288,16 +326,6 @@ impl Pdf {
             })
             .filter(|(_, value)| !matches!(value, Object::Dictionary(d) if d.is_empty()))
             .collect()
-    }
-}
-
-impl Pdf {
-    /// `object`, or the object it refers to, without copying it.
-    fn resolved<'a>(&'a self, object: &'a Object) -> Option<&'a Object> {
-        match object {
-            Object::Reference(id) => self.doc.get_object(*id).ok(),
-            other => Some(other),
-        }
     }
 }
 

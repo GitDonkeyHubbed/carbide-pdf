@@ -1128,3 +1128,209 @@ fn save_all_carries_on_with_another_dialog_on_screen() {
     let (_, path) = question(&app).expect("a.pdf asks");
     assert_eq!(path, a);
 }
+
+/// `labels` written to `name` with a signature field whose signature does not match the file: any
+/// document with a signature has a notice, and this one needs no signing key.
+fn with_signature(dir: &Path, name: &str, labels: &[&str]) -> PathBuf {
+    use lopdf::{dictionary, Object, StringFormat};
+    let mut pdf = document(labels);
+    let page = pdf.page_id(0).unwrap();
+    let doc = pdf.document_mut();
+    let value = doc.add_object(dictionary! {
+        "Type" => "Sig", "Filter" => "Adobe.PPKLite", "SubFilter" => "adbe.pkcs7.detached",
+        "ByteRange" => vec![0.into(), 10.into(), 20.into(), 30.into()],
+        "Contents" => Object::String(vec![0; 16], StringFormat::Hexadecimal),
+    });
+    let field = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Sig", "T" => Object::string_literal("Signature1"),
+        "V" => value, "P" => page, "Rect" => vec![0.into(), 0.into(), 0.into(), 0.into()],
+    });
+    doc.get_dictionary_mut(page).unwrap().set("Annots", vec![Object::Reference(field)]);
+    doc.catalog_mut().unwrap().set("AcroForm", dictionary! { "Fields" => vec![Object::Reference(field)] });
+    let path = dir.join(name);
+    std::fs::write(&path, pdf.to_bytes().unwrap()).unwrap();
+    path
+}
+
+#[test]
+fn signature_results_say_when_unsaved_changes_are_not_covered() {
+    let dir = scratch();
+    let signed = with_signature(&dir, "signed.pdf", &["SIGNED"]);
+    let other = plain(&dir, "other.pdf", &["OTHER"]);
+    let mut app = app(&dir);
+    app.open_path(&signed);
+    let summary = app.notice.clone().expect("a signed document has a notice");
+    assert_eq!(app.shown_notice(), Some(summary.clone()));
+    let unsaved = format!("{summary} {}", crate::UNSAVED_CHANGES_NOT_SIGNED);
+
+    // Every way the shown document comes to differ from its file says so.
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    assert_eq!(app.shown_notice().as_ref(), Some(&unsaved), "after an edit");
+    app.undo();
+    assert_eq!(app.shown_notice().as_ref(), Some(&unsaved), "after undo");
+    app.redo();
+    assert_eq!(app.shown_notice().as_ref(), Some(&unsaved), "after redo");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let doc = app.doc.as_ref().unwrap();
+    app.ocr_job = Some(OcrJob { doc: doc.id, version: doc.version, receiver, result: None });
+    let mut recognized = doc.pdf.clone();
+    recognized.add_text_box(0, 72.0, 600.0, "RECOGNIZED", 12.0).unwrap();
+    sender.send(Ok((recognized, OcrReport::default()))).unwrap();
+    app.poll_ocr();
+    assert!(contains(&app.doc.as_ref().unwrap().bytes, "RECOGNIZED"));
+    assert_eq!(app.shown_notice().as_ref(), Some(&unsaved), "after OCR");
+
+    // So do the results of checking the signatures.
+    app.validate_signatures();
+    match app.dialog.take() {
+        Some(Dialog::Signatures { notice, .. }) => assert_eq!(app.about_saved_file(&notice), unsaved),
+        _ => panic!("the signatures were not shown"),
+    }
+
+    // Another document in front has its own notice (none); coming back brings this one back.
+    app.open_path(&other);
+    assert_eq!(app.shown_notice(), None);
+    app.activate(Some(0));
+    assert_eq!(app.shown_notice().as_ref(), Some(&unsaved), "after switching tabs");
+
+    // Saved, the notice is about what is shown again.
+    app.save();
+    assert!(question(&app).is_none() && !app.doc.as_ref().unwrap().dirty);
+    let saved = app.shown_notice().expect("still signed");
+    assert!(!saved.contains(crate::UNSAVED_CHANGES_NOT_SIGNED), "{saved}");
+    assert_eq!(Some(saved), app.notice);
+}
+
+#[test]
+fn protecting_the_open_file_keeps_it_protected_from_then_on() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["PRIVATE WORDS"]);
+    let mut app = app(&dir);
+    app.open_path(&a);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    let options = ProtectionOptions::new("open pw", "owner pw");
+    app.protect_to(&a, &options);
+    let written = std::fs::read(&a).unwrap();
+    assert!(matches!(Pdf::from_bytes(&written), Err(carbide_engine::Error::PasswordRequired)));
+    let key = file_key(&written, "owner pw");
+    // The document is that file now, the edit made before included.
+    let doc = app.doc.as_ref().unwrap();
+    assert!(doc.is_protected() && !doc.dirty);
+    assert_eq!(doc.saved.as_ref().unwrap().bytes(), written.as_slice());
+    assert_eq!(doc.pdf.page_rotation(0).unwrap(), 90);
+
+    // Later edits get no unencrypted recovery copy, and Save and Save As keep the protection.
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    overdue(&mut app);
+    app.autosave_tick();
+    assert_eq!(recovery_copies(&dir), 0, "an unencrypted recovery copy was written");
+    app.save();
+    let saved = std::fs::read(&a).unwrap();
+    assert!(matches!(Pdf::from_bytes(&saved), Err(carbide_engine::Error::PasswordRequired)), "saved without protection");
+    assert_eq!(file_key(&saved, "open pw"), key);
+    assert_eq!(Pdf::from_bytes_with_password(&saved, "open pw").unwrap().page_rotation(0).unwrap(), 180);
+    let b = dir.join("b.pdf");
+    app.write_to(&b, None, AfterSave::Nothing);
+    assert_eq!(file_key(&std::fs::read(&b).unwrap(), "open pw"), key);
+
+    // A file open in another tab is only written over when that tab has nothing unsaved, and the
+    // tab then closes rather than go on showing the old file.
+    let c = plain(&dir, "c.pdf", &["C"]);
+    let c_before = std::fs::read(&c).unwrap();
+    app.open_path(&c);
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    app.activate(Some(0));
+    app.protect_to(&c, &options);
+    assert_eq!(std::fs::read(&c).unwrap(), c_before, "a file with unsaved changes in another tab was replaced");
+    app.dialog = None;
+    app.activate(Some(1));
+    app.save();
+    app.activate(Some(0));
+    let tabs = app.tabs.len();
+    app.protect_to(&c, &options);
+    assert!(matches!(Pdf::from_bytes(&std::fs::read(&c).unwrap()), Err(carbide_engine::Error::PasswordRequired)));
+    assert_eq!(app.tabs.len(), tabs - 1);
+
+    // Nothing goes into the recovery folder.
+    let private = dir.join("AutoSave").join("copy.pdf");
+    app.protect_to(&private, &options);
+    assert!(!private.exists());
+
+    // A protected document protected again over its own file goes on with the new passwords.
+    let locked = protected(&dir, "locked.pdf", &["LOCKED"], "old pw");
+    assert!(app.open_with_password(locked.clone(), std::fs::read(&locked).unwrap(), "old pw".into()));
+    app.protect_to(&locked, &ProtectionOptions::new("new pw", "new owner"));
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    app.save();
+    let saved = std::fs::read(&locked).unwrap();
+    assert!(Pdf::from_bytes_with_password(&saved, "old pw").is_err(), "the old password still opens it");
+    assert_eq!(Pdf::from_bytes_with_password(&saved, "new pw").unwrap().page_rotation(0).unwrap(), 90);
+}
+
+/// The heading the Signatures dialog on screen shows, if it is on screen.
+fn signatures_heading(app: &CarbideApp) -> Option<String> {
+    match &app.dialog {
+        Some(Dialog::Signatures { notice, .. }) => Some(app.about_saved_file(notice)),
+        _ => None,
+    }
+}
+
+#[test]
+fn signature_results_on_screen_follow_edits_and_close_when_the_file_is_written() {
+    let dir = scratch();
+    let signed = with_signature(&dir, "signed.pdf", &["SIGNED"]);
+    let mut app = app(&dir);
+    app.open_path(&signed);
+
+    // Checked with nothing unsaved, then edited with the results still up: they say the edit is
+    // not covered.
+    app.validate_signatures();
+    let summary = signatures_heading(&app).expect("the signatures are shown");
+    assert!(!summary.contains(crate::UNSAVED_CHANGES_NOT_SIGNED), "{summary}");
+    app.edit("Rotate", |p| p.rotate_pages(&[0], 90));
+    assert_eq!(signatures_heading(&app), Some(format!("{summary} {}", crate::UNSAVED_CHANGES_NOT_SIGNED)));
+
+    // Saving writes a new file, which the results are not about: they close, waiting ones too.
+    app.validate_signatures();
+    app.queued_dialogs.push_back(Dialog::Signatures { doc: active_id(&app), reports: Vec::new(), notice: summary });
+    app.save();
+    assert!(!app.doc.as_ref().unwrap().dirty);
+    assert!(signatures_heading(&app).is_none());
+    assert!(!app.queued_dialogs.iter().any(|d| matches!(d, Dialog::Signatures { .. })));
+}
+
+#[test]
+fn files_made_from_a_document_never_replace_an_open_one() {
+    let dir = scratch();
+    let a = plain(&dir, "a.pdf", &["ONE", "TWO", "THREE"]);
+    let b = plain(&dir, "b.pdf", &["B"]);
+    let (a_before, b_before) = (std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+    let mut app = app(&dir);
+    app.open_path(&b);
+    app.open_path(&a);
+
+    // Its own file, and that of another tab, are refused; the documents stay what is on disk.
+    for target in [&a, &b] {
+        app.extract_page_to(0, target);
+        assert!(matches!(app.dialog.take(), Some(Dialog::Message(m)) if m.contains("is open")), "{}", target.display());
+        let options = carbide_engine::imposition::ImpositionOptions::default();
+        assert!(app.impose_to(&options, target).is_err_and(|m| m.contains("is open")), "{}", target.display());
+    }
+    assert_eq!(std::fs::read(&a).unwrap(), a_before);
+    assert_eq!(std::fs::read(&b).unwrap(), b_before);
+    assert_eq!(app.doc.as_ref().unwrap().pdf.page_count(), 3);
+
+    // Split parts that would replace an open file are refused too.
+    let part = dir.join("a-pages-1-1.pdf");
+    std::fs::write(&part, &b_before).unwrap();
+    app.open_path(&part);
+    app.activate(Some(1));
+    app.split_into(dir.clone(), "1", Some(carbide_engine::fs::Existing::Replace));
+    assert!(matches!(app.dialog.take(), Some(Dialog::Message(m)) if m.contains("is open")));
+    assert_eq!(std::fs::read(&part).unwrap(), b_before);
+
+    // Anywhere else is written.
+    let c = dir.join("c.pdf");
+    app.extract_page_to(1, &c);
+    assert_eq!(Pdf::open(&c).unwrap().page_count(), 1);
+}
