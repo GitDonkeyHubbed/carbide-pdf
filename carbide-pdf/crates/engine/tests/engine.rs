@@ -6408,11 +6408,16 @@ fn tampering_with_a_signed_file_comes_out_invalid() {
     // The /Contents value is changed in place (a hex digit flipped), offsets untouched.
     let mut swapped = signed.clone();
     swapped[b + 1] = if swapped[b + 1] == b'0' { b'1' } else { b'0' };
-    assert_ne!(
-        verify(&swapped, &trust_test_identity())[0].validity,
-        Validity::Valid,
+    let reports = verify(&swapped, &trust_test_identity());
+    assert_eq!(
+        (reports[0].validity, reports[0].detail),
+        (Validity::Invalid, Detail::Corrupt),
         "altered /Contents"
     );
+    assert_eq!(reports[0].status_line(), sig_messages::INVALID);
+    assert!(reports[0]
+        .description_lines()
+        .contains(&sig_messages::CORRUPTED));
 }
 
 /// The signature dictionary's object number, read from its `N 0 obj` header before `/ByteRange`.
@@ -6815,7 +6820,7 @@ mod algo {
 }
 
 /// A detached CMS SignedData with one signer, no signed attributes: the signature covers the
-/// content directly. `cert_der` is embedded and named as the signer.
+/// content directly. `cert_der` is embedded and named as the signer by issuer and serial number.
 fn detached_cms(
     cert_der: &[u8],
     digest_oid: &[u32],
@@ -6829,14 +6834,37 @@ fn detached_cms(
     let issuer = cert.tbs_certificate.issuer.to_der().unwrap();
     let serial = cert.tbs_certificate.serial_number.to_der().unwrap();
     let issuer_and_serial = seq(&[&issuer, &serial]);
+    detached_cms_for(
+        &[cert_der],
+        &issuer_and_serial,
+        1,
+        digest_oid,
+        sig_oid,
+        sig_params,
+        signature,
+    )
+}
+
+/// Like `detached_cms`, with every certificate in `certificates` embedded and the signer named by
+/// the already encoded `signer_id` (a SignerIdentifier), under SignerInfo `version`.
+fn detached_cms_for(
+    certificates: &[&[u8]],
+    signer_id: &[u8],
+    version: u8,
+    digest_oid: &[u32],
+    sig_oid: &[u32],
+    sig_params: Option<Vec<u8>>,
+    signature: &[u8],
+) -> Vec<u8> {
+    use algo::*;
     let digest_algo = seq(&[&oid(digest_oid), &null()]);
     let sig_algo = match sig_params {
         Some(params) => seq(&[&oid(sig_oid), &params]),
         None => seq(&[&oid(sig_oid)]),
     };
     let signer_info = seq(&[
-        &tlv(0x02, &[1]),
-        &issuer_and_serial,
+        &tlv(0x02, &[version]),
+        signer_id,
         &digest_algo,
         &sig_algo,
         &tlv(0x04, signature),
@@ -6845,7 +6873,7 @@ fn detached_cms(
         &tlv(0x02, &[1]),
         &set(&[&digest_algo]),
         &seq(&[&oid(&[1, 2, 840, 113549, 1, 7, 1])]), // id-data
-        &ctx(0, cert_der),
+        &ctx(0, &certificates.concat()),
         &set(&[&signer_info]),
     ]);
     seq(&[&oid(&[1, 2, 840, 113549, 1, 7, 2]), &ctx(0, &signed_data)]) // id-signedData
@@ -7296,8 +7324,17 @@ fn flipping_an_unsigned_algorithm_identifier_does_not_hide_tampering() {
         forged[position + 4] = b'9';
 
         let reports = verify(&forged, &trust_test_identity());
-        assert_ne!(reports[0].validity, Validity::Valid, "{sub_filter:?}");
+        // Not checkable, so neither valid nor claimed intact: "unknown", with the reason given.
+        assert_eq!(
+            (reports[0].validity, reports[0].detail),
+            (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm),
+            "{sub_filter:?}"
+        );
         let lines = reports[0].description_lines();
+        assert!(
+            lines.contains(&sig_messages::UNSUPPORTED_ALGORITHM),
+            "{sub_filter:?}: {lines:?}"
+        );
         assert!(
             !lines.contains(&sig_messages::NOT_MODIFIED)
                 && !lines.contains(&sig_messages::REVISION_UNALTERED),
@@ -7309,6 +7346,175 @@ fn flipping_an_unsigned_algorithm_identifier_does_not_hide_tampering() {
             "{sub_filter:?}"
         );
     }
+}
+
+/// The bytes inside a certificate's subjectKeyIdentifier extension.
+fn subject_key_identifier(cert_der: &[u8]) -> Vec<u8> {
+    use x509_cert::der::Decode;
+    let cert = x509_cert::Certificate::from_der(cert_der).unwrap();
+    let extensions = cert.tbs_certificate.extensions.unwrap();
+    let extension = extensions
+        .iter()
+        .find(|e| e.extn_id.to_string() == "2.5.29.14")
+        .expect("the certificate has a subjectKeyIdentifier");
+    // The extension value is an OCTET STRING wrapping the key identifier OCTET STRING.
+    let inner = extension.extn_value.as_bytes();
+    let (_, header, total) = der_header(inner);
+    inner[header..total].to_vec()
+}
+
+/// A fresh RSA key and a self-signed signing certificate for it, which carries a
+/// subjectKeyIdentifier.
+fn rsa_signer(common_name: &str) -> (rsa::RsaPrivateKey, Vec<u8>) {
+    let (pair, key) = rsa_key();
+    let params = cert_params(
+        common_name,
+        IsCa::ExplicitNoCa,
+        &[KeyUsagePurpose::DigitalSignature],
+    );
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+    (key, cert)
+}
+
+const RSA_ENCRYPTION_OID: &[u32] = &[1, 2, 840, 113549, 1, 1, 1];
+const SHA256_RSA_OID: &[u32] = &[1, 2, 840, 113549, 1, 1, 11];
+const SHA384_RSA_OID: &[u32] = &[1, 2, 840, 113549, 1, 1, 12];
+const SHA512_RSA_OID: &[u32] = &[1, 2, 840, 113549, 1, 1, 13];
+const SHA384_OID: &[u32] = &[2, 16, 840, 1, 101, 3, 4, 2, 2];
+const SHA512_OID: &[u32] = &[2, 16, 840, 1, 101, 3, 4, 2, 3];
+
+#[test]
+fn a_signer_named_by_subject_key_identifier_verifies() {
+    use rsa::signature::{SignatureEncoding, Signer};
+    let (key, cert) = rsa_signer("Key Identifier Signer");
+    let (_, decoy) = rsa_signer("Decoy Signer");
+    let key_id = subject_key_identifier(&cert);
+    assert_ne!(key_id, subject_key_identifier(&decoy));
+    assert!(!key_id.is_empty());
+
+    // Sign with an identity that has both certificates, so room is reserved for both.
+    let identity = Identity::new(vec![cert.clone(), decoy.clone()], key.clone()).unwrap();
+    let mut doc = text_pdf(&[&["named by key id"]]);
+    let base = file_bytes(&mut doc);
+    let options = SignOptions {
+        identity: Some(&identity),
+        signing_time: Some("D:20261001000000Z".into()),
+        ..Default::default()
+    };
+    let placeholder = doc.sign(&base, &options).unwrap();
+    let signature = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(key)
+        .sign(&covered_bytes(&placeholder))
+        .to_vec();
+    let trust = TrustStore {
+        certificates: vec![cert.clone()],
+    };
+    // SignerInfo version 3 and `[0] IMPLICIT SubjectKeyIdentifier`. The decoy comes first, so the
+    // signer is found by its key identifier and not by being the first certificate.
+    let check = |key_id: &[u8]| {
+        let cms = detached_cms_for(
+            &[&decoy, &cert],
+            &algo::tlv(0x80, key_id),
+            3,
+            SHA256_OID,
+            SHA256_RSA_OID,
+            None,
+            &signature,
+        );
+        let mut signed = placeholder.clone();
+        put_signature_value(&mut signed, &cms);
+        verify(&signed, &trust).remove(0)
+    };
+
+    let report = check(&key_id);
+    assert_eq!(
+        (report.validity, report.detail),
+        (Validity::Valid, Detail::TrustedDirectly)
+    );
+    assert_eq!(report.signer.as_deref(), Some("Key Identifier Signer"));
+    assert!(!report.modified_after_signing);
+
+    // A key identifier that names no embedded certificate does not verify against the decoy.
+    let mut other = key_id.clone();
+    other[0] ^= 0xFF;
+    let report = check(&other);
+    assert_eq!(
+        (report.validity, report.detail),
+        (Validity::Invalid, Detail::DigestMismatch)
+    );
+}
+
+#[test]
+fn rsa_signatures_with_sha384_and_sha512_digests_verify() {
+    use rsa::signature::{SignatureEncoding, Signer};
+    let (key, cert) = rsa_signer("SHA-2 Signer");
+    let trust = TrustStore {
+        certificates: vec![cert.clone()],
+    };
+    let mut doc = text_pdf(&[&["pay 100 dollars"]]);
+    let base = file_bytes(&mut doc);
+    let covered = covered_bytes(&resign_with(&doc, &base, &[0x30, 0x00]));
+    let sha384 = rsa::pkcs1v15::SigningKey::<sha2::Sha384>::new(key.clone())
+        .sign(&covered)
+        .to_vec();
+    let sha512 = rsa::pkcs1v15::SigningKey::<sha2::Sha512>::new(key)
+        .sign(&covered)
+        .to_vec();
+    let check = |digest: &[u32], algorithm: &[u32], signature: &[u8], tamper: bool| {
+        let cms = detached_cms(&cert, digest, algorithm, None, signature);
+        let mut signed = resign_with(&doc, &base, &cms);
+        if tamper {
+            let at = signed
+                .windows(11)
+                .position(|w| w == b"pay 100 dol")
+                .unwrap();
+            signed[at + 4] = b'9';
+        }
+        verify(&signed, &trust).remove(0)
+    };
+
+    // Named by a digest-specific OID, or by plain rsaEncryption with the digest from the SignerInfo.
+    for (label, digest, algorithm, signature) in [
+        ("SHA-384", SHA384_OID, SHA384_RSA_OID, &sha384),
+        (
+            "SHA-384 with rsaEncryption",
+            SHA384_OID,
+            RSA_ENCRYPTION_OID,
+            &sha384,
+        ),
+        ("SHA-512", SHA512_OID, SHA512_RSA_OID, &sha512),
+        (
+            "SHA-512 with rsaEncryption",
+            SHA512_OID,
+            RSA_ENCRYPTION_OID,
+            &sha512,
+        ),
+    ] {
+        let report = check(digest, algorithm, signature, false);
+        assert_eq!(
+            (report.validity, report.detail),
+            (Validity::Valid, Detail::TrustedDirectly),
+            "{label}"
+        );
+        assert!(!report.weak_algorithm, "{label}");
+        assert!(!report.modified_after_signing, "{label}");
+        assert_eq!(report.signer.as_deref(), Some("SHA-2 Signer"), "{label}");
+
+        // The same signature over a changed document.
+        let report = check(digest, algorithm, signature, true);
+        assert_eq!(
+            (report.validity, report.detail),
+            (Validity::Invalid, Detail::DigestMismatch),
+            "{label}, altered"
+        );
+    }
+
+    // A signature made with one digest does not pass for another.
+    let report = check(SHA512_OID, SHA512_RSA_OID, &sha384, false);
+    assert_eq!(
+        (report.validity, report.detail),
+        (Validity::Invalid, Detail::DigestMismatch),
+        "SHA-384 signature declared as SHA-512"
+    );
 }
 
 // ---- time stamps ---------------------------------------------------------------------------
