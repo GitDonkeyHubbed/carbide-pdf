@@ -228,3 +228,41 @@ fn what_follows_a_real_inline_image_is_still_read() {
     pdf.check_drawable(0).unwrap();
 }
 
+// ---- deleting pages ------------------------------------------------------------------------
+
+/// Zlib data that decodes to `megabytes` MB of zeros.
+fn zeros_deflated(megabytes: usize) -> Vec<u8> {
+    let mut encoder =
+        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    let block = vec![0u8; 1 << 20];
+    for _ in 0..megabytes {
+        encoder.write_all(&block).unwrap();
+    }
+    encoder.finish().unwrap()
+}
+
+#[test]
+fn deleting_pages_that_cannot_be_finished_leaves_the_document_as_it_was() {
+    let mut pdf = text_pdf(&["first", "second"]);
+    // The page that stays has content too large to read, so the resources cannot be trimmed.
+    let ids = pdf.page_ids();
+    let bomb = pdf.document_mut().add_object(Stream::new(
+        dictionary! { "Filter" => "FlateDecode" },
+        zeros_deflated(300),
+    ));
+    pdf.document_mut()
+        .get_dictionary_mut(ids[1])
+        .unwrap()
+        .set("Contents", Object::Reference(bomb));
+    let before = pdf.document().objects.clone();
+
+    let refused = pdf.delete_pages(&[0]);
+    assert!(matches!(refused, Err(Error::TooLarge(_))), "{refused:?}");
+    assert_eq!(pdf.page_count(), 2, "a page was deleted though it failed");
+    assert_eq!(
+        pdf.document().objects,
+        before,
+        "a refused deletion changed the document"
+    );
+}
+

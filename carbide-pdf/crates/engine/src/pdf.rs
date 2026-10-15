@@ -366,7 +366,7 @@ impl Pdf {
     /// Deletes pages. A document must keep at least one page. Nothing of a deleted page stays in
     /// the document: its form fields, its tags and the resources only it used go with it, and so do
     /// the outline items, named destinations and other entries that lead only to it. The pages that
-    /// stay keep their page labels.
+    /// stay keep their page labels. When this fails, the document is as it was.
     pub fn delete_pages(&mut self, pages: &[usize]) -> Result<()> {
         let count = self.page_count();
         let mut unique: Vec<usize> = pages.to_vec();
@@ -378,6 +378,18 @@ impl Pdf {
         if unique.len() >= count {
             return Err(Error::Other("a document needs at least one page".into()));
         }
+        // Reading what the remaining pages use can fail once the pages are gone.
+        let backup = self.doc.clone();
+        let result = self.remove_pages(&unique);
+        if result.is_err() {
+            self.doc = backup;
+        }
+        result
+    }
+
+    /// Removes the pages at the sorted, distinct, valid indices `unique` (see
+    /// [`Pdf::delete_pages`]), leaving the document half changed when it fails.
+    fn remove_pages(&mut self, unique: &[usize]) -> Result<()> {
         let ids = self.page_ids();
         let doomed: HashSet<ObjectId> = unique.iter().map(|&p| ids[p]).collect();
         let staying: HashSet<ObjectId> = ids
@@ -393,7 +405,7 @@ impl Pdf {
         });
         self.drop_structure_of(&doomed);
         self.drop_navigation_to(&doomed);
-        let labels = self.page_labels_without(&unique);
+        let labels = self.page_labels_without(unique);
         // The pages leave every /Kids and everything else that names them in one pass, and the
         // counts are taken again from the tree itself; nothing follows /Parent, which can loop.
         self.drop_references_to(&doomed);
