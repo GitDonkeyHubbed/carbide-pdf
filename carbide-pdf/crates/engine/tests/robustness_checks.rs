@@ -297,3 +297,68 @@ fn redaction_refuses_an_area_whose_far_corner_overflows() {
     assert_eq!(pdf.document().objects, before);
 }
 
+// ---- checks that refuse an operation -------------------------------------------------------
+
+/// Three pages whose second no longer says it is a page, so that PDFium counts other pages than
+/// the engine does, and an object nothing refers to, which saving drops.
+fn damaged_with_an_orphan() -> (Pdf, ObjectId) {
+    let mut pdf = text_pdf(&["AAA first", "BBB SECRET", "CCC third"]);
+    let ids = pdf.page_ids();
+    pdf.document_mut()
+        .get_dictionary_mut(ids[1])
+        .unwrap()
+        .remove(b"Type");
+    let orphan = pdf
+        .document_mut()
+        .add_object(dictionary! { "Orphan" => "unreferenced" });
+    (pdf, orphan)
+}
+
+#[test]
+fn a_refused_redaction_does_not_prune_the_document() {
+    let (mut pdf, orphan) = damaged_with_an_orphan();
+    let before = pdf.document().objects.clone();
+    let refused = pdf.apply_redactions(
+        renderer(),
+        &[Redaction {
+            page: 1,
+            rect: Rect::new(60.0, 692.0, 300.0, 28.0),
+        }],
+        150.0,
+    );
+    assert!(refused
+        .unwrap_err()
+        .to_string()
+        .contains("page tree is damaged"));
+    assert!(pdf.document().objects.contains_key(&orphan));
+    assert_eq!(
+        pdf.document().objects,
+        before,
+        "a refused redaction changed the document"
+    );
+}
+
+#[test]
+fn refused_text_recognition_does_not_prune_the_document() {
+    let (mut pdf, orphan) = damaged_with_an_orphan();
+    let before = pdf.document().objects.clone();
+    let options = OcrOptions {
+        models_dir: Some(ocr_models()),
+        pages: Some(vec![1]),
+        ..Default::default()
+    };
+    let refused = pdf.make_searchable(renderer(), &options);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("page tree is damaged")),
+        "{refused:?}"
+    );
+    assert!(pdf.document().objects.contains_key(&orphan));
+    assert_eq!(
+        pdf.document().objects,
+        before,
+        "refused text recognition changed the document"
+    );
+}
+

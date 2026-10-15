@@ -90,6 +90,12 @@ impl Pdf {
         Ok(out)
     }
 
+    /// The bytes [`Pdf::to_bytes`] gives, without pruning or otherwise changing this document: for
+    /// a check that has to leave it as it was when it refuses what it was asked.
+    pub(crate) fn serialized(&self) -> Result<Vec<u8>> {
+        self.clone().to_bytes()
+    }
+
     /// Writes the document to `path` as [`Pdf::to_file_bytes`] does, replacing a file there in one
     /// step: a document that carries a protection is written encrypted with it. One protected with
     /// an open password needs that password, given to `to_file_bytes`.
