@@ -314,6 +314,49 @@ fn unused_image_deep_in_nested_forms_does_not_survive() {
     ));
 }
 
+#[test]
+fn default_colour_spaces_stay_with_content_that_paints_in_device_colours() {
+    // `rg`, `g` and `k` paint in the device colour spaces, which the page's /DefaultRGB,
+    // /DefaultGray and /DefaultCMYK stand in for without the content naming them.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let image = secret_image(doc);
+            let profile = |doc: &mut Document, marker: &str, n: i64| {
+                let stream = doc.add_object(Stream::new(
+                    dictionary! { "N" => n },
+                    marker.as_bytes().to_vec(),
+                ));
+                Object::Array(vec![Object::Name(b"ICCBased".to_vec()), stream.into()])
+            };
+            let rgb = profile(doc, "PROFILE-RGB", 3);
+            let gray = profile(doc, "PROFILE-GRAY", 1);
+            let cmyk = profile(doc, "PROFILE-CMYK", 4);
+            dictionary! {
+                "ColorSpace" => dictionary! {
+                    "DefaultRGB" => rgb, "DefaultGray" => gray, "DefaultCMYK" => cmyk,
+                },
+                "XObject" => dictionary! { "Im1" => image },
+            }
+        },
+        &[
+            "1 0 0 rg 0 0 10 10 re f 0.5 g 0 10 10 10 re f 0 0 0 1 k 10 0 10 10 re f",
+            "q 100 0 0 100 0 0 cm /Im1 Do Q",
+        ],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    for marker in [&b"PROFILE-RGB"[..], b"PROFILE-GRAY", b"PROFILE-CMYK"] {
+        assert!(
+            contains(&saved, marker),
+            "the kept page lost a default colour space"
+        );
+    }
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+}
+
 // ---- legacy passwords ----------------------------------------------------------------------
 
 const PADDING: [u8; 32] = [

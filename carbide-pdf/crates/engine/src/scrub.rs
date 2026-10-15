@@ -34,6 +34,10 @@ const NAMED_RESOURCES: [&[u8]; 7] = [
     PROPERTIES,
 ];
 
+/// Colour spaces that stand in for the device ones (`rg`, `g`, `k`, an image in `/DeviceRGB`)
+/// without content naming them; kept wherever they are.
+const DEFAULT_SPACES: [&[u8]; 3] = [b"DefaultGray", b"DefaultRGB", b"DefaultCMYK"];
+
 /// The resources content uses: each name with the category it is looked up in. A font `/R1`
 /// does not keep an image that is also called `/R1`.
 type Uses = HashSet<(&'static [u8], Vec<u8>)>;
@@ -468,7 +472,8 @@ impl Pdf {
         }
     }
 
-    /// `resources` with only the named entries in `uses`, as a direct dictionary.
+    /// `resources` with only the named entries in `uses` and the default colour spaces, as a
+    /// direct dictionary.
     fn keep_named(&self, resources: &Dictionary, uses: &Uses) -> Dictionary {
         let mut kept = Dictionary::new();
         for (key, value) in resources.iter() {
@@ -482,7 +487,10 @@ impl Pdf {
             };
             let used: Dictionary = entries
                 .iter()
-                .filter(|(name, _)| uses.contains(&(category, name.to_vec())))
+                .filter(|(name, _)| {
+                    uses.contains(&(category, name.to_vec()))
+                        || (category == COLOR_SPACE && DEFAULT_SPACES.contains(&name.as_slice()))
+                })
                 .map(|(n, v)| (n.clone(), v.clone()))
                 .collect();
             if !used.is_empty() {
