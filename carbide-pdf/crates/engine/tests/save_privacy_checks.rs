@@ -331,3 +331,80 @@ fn protections_that_encrypt_strings_differently_are_not_the_same() {
     assert!(Pdf::shared_protection(&[&sealed, &clear]).is_err());
     assert!(a.same_as(&sealed.protection().unwrap()));
 }
+
+// ---- the report of Remove Hidden Information -------------------------------------------------
+
+/// A one-page document; `edit` adds to it, given the catalog's and the page's ids.
+fn one_page(edit: impl FnOnce(&mut Document, lopdf::ObjectId, lopdf::ObjectId)) -> Pdf {
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(
+            dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 },
+        ),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    edit(&mut doc, catalog, page);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
+#[test]
+fn removals_that_were_the_only_hidden_information_are_reported() {
+    use carbide_engine::HiddenItem;
+
+    let mut pdf = one_page(|doc, _, page| {
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("LastModified", Object::string_literal("D:20240101000000Z"));
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::PrivateData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::PrivateData), 1);
+
+    let mut pdf = one_page(|doc, catalog, _| {
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("Collection", dictionary! { "View" => "D" });
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::Attachments])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::Attachments), 1);
+
+    // A check box shown checked and a text field showing text, neither holding a value.
+    let mut pdf = one_page(|doc, catalog, page| {
+        let shown = doc.add_object(Stream::new(
+            dictionary! { "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()] },
+            b"BT (typed) Tj ET".to_vec(),
+        ));
+        let check = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Btn", "T" => Object::string_literal("c"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page, "AS" => "Yes",
+        });
+        let text = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx", "T" => Object::string_literal("t"),
+            "Rect" => vec![0.into(), 20.into(), 10.into(), 30.into()], "P" => page,
+            "AP" => dictionary! { "N" => shown },
+        });
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![check.into(), text.into()]);
+        doc.get_dictionary_mut(catalog).unwrap().set(
+            "AcroForm",
+            dictionary! { "Fields" => vec![check.into(), text.into()] },
+        );
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 2);
+}
