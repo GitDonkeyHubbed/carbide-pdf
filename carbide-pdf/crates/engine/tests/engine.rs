@@ -4783,19 +4783,23 @@ fn an_embedded_time_stamp_is_reported_only_when_it_verifies() {
     let lines = reports[0].description_lines();
     assert!(lines.contains(&sig_messages::TIME_STAMP_UNCONFIRMED) && !lines.contains(&sig_messages::TIME_STAMPED));
 
-    // A token over something else says nothing about a time stamp.
+    // A token over something else gives no time stamp, and is said not to verify.
     let wrong = WrongImprint(tsa);
     let mut options = sign_options(SubFilter::Pkcs7Detached);
     options.timestamp = Some(&wrong);
     let reports = verify(&doc.sign(&base, &options).unwrap(), &tsa_trust());
     assert_eq!(reports[0].validity, Validity::Valid);
     assert!(!reports[0].has_embedded_timestamp && reports[0].time_stamp_time.is_none());
+    assert!(reports[0].embedded_timestamp_failed);
     let lines = reports[0].description_lines();
     assert!(!lines.contains(&sig_messages::TIME_STAMPED) && !lines.contains(&sig_messages::TIME_STAMP_UNCONFIRMED));
+    assert!(lines.contains(&sig_messages::TIME_STAMP_NOT_VERIFIED), "{lines:?}");
 
     // A signature with no time stamp says nothing about one.
     let plain = doc.sign(&base, &sign_options(SubFilter::Pkcs7Detached)).unwrap();
-    assert!(!verify(&plain, &trust_test_identity())[0].has_embedded_timestamp);
+    let report = verify(&plain, &trust_test_identity()).remove(0);
+    assert!(!report.has_embedded_timestamp && !report.embedded_timestamp_failed);
+    assert!(!report.description_lines().contains(&sig_messages::TIME_STAMP_NOT_VERIFIED));
 }
 
 #[test]

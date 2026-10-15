@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use carbide_engine::signature::{Identity, SignOptions};
+use carbide_engine::signature::{Identity, SignOptions, TimestampSource};
 use carbide_engine::{Error, Pdf, ProtectionOptions};
 
 fn carbide(args: &[&str]) -> Output {
@@ -586,6 +586,24 @@ fn verify_succeeds_only_when_every_signature_is_valid() {
         let output = carbide(&args.iter().map(String::as_str).collect::<Vec<_>>());
         assert_eq!(output.status.code(), Some(status), "{label}: {}{}", stdout(&output), stderr(&output));
     }
+    // A time stamp inside a signature that does not verify is said not to, and not used: the
+    // status is that of the signature.
+    struct Damaged;
+    impl TimestampSource for Damaged {
+        fn token_for_digest(&self, _digest: &[u8; 32]) -> carbide_engine::Result<Vec<u8>> {
+            Ok(vec![0x30, 0x03, 0x02, 0x01, 0x01])
+        }
+    }
+    let mut pdf = Pdf::new();
+    pdf.insert_blank_page(0, Some((612.0, 792.0))).unwrap();
+    let base = pdf.to_bytes().unwrap();
+    let options = SignOptions { identity: Some(&signer), timestamp: Some(&Damaged), ..Default::default() };
+    let stamped = write("damaged-stamp.pdf", &Pdf::from_bytes(&base).unwrap().sign(&base, &options).unwrap());
+    let output = carbide(&["verify", stamped.to_str().unwrap(), "--trust", trusted.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{}{}", stdout(&output), stderr(&output));
+    assert!(stdout(&output).contains("time stamp that could not be verified"), "{}", stdout(&output));
+    assert!(!stdout(&output).contains("  time stamp"), "{}", stdout(&output));
+
     // A command line that is wrong.
     assert_eq!(carbide(&["verify"]).status.code(), Some(2));
     // The statuses are described in the help.

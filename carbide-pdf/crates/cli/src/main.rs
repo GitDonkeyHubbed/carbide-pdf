@@ -47,16 +47,20 @@ mod verify_status {
 }
 
 const VERIFY_EXIT_STATUS: &str = "Exit status:
-  0  The file is signed, and every signature and time stamp in it is valid: intact, from a
-     certificate that is trusted (given with --trust, or issued through a chain of certificates
-     that leads to one), valid and allowed to sign. Nothing was added after the last signature.
+  0  The file is signed, and every signature and document time stamp in it is valid: intact,
+     from a certificate that is trusted (given with --trust, or issued through a chain of
+     certificates that leads to one), valid and allowed to sign. Nothing was added after the
+     last signature.
   1  The file could not be checked: it cannot be read, or it needs --password.
   2  The command line is wrong.
   3  At least one signature is invalid: it is damaged, or what it signed was changed.
-  4  No signature is invalid, but not all of them are proven valid: a signer or time stamp
-     authority is not trusted, a certificate has expired or may not sign, an algorithm cannot
-     be checked, or the file was changed after the last signature.
-  5  The file has no signatures.";
+  4  No signature is invalid, but not all of them are proven valid: a signer or the authority
+     of a document time stamp is not trusted, a certificate has expired or may not sign, an
+     algorithm cannot be checked, or the file was changed after the last signature.
+  5  The file has no signatures.
+A time stamp carried inside a signature only decides when that signature's certificates are
+checked: one that does not verify, or whose authority is not trusted, is reported and not used,
+and certificates are then checked as of now.";
 
 #[derive(Parser)]
 #[command(name = "carbide", version, about = "Carbide PDF: edit, protect, impose and reduce PDF files")]
@@ -1140,8 +1144,8 @@ fn run(cli: Cli) -> Result<(), Failure> {
 }
 
 /// What `verify` exits with when not every signature is valid (see [`VERIFY_EXIT_STATUS`]);
-/// `None` when the file is signed and every signature and time stamp holds, is trusted, and the
-/// last one covers the whole file.
+/// `None` when the file is signed and every signature and document time stamp holds, is trusted,
+/// and the last one covers the whole file.
 fn verify_outcome(reports: &[SignatureReport]) -> Option<Outcome> {
     let signed: Vec<&SignatureReport> = reports.iter().filter(|r| r.validity != Validity::Blank).collect();
     let outcome = |status, message| Some(Outcome { status, message });

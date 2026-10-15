@@ -72,6 +72,8 @@ pub mod messages {
     pub const FIELD_ALREADY_SIGNED: &str = "This field has already been signed.";
     pub const TIME_STAMPED: &str = "The signature carries a time stamp.";
     pub const TIME_STAMP_UNCONFIRMED: &str = "The signature carries a time stamp, but its authority is not confirmed.";
+    pub const TIME_STAMP_NOT_VERIFIED: &str =
+        "The signature carries a time stamp that could not be verified, so its time was not used.";
 }
 
 // ---- identity ------------------------------------------------------------------------------
@@ -902,6 +904,9 @@ pub struct SignatureReport {
     pub has_embedded_timestamp: bool,
     /// ...and that time stamp's authority is trusted.
     pub embedded_timestamp_trusted: bool,
+    /// The signature carries a time stamp that does not verify: it covers other data, is damaged,
+    /// or uses an algorithm this build cannot check. Its time is not used.
+    pub embedded_timestamp_failed: bool,
     /// The signature uses SHA-1, reported as a weak-algorithm note.
     pub weak_algorithm: bool,
     /// File offset where this signature's revision ends (for ordering).
@@ -942,6 +947,7 @@ impl SignatureReport {
             document_time_stamp: false,
             has_embedded_timestamp: false,
             embedded_timestamp_trusted: false,
+            embedded_timestamp_failed: false,
             weak_algorithm: false,
             revision_end: 0,
         }
@@ -1019,6 +1025,8 @@ impl SignatureReport {
             }
         } else if self.has_embedded_timestamp {
             lines.push(if self.embedded_timestamp_trusted { messages::TIME_STAMPED } else { messages::TIME_STAMP_UNCONFIRMED });
+        } else if self.embedded_timestamp_failed {
+            lines.push(messages::TIME_STAMP_NOT_VERIFIED);
         }
         lines
     }
@@ -1679,11 +1687,15 @@ fn verify_one(
     let embedded = cms::unsigned_attribute(signer_info, cms::OID_SIGNATURE_TIMESTAMP)
         .map(|token| check_timestamp_token(token, &[&signer_info.signature], trust, now));
     let mut timestamp_time = None;
-    if let Some(TokenResult::Verified { time, standing, .. }) = embedded {
-        report.has_embedded_timestamp = true;
-        report.embedded_timestamp_trusted = is_trusted(standing);
-        report.time_stamp_time = Some(pdf_date(time));
-        timestamp_time = report.embedded_timestamp_trusted.then_some(time);
+    match embedded {
+        Some(TokenResult::Verified { time, standing, .. }) => {
+            report.has_embedded_timestamp = true;
+            report.embedded_timestamp_trusted = is_trusted(standing);
+            report.time_stamp_time = Some(pdf_date(time));
+            timestamp_time = report.embedded_timestamp_trusted.then_some(time);
+        }
+        Some(_) => report.embedded_timestamp_failed = true,
+        None => {}
     }
 
     // 5. Trust and validity period, at the time a trusted time stamp gives, otherwise now. The
