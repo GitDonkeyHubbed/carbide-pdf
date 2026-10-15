@@ -401,6 +401,70 @@ fn a_signer_identifier_that_names_no_embedded_certificate_is_not_valid() {
     assert_eq!(report.signer, None);
 }
 
+// ---- RSA-PSS keys --------------------------------------------------------------------------
+
+fn pss_params(hash: &[u32], salt: u8) -> Vec<u8> {
+    let hash = seq(&[&oid(hash), &null()]);
+    seq(&[
+        &ctx(0, &hash),
+        &ctx(1, &seq(&[&oid(&[1, 2, 840, 113549, 1, 1, 8]), &hash])),
+        &ctx(2, &[0x02, 0x01, salt]),
+    ])
+}
+
+#[test]
+fn an_rsa_pss_key_restricted_to_other_parameters_does_not_verify_the_signature() {
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    let key_with = |parameters: Option<Vec<u8>>| {
+        let mut certificate = x509_cert::Certificate::from_der(&signer().cert).unwrap();
+        certificate
+            .tbs_certificate
+            .subject_public_key_info
+            .algorithm = x509_cert::spki::AlgorithmIdentifierOwned {
+            oid: "1.2.840.113549.1.1.10".parse().unwrap(),
+            parameters: parameters.map(|p| x509_cert::der::Any::from_der(&p).unwrap()),
+        };
+        certificate.to_der().unwrap()
+    };
+    // A SHA-256 PSS signature with a 32-byte salt, under a key that allows it or not.
+    let with = |cert: Vec<u8>| {
+        let file = signed_with(SubFilter::Pkcs7Detached, |covered| {
+            let signature = rsa::pss::SigningKey::<Sha256>::new(signer().key.clone())
+                .sign_with_rng(&mut rand::rngs::OsRng, covered)
+                .to_vec();
+            signed_data(
+                &[&cert],
+                &signer_id(&cert, None),
+                &seq(&[&oid(DATA_OID)]),
+                None,
+                &seq(&[&oid(RSA_PSS_OID), &pss_params(SHA256_OID, 32)]),
+                &signature,
+            )
+        });
+        let trust = TrustStore {
+            certificates: vec![cert.clone()],
+        };
+        verify(&file, &trust).remove(0).validity
+    };
+    assert_eq!(with(key_with(None)), Validity::Valid);
+    assert_eq!(
+        with(key_with(Some(pss_params(SHA256_OID, 32)))),
+        Validity::Valid
+    );
+    assert_eq!(
+        with(key_with(Some(pss_params(SHA256_OID, 20)))),
+        Validity::Valid
+    );
+    assert_eq!(
+        with(key_with(Some(pss_params(SHA384_OID, 48)))),
+        Validity::Invalid
+    );
+    assert_eq!(
+        with(key_with(Some(pss_params(SHA256_OID, 64)))),
+        Validity::Invalid
+    );
+}
+
 // ---- time stamps ---------------------------------------------------------------------------
 
 /// An RFC 3161 authority using the test signer's key, whose tokens give `gen_time`.
