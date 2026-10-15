@@ -100,13 +100,67 @@ fn link_new(temp: &Path, path: &Path) -> io::Result<()> {
     match fs::hard_link(temp, path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(taken()),
-        // A file system without hard links: look first, then rename, which leaves a short window.
-        Err(_) => {
-            if fs::symlink_metadata(path).is_ok() {
-                return Err(taken());
-            }
-            fs::rename(temp, path)
+        // A file system without hard links: rename, in a way that fails if the name is taken.
+        // Looking first and renaming after would replace a file made in between.
+        Err(_) => match rename_no_replace(temp, path) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(taken()),
+            other => other,
+        },
+    }
+}
+
+/// Renames `from` to `to` in one step, and fails with `AlreadyExists` instead of replacing
+/// whatever is at `to`, a link included. Where the system or the file system cannot do that, it
+/// fails with `Unsupported`: a name is never given up to a rename that might replace a file.
+pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = |path: &Path| {
+            CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path holds a NUL"))
+        };
+        let (from_c, to_c) = (c_path(from)?, c_path(to)?);
+        #[cfg(target_os = "macos")]
+        // SAFETY: both are NUL-terminated paths that live through the call.
+        let result = unsafe { libc::renamex_np(from_c.as_ptr(), to_c.as_ptr(), libc::RENAME_EXCL) };
+        #[cfg(target_os = "linux")]
+        // SAFETY: both are NUL-terminated paths that live through the call. RENAME_NOREPLACE is 1.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from_c.as_ptr(),
+                libc::AT_FDCWD,
+                to_c.as_ptr(),
+                1 as libc::c_uint,
+            )
+        };
+        if result == 0 {
+            return Ok(());
         }
+        let error = io::Error::last_os_error();
+        Err(match error.raw_os_error() {
+            Some(code) if code == libc::ENOTSUP || code == libc::EINVAL || code == libc::ENOSYS => {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "{} cannot be given a new name without risk of replacing a file",
+                        to.display()
+                    ),
+                )
+            }
+            _ => error,
+        })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (from, to);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this system cannot give a file a new name without risk of replacing another",
+        ))
     }
 }
 

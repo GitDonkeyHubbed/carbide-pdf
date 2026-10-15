@@ -76,3 +76,32 @@ fn moving_a_page_of_a_document_without_page_labels_adds_none() {
     pdf.move_page(0, 2).unwrap();
     assert!(!pdf.document().catalog().unwrap().has(b"PageLabels"));
 }
+
+#[test]
+fn a_file_is_renamed_only_to_a_name_nothing_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let from = dir.path().join("from.pdf");
+    let to = dir.path().join("to.pdf");
+    std::fs::write(&from, b"new").unwrap();
+
+    // Free: the file moves.
+    carbide_engine::fs::rename_no_replace(&from, &to).unwrap();
+    assert!(!from.exists());
+    assert_eq!(std::fs::read(&to).unwrap(), b"new");
+
+    // Taken, by a file or by a link that leads nowhere: nothing is replaced.
+    std::fs::write(&from, b"newer").unwrap();
+    let error = carbide_engine::fs::rename_no_replace(&from, &to).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&to).unwrap(), b"new");
+    let dangling = dir.path().join("dangling.pdf");
+    std::os::unix::fs::symlink(dir.path().join("nowhere.pdf"), &dangling).unwrap();
+    let error = carbide_engine::fs::rename_no_replace(&from, &dangling).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(dangling
+        .symlink_metadata()
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(std::fs::read(&from).unwrap(), b"newer");
+}
