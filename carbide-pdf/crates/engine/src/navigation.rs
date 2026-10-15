@@ -458,6 +458,16 @@ impl Pdf {
     /// the labels they have now, as a new /PageLabels number tree. `None` when the document has no
     /// page labels.
     pub(crate) fn page_labels_without(&self, deleted: &[usize]) -> Option<Object> {
+        let kept: Vec<usize> = (0..self.page_count())
+            .filter(|page| deleted.binary_search(page).is_err())
+            .collect();
+        self.page_labels_for(&kept)
+    }
+
+    /// The page labels for pages arranged as `order` says: the page now at index `n` is the page
+    /// that is at index `order[n]` now, and keeps its label. `None` when the document has no page
+    /// labels.
+    pub(crate) fn page_labels_for(&self, order: &[usize]) -> Option<Object> {
         let tree = self.doc.catalog().ok()?.get(b"PageLabels").ok()?.clone();
         let mut pairs = Vec::new();
         collect_pairs(&self.doc, &tree, b"Nums", &mut pairs);
@@ -500,8 +510,7 @@ impl Pdf {
 
         let mut nums = Vec::new();
         let mut previous: Option<Label> = None;
-        let kept = (0..self.page_count()).filter(|page| deleted.binary_search(page).is_err());
-        for (new_index, old_index) in kept.enumerate() {
+        for (new_index, &old_index) in order.iter().enumerate() {
             let (name, prefix, number) = label(old_index);
             let continues = previous.as_ref().is_some_and(|(n, p, last)| {
                 *n == name && *p == prefix && (name.is_none() || *last + 1 == number)

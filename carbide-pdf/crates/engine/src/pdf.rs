@@ -487,6 +487,11 @@ impl Pdf {
             return Err(Error::PageOutOfRange { index: to, count });
         }
         self.flatten_page_tree()?;
+        // Each page keeps its page label, so the labels are laid out again for the new order.
+        let mut order: Vec<usize> = (0..count).collect();
+        let moved = order.remove(from);
+        order.insert(to, moved);
+        let labels = self.page_labels_for(&order);
         let root_id = self.pages_root()?;
         let kids = self
             .doc
@@ -495,6 +500,9 @@ impl Pdf {
             .as_array_mut()?;
         let item = kids.remove(from);
         kids.insert(to, item);
+        if let Some(labels) = labels {
+            self.doc.catalog_mut()?.set("PageLabels", labels);
+        }
         Ok(())
     }
 
