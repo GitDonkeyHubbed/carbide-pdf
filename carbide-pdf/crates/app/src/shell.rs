@@ -55,6 +55,9 @@ struct StartRow {
     size: Option<u64>,
 }
 
+/// The comment list for one document version, keyed by (active tab, document version).
+type CommentsCache = ((Option<usize>, u64), Vec<AnnotationSummary>);
+
 /// View state that belongs to the shell rather than to a document.
 pub struct ShellState {
     ribbon_tab: RibbonTab,
@@ -71,7 +74,7 @@ pub struct ShellState {
     /// the question is up moves the tabs along.
     pending_close: Option<u64>,
     locations: Vec<PathBuf>,
-    comments: Option<((Option<usize>, u64), Vec<AnnotationSummary>)>,
+    comments: Option<CommentsCache>,
     window_title: String,
     /// Asking what to do with unsaved documents before the window closes.
     quit_prompt: bool,

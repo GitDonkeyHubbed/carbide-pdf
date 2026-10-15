@@ -96,22 +96,19 @@ pub(crate) fn parse_pdf_date(text: &str) -> Option<chrono::DateTime<chrono::Utc>
 
     let mut offset_seconds = 0i32;
     let mut chars = tail.chars();
-    match chars.next() {
-        Some(sign @ ('+' | '-')) => {
-            let numbers: Vec<u32> = chars
-                .as_str()
-                .split(|c: char| !c.is_ascii_digit())
-                .filter(|s| !s.is_empty())
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            let (h, m) = (
-                numbers.first().copied().unwrap_or(0),
-                numbers.get(1).copied().unwrap_or(0),
-            );
-            let total = (h * 3600 + m * 60) as i32;
-            offset_seconds = if sign == '-' { -total } else { total };
-        }
-        _ => {}
+    if let Some(sign @ ('+' | '-')) = chars.next() {
+        let numbers: Vec<u32> = chars
+            .as_str()
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let (h, m) = (
+            numbers.first().copied().unwrap_or(0),
+            numbers.get(1).copied().unwrap_or(0),
+        );
+        let total = (h * 3600 + m * 60) as i32;
+        offset_seconds = if sign == '-' { -total } else { total };
     }
 
     let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(
@@ -278,7 +275,9 @@ pub fn revision_display_name(source_name: &str, revision: &Revision) -> String {
 pub(crate) fn decode_text(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xFE, 0xFF]) {
         let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         String::from_utf16_lossy(&units)

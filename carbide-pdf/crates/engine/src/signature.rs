@@ -503,7 +503,7 @@ fn build_cms(
             der::sequence(&[&der::sequence(&[&der::sequence(&[&der::octet_string(
                 &cert_hash,
             )])])]);
-        let mut attributes = vec![
+        let mut attributes = [
             attribute(OID_CONTENT_TYPE, &der::oid(OID_DATA)),
             attribute(OID_MESSAGE_DIGEST, &der::octet_string(content_digest)),
             attribute(OID_SIGNING_CERT_V2, &signing_cert),

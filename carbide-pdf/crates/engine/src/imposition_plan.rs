@@ -604,11 +604,7 @@ mod tests {
             layout,
             binding,
             style,
-            columns: if layout == LayoutKind::Booklet2Up {
-                2
-            } else {
-                2
-            },
+            columns: 2,
             rows: if layout == LayoutKind::Booklet2Up {
                 1
             } else {

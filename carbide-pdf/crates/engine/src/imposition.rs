@@ -415,7 +415,7 @@ impl Pdf {
             for row in 0..plate.rows {
                 let cell_y = options.margins.bottom
                     + (plate.rows - 1 - row) as f32 * (grid.cell_h + options.gutter_vertical);
-                for col in 0..plate.cols {
+                for (col, &column_left) in column_x.iter().enumerate() {
                     let cell = plate.cell(row, col);
                     cells_done += 1;
                     if let Some(callback) = progress.as_deref_mut() {
@@ -449,7 +449,7 @@ impl Pdf {
                         sy = sy.min(s);
                     }
                     let (draw_w, draw_h) = (pw * sx, ph * sy);
-                    let mut x = column_x[col] + (grid.cell_w - draw_w) / 2.0;
+                    let mut x = column_left + (grid.cell_w - draw_w) / 2.0;
                     let y = cell_y + (grid.cell_h - draw_h) / 2.0;
                     if options.creep != 0.0 && cell.creep_steps > 0 {
                         // Move toward the spine of this spread: even columns shift right, odd left.
@@ -583,12 +583,12 @@ fn draw_marks(
             let y0 = options.margins.bottom
                 + (plate.rows - 1 - row) as f32 * (grid.cell_h + options.gutter_vertical);
             let y1 = y0 + grid.cell_h;
-            for col in 0..plate.cols {
+            for (col, &column_left) in column_x.iter().enumerate().take(plate.cols) {
                 let outer_left = col == 0;
                 let outer_right = col == plate.cols - 1;
                 let outer_top = row == 0;
                 let outer_bottom = row == plate.rows - 1;
-                let (x0, x1) = (column_x[col], column_x[col] + grid.cell_w);
+                let (x0, x1) = (column_left, column_left + grid.cell_w);
                 for (x, vertical_outer_x) in [(x0, outer_left), (x1, outer_right)] {
                     for (y, horizontal_outer_y) in [(y0, outer_bottom), (y1, outer_top)] {
                         if !options.inner_marks && !(vertical_outer_x && horizontal_outer_y) {
@@ -878,8 +878,10 @@ mod tests {
 
     #[test]
     fn validation_uses_the_original_messages() {
-        let mut o = ImpositionOptions::default();
-        o.media = Media::None;
+        let mut o = ImpositionOptions {
+            media: Media::None,
+            ..Default::default()
+        };
         assert_eq!(o.validate().unwrap_err().to_string(), messages::NO_MEDIA);
         o.media = Media::Named("Letter".into());
         o.margins = Margins {

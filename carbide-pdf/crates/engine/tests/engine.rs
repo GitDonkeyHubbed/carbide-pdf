@@ -146,8 +146,8 @@ fn merge_extract_split_delete() {
     let b = text_pdf(&[&["B1"]]);
     let mut merged = Pdf::merge(&[&a, &b]).unwrap();
     assert_eq!(merged.page_count(), 3);
-    assert!(page_text(&r, &mut merged, 2).contains("B1"));
-    assert!(page_text(&r, &mut merged, 0).contains("A1"));
+    assert!(page_text(r, &mut merged, 2).contains("B1"));
+    assert!(page_text(r, &mut merged, 0).contains("A1"));
 
     let parts = merged.split(&[0..=0, 1..=2]).unwrap();
     assert_eq!(
@@ -157,12 +157,12 @@ fn merge_extract_split_delete() {
     assert_eq!(merged.split_every_page().unwrap().len(), 3);
 
     let mut picked = merged.extract_pages(&[2, 0]).unwrap();
-    assert!(page_text(&r, &mut picked, 0).contains("B1"));
-    assert!(page_text(&r, &mut picked, 1).contains("A1"));
+    assert!(page_text(r, &mut picked, 0).contains("B1"));
+    assert!(page_text(r, &mut picked, 1).contains("A1"));
 
     merged.delete_pages(&[0, 2]).unwrap();
     assert_eq!(merged.page_count(), 1);
-    assert!(page_text(&r, &mut merged, 0).contains("A2"));
+    assert!(page_text(r, &mut merged, 0).contains("A2"));
     assert!(
         merged.delete_pages(&[0]).is_err(),
         "must keep at least one page"
@@ -179,11 +179,11 @@ fn rotate_insert_move() {
 
     pdf.insert_blank_page(1, None).unwrap();
     assert_eq!(pdf.page_count(), 3);
-    assert_eq!(page_text(&r, &mut pdf, 1).trim(), "");
-    assert!(page_text(&r, &mut pdf, 2).contains("two"));
+    assert_eq!(page_text(r, &mut pdf, 1).trim(), "");
+    assert!(page_text(r, &mut pdf, 2).contains("two"));
 
     pdf.move_page(2, 0).unwrap();
-    let texts: Vec<String> = (0..3).map(|i| page_text(&r, &mut pdf, i)).collect();
+    let texts: Vec<String> = (0..3).map(|i| page_text(r, &mut pdf, i)).collect();
     assert!(texts[0].contains("two"), "page order after move: {texts:?}");
     assert!(texts[1].contains("one"), "page order after move: {texts:?}");
     assert_eq!(
@@ -211,17 +211,17 @@ fn page_ranges_parse_and_validate() {
 fn watermark_is_visible_and_keeps_structure() {
     let r = renderer();
     let mut pdf = text_pdf(&[&["Hello world"], &["Second page"]]);
-    let before = render(&r, &mut pdf, 0);
+    let before = render(r, &mut pdf, 0);
 
     let mut options = WatermarkOptions::new("CONFIDENTIAL");
     options.pages = Some(vec![0]);
     pdf.apply_watermark(&options).unwrap();
 
-    assert!(page_text(&r, &mut pdf, 0).contains("CONFIDENTIAL"));
-    assert!(page_text(&r, &mut pdf, 0).contains("Hello world"));
-    assert!(!page_text(&r, &mut pdf, 1).contains("CONFIDENTIAL"));
+    assert!(page_text(r, &mut pdf, 0).contains("CONFIDENTIAL"));
+    assert!(page_text(r, &mut pdf, 0).contains("Hello world"));
+    assert!(!page_text(r, &mut pdf, 1).contains("CONFIDENTIAL"));
 
-    let after = render(&r, &mut pdf, 0);
+    let after = render(r, &mut pdf, 0);
     let (x0, y0, x1, y1) = changed_bounds(&before, &after).expect("watermark changes pixels");
     // Diagonal watermark centered on the page: its bounds straddle the page center.
     assert!(
@@ -247,7 +247,7 @@ fn bates_numbers_are_sequential_and_positioned() {
     assert_eq!(options.label(0), "ABC-00041");
     pdf.apply_bates(&options).unwrap();
     for (i, expected) in ["ABC-00041", "ABC-00042", "ABC-00043"].iter().enumerate() {
-        assert!(page_text(&r, &mut pdf, i).contains(expected), "page {i}");
+        assert!(page_text(r, &mut pdf, i).contains(expected), "page {i}");
     }
 }
 
@@ -257,14 +257,14 @@ fn bates_lands_in_the_displayed_bottom_right_even_on_rotated_pages() {
     for rotation in [0, 90, 180, 270] {
         let mut pdf = text_pdf(&[&[]]);
         pdf.rotate_pages(&[0], rotation).unwrap();
-        let before = render(&r, &mut pdf, 0);
+        let before = render(r, &mut pdf, 0);
         let options = BatesOptions {
             anchor: PageAnchor::BottomRight,
             font_size: 14.0,
             ..Default::default()
         };
         pdf.apply_bates(&options).unwrap();
-        let after = render(&r, &mut pdf, 0);
+        let after = render(r, &mut pdf, 0);
         let (x0, y0, x1, y1) = changed_bounds(&before, &after).expect("label drawn");
         let (w, h) = (after.width(), after.height());
         assert!(
@@ -281,9 +281,9 @@ fn rotated_page_keeps_size_and_text() {
     let mut pdf = text_pdf(&[&["upright"]]);
     pdf.rotate_pages(&[0], 90).unwrap();
     pdf.apply_watermark(&WatermarkOptions::new("W")).unwrap();
-    let image = render(&r, &mut pdf, 0);
+    let image = render(r, &mut pdf, 0);
     assert_eq!((image.width(), image.height()), (792, 612));
-    assert!(page_text(&r, &mut pdf, 0).contains("upright"));
+    assert!(page_text(r, &mut pdf, 0).contains("upright"));
 }
 
 // ---- redaction -----------------------------------------------------------------------------
@@ -294,10 +294,10 @@ fn redaction_removes_content_from_the_file() {
     let mut pdf = text_pdf(&[&["TOP SECRET 12345", "public line"], &["page two stays"]]);
     // "TOP SECRET 12345" sits on the first baseline (y=700), 18 pt tall.
     let rect = Rect::new(60.0, 692.0, 300.0, 28.0);
-    pdf.apply_redactions(&r, &[Redaction { page: 0, rect }], 150.0)
+    pdf.apply_redactions(r, &[Redaction { page: 0, rect }], 150.0)
         .unwrap();
 
-    let text = page_text(&r, &mut pdf, 0);
+    let text = page_text(r, &mut pdf, 0);
     assert!(
         !text.contains("SECRET") && !text.contains("12345"),
         "extractable text remains: {text:?}"
@@ -306,7 +306,7 @@ fn redaction_removes_content_from_the_file() {
     // Nothing anywhere in the saved file may still carry the secret, decoded or not.
     let bytes = pdf.to_bytes().unwrap();
     let reloaded = Document::load_mem(&bytes).unwrap();
-    for (_, object) in reloaded.objects.iter() {
+    for object in reloaded.objects.values() {
         if let Object::Stream(stream) = object {
             let data = stream
                 .get_plain_content()
@@ -316,14 +316,14 @@ fn redaction_removes_content_from_the_file() {
     }
     assert!(!String::from_utf8_lossy(&bytes).contains("SECRET"));
 
-    let image = render(&r, &mut pdf, 0);
+    let image = render(r, &mut pdf, 0);
     assert!(
         brightness(&image, rect.inset(4.0)) < 10.0,
         "redaction box should be black"
     );
     // The unredacted line is still visible (page keeps its non-white pixels outside the box).
     assert!(brightness(&image, Rect::new(60.0, 662.0, 200.0, 28.0)) < 250.0);
-    assert!(page_text(&r, &mut pdf, 1).contains("page two stays"));
+    assert!(page_text(r, &mut pdf, 1).contains("page two stays"));
 }
 
 // ---- compare, export, security -------------------------------------------------------------
@@ -333,7 +333,7 @@ fn compare_reports_line_changes() {
     let r = renderer();
     let mut old = text_pdf(&[&["alpha", "beta"], &["same"]]);
     let mut new = text_pdf(&[&["alpha", "gamma"], &["same"], &["extra page"]]);
-    let diffs = compare_documents(&r, &mut old, &mut new).unwrap();
+    let diffs = compare_documents(r, &mut old, &mut new).unwrap();
     assert_eq!(diffs.len(), 3);
     assert_eq!(diffs[0].removed, vec!["beta"]);
     assert_eq!(diffs[0].added, vec!["gamma"]);
@@ -374,7 +374,7 @@ fn export_images_and_text() {
     )
     .unwrap();
     assert_eq!(image::open(&jpegs[1]).unwrap().width(), 612);
-    assert!(export_text(&r, &mut pdf).unwrap().contains("page two"));
+    assert!(export_text(r, &mut pdf).unwrap().contains("page two"));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -464,7 +464,7 @@ fn encryption_requires_the_password() {
         Err(Error::WrongPassword)
     ));
     let mut opened = Pdf::from_bytes_with_password(&encrypted, "open-sesame").unwrap();
-    assert!(page_text(&renderer(), &mut opened, 0).contains("private"));
+    assert!(page_text(renderer(), &mut opened, 0).contains("private"));
 }
 
 #[test]
@@ -513,7 +513,7 @@ fn annotations_render_and_survive_a_round_trip() {
     let r = renderer();
     let mut pdf = text_pdf(&[&["Highlight me please"]]);
     let line = Rect::new(72.0, 696.0, 190.0, 22.0);
-    let before = render(&r, &mut pdf, 0);
+    let before = render(r, &mut pdf, 0);
 
     pdf.add_markup(0, &[line], MarkupStyle::Highlight, None)
         .unwrap();
@@ -524,7 +524,7 @@ fn annotations_render_and_survive_a_round_trip() {
 
     let mut reopened = Pdf::from_bytes(&pdf.to_bytes().unwrap()).unwrap();
     assert_eq!(reopened.annotations(0).unwrap().len(), 3);
-    let after = render(&r, &mut reopened, 0);
+    let after = render(r, &mut reopened, 0);
 
     // Yellow highlight: blue channel drops well below red/green in the covered area.
     let probe = (line.x as u32 + 150, (792.0 - line.y - 3.0) as u32);
@@ -566,10 +566,10 @@ fn annotations_on_rotated_pages_stay_upright_and_in_place() {
     let r = renderer();
     let mut pdf = text_pdf(&[&[]]);
     pdf.rotate_pages(&[0], 90).unwrap();
-    let before = render(&r, &mut pdf, 0);
+    let before = render(r, &mut pdf, 0);
     // Display page is 792 wide x 612 tall; put the note near the displayed top-left.
     pdf.add_note(0, 40.0, 580.0, "n").unwrap();
-    let after = render(&r, &mut pdf, 0);
+    let after = render(r, &mut pdf, 0);
     let (x0, y0, x1, y1) = changed_bounds(&before, &after).expect("note drawn");
     assert!(
         x1 < 120 && y1 < 120,
@@ -603,9 +603,9 @@ fn incremental_update_appends_without_touching_the_original_bytes() {
     );
     let mut reloaded = Pdf::from_bytes(&updated).unwrap();
     assert_eq!(reloaded.page_count(), 2);
-    assert!(page_text(&r, &mut reloaded, 0).contains("DRAFT"));
-    assert!(page_text(&r, &mut reloaded, 1).contains("DRAFT"));
-    assert!(page_text(&r, &mut reloaded, 0).contains("original text"));
+    assert!(page_text(r, &mut reloaded, 0).contains("DRAFT"));
+    assert!(page_text(r, &mut reloaded, 1).contains("DRAFT"));
+    assert!(page_text(r, &mut reloaded, 0).contains("original text"));
 }
 
 #[test]
@@ -671,12 +671,12 @@ fn revisions_are_prefixes_of_the_file_and_open_as_they_were() {
     let first = open_revision_bytes(&v2, &list[0]).unwrap();
     assert_eq!(first, v1);
     let mut first_doc = Pdf::from_bytes(&first).unwrap();
-    assert!(page_text(&r, &mut first_doc, 0).contains("DRAFT"));
-    assert!(!page_text(&r, &mut first_doc, 0).contains("REV-"));
+    assert!(page_text(r, &mut first_doc, 0).contains("DRAFT"));
+    assert!(!page_text(r, &mut first_doc, 0).contains("REV-"));
 
     let mut latest = Pdf::from_bytes(&open_revision_bytes(&v2, &list[1]).unwrap()).unwrap();
-    assert!(page_text(&r, &mut latest, 0).contains("REV-000001"));
-    assert!(page_text(&r, &mut latest, 0).contains("DRAFT"));
+    assert!(page_text(r, &mut latest, 0).contains("REV-000001"));
+    assert!(page_text(r, &mut latest, 0).contains("DRAFT"));
 
     // A zero or oversized position does nothing useful.
     let mut broken = list[0].clone();
@@ -3013,9 +3013,9 @@ fn autosave_survives_restart_and_follows_the_removal_rules() {
     let loaded_id = rows[1].record;
     let (mut recovered, title) = store.open_recovered(loaded_id, None).unwrap();
     assert_eq!(title, "contract.pdf (recovered)");
-    assert!(page_text(&r, &mut recovered, 0).contains("unsaved work"));
+    assert!(page_text(r, &mut recovered, 0).contains("unsaved work"));
     assert!(
-        page_text(&r, &mut recovered, 0).contains("000001"),
+        page_text(r, &mut recovered, 0).contains("000001"),
         "recovery copy has the latest edits"
     );
 
@@ -3299,7 +3299,7 @@ fn booklet_sheets_hold_the_right_pages_in_the_right_order() {
         ("PAGE4X", "PAGE5X"),
     ];
     for (index, (left, right)) in expected.iter().enumerate() {
-        let text = page_text(&r, &mut booklet, index);
+        let text = page_text(r, &mut booklet, index);
         let (l, rr) = (text.find(left), text.find(right));
         assert!(l.is_some() && rr.is_some(), "sheet {index}: {text:?}");
         // The left page is drawn first, so its text comes first in content order.
@@ -3327,11 +3327,11 @@ fn step_and_repeat_and_blanks() {
     };
     let mut sheets = source.impose(&options, None).unwrap();
     assert_eq!(sheets.page_count(), 2);
-    let first = page_text(&r, &mut sheets, 0);
+    let first = page_text(r, &mut sheets, 0);
     for n in 1..=4 {
         assert!(first.contains(&format!("PAGE{n}X")), "{first:?}");
     }
-    let second = page_text(&r, &mut sheets, 1);
+    let second = page_text(r, &mut sheets, 1);
     assert!(
         second.contains("PAGE5X") && second.contains("PAGE6X") && !second.contains("PAGE1X"),
         "{second:?}"
@@ -3374,8 +3374,8 @@ fn four_up_inverts_the_top_row_and_flip_backs_rotates_back_sheets() {
         ..options.clone()
     };
     let mut upright = source.impose(&plain, None).unwrap();
-    assert_eq!(page_text(&r, &mut sheets, 0).matches("PAGE").count(), 4);
-    assert_eq!(page_text(&r, &mut upright, 0).matches("PAGE").count(), 4);
+    assert_eq!(page_text(r, &mut sheets, 0).matches("PAGE").count(), 4);
+    assert_eq!(page_text(r, &mut upright, 0).matches("PAGE").count(), 4);
 }
 
 #[test]
@@ -3398,8 +3398,8 @@ fn printing_order_changes_the_output_order() {
     // Plates 0,1,2,3 -> output 0,2,1,3 for "fronts first".
     for (output, plate) in [(0usize, 0usize), (1, 2), (2, 1), (3, 3)] {
         assert_eq!(
-            page_text(&r, &mut fronts_first, output),
-            page_text(&r, &mut interleaved, plate),
+            page_text(r, &mut fronts_first, output),
+            page_text(r, &mut interleaved, plate),
             "output {output} should be plate {plate}"
         );
     }
@@ -5438,7 +5438,7 @@ fn reduce_shrinks_photos_and_merges_duplicates() {
     let r = renderer();
     let mut pdf = photo_pdf();
     let before = file_bytes(&mut pdf).len();
-    let before_render = render(&r, &mut pdf, 0);
+    let before_render = render(r, &mut pdf, 0);
 
     let (reduced, report) = pdf.reduce(&ReduceOptions::default(), Some(before)).unwrap();
     assert!(
@@ -5474,7 +5474,7 @@ fn reduce_shrinks_photos_and_merges_duplicates() {
     assert!(widths[0] < 600 && widths[0] >= 300, "width {}", widths[0]);
 
     // And it still looks like the same picture.
-    let after_render = render(&r, &mut reloaded, 0);
+    let after_render = render(r, &mut reloaded, 0);
     let area = Rect::new(50.0, 500.0, 200.0, 150.0);
     let (a, b) = (
         brightness(&before_render, area),
@@ -6015,10 +6015,10 @@ fn dragged_regions_snap_to_text_lines_even_on_rotated_pages() {
             .iter()
             .max_by(|a, b| (a.y + a.height).partial_cmp(&(b.y + b.height)).unwrap())
             .unwrap();
-        let before = render(&r, &mut pdf, 0);
+        let before = render(r, &mut pdf, 0);
         pdf.add_markup(0, &[*first], MarkupStyle::Highlight, None)
             .unwrap();
-        let after = render(&r, &mut pdf, 0);
+        let after = render(r, &mut pdf, 0);
         let changed = changed_bounds(&before, &after).expect("highlight drawn");
         let centre = (
             first.x + first.width / 2.0,
@@ -6125,7 +6125,7 @@ fn signing_produces_a_verifiable_pkcs7_signature() {
 
     // The signed file is still an ordinary, readable PDF.
     let mut reopened = Pdf::from_bytes(&signed).unwrap();
-    assert!(page_text(&renderer(), &mut reopened, 0).contains("contract"));
+    assert!(page_text(renderer(), &mut reopened, 0).contains("contract"));
 }
 
 #[test]
@@ -6218,7 +6218,7 @@ fn later_edits_and_second_signatures_keep_earlier_signatures_valid() {
     assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_UPDATED));
 
     let mut final_doc = Pdf::from_bytes(&both).unwrap();
-    assert!(page_text(&r, &mut final_doc, 0).contains("000001"));
+    assert!(page_text(r, &mut final_doc, 0).contains("000001"));
 }
 
 #[test]
@@ -6226,13 +6226,13 @@ fn visible_signatures_draw_an_appearance_and_invisible_ones_do_not() {
     let r = renderer();
     let mut doc = text_pdf(&[&["page"]]);
     let base = file_bytes(&mut doc);
-    let before = render(&r, &mut doc, 0);
+    let before = render(r, &mut doc, 0);
 
     let mut options = sign_options(SubFilter::Pkcs7Detached);
     options.appearance = Some((0, Rect::new(300.0, 100.0, 240.0, 70.0)));
     let signed = doc.sign(&base, &options).unwrap();
     let mut visible = Pdf::from_bytes(&signed).unwrap();
-    let after = render(&r, &mut visible, 0);
+    let after = render(r, &mut visible, 0);
     let (x0, y0, x1, y1) = changed_bounds(&before, &after).expect("appearance drawn");
     assert!(
         x0 >= 295 && x1 <= 545 && y0 >= 792 - 175 && y1 <= 792 - 95,
@@ -6243,7 +6243,7 @@ fn visible_signatures_draw_an_appearance_and_invisible_ones_do_not() {
         .sign(&base, &sign_options(SubFilter::Pkcs7Detached))
         .unwrap();
     let mut invisible = Pdf::from_bytes(&hidden).unwrap();
-    assert!(changed_bounds(&before, &render(&r, &mut invisible, 0)).is_none());
+    assert!(changed_bounds(&before, &render(r, &mut invisible, 0)).is_none());
 }
 
 #[test]
@@ -9009,26 +9009,26 @@ fn ocr_adds_a_searchable_layer_without_changing_the_scan() {
     let r = renderer();
     let mut pdf = scanned_page(&["Invoice number 20481", "Total due 1250 dollars"]);
     assert!(
-        page_text(&r, &mut pdf, 0).trim().is_empty(),
+        page_text(r, &mut pdf, 0).trim().is_empty(),
         "the scan has no text to begin with"
     );
-    let before = render(&r, &mut pdf, 0);
+    let before = render(r, &mut pdf, 0);
 
     let options = OcrOptions {
         models_dir: Some(ocr_models()),
         ..Default::default()
     };
-    let report = pdf.make_searchable(&r, &options).unwrap();
+    let report = pdf.make_searchable(r, &options).unwrap();
     assert_eq!(report.recognized_pages, vec![0]);
     assert!(report.lines >= 2, "{report:?}");
 
-    let text = page_text(&r, &mut pdf, 0).to_lowercase();
+    let text = page_text(r, &mut pdf, 0).to_lowercase();
     assert!(text.contains("invoice"), "recognized text: {text:?}");
     assert!(text.contains("20481"), "recognized text: {text:?}");
     assert!(text.contains("1250"), "recognized text: {text:?}");
 
     // The picture itself is untouched: the invisible layer draws nothing.
-    let after = render(&r, &mut pdf, 0);
+    let after = render(r, &mut pdf, 0);
     assert!(
         changed_bounds(&before, &after).is_none(),
         "OCR text must be invisible"
@@ -9043,7 +9043,7 @@ fn ocr_skips_pages_that_already_have_text() {
         models_dir: Some(ocr_models()),
         ..Default::default()
     };
-    let report = pdf.make_searchable(&r, &options).unwrap();
+    let report = pdf.make_searchable(r, &options).unwrap();
     assert_eq!(report.skipped_pages, vec![0]);
     assert!(report.recognized_pages.is_empty());
 }
@@ -9058,7 +9058,7 @@ fn ocr_reports_missing_models_clearly() {
     };
     // Only fails if no other search location has them either.
     if std::env::var_os("CARBIDE_OCR_MODELS").is_none() {
-        let err = pdf.make_searchable(&r, &options).unwrap_err().to_string();
+        let err = pdf.make_searchable(r, &options).unwrap_err().to_string();
         assert!(
             err.contains("OCR models not found") || err.contains("page"),
             "{err}"
