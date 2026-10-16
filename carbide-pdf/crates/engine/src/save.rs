@@ -447,28 +447,35 @@ pub(crate) fn prune(doc: &mut Document) -> Vec<ObjectId> {
 
 /// How many updates were appended to the file `bytes`, read as `doc`. Counted by following the
 /// cross-reference sections' /Prev links back from the last one to the first; the link from a
-/// linearized file's first-page section to its main section is not an update. A start of zero
-/// means the cross-reference table had to be rebuilt, which leaves nothing to follow.
+/// linearized file's first-page section to its main section is not an update. That link points
+/// forward, at a section later in the file. An appended update points backward, and a dictionary
+/// that merely claims to be linearization data does not hide it. A start of zero means the
+/// cross-reference table had to be rebuilt, which leaves nothing to follow.
 fn appended_updates(bytes: &[u8], doc: &Document) -> usize {
+    let linearized = is_linearized(doc);
     let mut seen = HashSet::new();
     let mut at = doc.xref_start;
     let mut links = 0;
+    let mut linearization_link = false;
     while at != 0 && seen.insert(at) {
         match previous_section(bytes, at) {
             Some(previous) if previous < bytes.len() => {
                 links += 1;
+                if linearized && previous > at {
+                    linearization_link = true;
+                }
                 at = previous;
             }
             _ => break,
         }
     }
-    links - usize::from(is_linearized(doc) && links > 0)
+    links - usize::from(linearization_link)
 }
 
 /// True when the first object of the file is a linearization dictionary: one that starts within
-/// the first 1024 bytes and has the version and every entry the format requires. Text that merely
-/// reads `/Linearized` near the start of the file does not count, nor does a dictionary that
-/// names it without the rest.
+/// the first 1024 bytes, whose version is 1, and that has every entry the format requires. Text
+/// that merely reads `/Linearized` near the start of the file does not count, nor does a
+/// dictionary that names it without the rest, nor one whose version is anything but 1.
 fn is_linearized(doc: &Document) -> bool {
     let first = doc
         .reference_table
@@ -488,7 +495,7 @@ fn is_linearized(doc: &Document) -> bool {
                 .is_some_and(|dict| {
                     let integer = |key: &[u8]| dict.get(key).is_ok_and(|v| v.as_i64().is_ok());
                     dict.get(b"Linearized")
-                        .is_ok_and(|v| v.as_float().is_ok_and(|version| version > 0.0))
+                        .is_ok_and(|v| v.as_float().is_ok_and(|version| version == 1.0))
                         && dict.get(b"H").is_ok_and(|v| v.as_array().is_ok())
                         && [&b"L"[..], b"O", b"E", b"N", b"T"].into_iter().all(integer)
                 })
