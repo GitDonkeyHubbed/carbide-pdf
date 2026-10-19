@@ -1,6 +1,6 @@
 //! Follow-up checks on what a save counts as removed content.
 
-use carbide_engine::SavedFile;
+use carbide_engine::{SavePlan, SavedFile};
 use lopdf::{dictionary, Document, Object, ObjectId};
 
 /// A one-page file with an ink annotation whose points sit in an array object of their own.
@@ -139,5 +139,39 @@ fn ink_points_changed_beyond_the_reference_depth_limit_count_as_removed() {
     assert!(
         saved.removed_from(&pdf),
         "ink points removed behind a long reference chain went unnoticed"
+    );
+}
+
+#[test]
+fn an_unchanged_deep_annotation_is_not_removed_content() {
+    let (bytes, _) = ink_behind_a_reference_chain(12);
+    let (pdf, saved) = SavedFile::open(bytes, None).unwrap();
+    assert!(
+        !saved.removed_from(&pdf),
+        "an unchanged annotation behind a long reference chain was taken for removed content"
+    );
+}
+
+#[test]
+fn a_deep_annotation_does_not_force_a_rewrite_that_drops_revisions() {
+    let (bytes, _) = ink_behind_a_reference_chain(12);
+    let (pdf, _) = SavedFile::open(bytes.clone(), None).unwrap();
+    let revised = pdf
+        .save_revision(&bytes, "First", "D:20261019110000+00'00'")
+        .unwrap();
+    let (mut pdf, saved) = SavedFile::open(revised, None).unwrap();
+    let page = pdf.page_id(0).unwrap();
+    pdf.document_mut()
+        .get_dictionary_mut(page)
+        .unwrap()
+        .set("Rotate", 90);
+    assert!(
+        !saved.removed_from(&pdf),
+        "rotating a page was taken for removed content because an annotation is deeply nested"
+    );
+    assert_eq!(
+        pdf.save_plan(Some(&saved), false).unwrap(),
+        SavePlan::Incremental,
+        "a page rotation was saved as a full rewrite that drops the earlier revision"
     );
 }

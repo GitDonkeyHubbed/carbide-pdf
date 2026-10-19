@@ -10,7 +10,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use lopdf::xref::XrefEntry;
 use lopdf::{Document, EncryptionState, Object, ObjectId, SaveOptions};
@@ -576,11 +575,9 @@ impl Fingerprint {
     }
 }
 
-/// How many references in a row are followed when hashing an annotation's values.
+/// How many references in a row are followed before the rest of the chain is hashed without
+/// further recursion. The bound is only there to keep the walk off the call stack.
 const MAX_REFERENCE_DEPTH: usize = 8;
-
-/// Hands out a different marker each time a reference is met beyond [`MAX_REFERENCE_DEPTH`].
-static UNCOMPARABLE: AtomicU64 = AtomicU64::new(0);
 
 /// Keys that lead from an annotation to the rest of the document rather than to its own drawing
 /// data: following them would count a change to a page, a reply thread or a popup as a change to
@@ -642,10 +639,12 @@ fn hash_values(
                         .is_ok_and(|dict| dict.has_type(b"Page") || dict.has_type(b"Pages"))
             });
             match target {
-                // A chain too deep to follow cannot be compared, so it never matches: the
-                // annotation counts as changed rather than risk missing a change beyond the limit.
+                // Past the recursion bound the rest of the chain is still hashed, on an explicit
+                // stack. A fresh marker each time would make an unchanged annotation look removed
+                // and force a rewrite that drops signatures and saved revisions.
                 Some(_) if depth >= MAX_REFERENCE_DEPTH => {
-                    (7u8, UNCOMPARABLE.fetch_add(1, Ordering::Relaxed)).hash(hasher)
+                    7u8.hash(hasher);
+                    hash_deep(doc, *id, hasher);
                 }
                 Some(target) if seen.insert(*id) => {
                     6u8.hash(hasher);
@@ -654,6 +653,85 @@ fn hash_values(
                 }
                 _ => 0u8.hash(hasher),
             }
+        }
+        _ => 0u8.hash(hasher),
+    }
+}
+
+/// Hashes the drawing values reachable from `root` with an explicit stack, so a long chain does
+/// not recurse and a cycle ends. The same values hash the same way every time, and a change
+/// anywhere in the chain changes the hash.
+fn hash_deep(doc: &Document, root: ObjectId, hasher: &mut DefaultHasher) {
+    let mut seen = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            (9u8, id).hash(hasher);
+            continue;
+        }
+        let Some(object) = doc.objects.get(&id).filter(|target| {
+            !matches!(target, Object::Stream(_))
+                && !target
+                    .as_dict()
+                    .is_ok_and(|dict| dict.has_type(b"Page") || dict.has_type(b"Pages"))
+        }) else {
+            0u8.hash(hasher);
+            continue;
+        };
+        hash_deep_object(object, hasher, &mut stack);
+    }
+}
+
+/// The numbers, names and booleans of one object in a [`hash_deep`] walk. References are recorded
+/// here and their targets are pushed, so each object is entered once.
+fn hash_deep_object(object: &Object, hasher: &mut DefaultHasher, stack: &mut Vec<ObjectId>) {
+    match object {
+        Object::Integer(value) => (1u8, *value).hash(hasher),
+        Object::Real(value) => {
+            let value = value + 0.0;
+            if value.fract() == 0.0 && value.abs() < 9.0e18 {
+                (1u8, value as i64).hash(hasher);
+            } else {
+                (8u8, value.to_bits()).hash(hasher);
+            }
+        }
+        Object::Boolean(value) => (2u8, *value).hash(hasher),
+        Object::Name(name) => (3u8, name).hash(hasher),
+        Object::Array(items) => {
+            (4u8, items.len()).hash(hasher);
+            let mut refs = Vec::new();
+            for item in items {
+                if let Object::Reference(id) = item {
+                    (6u8, *id).hash(hasher);
+                    refs.push(*id);
+                } else {
+                    hash_deep_object(item, hasher, stack);
+                }
+            }
+            stack.extend(refs.into_iter().rev());
+        }
+        Object::Dictionary(dict) => {
+            let mut entries: Vec<_> = dict
+                .iter()
+                .filter(|(key, _)| !STRUCTURAL_KEYS.contains(&key.as_slice()))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            (5u8, entries.len()).hash(hasher);
+            let mut refs = Vec::new();
+            for (key, value) in entries {
+                key.hash(hasher);
+                if let Object::Reference(id) = value {
+                    (6u8, *id).hash(hasher);
+                    refs.push(*id);
+                } else {
+                    hash_deep_object(value, hasher, stack);
+                }
+            }
+            stack.extend(refs.into_iter().rev());
+        }
+        Object::Reference(id) => {
+            (6u8, *id).hash(hasher);
+            stack.push(*id);
         }
         _ => 0u8.hash(hasher),
     }
