@@ -344,7 +344,9 @@ impl Pdf {
     }
 
     /// Makes the changes [`Self::plan_resource_trim`] worked out. Only resource dictionaries are
-    /// replaced, so nothing else is copied, and nothing here can fail.
+    /// replaced, so nothing else is copied, and nothing here can fail. Pages that inherited
+    /// resources already hold their own copy, so taking them off the nodes above does not change
+    /// what those pages draw.
     pub(crate) fn apply_resource_trim(&mut self, trim: ResourceTrim) {
         for (id, resources) in trim.nested {
             match self.doc.get_object_mut(id) {
@@ -367,16 +369,26 @@ impl Pdf {
             if !visited.insert(node) {
                 continue;
             }
-            let Ok(dict) = self.doc.get_dictionary_mut(node) else {
+            // A sound tree can store /Kids as a reference to its array, and opening the file
+            // leaves that reference in place. The array has to be followed, or every node below
+            // this one keeps the resources a removed page drew.
+            let kids = {
+                let Ok(dict) = self.doc.get_dictionary_mut(node) else {
+                    continue;
+                };
+                if !dict.has_type(b"Pages") {
+                    continue;
+                }
+                dict.remove(b"Resources");
+                dict.get(b"Kids").ok().cloned()
+            };
+            let Some(kids) = kids else {
                 continue;
             };
-            if !dict.has_type(b"Pages") {
+            let Object::Array(kids) = self.resolve(&kids) else {
                 continue;
-            }
-            dict.remove(b"Resources");
-            if let Ok(Object::Array(kids)) = dict.get(b"Kids") {
-                nodes.extend(kids.iter().filter_map(|k| k.as_reference().ok()));
-            }
+            };
+            nodes.extend(kids.iter().filter_map(|k| k.as_reference().ok()));
         }
     }
 
