@@ -27,7 +27,7 @@ The current directory is never searched, not even through the system loader's ow
 export CARBIDE_PDFIUM_LIB=/path/to/lib/libpdfium.dylib
 ```
 
-**OCR models (runtime, for OCR only).** Two files, `text-detection.rten` and `text-recognition.rten`, go in one folder. Download them from https://ocrs-models.s3-accelerate.amazonaws.com/ and set `CARBIDE_OCR_MODELS` to that folder. The `ocr` command also accepts `--models DIR`. If the models are missing, OCR fails with a message that names both files.
+**OCR models (runtime, for OCR only).** Download `text-detection-ssfbcj81.rten` and `text-rec-checkpoint-s52qdbqt.rten` from the [Ocrs model repository on Hugging Face](https://huggingface.co/robertknight/ocrs/tree/0ab539ff43cc2e95f017103649bca7be14710dcf), and save them in one folder as `text-detection.rten` and `text-recognition.rten`, respectively. Set `CARBIDE_OCR_MODELS` to that folder. The `ocr` command also accepts `--models DIR`. If the models are missing, OCR fails with a message that names both files.
 
 ## Build, test, run
 
