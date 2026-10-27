@@ -20,11 +20,10 @@ env:
   PDFIUM_TAG: chromium/8086
   PDFIUM_ARM64_SHA256: e98679e052c07edbb5a627980902abb823d4b3f35744d877bd21668bd9fc13ab
   PDFIUM_X64_SHA256: 933a85a138f6027243c56bff8676375c33ceeb767401389415ffc44d689ca85d
-  # OCR models, from the location the README gives. The files at that address are not versioned,
-  # so they are checked against these checksums.
-  OCR_MODELS_URL: https://ocrs-models.s3-accelerate.amazonaws.com
-  OCR_DETECTION_SHA256: f15cfb56bd02c4bf478a20343986504a1f01e1665c2b3a0ad66340f054b1b5ca
-  OCR_RECOGNITION_SHA256: e484866d4cce403175bd8d00b128feb08ab42e208de30e42cd9889d8f1735a6e
+  # Pin the official OCR models to the Hugging Face revision and verify their contents.
+  OCR_MODELS_URL: https://huggingface.co/robertknight/ocrs/resolve/0ab539ff43cc2e95f017103649bca7be14710dcf
+  OCR_DETECTION_SHA256: 614aafabf27c94d386f7aa036c967c2e47e4b9938fa11531ca8f5698c1ca4c36
+  OCR_RECOGNITION_SHA256: 606d9a0414c6b73c99df75b707c11c70d1c8b12e1d4f900922e185fc37bfca65
 
 jobs:
   check:
@@ -76,8 +75,10 @@ jobs:
           set -euo pipefail
           dir="$RUNNER_TEMP/ocr-models"
           mkdir -p "$dir"
-          curl -fsSL --retry 3 -o "$dir/text-detection.rten" "${OCR_MODELS_URL}/text-detection.rten"
-          curl -fsSL --retry 3 -o "$dir/text-recognition.rten" "${OCR_MODELS_URL}/text-recognition.rten"
+          curl -fsSL --retry 3 -o "$dir/text-detection.rten" \
+            "${OCR_MODELS_URL}/text-detection-ssfbcj81.rten"
+          curl -fsSL --retry 3 -o "$dir/text-recognition.rten" \
+            "${OCR_MODELS_URL}/text-rec-checkpoint-s52qdbqt.rten"
           echo "${OCR_DETECTION_SHA256}  $dir/text-detection.rten" | shasum -a 256 -c -
           echo "${OCR_RECOGNITION_SHA256}  $dir/text-recognition.rten" | shasum -a 256 -c -
           echo "CARBIDE_OCR_MODELS=$dir" >> "$GITHUB_ENV"
