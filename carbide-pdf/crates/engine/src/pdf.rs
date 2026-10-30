@@ -400,8 +400,8 @@ impl Pdf {
         let doomed_annotations = self.annotations_leaving(&doomed, &staying);
         // What refers to the pages is found through them, so this comes first. An invisible
         // signature only sits on a page because every field has to; it is not the page's content.
-        self.drop_form_fields_on(&doomed, &|_, widget, signature| {
-            !signature || widget_area(widget).is_some()
+        self.drop_form_fields_on(&doomed, &|doc, _, widget, signature| {
+            !signature || widget_area(doc, widget).is_some()
         });
         self.drop_structure_of(&doomed);
         self.drop_navigation_to(&doomed);
@@ -529,7 +529,7 @@ impl Pdf {
             .filter(|id| !kept.contains(id))
             .collect();
         let dropped_annotations = copy.annotations_leaving(&dropped, &kept);
-        copy.drop_form_fields_on(&dropped, &|_, _, _| true);
+        copy.drop_form_fields_on(&dropped, &|_, _, _, _| true);
         // Article threads that run only through other pages, with their titles, go too.
         copy.prune_threads(&dropped);
         let root_id = copy.pages_root()?;
