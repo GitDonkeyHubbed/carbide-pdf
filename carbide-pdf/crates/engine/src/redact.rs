@@ -99,9 +99,9 @@ impl Pdf {
             .filter(|id| !rebuilt.contains(id))
             .collect();
         let lost_annotations = self.annotations_leaving(&rebuilt, &others);
-        self.drop_form_fields_on(&rebuilt, &|page, widget, signature| {
+        self.drop_form_fields_on(&rebuilt, &|doc, page, widget, signature| {
             !signature
-                || widget_area(widget).is_some_and(|[x0, y0, x1, y1]| {
+                || widget_area(doc, widget).is_some_and(|[x0, y0, x1, y1]| {
                     redacted.get(&page).is_some_and(|areas| {
                         areas
                             .iter()

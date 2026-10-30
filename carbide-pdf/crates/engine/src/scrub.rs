@@ -124,12 +124,12 @@ impl Pdf {
 
     /// Takes widgets on `pages` out of the form, together with every field left without a widget,
     /// so their values and appearances are no longer part of the document. `goes` decides for each
-    /// widget, given its page, its dictionary and whether it belongs to a signature field. A field
-    /// that still has a widget elsewhere keeps its value: it is still shown there.
+    /// widget, given the document, its page, its dictionary and whether it belongs to a signature
+    /// field. A field that still has a widget elsewhere keeps its value: it is still shown there.
     pub(crate) fn drop_form_fields_on(
         &mut self,
         pages: &HashSet<ObjectId>,
-        goes: &dyn Fn(ObjectId, &Dictionary, bool) -> bool,
+        goes: &dyn Fn(&Document, ObjectId, &Dictionary, bool) -> bool,
     ) {
         let annotations = self.annotations_on(pages);
         let widgets = WidgetScope {
@@ -950,14 +950,36 @@ impl NameScan {
 }
 
 /// The area a widget covers on its page, in user space; `None` for an invisible one.
-pub(crate) fn widget_area(widget: &Dictionary) -> Option<[f32; 4]> {
-    let rect = widget.get(b"Rect").and_then(Object::as_array).ok()?;
-    let values: Vec<f32> = rect.iter().filter_map(|v| v.as_float().ok()).collect();
+///
+/// `/Rect` may name its array through a reference, and any corner may name its number the same
+/// way. A rectangle that cannot be read is not an area.
+pub(crate) fn widget_area(doc: &Document, widget: &Dictionary) -> Option<[f32; 4]> {
+    let rect = followed(doc, widget.get(b"Rect").ok()?);
+    let items = rect.as_array().ok()?;
+    let values: Vec<f32> = items
+        .iter()
+        .filter_map(|corner| followed(doc, corner).as_float().ok())
+        .collect();
     let [x0, y0, x1, y1] = values[..] else {
         return None;
     };
     let area = [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)];
     (area[2] > area[0] && area[3] > area[1]).then_some(area)
+}
+
+/// `object`, or what it refers to through up to 16 references.
+fn followed<'a>(doc: &'a Document, object: &'a Object) -> &'a Object {
+    let mut current = object;
+    for _ in 0..16 {
+        let Object::Reference(id) = current else {
+            return current;
+        };
+        match doc.get_object(*id) {
+            Ok(next) => current = next,
+            Err(_) => return current,
+        }
+    }
+    current
 }
 
 /// The resources `content` uses: the names given to the operators that look a resource up, each
@@ -1045,7 +1067,7 @@ struct WidgetScope<'a> {
     pages: &'a HashSet<ObjectId>,
     /// Annotations on those pages, with their page.
     annotations: &'a HashMap<ObjectId, ObjectId>,
-    goes: &'a dyn Fn(ObjectId, &Dictionary, bool) -> bool,
+    goes: &'a dyn Fn(&Document, ObjectId, &Dictionary, bool) -> bool,
 }
 
 /// Prunes one node of the form's field tree. True when the node goes: a widget on one of the
@@ -1090,8 +1112,9 @@ fn prune_field(
             .ok()
             .filter(|p| scope.pages.contains(p))
             .or_else(|| id.and_then(|id| scope.annotations.get(&id).copied()));
-        if page.is_some_and(|page| (scope.goes)(page, &dict, field_type.as_deref() == Some(b"Sig")))
-        {
+        if page.is_some_and(|page| {
+            (scope.goes)(doc, page, &dict, field_type.as_deref() == Some(b"Sig"))
+        }) {
             removed.extend(id);
             return true;
         }
