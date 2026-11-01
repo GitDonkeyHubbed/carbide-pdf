@@ -113,3 +113,109 @@ fn deleting_a_page_drops_images_on_a_branch_whose_parent_kids_are_indirect() {
         "the kept page lost the font it inherited"
     );
 }
+
+#[test]
+fn deleting_a_page_drops_images_behind_an_indirect_kids_array_below_the_root() {
+    // The root lists its only branch in a direct array, so following an indirect /Kids only on
+    // the root never matters here. The branch's own /Kids is a reference to the node that holds
+    // the resources. Leaving that reference unfollowed keeps the deleted page's image.
+    let mut doc = Document::with_version("1.7");
+    let root_id = doc.new_object_id();
+    let middle_id = doc.new_object_id();
+    let deep_id = doc.new_object_id();
+    let font = helvetica(&mut doc);
+    let image = secret_image(&mut doc);
+    let resources = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font },
+        "XObject" => dictionary! { "Im1" => image },
+    });
+    let kept_contents = doc.add_object(Stream::new(
+        lopdf::Dictionary::new(),
+        b"BT /F1 12 Tf (kept) Tj ET".to_vec(),
+    ));
+    let gone_contents = doc.add_object(Stream::new(
+        lopdf::Dictionary::new(),
+        b"q 100 0 0 100 0 0 cm /Im1 Do Q".to_vec(),
+    ));
+    let kept = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => deep_id,
+        "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+        "Contents" => kept_contents,
+    });
+    let gone = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => deep_id,
+        "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+        "Contents" => gone_contents,
+    });
+    doc.objects.insert(
+        deep_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Parent" => middle_id,
+            "Kids" => vec![kept.into(), gone.into()],
+            "Count" => 2, "Resources" => resources,
+        }),
+    );
+    let deep_kids = doc.add_object(Object::Array(vec![deep_id.into()]));
+    doc.objects.insert(
+        middle_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Parent" => root_id,
+            "Kids" => deep_kids, "Count" => 2,
+        }),
+    );
+    doc.objects.insert(
+        root_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![middle_id.into()],
+            "Count" => 2,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => root_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+
+    let pages_id = pdf
+        .document()
+        .catalog()
+        .unwrap()
+        .get(b"Pages")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let Object::Array(root_kids) = pdf
+        .document()
+        .get_dictionary(pages_id)
+        .unwrap()
+        .get(b"Kids")
+        .unwrap()
+    else {
+        panic!("the root /Kids is not a direct array, so this does not exercise a node below it");
+    };
+    let middle = root_kids[0].as_reference().unwrap();
+    assert!(
+        matches!(
+            pdf.document()
+                .get_dictionary(middle)
+                .unwrap()
+                .get(b"Kids")
+                .unwrap(),
+            Object::Reference(_)
+        ),
+        "opening the file inlined the branch /Kids, so this does not exercise the walk"
+    );
+    assert_eq!(pdf.page_count(), 2);
+
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the kept page lost the font it inherited"
+    );
+}
