@@ -91,45 +91,61 @@ fn write_first_free(path: &Path, bytes: &[u8], last: usize) -> io::Result<PathBu
 
 /// Gives the finished file `temp` the name `path`, unless something already has that name.
 fn link_new(temp: &Path, path: &Path) -> io::Result<()> {
-    let taken = || {
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("{} already exists", path.display()),
-        )
-    };
     match fs::hard_link(temp, path) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(taken()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(name_taken(path)),
         // A file system without hard links: rename, in a way that fails if the name is taken.
         // Looking first and renaming after would replace a file made in between.
         Err(_) => match rename_no_replace(temp, path) {
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(taken()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(name_taken(path)),
             // Nor that (FAT and exFAT drives, for one): claim the name with an empty file made
             // only if nothing has it, then rename over that claim, which is ours to replace.
-            Err(e) if e.kind() == io::ErrorKind::Unsupported => {
-                let claim = match fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
-                {
-                    Ok(claim) => claim.metadata()?,
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(taken()),
-                    Err(e) => return Err(e),
-                };
-                // Something may have taken the claim's place since; that is not ours to replace
-                // or remove.
-                if !still_the_claim(path, &claim) {
-                    return Err(taken());
-                }
-                fs::rename(temp, path).inspect_err(|_| {
-                    if still_the_claim(path, &claim) {
-                        let _ = fs::remove_file(path);
-                    }
-                })
-            }
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => publish_by_claim(temp, path),
             other => other,
         },
     }
+}
+
+fn name_taken(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("{} already exists", path.display()),
+    )
+}
+
+/// Claims `path` with a new empty file and renames `temp` over that claim.
+fn publish_by_claim(temp: &Path, path: &Path) -> io::Result<()> {
+    // The two functions run at the moments another program could swap the claim. Production has
+    // nothing to do there; tests stand in for that program.
+    publish_claimed(temp, path, |_| {}, |_| {})
+}
+
+fn publish_claimed(
+    temp: &Path,
+    path: &Path,
+    after_claim: impl FnOnce(&fs::Metadata),
+    before_rename: impl FnOnce(&fs::Metadata),
+) -> io::Result<()> {
+    let claim = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(claim) => claim.metadata()?,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(name_taken(path)),
+        Err(e) => return Err(e),
+    };
+    after_claim(&claim);
+    // Something may have taken the claim's place since; that is not ours to replace or remove.
+    if !still_the_claim(path, &claim) {
+        return Err(name_taken(path));
+    }
+    before_rename(&claim);
+    fs::rename(temp, path).inspect_err(|_| {
+        if still_the_claim(path, &claim) {
+            let _ = fs::remove_file(path);
+        }
+    })
 }
 
 /// True when `path` is still the empty file whose metadata, read when it was made, is `claim`.
@@ -865,6 +881,160 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn restore_modified(path: &Path, claim: &fs::Metadata) {
+        let modified = claim.modified().unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(
+            fs::symlink_metadata(path).unwrap().modified().ok(),
+            claim.modified().ok(),
+            "this system could not put the claim's modification time back"
+        );
+    }
+
+    #[test]
+    fn a_claim_stops_being_ours_once_it_holds_bytes_or_is_gone() {
+        let dir = scratch("claim-length");
+        let path = dir.join("page.png");
+        let claim = fs::File::create(&path).unwrap().metadata().unwrap();
+        assert!(still_the_claim(&path, &claim));
+
+        fs::write(&path, b"x").unwrap();
+        restore_modified(&path, &claim);
+        assert!(
+            !still_the_claim(&path, &claim),
+            "a claim that gained bytes was still ours to replace"
+        );
+
+        fs::remove_file(&path).unwrap();
+        assert!(!still_the_claim(&path, &claim));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Puts a new empty file at `path` by renaming one that already exists, so the inode cannot
+    /// be the claim's, and gives it the claim's modification time.
+    #[cfg(unix)]
+    fn take_the_claims_place(dir: &Path, path: &Path, claim: &fs::Metadata) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        let sibling = dir.join(format!("taken-place-{}", std::process::id()));
+        let _ = fs::remove_file(&sibling);
+        fs::write(&sibling, b"").unwrap();
+        let inode = fs::symlink_metadata(&sibling).unwrap().ino();
+        assert_ne!(
+            inode,
+            claim.ino(),
+            "the replacement did not get a new inode, so this does not exercise the check"
+        );
+        fs::rename(&sibling, path).unwrap();
+        restore_modified(path, claim);
+        assert_eq!(fs::symlink_metadata(path).unwrap().ino(), inode);
+        inode
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_empty_file_at_the_claims_path_is_not_the_claim() {
+        let dir = scratch("claim-inode");
+        let path = dir.join("page.png");
+        let claim = fs::File::create(&path).unwrap().metadata().unwrap();
+        take_the_claims_place(&dir, &path, &claim);
+        assert!(
+            !still_the_claim(&path, &claim),
+            "an empty file that took the claim's place was still ours to replace"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_standing_where_the_claim_was_is_not_the_claim() {
+        use std::os::unix::fs::symlink;
+        let dir = scratch("claim-symlink");
+        let path = dir.join("page.png");
+        let elsewhere = dir.join("elsewhere.png");
+        let claim_file = fs::File::create(&path).unwrap();
+        let claim = claim_file.metadata().unwrap();
+        drop(claim_file);
+        // The same inode, reached through a link put where the claim used to be.
+        fs::rename(&path, &elsewhere).unwrap();
+        symlink(&elsewhere, &path).unwrap();
+        assert!(
+            !still_the_claim(&path, &claim),
+            "a link standing in for the claim was ours to replace"
+        );
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publishing_over_a_claim_leaves_a_file_that_was_already_there() {
+        let dir = scratch("claim-publish");
+        let temp = dir.join("staged");
+        let path = dir.join("page.png");
+        fs::write(&temp, b"ours").unwrap();
+        fs::write(&path, b"theirs").unwrap();
+        let err = publish_by_claim(&temp, &path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"theirs");
+        assert_eq!(fs::read(&temp).unwrap(), b"ours");
+
+        fs::remove_file(&path).unwrap();
+        publish_by_claim(&temp, &path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"ours");
+        assert!(!temp.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_swapped_claim_is_neither_replaced_nor_removed() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = scratch("claim-swap");
+        let temp = dir.join("staged");
+        let path = dir.join("page.png");
+        fs::write(&temp, b"ours").unwrap();
+
+        let mut attacker = 0;
+        let err = publish_claimed(
+            &temp,
+            &path,
+            |claim| {
+                attacker = take_the_claims_place(&dir, &path, claim);
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), attacker);
+        assert_eq!(fs::read(&temp).unwrap(), b"ours");
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&temp, b"ours").unwrap();
+        let mut attacker = 0;
+        let err = publish_claimed(
+            &temp,
+            &path,
+            |_| {},
+            |claim| {
+                attacker = take_the_claims_place(&dir, &path, claim);
+                fs::remove_file(&temp).unwrap();
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::symlink_metadata(&path).unwrap().ino(),
+            attacker,
+            "the empty file that took the claim's place was removed after the rename failed"
+        );
+        assert!(!temp.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn keep_both_writes_once_however_many_names_are_taken() {
         let dir = scratch("keep-both");
@@ -920,6 +1090,66 @@ mod tests {
         remove_private_temp_file(&path).unwrap();
         remove_private_temp_file(&other).unwrap();
         assert!(!dir.exists());
+    }
+
+    /// A folder this app did not make for a private copy, including one the old `carbide-` prefix
+    /// would have accepted, must not be deleted.
+    #[test]
+    fn only_this_apps_private_copy_folders_are_removed() {
+        let pid = std::process::id();
+        let temp = std::env::temp_dir();
+        let plant = |dir: &Path, name: &str| {
+            let folder = dir.join(name);
+            let _ = fs::remove_dir_all(&folder);
+            fs::create_dir_all(&folder).unwrap();
+            let path = folder.join("secret.pdf");
+            fs::write(&path, b"secret").unwrap();
+            path
+        };
+        // `carbide-` plus sixteen hex digits is the shape the old check deleted. Upper case, a
+        // non-hex digit and an extra character are not folders this app creates either.
+        let kept = [
+            plant(&temp, &format!("carbide-{pid:016x}")),
+            plant(&temp, &format!("carbide-copy-{pid:015X}A")),
+            plant(&temp, &format!("carbide-copy-{pid:015x}g")),
+            plant(&temp, &format!("carbide-copy-{pid:016x}x")),
+        ];
+        let nested_root = scratch("private-lookalike");
+        let nested = plant(&nested_root, "carbide-copy-0123456789abcdef");
+        let buried_folder = temp.join(format!("carbide-copy-{pid:016x}"));
+        let _ = fs::remove_dir_all(&buried_folder);
+        let buried = buried_folder.join("extra").join("secret.pdf");
+        fs::create_dir_all(buried.parent().unwrap()).unwrap();
+        fs::write(&buried, b"secret").unwrap();
+        let mut folders: Vec<PathBuf> = kept
+            .iter()
+            .map(|path| path.parent().unwrap().to_path_buf())
+            .collect();
+        folders.push(nested_root);
+        folders.push(buried_folder);
+
+        for path in kept.iter().chain([&nested, &buried]) {
+            assert!(
+                !is_private_temp_file(path),
+                "{} was treated as a private copy",
+                path.display()
+            );
+            let err = remove_private_temp_file(path).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(fs::read(path).unwrap(), b"secret");
+        }
+
+        // The same shape this app uses, directly in the temporary folder, still goes.
+        let exact = plant(&temp, &format!("carbide-copy-{pid:015x}a"));
+        assert!(is_private_temp_file(&exact));
+        remove_private_temp_file(&exact).unwrap();
+        assert!(!exact.exists());
+        assert!(!exact.parent().unwrap().exists());
+        folders.push(exact.parent().unwrap().to_path_buf());
+
+        for folder in &folders {
+            let _ = fs::remove_dir_all(folder);
+        }
     }
 
     #[cfg(unix)]

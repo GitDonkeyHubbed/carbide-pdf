@@ -1120,8 +1120,88 @@ fn removals_that_were_the_only_hidden_information_are_reported() {
 fn a_check_box_whose_state_is_a_reference_to_a_name_counts_as_cleared() {
     use carbide_engine::HiddenItem;
     // The state is stored as a reference to a name object, and the field holds no value.
+    let check_id = std::cell::Cell::new((0, 0));
     let mut pdf = one_page(|doc, catalog, page| {
         let state = doc.add_object(Object::Name(b"Yes".to_vec()));
+        let check = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Btn", "T" => Object::string_literal("c"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page, "AS" => state,
+        });
+        check_id.set(check);
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![check.into()]);
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("AcroForm", dictionary! { "Fields" => vec![check.into()] });
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    assert_eq!(
+        pdf.document()
+            .get_dictionary(check_id.get())
+            .unwrap()
+            .get(b"AS")
+            .and_then(Object::as_name)
+            .unwrap(),
+        b"Off",
+        "the box was counted as cleared but still shows Yes"
+    );
+}
+
+#[test]
+fn a_radio_button_whose_type_and_state_live_apart_is_cleared() {
+    use carbide_engine::HiddenItem;
+    // The button type is on the parent field. The kid only shows a state, and that state is a
+    // reference to a name. Clearing has to follow both, or the button stays on.
+    let kid_id = std::cell::Cell::new((0, 0));
+    let mut pdf = one_page(|doc, catalog, page| {
+        let state = doc.add_object(Object::Name(b"Yes".to_vec()));
+        let parent_id = doc.new_object_id();
+        let kid = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "Parent" => parent_id,
+            "Rect" => vec![0.into(), 0.into(), 12.into(), 12.into()],
+            "P" => page, "AS" => state,
+        });
+        kid_id.set(kid);
+        doc.objects.insert(
+            parent_id,
+            Object::Dictionary(dictionary! {
+                "FT" => "Btn", "T" => Object::string_literal("group"),
+                "Kids" => vec![kid.into()],
+            }),
+        );
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![kid.into()]);
+        doc.get_dictionary_mut(catalog).unwrap().set(
+            "AcroForm",
+            dictionary! { "Fields" => vec![parent_id.into()] },
+        );
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    assert_eq!(
+        pdf.document()
+            .get_dictionary(kid_id.get())
+            .unwrap()
+            .get(b"AS")
+            .and_then(Object::as_name)
+            .unwrap(),
+        b"Off",
+        "the radio button still shows Yes"
+    );
+}
+
+#[test]
+fn a_check_box_that_shows_off_through_a_reference_is_not_form_data() {
+    use carbide_engine::HiddenItem;
+    let mut pdf = one_page(|doc, catalog, page| {
+        let state = doc.add_object(Object::Name(b"Off".to_vec()));
         let check = doc.add_object(dictionary! {
             "Type" => "Annot", "Subtype" => "Widget", "FT" => "Btn", "T" => Object::string_literal("c"),
             "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page, "AS" => state,
@@ -1136,7 +1216,7 @@ fn a_check_box_whose_state_is_a_reference_to_a_name_counts_as_cleared() {
     let report = pdf
         .remove_hidden_information(&[HiddenItem::FormData])
         .unwrap();
-    assert_eq!(report.count(HiddenItem::FormData), 1);
+    assert_eq!(report.count(HiddenItem::FormData), 0);
 }
 
 // ---- changes to annotations ----------------------------------------------------------------
