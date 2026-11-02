@@ -183,6 +183,35 @@ impl CarbideApp {
         app
     }
 
+    /// An app with no window, used to exercise save without starting the UI.
+    #[cfg(test)]
+    fn for_tests() -> Self {
+        Self {
+            renderer: None,
+            renderer_error: None,
+            doc: None,
+            tool: Tool::Select,
+            zoom: 1.0,
+            status: String::new(),
+            dialog: None,
+            textures: HashMap::new(),
+            thumbs: HashMap::new(),
+            drag: None,
+            pending_redactions: Vec::new(),
+            current_page: 0,
+            scroll_to: None,
+            autosave: None,
+            settings: AutoSaveSettings::default(),
+            last_autosave: Instant::now(),
+            ocr_job: None,
+            notice: None,
+            tabs: Vec::new(),
+            active_tab: None,
+            recent: Vec::new(),
+            shell: shell::ShellState::new(),
+        }
+    }
+
     // ---- documents ---------------------------------------------------------------------
 
     pub fn open_path(&mut self, path: &Path) {
@@ -1029,6 +1058,175 @@ fn signature_notice(doc: &OpenDoc) -> Option<String> {
     let trust = paths::load_trust_store();
     let reports = Pdf::verify_signatures(bytes, &trust, chrono::Utc::now()).ok()?;
     carbide_engine::signature::notice_text(&reports).map(str::to_string)
+}
+
+#[cfg(test)]
+mod save_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use carbide_engine::{Pdf, ProtectionOptions, WatermarkOptions};
+
+    use super::{CarbideApp, OpenDoc};
+
+    struct Scratch {
+        dir: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("carbide-save-{tag}-{}-{nanos}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn one_page() -> Pdf {
+        let mut pdf = Pdf::new();
+        pdf.insert_blank_page(0, Some((200.0, 200.0))).unwrap();
+        pdf
+    }
+
+    fn app_with(pdf: Pdf, path: &Path, saved: Vec<u8>, password: Option<String>) -> CarbideApp {
+        let mut app = CarbideApp::for_tests();
+        app.doc = Some(OpenDoc::new(pdf, Some(path.to_path_buf()), Some(saved), password).unwrap());
+        app
+    }
+
+    #[test]
+    fn saving_without_edits_leaves_the_file_bytes_unchanged() {
+        let scratch = Scratch::new("untouched");
+        let path = scratch.path("notes.pdf");
+        let mut pdf = one_page();
+        let original = pdf.to_bytes().unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let mut app = app_with(Pdf::from_bytes(&original).unwrap(), &path, original.clone(), None);
+        app.save_to(&path);
+
+        assert!(app.dialog.is_none(), "{:?}", app.status);
+        assert!(app.status.starts_with("Saved "));
+        let written = fs::read(&path).unwrap();
+        assert!(
+            written == original,
+            "saving with no edits rewrote the file ({} bytes vs {})",
+            written.len(),
+            original.len()
+        );
+        assert_eq!(app.doc.as_ref().unwrap().version, 0);
+        assert!(!app.doc.as_ref().unwrap().dirty);
+    }
+
+    #[test]
+    fn saving_an_edit_appends_to_the_original_bytes() {
+        let scratch = Scratch::new("append");
+        let path = scratch.path("notes.pdf");
+        let mut pdf = one_page();
+        let original = pdf.to_bytes().unwrap();
+        fs::write(&path, &original).unwrap();
+        let mut edited = Pdf::from_bytes(&original).unwrap();
+        edited.apply_watermark(&WatermarkOptions::new("EDITMARK77")).unwrap();
+
+        let mut app = app_with(edited, &path, original.clone(), None);
+        app.doc.as_mut().unwrap().dirty = true;
+        app.save_to(&path);
+
+        assert!(app.dialog.is_none(), "{:?}", app.status);
+        let written = fs::read(&path).unwrap();
+        assert!(written.len() > original.len());
+        assert!(
+            written.starts_with(&original),
+            "Save rewrote the file instead of appending ({} bytes, original {})",
+            written.len(),
+            original.len()
+        );
+        assert!(written.windows(10).any(|w| w == b"EDITMARK77"));
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(doc.bytes, written, "the open document has to match the file just written");
+        assert_eq!(doc.version, 1);
+        assert!(!doc.dirty);
+        assert!(Pdf::from_bytes(&written).is_ok());
+    }
+
+    #[test]
+    fn saving_a_protected_document_rewrites_ciphertext_and_keeps_the_decrypted_copy() {
+        let scratch = Scratch::new("protected");
+        let path = scratch.path("secret.pdf");
+        let mut pdf = one_page();
+        pdf.apply_watermark(&WatermarkOptions::new("SECRETTEXT")).unwrap();
+        let encrypted = pdf
+            .to_encrypted_bytes(&ProtectionOptions::new("open-sesame", "owner-only"))
+            .unwrap();
+        fs::write(&path, &encrypted).unwrap();
+        let mut opened = Pdf::from_bytes_with_password(&encrypted, "open-sesame").unwrap();
+        opened.apply_watermark(&WatermarkOptions::new("EDITMARK77")).unwrap();
+
+        let mut app = app_with(opened, &path, encrypted.clone(), Some("open-sesame".into()));
+        let version = app.doc.as_ref().unwrap().version;
+        app.save_to(&path);
+
+        assert!(app.dialog.is_none(), "{:?}", app.status);
+        assert!(
+            !app.status.contains("could not reload"),
+            "a protected save must not reload the encrypted bytes as the working copy: {}",
+            app.status
+        );
+        let written = fs::read(&path).unwrap();
+        assert!(!written.starts_with(&encrypted), "a protected save is a new encrypted file");
+        assert!(!written.windows(10).any(|w| w == b"SECRETTEXT"));
+        assert!(!written.windows(10).any(|w| w == b"EDITMARK77"));
+        assert!(matches!(Pdf::from_bytes(&written), Err(carbide_engine::Error::PasswordRequired)));
+        let mut again = Pdf::from_bytes_with_password(&written, "open-sesame").unwrap();
+        let plain = again.to_bytes().unwrap();
+        assert!(plain.windows(10).any(|w| w == b"SECRETTEXT"));
+        assert!(plain.windows(10).any(|w| w == b"EDITMARK77"));
+
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(doc.version, version, "reloading the ciphertext would replace the decrypted document");
+        assert_eq!(doc.password.as_deref(), Some("open-sesame"));
+        assert!(doc.bytes.windows(10).any(|w| w == b"SECRETTEXT"));
+        assert!(doc.bytes.windows(10).any(|w| w == b"EDITMARK77"));
+        assert!(!doc.dirty);
+    }
+
+    #[test]
+    fn a_failed_save_leaves_the_previous_file_in_place() {
+        let scratch = Scratch::new("failed");
+        let path = scratch.path("notes.pdf");
+        let mut pdf = one_page();
+        let original = pdf.to_bytes().unwrap();
+        fs::write(&path, b"ORIGINAL-KEEP").unwrap();
+        let mut edited = Pdf::from_bytes(&original).unwrap();
+        edited.apply_watermark(&WatermarkOptions::new("EDITMARK77")).unwrap();
+        // The temporary name is a directory, so the new bytes cannot be written and the
+        // existing file must not be truncated in its place.
+        fs::create_dir(path.with_extension("pdf.carbide-tmp")).unwrap();
+
+        let mut app = app_with(edited, &path, original.clone(), None);
+        app.doc.as_mut().unwrap().dirty = true;
+        app.save_to(&path);
+
+        assert_eq!(fs::read(&path).unwrap(), b"ORIGINAL-KEEP");
+        assert!(path.with_extension("pdf.carbide-tmp").is_dir());
+        assert!(app.status.starts_with("Could not save"), "{}", app.status);
+        assert!(matches!(app.dialog, Some(super::dialogs::Dialog::Message(_))));
+        let doc = app.doc.as_ref().unwrap();
+        assert!(doc.dirty);
+        assert_eq!(doc.saved_bytes.as_deref(), Some(original.as_slice()));
+    }
 }
 
 fn pdf_rect_to_screen(page_rect: egui::Rect, zoom: f32, page_height: f32, r: Rect) -> egui::Rect {
