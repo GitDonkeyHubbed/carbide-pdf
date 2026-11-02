@@ -80,6 +80,25 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// True when `needle` is a string or stream still in the document.
+fn holds(pdf: &Pdf, needle: &[u8]) -> bool {
+    fn walk(object: &Object, needle: &[u8]) -> bool {
+        match object {
+            Object::String(bytes, _) => bytes == needle,
+            Object::Array(items) => items.iter().any(|item| walk(item, needle)),
+            Object::Dictionary(dict) => dict.iter().any(|(_, value)| walk(value, needle)),
+            Object::Stream(stream) => {
+                stream.content == needle || stream.dict.iter().any(|(_, value)| walk(value, needle))
+            }
+            _ => false,
+        }
+    }
+    pdf.document()
+        .objects
+        .values()
+        .any(|object| walk(object, needle))
+}
+
 #[test]
 fn deleted_page_image_does_not_survive_through_a_font_of_the_same_name() {
     // The kept page draws the font /R1; the deleted page drew the image /R1.
@@ -1137,6 +1156,154 @@ fn a_check_box_whose_state_is_a_reference_to_a_name_counts_as_cleared() {
         .remove_hidden_information(&[HiddenItem::FormData])
         .unwrap();
     assert_eq!(report.count(HiddenItem::FormData), 1);
+}
+
+#[test]
+fn removing_comments_keeps_a_widget_whose_subtype_is_a_reference() {
+    use carbide_engine::HiddenItem;
+    // /Widget and /FileAttachment stored once, as name objects. An unresolved subtype is not
+    // "Widget", so removing comments would delete the field, and an attachment would stay.
+    let mut pdf = one_page(|doc, catalog, page| {
+        let widget_kind = doc.add_object(Object::Name(b"Widget".to_vec()));
+        let file_kind = doc.add_object(Object::Name(b"FileAttachment".to_vec()));
+        let field = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => widget_kind, "FT" => "Tx",
+            "T" => Object::string_literal("name"),
+            "V" => Object::string_literal("WIDGET-VALUE-KEEP"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page,
+        });
+        let note = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Text",
+            "Contents" => Object::string_literal("SECRET-NOTE-TEXT"),
+            "Rect" => vec![0.into(), 20.into(), 10.into(), 30.into()], "P" => page,
+        });
+        let attachment = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => file_kind,
+            "Contents" => Object::string_literal("SECRET-ATTACHMENT"),
+            "Rect" => vec![0.into(), 40.into(), 10.into(), 50.into()], "P" => page,
+        });
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![field.into(), note.into(), attachment.into()]);
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("AcroForm", dictionary! { "Fields" => vec![field.into()] });
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::Comments, HiddenItem::Attachments])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::Comments), 1);
+    assert_eq!(report.count(HiddenItem::Attachments), 1);
+    assert!(holds(&pdf, b"WIDGET-VALUE-KEEP"));
+    assert!(!holds(&pdf, b"SECRET-NOTE-TEXT"));
+    assert!(!holds(&pdf, b"SECRET-ATTACHMENT"));
+}
+
+#[test]
+fn a_widget_whose_subtype_is_a_reference_loses_the_value_it_draws() {
+    use carbide_engine::HiddenItem;
+    let shown_id = std::cell::Cell::new((0, 0));
+    let mut pdf = one_page(|doc, catalog, page| {
+        let subtype = doc.add_object(Object::Name(b"Widget".to_vec()));
+        let shown = doc.add_object(Stream::new(
+            dictionary! {
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+            },
+            b"TYPED-SECRET-APPEARANCE".to_vec(),
+        ));
+        shown_id.set(shown);
+        let text = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => subtype, "FT" => "Tx",
+            "T" => Object::string_literal("t"),
+            "V" => Object::string_literal("TYPED-SECRET-VALUE"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page,
+            "AP" => dictionary! { "N" => shown },
+        });
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![text.into()]);
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("AcroForm", dictionary! { "Fields" => vec![text.into()] });
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    assert!(pdf.document().get_object(shown_id.get()).is_err());
+    assert!(!holds(&pdf, b"TYPED-SECRET-APPEARANCE"));
+    assert!(!holds(&pdf, b"TYPED-SECRET-VALUE"));
+}
+
+#[test]
+fn a_signature_whose_type_is_a_reference_is_kept_and_a_check_box_is_cleared() {
+    use carbide_engine::HiddenItem;
+    let ids = std::cell::Cell::new(((0, 0), (0, 0)));
+    let mut pdf = one_page(|doc, catalog, page| {
+        let signature_type = doc.add_object(Object::Name(b"Sig".to_vec()));
+        let button_type = doc.add_object(Object::Name(b"Btn".to_vec()));
+        let signature = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => signature_type,
+            "T" => Object::string_literal("sig"),
+            "V" => Object::string_literal("SIG-BYTES-KEEP"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page,
+        });
+        let check = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => button_type,
+            "T" => Object::string_literal("c"),
+            "Rect" => vec![0.into(), 20.into(), 10.into(), 30.into()], "P" => page,
+            "AS" => "Yes",
+        });
+        ids.set((signature, check));
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![signature.into(), check.into()]);
+        doc.get_dictionary_mut(catalog).unwrap().set(
+            "AcroForm",
+            dictionary! { "Fields" => vec![signature.into(), check.into()] },
+        );
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    let (signature, check) = ids.get();
+    let signed = pdf.document().get_dictionary(signature).unwrap();
+    assert_eq!(
+        signed.get(b"V").unwrap().as_str().unwrap(),
+        b"SIG-BYTES-KEEP"
+    );
+    let cleared = pdf.document().get_dictionary(check).unwrap();
+    assert_eq!(cleared.get(b"AS").unwrap().as_name().unwrap(), b"Off");
+}
+
+#[test]
+fn a_script_whose_action_type_is_a_reference_is_removed() {
+    use carbide_engine::HiddenItem;
+    let script_id = std::cell::Cell::new((0, 0));
+    let mut pdf = one_page(|doc, _, page| {
+        let kind = doc.add_object(Object::Name(b"JavaScript".to_vec()));
+        let script = doc.add_object(dictionary! {
+            "S" => kind,
+            "JS" => Object::string_literal("SECRET-INDIRECT-JS"),
+        });
+        script_id.set(script);
+        let link = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Link",
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page,
+            "A" => script,
+        });
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![link.into()]);
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::Scripts])
+        .unwrap();
+    assert!(report.count(HiddenItem::Scripts) >= 1);
+    assert!(pdf.document().get_object(script_id.get()).is_err());
+    assert!(!holds(&pdf, b"SECRET-INDIRECT-JS"));
 }
 
 // ---- changes to annotations ----------------------------------------------------------------

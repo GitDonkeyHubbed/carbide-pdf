@@ -271,12 +271,21 @@ impl Pdf {
             count += usize::from(catalog.remove(b"OpenAction").is_some());
         }
         count += remove_key_everywhere(&mut self.doc, b"AA");
-        let code: HashSet<ObjectId> = self
+        // The action type is collected before it is resolved: looking a reference up borrows the
+        // document, which the walk of its objects already holds.
+        let named: Vec<(ObjectId, Object)> = self
             .doc
             .objects
             .iter()
-            .filter(|(_, object)| object.as_dict().is_ok_and(runs_code))
-            .map(|(id, _)| *id)
+            .filter_map(|(id, object)| Some((*id, object.as_dict().ok()?.get(b"S").ok()?.clone())))
+            .collect();
+        let code: HashSet<ObjectId> = named
+            .into_iter()
+            .filter(|(_, kind)| {
+                resolved_name(&self.doc, kind)
+                    .is_some_and(|name| matches!(name.as_slice(), b"JavaScript" | b"Launch"))
+            })
+            .map(|(id, _)| id)
             .collect();
         let mut removed = HashSet::new();
         let ids: Vec<ObjectId> = self.doc.objects.keys().copied().collect();
@@ -353,10 +362,14 @@ impl Pdf {
         let Ok(dict) = self.doc.get_dictionary(id).cloned() else {
             return 0;
         };
+        // /FT and /Subtype are names, and a name may be stored as a reference. An unresolved
+        // type would clear a signature (they are exempt) or leave a widget's drawn value behind.
         let field_type = dict
             .get(b"FT")
-            .and_then(Object::as_name)
             .ok()
+            .map(|value| self.resolve(value))
+            .as_ref()
+            .and_then(|value| value.as_name().ok())
             .or(field_type)
             .map(<[u8]>::to_vec);
         if field_type.as_deref() == Some(b"Sig") {
@@ -368,6 +381,11 @@ impl Pdf {
             dict.get(b"AS").map(|state| self.resolve(state)),
             Ok(Object::Name(state)) if state != b"Off"
         );
+        let is_widget = dict.get(b"Subtype").ok().is_some_and(|subtype| {
+            self.resolve(subtype)
+                .as_name()
+                .is_ok_and(|name| name == b"Widget")
+        });
         if let Ok(dict) = self.doc.get_dictionary_mut(id) {
             // The value, its rich text, the options picked in a list (/I) and the value a reset
             // restores (/DV).
@@ -375,10 +393,6 @@ impl Pdf {
                 .into_iter()
                 .filter(|key| dict.remove(key).is_some())
                 .count();
-            let is_widget = dict
-                .get(b"Subtype")
-                .and_then(Object::as_name)
-                .is_ok_and(|s| s == b"Widget");
             // A widget can show a value its field no longer holds; clearing that counts too.
             let shown = is_widget
                 && match field_type.as_deref() {
@@ -417,15 +431,15 @@ impl Pdf {
             let mut kept = Vec::with_capacity(annotations.len());
             let mut popups = HashSet::new();
             let subtype = |doc: &Document, annotation: &Object| -> Option<Vec<u8>> {
-                let dict = match annotation {
-                    Object::Reference(id) => doc.get_dictionary(*id).ok()?,
-                    Object::Dictionary(dict) => dict,
-                    _ => return None,
+                let stored = {
+                    let dict = match annotation {
+                        Object::Reference(id) => doc.get_dictionary(*id).ok()?,
+                        Object::Dictionary(dict) => dict,
+                        _ => return None,
+                    };
+                    dict.get(b"Subtype").ok()?.clone()
                 };
-                dict.get(b"Subtype")
-                    .and_then(Object::as_name)
-                    .ok()
-                    .map(<[u8]>::to_vec)
+                resolved_name(doc, &stored)
             };
             for annotation in &annotations {
                 let kind = subtype(&self.doc, annotation).unwrap_or_default();
@@ -542,12 +556,26 @@ fn count_outline(doc: &Document, node: ObjectId) -> usize {
     count
 }
 
+/// The name `object` is, following a reference. A PDF name may be an object of its own.
+fn resolved_name(doc: &Document, object: &Object) -> Option<Vec<u8>> {
+    let mut current = object.clone();
+    for _ in 0..16 {
+        match current {
+            Object::Reference(id) => current = doc.get_object(id).ok()?.clone(),
+            Object::Name(name) => return Some(name),
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// True for an action that runs code: JavaScript, or launching an application or file.
-fn runs_code(action: &Dictionary) -> bool {
-    action
-        .get(b"S")
-        .and_then(Object::as_name)
-        .is_ok_and(|s| matches!(s, b"JavaScript" | b"Launch"))
+fn runs_code(doc: &Document, action: &Dictionary) -> bool {
+    let Ok(kind) = action.get(b"S").cloned() else {
+        return false;
+    };
+    resolved_name(doc, &kind)
+        .is_some_and(|name| matches!(name.as_slice(), b"JavaScript" | b"Launch"))
 }
 
 /// Takes the actions that run code out of the action chains in `object` and in everything it holds
@@ -576,12 +604,10 @@ fn strip_code(
         _ => return 0,
     };
     let mut count = 0;
-    if dict
-        .get(b"S")
-        .and_then(Object::as_name)
-        .is_ok_and(|s| s == b"Rendition")
-        && dict.remove(b"JS").is_some()
-    {
+    let rendition = dict.get(b"S").ok().cloned().is_some_and(|kind| {
+        resolved_name(doc, &kind).is_some_and(|name| name.as_slice() == b"Rendition")
+    });
+    if rendition && dict.remove(b"JS").is_some() {
         count += 1;
     }
     for key in [&b"A"[..], b"Next"] {
@@ -668,7 +694,7 @@ fn splice(
                 .ok()
                 .and_then(|action| action.get(b"Next").ok())
         }
-        Object::Dictionary(action) if runs_code(action) => {
+        Object::Dictionary(action) if runs_code(doc, action) => {
             *count += 1;
             action.get(b"Next").ok()
         }
