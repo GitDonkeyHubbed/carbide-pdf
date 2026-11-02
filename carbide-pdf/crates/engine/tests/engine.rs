@@ -176,6 +176,108 @@ fn page_ranges_parse_and_validate() {
     }
 }
 
+#[test]
+fn page_edits_reject_a_bad_index_before_changing_the_document() {
+    let mut pdf = text_pdf(&[&["one"], &["two"]]);
+    let objects = pdf.document().objects.len();
+    assert!(matches!(
+        pdf.delete_pages(&[0, 9]),
+        Err(Error::PageOutOfRange { index: 9, count: 2 })
+    ));
+    assert_eq!(
+        (pdf.page_count(), pdf.document().objects.len()),
+        (2, objects)
+    );
+    // The same page twice is one deletion, not "delete everything".
+    pdf.delete_pages(&[1, 1]).unwrap();
+    assert_eq!(pdf.page_count(), 1);
+
+    let mut pdf = text_pdf(&[&["one"]]);
+    let objects = pdf.document().objects.len();
+    assert!(matches!(
+        pdf.insert_blank_page(2, None),
+        Err(Error::PageOutOfRange { index: 2, count: 1 })
+    ));
+    assert_eq!(
+        (pdf.page_count(), pdf.document().objects.len()),
+        (1, objects)
+    );
+}
+
+#[test]
+fn extract_drops_the_other_pages_and_catalog_pointers() {
+    let mut pdf = text_pdf(&[&["AlphaPage"], &["BetaPage"]]);
+    let catalog_id = pdf
+        .document()
+        .trailer
+        .get(b"Root")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let catalog = pdf.document_mut().get_dictionary_mut(catalog_id).unwrap();
+    catalog.set("Names", dictionary! { "Dests" => dictionary! {} });
+    catalog.set("OpenAction", Object::Null);
+
+    let mut picked = pdf.extract_pages(&[1]).unwrap();
+    let catalog = picked.document().catalog().unwrap();
+    assert!(catalog.get(b"Outlines").is_err());
+    assert!(catalog.get(b"Names").is_err());
+    assert!(catalog.get(b"OpenAction").is_err());
+    let bytes = picked.to_bytes().unwrap();
+    assert!(bytes.windows(8).any(|w| w == b"BetaPage"));
+    assert!(
+        !bytes.windows(9).any(|w| w == b"AlphaPage"),
+        "the dropped page's text must not remain"
+    );
+}
+
+#[test]
+fn page_geometry_inherits_media_and_ignores_an_empty_crop() {
+    let mut pdf = text_pdf(&[&["x"]]);
+    let page_id = pdf.page_id(0).unwrap();
+    let parent_id = pdf
+        .document()
+        .get_dictionary(page_id)
+        .unwrap()
+        .get(b"Parent")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    pdf.document_mut()
+        .get_dictionary_mut(page_id)
+        .unwrap()
+        .remove(b"MediaBox");
+    pdf.document_mut()
+        .get_dictionary_mut(parent_id)
+        .unwrap()
+        .set("MediaBox", vec![0.into(), 0.into(), 200.into(), 400.into()]);
+    let g = pdf.page_geometry(0).unwrap();
+    assert_eq!(
+        (g.box_width, g.box_height),
+        (200.0, 400.0),
+        "the page has to inherit its parent's media box"
+    );
+
+    // Completely outside the page: fall back to the media box instead of a negative box.
+    pdf.document_mut().get_dictionary_mut(page_id).unwrap().set(
+        "CropBox",
+        vec![500.into(), 500.into(), 700.into(), 800.into()],
+    );
+    let g = pdf.page_geometry(0).unwrap();
+    assert_eq!((g.box_width, g.box_height), (200.0, 400.0));
+
+    // Inverted corners, clipped to the media box: [150, 350, 200, 400].
+    pdf.document_mut().get_dictionary_mut(page_id).unwrap().set(
+        "CropBox",
+        vec![200.into(), 400.into(), 150.into(), 350.into()],
+    );
+    let g = pdf.page_geometry(0).unwrap();
+    assert_eq!(
+        (g.x0, g.y0, g.box_width, g.box_height),
+        (150.0, 350.0, 50.0, 50.0)
+    );
+}
+
 // ---- stamping ------------------------------------------------------------------------------
 
 #[test]
@@ -328,6 +430,167 @@ fn saving_a_protected_document_does_not_write_the_plaintext() {
     assert!(matches!(Pdf::from_bytes_with_password(&saved, "owner-pw"), Err(Error::WrongPassword) | Err(Error::PasswordRequired)));
 }
 
+#[test]
+fn saving_an_edit_reencrypts_with_the_trimmed_password() {
+    let mut pdf = text_pdf(&[&["private"]]);
+    let encrypted = pdf
+        .to_encrypted_bytes(&ProtectionOptions::new("open-sesame", "owner-pw"))
+        .unwrap();
+    let mut opened = Pdf::from_bytes_with_password(&encrypted, "open-sesame").unwrap();
+    opened
+        .apply_watermark(&WatermarkOptions::new("EDITMARK77"))
+        .unwrap();
+
+    // Padding is not part of the password. A full rewrite must carry the edit and still not be plaintext.
+    let saved = opened
+        .bytes_for_save(Some(&encrypted), Some("  open-sesame  "))
+        .unwrap();
+    assert!(
+        !saved.starts_with(&encrypted),
+        "a protected save is a new encrypted file, not an append"
+    );
+    assert!(!saved.windows(7).any(|w| w == b"private"));
+    assert!(!saved.windows(10).any(|w| w == b"EDITMARK77"));
+    assert!(matches!(
+        Pdf::from_bytes(&saved),
+        Err(Error::PasswordRequired)
+    ));
+    assert!(matches!(
+        Pdf::from_bytes_with_password(&saved, "  open-sesame  "),
+        Err(Error::WrongPassword) | Err(Error::PasswordRequired)
+    ));
+    let mut again = Pdf::from_bytes_with_password(&saved, "open-sesame").unwrap();
+    let plain = again.to_bytes().unwrap();
+    assert!(plain.windows(7).any(|w| w == b"private"));
+    assert!(
+        plain.windows(10).any(|w| w == b"EDITMARK77"),
+        "the edit has to survive re-encryption"
+    );
+}
+
+#[test]
+fn a_blank_password_or_an_encrypted_base_cannot_strip_protection() {
+    let mut pdf = text_pdf(&[&["plain body"]]);
+    let base = file_bytes(&mut pdf);
+    // Whitespace is not a password, so Save stays on the incremental path.
+    assert_eq!(pdf.bytes_for_save(Some(&base), Some(" \t ")).unwrap(), base);
+    let mut edited = Pdf::from_bytes(&base).unwrap();
+    edited
+        .apply_watermark(&WatermarkOptions::new("PLAIN-MARK"))
+        .unwrap();
+    let saved = edited.bytes_for_save(Some(&base), Some(" \t ")).unwrap();
+    assert!(saved.starts_with(&base));
+    assert!(
+        Pdf::from_bytes(&saved).is_ok(),
+        "a blank password must not encrypt the file"
+    );
+    assert!(saved.windows(10).any(|w| w == b"PLAIN-MARK"));
+
+    let mut secret = text_pdf(&[&["private-body"]]);
+    assert!(
+        secret
+            .to_encrypted_bytes(&ProtectionOptions::new("user", ""))
+            .is_err(),
+        "an empty owner password has to be refused"
+    );
+    // An empty user password still encrypts the file. The loader accepts that empty password by
+    // itself, so the document opens with no prompt and the text comes back.
+    let encrypted = secret
+        .to_encrypted_bytes(&ProtectionOptions::new("", "owner-only"))
+        .unwrap();
+    assert!(!encrypted.windows(12).any(|w| w == b"private-body"));
+    let mut opened = Pdf::from_bytes(&encrypted).unwrap();
+    assert!(opened
+        .to_bytes()
+        .unwrap()
+        .windows(12)
+        .any(|w| w == b"private-body"));
+
+    let encrypted = secret
+        .to_encrypted_bytes(&ProtectionOptions::new("pw", "owner-only"))
+        .unwrap();
+    let mut opened = Pdf::from_bytes_with_password(&encrypted, "pw").unwrap();
+    opened
+        .apply_watermark(&WatermarkOptions::new("LEAK-MARK"))
+        .unwrap();
+    for result in [
+        opened.bytes_for_save(Some(&encrypted), None).map(|_| ()),
+        opened.incremental_update(&encrypted).map(|_| ()),
+        opened
+            .save_revision(&encrypted, "Kept", &pdf_date_now())
+            .map(|_| ()),
+        opened
+            .sign(&encrypted, &sign_options(SubFilter::Pkcs7Detached))
+            .map(|_| ()),
+    ] {
+        match result {
+            Err(Error::Unsupported(message)) => assert!(message.contains("encrypted"), "{message}"),
+            other => panic!("encrypted bytes must not be rewritten, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn permission_flags_change_the_encryption_dictionary() {
+    fn permissions(print: bool, copy: bool, modify: bool, annotate: bool) -> i64 {
+        let mut pdf = text_pdf(&[&["flagged"]]);
+        let mut options = ProtectionOptions::new("user", "owner-only");
+        options.allow_printing = print;
+        options.allow_copying = copy;
+        options.allow_modifying = modify;
+        options.allow_annotating = annotate;
+        let bytes = pdf.to_encrypted_bytes(&options).unwrap();
+        permission_integer(&bytes)
+    }
+
+    let baseline = permissions(true, true, true, true);
+    let cases = [
+        (false, true, true, true, "printing"),
+        (true, false, true, true, "copying"),
+        (true, true, false, true, "modifying"),
+        (true, true, true, false, "annotating"),
+    ];
+    for (print, copy, modify, annotate, flag) in cases {
+        assert_ne!(
+            permissions(print, copy, modify, annotate),
+            baseline,
+            "{flag} did not change /P"
+        );
+    }
+}
+
+/// The plaintext `/P` integer in an encrypted file.
+fn permission_integer(pdf: &[u8]) -> i64 {
+    let mut from = 0;
+    while let Some(rel) = pdf[from..].windows(2).position(|w| w == b"/P") {
+        let at = from + rel;
+        from = at + 2;
+        if !matches!(pdf.get(at + 2), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            continue;
+        }
+        let rest = &pdf[at + 2..];
+        let start = rest
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(rest.len());
+        let mut end = start;
+        if rest.get(end) == Some(&b'-') {
+            end += 1;
+        }
+        let digits = end;
+        while rest.get(end).is_some_and(|b| b.is_ascii_digit()) {
+            end += 1;
+        }
+        if end > digits {
+            return std::str::from_utf8(&rest[start..end])
+                .unwrap()
+                .parse()
+                .unwrap();
+        }
+    }
+    panic!("encryption dictionary has no /P value");
+}
+
 // ---- annotations ---------------------------------------------------------------------------
 
 #[test]
@@ -376,6 +639,167 @@ fn annotations_on_rotated_pages_stay_upright_and_in_place() {
     assert!(x1 < 120 && y1 < 120, "note should be at the displayed top-left, got ({x0},{y0})-({x1},{y1})");
 }
 
+#[test]
+fn watermark_rejects_blank_text_and_a_missing_page() {
+    let mut pdf = text_pdf(&[&["only"]]);
+    let objects = pdf.document().objects.len();
+    assert!(pdf.apply_watermark(&WatermarkOptions::new(" \t")).is_err());
+    let mut options = WatermarkOptions::new("NO-WRITE");
+    options.pages = Some(vec![2]);
+    assert!(matches!(
+        pdf.apply_watermark(&options),
+        Err(Error::PageOutOfRange { index: 2, count: 1 })
+    ));
+    assert_eq!(pdf.document().objects.len(), objects);
+}
+
+#[test]
+fn watermark_opacity_is_clamped_and_a_shared_resource_dict_is_copied() {
+    let mut pdf = text_pdf(&[&["only"]]);
+    let mut options = WatermarkOptions::new("MARK");
+    options.opacity = 5.0;
+    pdf.apply_watermark(&options).unwrap();
+    assert_eq!(ext_state_alpha(&pdf), 1.0);
+
+    let mut pdf = text_pdf(&[&["only"]]);
+    let mut options = WatermarkOptions::new("MARK");
+    options.opacity = -0.4;
+    pdf.apply_watermark(&options).unwrap();
+    assert_eq!(ext_state_alpha(&pdf), 0.0);
+
+    let mut pdf = two_pages_sharing_resources();
+    let page1 = pdf.page_id(1).unwrap();
+    let shared_id = pdf
+        .document()
+        .get_dictionary(page1)
+        .unwrap()
+        .get(b"Resources")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let content_id = pdf
+        .document()
+        .get_dictionary(page1)
+        .unwrap()
+        .get(b"Contents")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let content_before = pdf.document().get_object(content_id).unwrap().clone();
+
+    let mut options = WatermarkOptions::new("SHARED-MARK");
+    options.pages = Some(vec![0]);
+    pdf.apply_watermark(&options).unwrap();
+
+    let page0 = pdf.page_id(0).unwrap();
+    let page0_resources = pdf
+        .document()
+        .get_dictionary(page0)
+        .unwrap()
+        .get(b"Resources")
+        .unwrap();
+    let Object::Dictionary(copied) = page0_resources else {
+        panic!("page 0 should own a copied resource dictionary");
+    };
+    assert!(copied
+        .get(b"Font")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"CarbideF1")
+        .is_ok());
+
+    let page1_resources = pdf
+        .document()
+        .get_dictionary(page1)
+        .unwrap()
+        .get(b"Resources")
+        .unwrap();
+    assert_eq!(page1_resources.as_reference().unwrap(), shared_id);
+    let shared_fonts = pdf
+        .document()
+        .get_dictionary(shared_id)
+        .unwrap()
+        .get(b"Font")
+        .unwrap()
+        .as_dict()
+        .unwrap();
+    assert!(shared_fonts.get(b"F1").is_ok());
+    assert!(
+        shared_fonts.get(b"CarbideF1").is_err(),
+        "the other page's resource dictionary must stay untouched"
+    );
+    assert_eq!(
+        pdf.document().get_object(content_id).unwrap(),
+        &content_before
+    );
+    let bytes = pdf.to_bytes().unwrap();
+    assert!(bytes.windows(11).any(|w| w == b"SHARED-MARK"));
+}
+
+fn ext_state_alpha(pdf: &Pdf) -> f32 {
+    let page_id = pdf.page_id(0).unwrap();
+    let resources = pdf
+        .document()
+        .get_dictionary(page_id)
+        .unwrap()
+        .get(b"Resources")
+        .unwrap()
+        .as_dict()
+        .unwrap();
+    let state = resources
+        .get(b"ExtGState")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"CarbideGS1")
+        .unwrap()
+        .as_dict()
+        .unwrap();
+    let (fill, stroke) = (
+        state.get(b"ca").unwrap().as_float().unwrap(),
+        state.get(b"CA").unwrap().as_float().unwrap(),
+    );
+    assert_eq!(fill, stroke);
+    fill
+}
+
+fn two_pages_sharing_resources() -> Pdf {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+    });
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font },
+    });
+    let mut kids = Vec::new();
+    for line in ["PageOne", "PageTwo"] {
+        let content = format!("BT /F1 12 Tf ({line}) Tj ET\n");
+        let content_id =
+            doc.add_object(Stream::new(lopdf::Dictionary::new(), content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => content_id,
+            "Resources" => resources_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => kids, "Count" => 2,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
 // ---- incremental updates and revisions -----------------------------------------------------
 
 fn file_bytes(pdf: &mut Pdf) -> Vec<u8> {
@@ -399,6 +823,42 @@ fn incremental_update_appends_without_touching_the_original_bytes() {
     assert!(page_text(&r, &mut reloaded, 0).contains("DRAFT"));
     assert!(page_text(&r, &mut reloaded, 1).contains("DRAFT"));
     assert!(page_text(&r, &mut reloaded, 0).contains("original text"));
+}
+
+#[test]
+fn incremental_update_records_a_trailer_info_change() {
+    let mut pdf = text_pdf(&[&["body"]]);
+    let base = file_bytes(&mut pdf);
+    let mut info = lopdf::Dictionary::new();
+    info.set(
+        "Title",
+        Object::String(b"CarbideTitleXYZ".to_vec(), lopdf::StringFormat::Literal),
+    );
+    let info_id = pdf.document_mut().add_object(info);
+    pdf.document_mut()
+        .trailer
+        .set("Info", Object::Reference(info_id));
+
+    let updated = pdf.incremental_update(&base).unwrap();
+    assert!(updated.len() > base.len());
+    assert_eq!(&updated[..base.len()], &base[..]);
+    let reloaded = Pdf::from_bytes(&updated).unwrap();
+    let info_id = reloaded
+        .document()
+        .trailer
+        .get(b"Info")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let title = reloaded
+        .document()
+        .get_dictionary(info_id)
+        .unwrap()
+        .get(b"Title")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert_eq!(title, b"CarbideTitleXYZ");
 }
 
 #[test]
@@ -1048,6 +1508,230 @@ fn a_damaged_byte_range_is_reported_as_such() {
     signed[digits] = b'7';
     let reports = verify(&signed, &TrustStore::default());
     assert_eq!((reports[0].validity, reports[0].detail), (Validity::Invalid, Detail::BadByteRange));
+}
+
+#[test]
+fn signature_byte_range_must_bracket_the_contents_and_stay_inside_the_file() {
+    let mut doc = text_pdf(&[&["range"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc
+        .sign(&base, &sign_options(SubFilter::Pkcs7Detached))
+        .unwrap();
+    let range = read_byte_range(&signed);
+    assert_eq!(range[0], 0);
+    assert_eq!(signed[range[1]], b'<');
+    assert_eq!(signed[range[2] - 1], b'>');
+    assert_eq!(range[2] + range[3], signed.len());
+
+    // Point the range one byte into the hex string, and one byte early for the closing
+    // delimiter. Those numbers are covered by the digest, so a missing bracket check would
+    // report a mismatch instead of a bad byte range.
+    let mut into_hex = signed.clone();
+    write_byte_range(&mut into_hex, [0, range[1] + 1, range[2], range[3]]);
+    assert_eq!(
+        verify(&into_hex, &TrustStore::default())[0].detail,
+        Detail::BadByteRange
+    );
+
+    let mut early_end = signed.clone();
+    write_byte_range(&mut early_end, [0, range[1], range[2] - 1, range[3] + 1]);
+    assert_eq!(
+        verify(&early_end, &TrustStore::default())[0].detail,
+        Detail::BadByteRange
+    );
+
+    let mut past_eof = signed.clone();
+    write_byte_range(&mut past_eof, [0, range[1], range[2], range[3] + 50]);
+    assert_eq!(
+        verify(&past_eof, &TrustStore::default())[0].detail,
+        Detail::BadByteRange
+    );
+}
+
+#[test]
+fn an_unsupported_subfilter_is_not_reported_as_tampering() {
+    let mut doc = text_pdf(&[&["filter"]]);
+    let base = file_bytes(&mut doc);
+    let mut signed = doc
+        .sign(&base, &sign_options(SubFilter::Pkcs7Detached))
+        .unwrap();
+    let name = SubFilter::Pkcs7Detached.name().as_bytes();
+    let at = signed.windows(name.len()).position(|w| w == name).unwrap();
+    assert_eq!(signed.windows(name.len()).filter(|w| *w == name).count(), 1);
+    signed[at..at + name.len()].copy_from_slice(b"adbe.pkcs7.sha1XXXX");
+    let reports = verify(&signed, &trust_test_identity());
+    assert_eq!(
+        (reports[0].validity, reports[0].detail),
+        (Validity::Invalid, Detail::UnsupportedFilter)
+    );
+    assert!(reports[0]
+        .description_lines()
+        .contains(&sig_messages::FILTER_NOT_SUPPORTED));
+    assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_PROBLEMS));
+}
+
+#[test]
+fn trailing_whitespace_does_not_count_as_a_change_after_signing() {
+    let mut doc = text_pdf(&[&["signed body"]]);
+    let base = file_bytes(&mut doc);
+    let signed = doc
+        .sign(&base, &sign_options(SubFilter::Pkcs7Detached))
+        .unwrap();
+    let trust = trust_test_identity();
+
+    let mut spaced = signed.clone();
+    spaced.extend_from_slice(b"\n \t\r");
+    let reports = verify(&spaced, &trust);
+    assert_eq!(reports[0].validity, Validity::Valid);
+    assert!(!reports[0].modified_after_signing);
+    assert_eq!(notice_text(&reports), Some(sig_messages::NOTICE_ALL_VALID));
+
+    let mut dirty = signed.clone();
+    dirty.push(b'Q');
+    let reports = verify(&dirty, &trust);
+    assert_eq!(reports[0].validity, Validity::Valid);
+    assert!(reports[0].modified_after_signing);
+    assert_eq!(
+        notice_text(&reports),
+        Some(sig_messages::NOTICE_CHANGED_AFTER_LAST)
+    );
+}
+
+#[test]
+fn signature_time_outside_the_allowed_window_is_not_valid() {
+    let mut doc = text_pdf(&[&["dated"]]);
+    let base = file_bytes(&mut doc);
+    let trust = trust_test_identity();
+
+    let mut soon = sign_options(SubFilter::Pkcs7Detached);
+    soon.signing_time = Some(pdf_date_utc(
+        chrono::Utc::now() + chrono::Duration::minutes(3),
+    ));
+    let signed = doc.sign(&base, &soon).unwrap();
+    assert_eq!(
+        verify(&signed, &trust)[0].validity,
+        Validity::Valid,
+        "a few minutes of clock skew is allowed"
+    );
+
+    let mut ahead = sign_options(SubFilter::Pkcs7Detached);
+    ahead.signing_time = Some(pdf_date_utc(
+        chrono::Utc::now() + chrono::Duration::minutes(10),
+    ));
+    let signed = doc.sign(&base, &ahead).unwrap();
+    let reports = verify(&signed, &trust);
+    assert_eq!(
+        (reports[0].validity, reports[0].detail),
+        (Validity::ValidityUnknown, Detail::DigestOkUntrusted)
+    );
+    assert!(!reports[0]
+        .description_lines()
+        .contains(&sig_messages::IDENTITY_EXPIRED));
+
+    // The test certificate is valid from 1975 through 4096, and PDF dates only parse through
+    // year 3000, so the expiry check is reached with a date before the certificate.
+    let mut expired = sign_options(SubFilter::Pkcs7Detached);
+    expired.signing_time = Some("D:19720101000000Z".into());
+    let signed = doc.sign(&base, &expired).unwrap();
+    let reports = verify(&signed, &trust);
+    assert_eq!(
+        (reports[0].validity, reports[0].detail),
+        (Validity::ValidityUnknown, Detail::Expired)
+    );
+    assert!(reports[0]
+        .description_lines()
+        .contains(&sig_messages::IDENTITY_EXPIRED));
+    assert_eq!(reports[0].status_line(), sig_messages::VALIDITY_UNKNOWN);
+}
+
+#[test]
+fn notice_text_ignores_blank_fields_and_ranks_a_broken_signature_first() {
+    let blank = signature_report(Validity::Blank, Detail::NotVerified, false, 500);
+    let good = signature_report(Validity::Valid, Detail::TrustedDirectly, false, 20);
+    assert_eq!(
+        notice_text(&[blank, good]),
+        Some(sig_messages::NOTICE_ALL_VALID)
+    );
+
+    let broken = signature_report(Validity::Invalid, Detail::DigestMismatch, false, 10);
+    let later = signature_report(Validity::Valid, Detail::TrustedDirectly, true, 400);
+    assert_eq!(
+        notice_text(&[later, broken]),
+        Some(sig_messages::NOTICE_PROBLEMS)
+    );
+}
+
+fn pdf_date_utc(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.format("D:%Y%m%d%H%M%SZ").to_string()
+}
+
+fn read_byte_range(file: &[u8]) -> [usize; 4] {
+    let (_, text) = byte_range_text(file);
+    let mut nums = text.split_whitespace().map(|s| s.parse().unwrap());
+    [
+        nums.next().unwrap(),
+        nums.next().unwrap(),
+        nums.next().unwrap(),
+        nums.next().unwrap(),
+    ]
+}
+
+fn write_byte_range(file: &mut [u8], range: [usize; 4]) {
+    let (start, _) = byte_range_text(file);
+    let text = format!(
+        "{:010} {:010} {:010} {:010}",
+        range[0], range[1], range[2], range[3]
+    );
+    file[start..start + text.len()].copy_from_slice(text.as_bytes());
+}
+
+fn byte_range_text(file: &[u8]) -> (usize, String) {
+    let key = b"/ByteRange";
+    let at = file
+        .windows(key.len())
+        .rposition(|w| w == key)
+        .expect("byte range");
+    let bracket = file[at + key.len()..]
+        .iter()
+        .position(|b| *b == b'[')
+        .expect("byte range bracket")
+        + at
+        + key.len();
+    let mut start = bracket + 1;
+    if file.get(start) == Some(&b' ') {
+        start += 1;
+    }
+    let text = std::str::from_utf8(&file[start..start + 43])
+        .unwrap()
+        .to_string();
+    assert!(
+        text.chars().all(|c| c.is_ascii_digit() || c == ' '),
+        "byte range text {text:?}"
+    );
+    (start, text)
+}
+
+fn signature_report(
+    validity: Validity,
+    detail: Detail,
+    modified_after_signing: bool,
+    revision_end: usize,
+) -> carbide_engine::signature::SignatureReport {
+    carbide_engine::signature::SignatureReport {
+        field_name: "Signature1".into(),
+        signer: None,
+        sub_filter: None,
+        reason: None,
+        location: None,
+        signing_time: None,
+        validity,
+        detail,
+        modified_after_signing,
+        certifying: false,
+        document_time_stamp: false,
+        has_embedded_timestamp: false,
+        revision_end,
+    }
 }
 
 #[test]
