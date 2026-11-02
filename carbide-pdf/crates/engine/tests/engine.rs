@@ -176,6 +176,169 @@ fn page_ranges_parse_and_validate() {
     }
 }
 
+#[test]
+fn moving_past_the_last_page_does_not_reorder() {
+    let mut pdf = text_pdf(&[&["one"], &["two"]]);
+    let ids = pdf.page_ids();
+    // `from` is in range. An off-by-one on the destination used to be able to panic or drop a page.
+    assert!(matches!(
+        pdf.move_page(0, 2),
+        Err(Error::PageOutOfRange { index: 2, count: 2 })
+    ));
+    assert_eq!(pdf.page_ids(), ids);
+}
+
+#[test]
+fn a_blank_page_can_be_appended_and_an_empty_document_uses_letter_size() {
+    let mut pdf = text_pdf(&[&["one"]]);
+    // Index equal to the page count appends. The requested size must win over the neighbour's.
+    pdf.insert_blank_page(1, Some((200.0, 100.0))).unwrap();
+    assert_eq!(pdf.page_count(), 2);
+    let g = pdf.page_geometry(1).unwrap();
+    assert_eq!((g.x0, g.y0, g.box_width, g.box_height), (0.0, 0.0, 200.0, 100.0));
+
+    let mut empty = Pdf::new();
+    empty.insert_blank_page(0, None).unwrap();
+    let g = empty.page_geometry(0).unwrap();
+    assert_eq!(
+        (g.box_width, g.box_height),
+        (612.0, 792.0),
+        "an empty document has no neighbour to copy a size from"
+    );
+}
+
+#[test]
+fn page_geometry_clips_a_crop_that_crosses_the_page_edge() {
+    let mut pdf = text_pdf(&[&["x"]]);
+    let page_id = pdf.page_id(0).unwrap();
+    pdf.document_mut().get_dictionary_mut(page_id).unwrap().set(
+        "MediaBox",
+        vec![0.into(), 0.into(), 200.into(), 400.into()],
+    );
+    // Crosses the left, bottom, and right edges, and stops inside the top.
+    // Raw crop is 50, -10, 260 x 110. Media-only fallback is 0, 0, 200 x 400.
+    pdf.document_mut().get_dictionary_mut(page_id).unwrap().set(
+        "CropBox",
+        vec![50.into(), Object::Integer(-10), 250.into(), 100.into()],
+    );
+    let g = pdf.page_geometry(0).unwrap();
+    assert_eq!(
+        (g.x0, g.y0, g.box_width, g.box_height),
+        (50.0, 0.0, 150.0, 100.0),
+        "a crop that overlaps the page is clipped to the media box"
+    );
+}
+
+#[test]
+fn page_geometry_follows_indirect_media_boxes() {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let zero = doc.add_object(Object::Integer(0));
+    let width = doc.add_object(Object::Integer(200));
+    let height = doc.add_object(Object::Integer(400));
+    let referenced = doc.add_object(Object::Array(vec![
+        0.into(),
+        0.into(),
+        180.into(),
+        360.into(),
+    ]));
+    let content = doc.add_object(Stream::new(lopdf::Dictionary::new(), b" ".to_vec()));
+    let by_elements = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![
+            Object::Reference(zero),
+            Object::Reference(zero),
+            Object::Reference(width),
+            Object::Reference(height),
+        ],
+        "Contents" => content,
+    });
+    let by_array = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => Object::Reference(referenced),
+        "Contents" => content,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(by_elements), Object::Reference(by_array)],
+            "Count" => 2,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let pdf = Pdf::from_bytes(&bytes).unwrap();
+
+    let elements = pdf.page_geometry(0).unwrap();
+    assert_eq!(
+        (elements.box_width, elements.box_height),
+        (200.0, 400.0),
+        "each media-box number is its own object"
+    );
+    let array = pdf.page_geometry(1).unwrap();
+    assert_eq!(
+        (array.box_width, array.box_height),
+        (180.0, 360.0),
+        "the media box itself is an indirect array"
+    );
+}
+
+#[test]
+fn page_rotation_is_inherited_past_an_intermediate_node_unless_the_page_sets_it() {
+    let mut doc = Document::with_version("1.5");
+    let root_id = doc.new_object_id();
+    let middle_id = doc.new_object_id();
+    let content = doc.add_object(Stream::new(lopdf::Dictionary::new(), b" ".to_vec()));
+    let inherited = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => middle_id,
+        "MediaBox" => vec![0.into(), 0.into(), 100.into(), 200.into()],
+        "Contents" => content,
+    });
+    let own = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => middle_id,
+        "MediaBox" => vec![0.into(), 0.into(), 100.into(), 200.into()],
+        "Rotate" => 0,
+        "Contents" => content,
+    });
+    doc.objects.insert(
+        middle_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Parent" => root_id,
+            "Kids" => vec![Object::Reference(inherited), Object::Reference(own)],
+            "Count" => 2,
+        }),
+    );
+    doc.objects.insert(
+        root_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(middle_id)],
+            "Count" => 2,
+            "Rotate" => 90,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => root_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let pdf = Pdf::from_bytes(&bytes).unwrap();
+
+    let g = pdf.page_geometry(0).unwrap();
+    assert_eq!(g.rotation, 90, "rotation lives on the grandparent, not the page");
+    assert_eq!(g.display_size(), (200.0, 100.0));
+    let own = pdf.page_geometry(1).unwrap();
+    assert_eq!(own.rotation, 0, "a page's own rotation has to win over its ancestors");
+    assert_eq!(own.display_size(), (100.0, 200.0));
+}
+
 // ---- stamping ------------------------------------------------------------------------------
 
 #[test]
@@ -514,6 +677,113 @@ fn revisions_are_prefixes_of_the_file_and_open_as_they_were() {
     assert!(open_revision_bytes(&v2, &broken).is_err());
     broken.file_offset = v2.len() as u64 + 10;
     assert!(open_revision_bytes(&v2, &broken).is_err());
+}
+
+#[test]
+fn a_revision_prefix_that_is_not_a_pdf_is_not_opened() {
+    let mut pdf = text_pdf(&[&["body"]]);
+    let base = file_bytes(&mut pdf);
+    pdf.apply_watermark(&WatermarkOptions::new("MARK")).unwrap();
+    let saved = pdf.save_revision(&base, "kept", &pdf_date_now()).unwrap();
+    let mut revision = Pdf::from_bytes(&saved).unwrap().revisions().remove(0);
+    assert!(revision.file_offset > 64, "the stored end is inside the file");
+    revision.file_offset = 24;
+    match open_revision_bytes(&saved, &revision) {
+        Ok(bytes) => panic!("a truncated prefix opened as a revision ({} bytes)", bytes.len()),
+        Err(Error::Other(message))
+            if message.contains("no stored position") || message.contains("shorter than") =>
+        {
+            panic!("the prefix is inside the file, so this is the wrong refusal: {message}");
+        }
+        Err(_) => {}
+    }
+}
+
+#[test]
+fn watermark_keeps_a_font_inherited_from_the_parent_and_names_the_next_font() {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+    });
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font },
+    });
+    let content = doc.add_object(Stream::new(
+        lopdf::Dictionary::new(),
+        b"BT /F1 12 Tf (PageOne) Tj ET\n".to_vec(),
+    ));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+            "Resources" => resources_id,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+
+    let page_id = pdf.page_id(0).unwrap();
+    let parent_id = pdf
+        .document()
+        .get_dictionary(page_id)
+        .unwrap()
+        .get(b"Parent")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let resources_id = pdf
+        .document()
+        .get_dictionary(parent_id)
+        .unwrap()
+        .get(b"Resources")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    assert!(
+        pdf.document().get_dictionary(page_id).unwrap().get(b"Resources").is_err(),
+        "the page has its own resources, so this does not exercise inheritance"
+    );
+
+    pdf.apply_watermark(&WatermarkOptions::new("ONE")).unwrap();
+    pdf.apply_watermark(&WatermarkOptions::new("TWO")).unwrap();
+
+    let page_resources = pdf.document().get_dictionary(page_id).unwrap().get(b"Resources").unwrap();
+    let Object::Dictionary(copied) = page_resources else {
+        panic!("inherited resources must be copied onto the page, not shared by reference");
+    };
+    let fonts = copied.get(b"Font").unwrap().as_dict().unwrap();
+    assert!(fonts.get(b"F1").is_ok(), "the page lost the font it inherited");
+    assert!(fonts.get(b"CarbideF1").is_ok());
+    assert!(
+        fonts.get(b"CarbideF2").is_ok(),
+        "the second stamp overwrote CarbideF1 instead of taking the next name"
+    );
+
+    let parent_fonts = pdf
+        .document()
+        .get_dictionary(resources_id)
+        .unwrap()
+        .get(b"Font")
+        .unwrap()
+        .as_dict()
+        .unwrap();
+    assert!(parent_fonts.get(b"F1").is_ok());
+    assert!(
+        parent_fonts.get(b"CarbideF1").is_err() && parent_fonts.get(b"CarbideF2").is_err(),
+        "stamping wrote into the parent's resource dictionary"
+    );
 }
 
 // ---- auto save / auto recovery -------------------------------------------------------------
