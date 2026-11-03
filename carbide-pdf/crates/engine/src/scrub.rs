@@ -1041,6 +1041,19 @@ fn edit_array<T>(
     }
 }
 
+/// The name `object` is, following up to 16 references. `None` when it is not a name.
+fn referenced_name(doc: &Document, object: &Object) -> Option<Vec<u8>> {
+    let mut current = object.clone();
+    for _ in 0..16 {
+        match current {
+            Object::Reference(id) => current = doc.get_object(id).ok()?.clone(),
+            Object::Name(name) => return Some(name),
+            _ => return None,
+        }
+    }
+    None
+}
+
 struct WidgetScope<'a> {
     pages: &'a HashSet<ObjectId>,
     /// Annotations on those pages, with their page.
@@ -1073,16 +1086,20 @@ fn prune_field(
         Object::Dictionary(dict) => (None, dict.clone()),
         _ => return false,
     };
+    // /FT and /Subtype may be references to name objects. Reading them as names
+    // only when they are already direct misses the widget, so a deleted page's
+    // field value stays, and misses a signature type, so an invisible signature
+    // is treated as an ordinary field and dropped.
     let field_type = dict
         .get(b"FT")
-        .and_then(Object::as_name)
         .ok()
-        .map(<[u8]>::to_vec)
+        .and_then(|value| referenced_name(doc, value))
         .or(field_type.map(<[u8]>::to_vec));
     if dict
         .get(b"Subtype")
-        .and_then(Object::as_name)
-        .is_ok_and(|s| s == b"Widget")
+        .ok()
+        .and_then(|value| referenced_name(doc, value))
+        .is_some_and(|name| name == b"Widget")
     {
         let page = dict
             .get(b"P")
