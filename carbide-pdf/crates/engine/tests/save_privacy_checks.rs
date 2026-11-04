@@ -149,6 +149,83 @@ fn deleted_page_image_does_not_survive_in_a_form_with_resources_of_its_own() {
     );
 }
 
+#[test]
+fn a_form_whose_subtype_is_a_reference_keeps_the_font_it_draws_from_the_page() {
+    // The form has no resources of its own, so it draws with the page's. /Subtype is a name
+    // object. An unresolved subtype is not "Form", so the font the form uses is treated as unused
+    // and dropped when another page is deleted.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let font = helvetica(doc);
+            let image = secret_image(doc);
+            let subtype = doc.add_object(Object::Name(b"Form".to_vec()));
+            let form = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => subtype,
+                    "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                },
+                b"BT /F1 12 Tf (kept) Tj ET".to_vec(),
+            ));
+            dictionary! {
+                "Font" => dictionary! { "F1" => font },
+                "XObject" => dictionary! { "Fm1" => form, "Im1" => image },
+            }
+        },
+        &["/Fm1 Do", "q 100 0 0 100 0 0 cm /Im1 Do Q"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the kept form lost its font"
+    );
+}
+
+#[test]
+fn deleted_page_image_does_not_survive_in_a_form_whose_subtype_is_a_reference() {
+    // Same sharing as the direct-subtype case, except /Subtype is a name object. An unresolved
+    // subtype skips trimming the form, so the image only the deleted page drew stays.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let font = helvetica(doc);
+            let image = secret_image(doc);
+            let subtype = doc.add_object(Object::Name(b"Form".to_vec()));
+            let shared = doc.add_object(dictionary! {
+                "Font" => dictionary! { "F1" => font },
+                "XObject" => dictionary! { "Im1" => image },
+            });
+            let form = |doc: &mut Document, content: &str| {
+                Object::Reference(doc.add_object(Stream::new(
+                    dictionary! {
+                        "Type" => "XObject", "Subtype" => subtype,
+                        "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                        "Resources" => shared,
+                    },
+                    content.as_bytes().to_vec(),
+                )))
+            };
+            let kept = form(doc, "BT /F1 12 Tf (kept) Tj ET");
+            let gone = form(doc, "q 100 0 0 100 0 0 cm /Im1 Do Q");
+            dictionary! { "XObject" => dictionary! { "Fm1" => kept, "Fm2" => gone } }
+        },
+        &["/Fm1 Do", "/Fm2 Do"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the kept form lost its font"
+    );
+}
+
 fn form(doc: &mut Document, res: Object, content: &str) -> Object {
     Object::Reference(doc.add_object(Stream::new(
         dictionary! { "Type" => "XObject", "Subtype" => "Form",
@@ -216,6 +293,37 @@ fn unused_image_of_a_type3_font_written_into_a_shared_font_list_does_not_survive
                 doc,
                 Object::Dictionary(dictionary! { "XObject" => dictionary! { "ImS" => image } }),
             );
+            let listed = doc.add_object(dictionary! { "T3" => font });
+            let outer = form(
+                doc,
+                Object::Dictionary(dictionary! { "Font" => listed }),
+                "BT /T3 12 Tf (a) Tj ET",
+            );
+            dictionary! { "XObject" => dictionary! { "F" => outer } }
+        },
+        &["/F Do", "BT ET"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the unused image is still in the file"
+    );
+}
+
+#[test]
+fn unused_image_of_a_type3_font_whose_subtype_is_a_reference_does_not_survive() {
+    // The Type 3 font's /Subtype is a name object. An unresolved subtype is not "Type3", so the
+    // image its resources hold and its glyphs never draw is left in the file.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let image = secret_image(doc);
+            let subtype = doc.add_object(Object::Name(b"Type3".to_vec()));
+            let mut font = type3(
+                doc,
+                Object::Dictionary(dictionary! { "XObject" => dictionary! { "ImS" => image } }),
+            );
+            font.set("Subtype", Object::Reference(subtype));
             let listed = doc.add_object(dictionary! { "T3" => font });
             let outer = form(
                 doc,
@@ -560,6 +668,80 @@ fn colour_spaces_a_transparency_group_blends_in_stay_with_it() {
     assert!(
         contains(&saved, b"0.9642"),
         "the page's blending space was dropped"
+    );
+}
+
+#[test]
+fn a_blend_space_whose_name_is_a_reference_stays_with_the_page() {
+    // The page blends in a colour space its content never selects. /CS is a name object. An
+    // unresolved name is not the resource, so deleting another page drops the space.
+    let blend = Object::Array(vec![
+        Object::Name(b"CalRGB".to_vec()),
+        Object::Dictionary(dictionary! {
+            "WhitePoint" => vec![0.9731.into(), 1.into(), 1.0889.into()],
+        }),
+    ]);
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let space = doc.add_object(Object::Name(b"PageBlend".to_vec()));
+    let resources = doc.add_object(dictionary! {
+        "ColorSpace" => dictionary! { "PageBlend" => blend },
+    });
+    let mut kids = Vec::new();
+    for content in ["BT ET", "BT ET"] {
+        let contents = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+        kids.push(Object::Reference(doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+            "Contents" => contents, "Resources" => resources,
+            "Group" => dictionary! { "S" => "Transparency", "CS" => space },
+        })));
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 2 }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, b"0.9731"),
+        "the page's blending space was dropped"
+    );
+}
+
+#[test]
+fn an_image_keeps_a_colour_space_whose_name_is_a_reference() {
+    // The image names its colour space through a reference. An unresolved name is not a use, so
+    // the space is dropped when another page is deleted and the image no longer has one.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let space_name = doc.add_object(Object::Name(b"SpotInk".to_vec()));
+            let image = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Image", "Width" => 8, "Height" => 8,
+                    "ColorSpace" => space_name, "BitsPerComponent" => 8,
+                },
+                vec![0; 8 * 8],
+            ));
+            dictionary! {
+                "XObject" => dictionary! { "Im1" => image },
+                "ColorSpace" => dictionary! {
+                    "SpotInk" => dictionary! { "Marker" => "InkMarker7f3a" },
+                },
+            }
+        },
+        &["q 100 0 0 100 0 0 cm /Im1 Do Q", "BT ET"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, b"InkMarker7f3a"),
+        "the image lost its colour space"
     );
 }
 
