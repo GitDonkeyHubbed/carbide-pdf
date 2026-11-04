@@ -461,17 +461,20 @@ impl Pdf {
                             Object::Array(items) => items.iter().collect(),
                             other => vec![other],
                         };
-                        more.extend(
-                            items
-                                .into_iter()
-                                .filter_map(|v| v.as_name().ok())
-                                .map(|n| (COLOR_SPACE, n.to_vec())),
-                        );
+                        more.extend(items.into_iter().filter_map(|v| {
+                            // A colour-space name may be an object of its own.
+                            self.resolve(v)
+                                .as_name()
+                                .ok()
+                                .map(|n| (COLOR_SPACE, n.to_vec()))
+                        }));
                     }
                     if category == EXT_G_STATE {
                         if let Some(id) = self.soft_mask_form(value) {
                             if let Ok(Object::Stream(mask)) = self.doc.get_object(id) {
-                                if !self.has_own_resources(&mask.dict) && is_content(&mask.dict) {
+                                if !self.has_own_resources(&mask.dict)
+                                    && self.is_content(&mask.dict)
+                                {
                                     let Some(found) = scan.uses_in(Some(id), mask)? else {
                                         return Ok(None);
                                     };
@@ -483,7 +486,7 @@ impl Pdf {
                     match resolved {
                         Object::Stream(stream)
                             if !self.has_own_resources(&stream.dict)
-                                && is_content(&stream.dict) =>
+                                && self.is_content(&stream.dict) =>
                         {
                             let Some(found) = scan.uses_in(value.as_reference().ok(), stream)?
                             else {
@@ -492,11 +495,7 @@ impl Pdf {
                             more.extend(found);
                         }
                         Object::Dictionary(font)
-                            if font
-                                .get(b"Subtype")
-                                .and_then(Object::as_name)
-                                .is_ok_and(|s| s == b"Type3")
-                                && !self.has_own_resources(font) =>
+                            if self.is_type3(font) && !self.has_own_resources(font) =>
                         {
                             let Object::Dictionary(procs) = font
                                 .get(b"CharProcs")
@@ -731,15 +730,8 @@ impl Pdf {
         };
         let group = self.group_colour_space(dict);
         let content = match owner {
-            Object::Stream(stream) if is_content(&stream.dict) => scan.uses_in(id, stream)?,
-            Object::Dictionary(font)
-                if font
-                    .get(b"Subtype")
-                    .and_then(Object::as_name)
-                    .is_ok_and(|s| s == b"Type3") =>
-            {
-                self.glyph_uses(font, scan)?
-            }
+            Object::Stream(stream) if self.is_content(&stream.dict) => scan.uses_in(id, stream)?,
+            Object::Dictionary(font) if self.is_type3(font) => self.glyph_uses(font, scan)?,
             _ => return Ok(None),
         };
         if depth >= MAX_FORM_DEPTH {
@@ -769,8 +761,25 @@ impl Pdf {
         let Object::Dictionary(group) = owner.get(b"Group").map(|g| self.resolve(g)).ok()? else {
             return None;
         };
-        let name = group.get(b"CS").and_then(Object::as_name).ok()?;
-        Some((COLOR_SPACE, name.to_vec()))
+        let name = self.name_at(&group, b"CS")?;
+        Some((COLOR_SPACE, name))
+    }
+
+    /// The name `dict` stores at `key`, following a reference. A PDF name may be an object of its own.
+    fn name_at(&self, dict: &Dictionary, key: &[u8]) -> Option<Vec<u8>> {
+        let value = dict.get(key).ok()?;
+        self.resolve(value).as_name().ok().map(|name| name.to_vec())
+    }
+
+    /// Whether `dict` is that of a stream that holds content: a form or a tiling pattern.
+    /// `/Subtype` may be a reference to the name `/Form`.
+    fn is_content(&self, dict: &Dictionary) -> bool {
+        dict.has(b"PatternType") || self.name_at(dict, b"Subtype").as_deref() == Some(b"Form")
+    }
+
+    /// Whether `dict` is a Type 3 font. `/Subtype` may be a reference to the name `/Type3`.
+    fn is_type3(&self, dict: &Dictionary) -> bool {
+        self.name_at(dict, b"Subtype").as_deref() == Some(b"Type3")
     }
 
     /// The resources the glyphs of the Type 3 font `font` use; `None` when one cannot be read.
@@ -1010,15 +1019,6 @@ fn uses_in(content: &[u8], left: &mut usize) -> Result<Uses> {
         return Err(Error::TooLarge(messages::TOO_COMPLEX.into()));
     }
     Ok(uses)
-}
-
-/// Whether `dict` is that of a stream that holds content: a form or a tiling pattern.
-fn is_content(dict: &Dictionary) -> bool {
-    dict.has(b"PatternType")
-        || dict
-            .get(b"Subtype")
-            .and_then(Object::as_name)
-            .is_ok_and(|s| s == b"Form")
 }
 
 /// Runs `edit` on the array `holder` is, or refers to, and stores the result where it came from.
