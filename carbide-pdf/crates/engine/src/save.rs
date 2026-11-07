@@ -550,7 +550,7 @@ impl Fingerprint {
         strings(object, &mut found);
         found.sort_unstable();
         let stream = object.as_stream().ok().map(|s| hash(&s.content));
-        let drawing = is_annotation(object).then(|| {
+        let drawing = is_annotation(doc, object).then(|| {
             let mut hasher = DefaultHasher::new();
             hash_values(doc, object, &mut hasher, &mut HashSet::new(), 0);
             hasher.finish()
@@ -659,13 +659,28 @@ fn hash_values(
     }
 }
 
-/// An annotation dictionary. Ink, shapes and stamps can hold nothing but numbers and names.
-fn is_annotation(object: &Object) -> bool {
+/// An annotation dictionary. Ink, shapes and stamps can hold nothing but numbers and names,
+/// and those are still content. `/Type` and `/Subtype` may each be a name stored as its own
+/// object; a direct name is what most files write, and either has to count.
+fn is_annotation(doc: &Document, object: &Object) -> bool {
     let Object::Dictionary(dict) = object else {
         return false;
     };
-    dict.has_type(b"Annot")
-        || (dict.get(b"Subtype").is_ok_and(|s| s.as_name().is_ok()) && dict.has(b"Rect"))
+    resolved_name(doc, dict.get(b"Type").ok()).as_deref() == Some(b"Annot")
+        || (resolved_name(doc, dict.get(b"Subtype").ok()).is_some() && dict.has(b"Rect"))
+}
+
+/// The name `object` is, following a reference. A PDF name may be an object of its own.
+fn resolved_name(doc: &Document, object: Option<&Object>) -> Option<Vec<u8>> {
+    let mut current = object?;
+    for _ in 0..16 {
+        match current {
+            Object::Reference(id) => current = doc.objects.get(id)?,
+            Object::Name(name) => return Some(name.clone()),
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn hash(bytes: &[u8]) -> u64 {

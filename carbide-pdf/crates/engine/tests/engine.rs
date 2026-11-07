@@ -2079,6 +2079,71 @@ fn removing_an_annotation_counts_even_when_it_holds_only_numbers() {
 }
 
 #[test]
+fn removing_an_ink_annotation_whose_subtype_is_its_own_object_counts_as_removed_content() {
+    // Same drawing as the direct-name case, except /Subtype is a name object. An unresolved
+    // subtype is not a name, so the ink would not count as content and a signed save would
+    // append the deletion, leaving the drawing in the signed bytes.
+    let mut doc = text_pdf(&[&["contract body"]]);
+    let page = doc.page_id(0).unwrap();
+    let subtype = doc.document_mut().add_object(Object::Name(b"Ink".to_vec()));
+    let ink = doc.document_mut().add_object(dictionary! {
+        "Subtype" => subtype,
+        "Rect" => vec![100.into(), 100.into(), 200.into(), 200.into()],
+        "InkList" => vec![Object::Array(vec![100.into(), 100.into(), 150.into(), 180.into(), 200.into(), 120.into()])],
+    });
+    doc.document_mut()
+        .get_dictionary_mut(page)
+        .unwrap()
+        .set("Annots", vec![Object::Reference(ink)]);
+    let base = file_bytes(&mut doc);
+    let signed = doc
+        .sign(&base, &sign_options(SubFilter::Pkcs7Detached))
+        .unwrap();
+    let (mut pdf, saved) = SavedFile::open(signed, None).unwrap();
+    let page = pdf.page_id(0).unwrap();
+    let annots = pdf
+        .document()
+        .get_dictionary(page)
+        .unwrap()
+        .get(b"Annots")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .clone();
+    let ink = annots.iter().find(|annotation| {
+        pdf.document()
+            .get_dictionary(annotation.as_reference().unwrap())
+            .unwrap()
+            .has(b"InkList")
+    });
+    let ink_id = ink.unwrap().as_reference().unwrap();
+    assert!(
+        matches!(
+            pdf.document()
+                .get_dictionary(ink_id)
+                .unwrap()
+                .get(b"Subtype")
+                .unwrap(),
+            Object::Reference(_)
+        ),
+        "the fixture must keep /Subtype indirect"
+    );
+    let kept: Vec<Object> = annots.iter().filter(|a| Some(*a) != ink).cloned().collect();
+    pdf.document_mut()
+        .get_dictionary_mut(page)
+        .unwrap()
+        .set("Annots", kept);
+    assert!(saved.removed_from(&pdf));
+    assert_eq!(
+        pdf.save_plan(Some(&saved), false).unwrap(),
+        SavePlan::FullRewrite {
+            breaks_signatures: true,
+            drops_revisions: false
+        }
+    );
+}
+
+#[test]
 fn appended_updates_carry_only_what_the_document_still_uses() {
     let (signed, annots) = signed_with_ink();
     let (mut pdf, saved) = SavedFile::open(signed.clone(), None).unwrap();
