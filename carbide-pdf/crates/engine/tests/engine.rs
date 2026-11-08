@@ -4808,6 +4808,65 @@ fn recursive_forms(fanout: usize, self_drawing: bool) -> Pdf {
     pdf
 }
 
+/// Points every form XObject's `/Subtype` at one shared name object.
+fn indirect_form_subtype(pdf: &mut Pdf) {
+    let name = pdf
+        .document_mut()
+        .add_object(Object::Name(b"Form".to_vec()));
+    let forms: Vec<_> = pdf
+        .document()
+        .objects
+        .iter()
+        .filter_map(|(id, object)| {
+            let stream = object.as_stream().ok()?;
+            let is_form = stream
+                .dict
+                .get(b"Subtype")
+                .ok()
+                .and_then(|value| value.as_name().ok())
+                == Some(b"Form");
+            is_form.then_some(*id)
+        })
+        .collect();
+    assert!(!forms.is_empty(), "the fixture has a form");
+    for id in forms {
+        pdf.document_mut()
+            .get_object_mut(id)
+            .unwrap()
+            .as_stream_mut()
+            .unwrap()
+            .dict
+            .set("Subtype", name);
+    }
+}
+
+#[test]
+fn a_self_drawing_form_whose_subtype_is_its_own_object_is_not_rendered() {
+    use carbide_engine::limits::messages::TOO_COMPLEX;
+    // Same form as the direct-name case, except /Subtype is a name object. An unresolved
+    // subtype is not "Form", so the form is not counted and the page looks cheap enough to
+    // render. PDFium would then draw the form inside itself and never finish.
+    let mut pdf = recursive_forms(2, true);
+    indirect_form_subtype(&mut pdf);
+    let form = pdf.document().objects.values().find(|object| {
+        object.as_stream().is_ok_and(|stream| {
+            stream.content.windows(5).any(|window| window == b"/X Do")
+                && matches!(stream.dict.get(b"Subtype"), Ok(Object::Reference(_)))
+        })
+    });
+    assert!(form.is_some(), "the fixture must keep /Subtype indirect");
+    match pdf.check_drawable(0) {
+        Err(Error::TooLarge(message)) => assert_eq!(message, TOO_COMPLEX),
+        other => panic!("self-drawing form was not refused: {other:?}"),
+    }
+
+    // A form that draws a line once is still a form when its subtype is indirect, so the
+    // page stays within the limit.
+    let mut safe = recursive_forms(1, false);
+    indirect_form_subtype(&mut safe);
+    safe.check_drawable(0).unwrap();
+}
+
 #[test]
 fn forms_that_draw_themselves_are_not_rendered_or_followed_forever() {
     use carbide_engine::limits::messages::TOO_COMPLEX;
