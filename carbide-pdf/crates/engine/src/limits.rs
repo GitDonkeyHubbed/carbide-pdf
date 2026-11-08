@@ -207,12 +207,16 @@ impl<'a> Drawing<'a> {
         let Ok(Object::Stream(stream)) = pdf.doc.get_object(id) else {
             return Ok(Cost::default());
         };
-        if !stream
-            .dict
-            .get(b"Subtype")
-            .and_then(Object::as_name)
-            .is_ok_and(|s| s == b"Form")
-        {
+        // `/Subtype` may be a name stored as its own object. A direct name is what most files
+        // write. Either has to count: an unresolved name is not "Form", so a form that draws
+        // itself looks empty and the page is handed to PDFium, which has no such limit.
+        let subtype = stream.dict.get(b"Subtype").ok().cloned();
+        let is_form = subtype.is_some_and(|subtype| {
+            pdf.resolve(&subtype)
+                .as_name()
+                .is_ok_and(|name| name == b"Form")
+        });
+        if !is_form {
             return Ok(Cost::default());
         }
         let own = stream
