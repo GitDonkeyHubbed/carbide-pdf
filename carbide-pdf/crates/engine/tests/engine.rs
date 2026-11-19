@@ -6087,6 +6087,90 @@ fn sign_options(sub_filter: SubFilter) -> SignOptions<'static> {
     }
 }
 
+/// A one-page file whose signature stores `/ByteRange` and `/SubFilter` as objects of their own.
+/// The byte-range numbers are patched in after the cross-reference table is written, at a fixed
+/// width, so they describe this file. The signature value is not a real CMS token.
+fn file_with_indirect_signature_values() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(b"%PDF-1.7\n");
+    let mut offsets = Vec::new();
+    let mut add = |content: &str| {
+        let number = offsets.len() + 1;
+        offsets.push(body.len());
+        body.extend_from_slice(format!("{number} 0 obj\n{content}\nendobj\n").as_bytes());
+    };
+    add("<< /Type /Catalog /Pages 2 0 R >>");
+    add("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    add("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> >>");
+    add(
+        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter 6 0 R /ByteRange 5 0 R /Contents <0000> >>",
+    );
+    let placeholder = "[0000000000 0000000000 0000000000 0000000000]";
+    add(placeholder);
+    add("/adbe.pkcs7.detached");
+
+    let xref_at = body.len();
+    let count = offsets.len() + 1;
+    body.extend_from_slice(format!("xref\n0 {count}\n").as_bytes());
+    body.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        body.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    body.extend_from_slice(
+        format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF").as_bytes(),
+    );
+
+    let contents_at = body.windows(6).position(|w| w == b"<0000>").unwrap();
+    let file_end = body
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .unwrap()
+        + 1;
+    // The first number is always 0. The gap is the hex string, and the second range runs to the
+    // last byte that is not white space.
+    let numbers = format!(
+        "[{:010} {:010} {:010} {:010}]",
+        0,
+        contents_at,
+        contents_at + 6,
+        file_end - (contents_at + 6)
+    );
+    let at = body
+        .windows(placeholder.len())
+        .position(|window| window == placeholder.as_bytes())
+        .unwrap();
+    body[at..at + placeholder.len()].copy_from_slice(numbers.as_bytes());
+    body
+}
+
+#[test]
+fn a_signature_whose_byte_range_is_its_own_object_is_kept_when_saving() {
+    let file = file_with_indirect_signature_values();
+    let trust = TrustStore {
+        certificates: Vec::new(),
+    };
+    let reports = verify(&file, &trust);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].sub_filter.as_deref(),
+        Some("adbe.pkcs7.detached")
+    );
+    assert_ne!(reports[0].detail, Detail::UnsupportedFilter);
+    assert_ne!(reports[0].detail, Detail::BadByteRange);
+
+    // The value is not a real signature, so it cannot be confirmed. What it must not be is a bad
+    // range: that is the only failure for which a later edit is written over the file, which
+    // drops the signature, and without a warning, because the signature was not counted as intact.
+    let (mut pdf, saved) = SavedFile::open(file, None).unwrap();
+    pdf.add_note(0, 20.0, 80.0, "a note beside the signature")
+        .unwrap();
+    assert!(!saved.removed_from(&pdf));
+    assert_eq!(
+        pdf.save_plan(Some(&saved), false).unwrap(),
+        SavePlan::Incremental
+    );
+}
+
 #[test]
 fn signing_produces_a_verifiable_pkcs7_signature() {
     let mut doc = text_pdf(&[&["contract"]]);
