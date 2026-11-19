@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, TimeZone, Utc};
 use lopdf::xref::XrefEntry;
-use lopdf::{dictionary, Dictionary, Object, ObjectId, Stream, StringFormat};
+use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream, StringFormat};
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
 use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
@@ -1105,10 +1105,12 @@ const MAX_FIELD_DEPTH: usize = 32;
 /// `/Sig`. The type is inheritable: a field without its own `/FT` takes its nearest ancestor's.
 fn signature_field_value(pdf: &Pdf, d: &Dictionary) -> Option<ObjectId> {
     let mut field = d;
-    let mut field_type = None;
+    let mut field_type: Option<Vec<u8>> = None;
     for _ in 0..MAX_FIELD_DEPTH {
         if let Ok(kind) = field.get(b"FT") {
-            field_type = kind.as_name().ok();
+            // `/FT` may be a name stored as its own object. Read only as a direct name, it is
+            // not `/Sig`, so a signature field is missed.
+            field_type = resolved_name(&pdf.doc, Some(kind));
             break;
         }
         match field.get(b"Parent") {
@@ -1119,7 +1121,7 @@ fn signature_field_value(pdf: &Pdf, d: &Dictionary) -> Option<ObjectId> {
             _ => break,
         }
     }
-    let is_signature = field_type == Some(b"Sig".as_slice());
+    let is_signature = field_type.as_deref() == Some(b"Sig".as_slice());
     match d.get(b"V") {
         Ok(Object::Reference(value)) if is_signature => Some(*value),
         _ => None,
@@ -1153,17 +1155,16 @@ impl SignatureReport {
 
     /// Takes what the signature dictionary `v` says about itself: its handler, type, and the
     /// signer's claims (name, reason, location, time). A document time stamp's time is the one in
-    /// its token, and only once that verifies: a `/M` beside it is not taken.
-    fn describe(&mut self, v: &Dictionary) {
-        self.sub_filter = v
-            .get(b"SubFilter")
-            .ok()
-            .and_then(|o| o.as_name().ok())
-            .map(|n| String::from_utf8_lossy(n).into_owned());
+    /// its token, and only once that verifies: a `/M` beside it is not taken. `/SubFilter` and
+    /// `/Type` may each be a name stored as its own object; a direct name is what most files
+    /// write, and either has to count.
+    fn describe(&mut self, doc: &Document, v: &Dictionary) {
+        self.sub_filter = resolved_name(doc, v.get(b"SubFilter").ok())
+            .map(|name| String::from_utf8_lossy(&name).into_owned());
         self.claimed_name = text_of(v, b"Name");
         self.reason = text_of(v, b"Reason");
         self.location = text_of(v, b"Location");
-        self.document_time_stamp = v.get(b"Type").ok().and_then(|o| o.as_name().ok())
+        self.document_time_stamp = resolved_name(doc, v.get(b"Type").ok()).as_deref()
             == Some(b"DocTimeStamp".as_slice())
             || self.sub_filter.as_deref() == Some("ETSI.RFC3161");
         self.signing_time = if self.document_time_stamp {
@@ -1624,9 +1625,10 @@ fn valid_at(cert: &Certificate, at: DateTime<Utc>) -> bool {
 }
 
 /// `/ByteRange [0 b c d]` as offsets into `file`: the first range starts the file, the gap between
-/// the ranges is a hex string, and the second range ends inside the file.
-fn signed_range(v: &Dictionary, file: &[u8]) -> Option<(usize, usize, usize)> {
-    let range = integer_array(v.get(b"ByteRange").ok()).filter(|r| r.len() == 4)?;
+/// the ranges is a hex string, and the second range ends inside the file. The array, and each
+/// number in it, may be an object of its own.
+fn signed_range(doc: &Document, v: &Dictionary, file: &[u8]) -> Option<(usize, usize, usize)> {
+    let range = integer_array(doc, v.get(b"ByteRange").ok()).filter(|r| r.len() == 4)?;
     let [a, b, c, d] = [range[0], range[1], range[2], range[3]].map(|n| usize::try_from(n).ok());
     let (b, c, d) = (b?, c?, d?);
     let end = c.checked_add(d)?;
@@ -1839,9 +1841,40 @@ fn text_of(dict: &Dictionary, key: &[u8]) -> Option<String> {
     dict.get(key).ok()?.as_str().ok().map(decode_text)
 }
 
-fn integer_array(object: Option<&Object>) -> Option<Vec<i64>> {
-    match object? {
-        Object::Array(items) => items.iter().map(|o| o.as_i64().ok()).collect(),
+/// The integers of an array. The array may be a reference, and so may each integer: a PDF number
+/// or array may be an object of its own. A signature's `/ByteRange` is read this way. One that
+/// cannot be read is a bad range, and a save then rewrites the file and drops the signature
+/// without saying that it will.
+fn integer_array(doc: &Document, object: Option<&Object>) -> Option<Vec<i64>> {
+    let items = match resolved_object(doc, object?)? {
+        Object::Array(items) => items.clone(),
+        _ => return None,
+    };
+    items
+        .iter()
+        .map(|item| match resolved_object(doc, item)? {
+            Object::Integer(value) => Some(*value),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Follows up to 16 references to a direct object.
+fn resolved_object<'a>(doc: &'a Document, object: &'a Object) -> Option<&'a Object> {
+    let mut current = object;
+    for _ in 0..16 {
+        match current {
+            Object::Reference(id) => current = doc.get_object(*id).ok()?,
+            other => return Some(other),
+        }
+    }
+    None
+}
+
+/// The name `object` is, following a reference. A PDF name may be an object of its own.
+fn resolved_name(doc: &Document, object: Option<&Object>) -> Option<Vec<u8>> {
+    match resolved_object(doc, object?)? {
+        Object::Name(name) => Some(name.clone()),
         _ => None,
     }
 }
@@ -1995,7 +2028,7 @@ fn verify_one(
     now: DateTime<Utc>,
 ) -> SignatureReport {
     let mut report = SignatureReport::new(name.unwrap_or_else(|| format!("object {}", id.0)));
-    report.describe(v);
+    report.describe(&pdf.doc, v);
 
     let invalid = |report: &mut SignatureReport, detail: Detail| {
         report.validity = Validity::Invalid;
@@ -2018,7 +2051,7 @@ fn verify_one(
     // 2. The byte range, bound to the signature value: the gap holds exactly this dictionary's
     //    /Contents, the dictionary lies in the signed part, and so does the revision's own
     //    cross-reference data.
-    let Some((b, c, d)) = signed_range(v, file) else {
+    let Some((b, c, d)) = signed_range(&pdf.doc, v, file) else {
         invalid(&mut report, Detail::BadByteRange);
         return report;
     };
@@ -2051,7 +2084,11 @@ fn verify_one(
         pdf
     };
     let signed = match revision.doc.objects.get(&id) {
-        Some(Object::Dictionary(signed)) if signed_range(signed, file) == Some((b, c, d)) => signed,
+        Some(Object::Dictionary(signed))
+            if signed_range(&revision.doc, signed, file) == Some((b, c, d)) =>
+        {
+            signed
+        }
         _ => {
             invalid(&mut report, Detail::BadByteRange);
             return report;
@@ -2069,7 +2106,7 @@ fn verify_one(
         return report;
     };
     // From here on, what the report says about the signature comes from the signed dictionary.
-    report.describe(signed);
+    report.describe(&revision.doc, signed);
     report.certifying = revision.is_certifying_signature(id);
     if !supported(&report) {
         invalid(&mut report, Detail::UnsupportedFilter);
@@ -2520,6 +2557,33 @@ impl Pdf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_byte_range_and_handler_stored_as_their_own_objects_are_read() {
+        let mut doc = Document::new();
+        let numbers: Vec<ObjectId> = [0i64, 10, 20, 4]
+            .into_iter()
+            .map(|n| doc.add_object(Object::Integer(n)))
+            .collect();
+        let array = doc.add_object(Object::Array(
+            numbers.into_iter().map(Object::Reference).collect(),
+        ));
+        let mut dict = Dictionary::new();
+        dict.set("ByteRange", Object::Reference(array));
+        let mut file = vec![0u8; 24];
+        file[10] = b'<';
+        file[19] = b'>';
+        assert_eq!(signed_range(&doc, &dict, &file), Some((10, 20, 4)));
+
+        let sub_filter = doc.add_object(Object::Name(b"adbe.pkcs7.detached".to_vec()));
+        let kind = doc.add_object(Object::Name(b"DocTimeStamp".to_vec()));
+        dict.set("SubFilter", Object::Reference(sub_filter));
+        dict.set("Type", Object::Reference(kind));
+        let mut report = SignatureReport::new("field".into());
+        report.describe(&doc, &dict);
+        assert_eq!(report.sub_filter.as_deref(), Some("adbe.pkcs7.detached"));
+        assert!(report.document_time_stamp);
+    }
 
     #[test]
     fn a_time_stamp_time_keeps_its_fraction_of_a_second() {
