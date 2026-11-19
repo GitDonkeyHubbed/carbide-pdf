@@ -2586,6 +2586,116 @@ mod tests {
     }
 
     #[test]
+    fn a_value_behind_two_references_is_still_read() {
+        // The test above stores the array, each integer, and each name one reference away. A
+        // reader that follows a reference only once still passes it, and then misses a value
+        // whose object is itself a reference.
+        let mut doc = Document::new();
+        let numbers: Vec<Object> = [0i64, 10, 20, 4]
+            .into_iter()
+            .map(|n| reference_chain(&mut doc, Object::Integer(n), 2))
+            .collect();
+        let mut dict = Dictionary::new();
+        dict.set(
+            "ByteRange",
+            reference_chain(&mut doc, Object::Array(numbers), 2),
+        );
+        assert_eq!(
+            signed_range(&doc, &dict, &file_with_contents_gap()),
+            Some((10, 20, 4))
+        );
+
+        let sub_filter =
+            reference_chain(&mut doc, Object::Name(b"adbe.pkcs7.detached".to_vec()), 2);
+        let kind = reference_chain(&mut doc, Object::Name(b"DocTimeStamp".to_vec()), 2);
+        dict.set("SubFilter", sub_filter);
+        dict.set("Type", kind);
+        let mut report = SignatureReport::new("field".into());
+        report.describe(&doc, &dict);
+        assert_eq!(report.sub_filter.as_deref(), Some("adbe.pkcs7.detached"));
+        assert!(report.document_time_stamp);
+    }
+
+    #[test]
+    fn a_cyclic_byte_range_reference_is_not_a_range() {
+        // A cycle has no array at the end. The walk has to stop and the range has to be unusable.
+        let file = file_with_contents_gap();
+        let mut doc = Document::new();
+        let id = doc.new_object_id();
+        doc.objects.insert(id, Object::Reference(id));
+        let mut dict = Dictionary::new();
+        dict.set("ByteRange", id);
+        assert_eq!(signed_range(&doc, &dict, &file), None);
+
+        let mut doc = Document::new();
+        let left = doc.new_object_id();
+        let right = doc.new_object_id();
+        doc.objects.insert(left, Object::Reference(right));
+        doc.objects.insert(right, Object::Reference(left));
+        let mut dict = Dictionary::new();
+        dict.set("ByteRange", left);
+        assert_eq!(signed_range(&doc, &dict, &file), None);
+    }
+
+    #[test]
+    fn a_signature_field_whose_type_is_stored_indirectly_still_counts() {
+        // The value is no longer a signature dictionary, so the field counts only because its
+        // type is /Sig. A reader that accepts a direct /FT and not a name stored as an object
+        // reports no signature, and the document can then be certified over the field.
+        assert!(
+            document_with_field_type(b"Sig", false).has_signatures(),
+            "a field whose /FT is two references away from /Sig is still a signature"
+        );
+        assert!(
+            document_with_field_type(b"Sig", true).has_signatures(),
+            "a field inherits /FT when only its parent stores that name indirectly"
+        );
+        assert!(
+            !document_with_field_type(b"Tx", false).has_signatures(),
+            "an indirect /FT of /Tx is a text field, not a signature"
+        );
+    }
+
+    /// `leaf` reached through `links` references.
+    fn reference_chain(doc: &mut Document, leaf: Object, links: usize) -> Object {
+        assert!(links >= 1, "a chain follows at least one reference");
+        let mut id = doc.add_object(leaf);
+        for _ in 1..links {
+            id = doc.add_object(Object::Reference(id));
+        }
+        Object::Reference(id)
+    }
+
+    /// 24 bytes whose gap at 10..20 is a hex string, matching `[0 10 20 4]`.
+    fn file_with_contents_gap() -> Vec<u8> {
+        let mut file = vec![0u8; 24];
+        file[10] = b'<';
+        file[19] = b'>';
+        file
+    }
+
+    /// A field named Approval whose value is only `{ /Type /Sig }`, so it is a signature only
+    /// when its type says so. The type name sits two references away. `on_parent` stores that
+    /// type on the parent field, which a field without its own type inherits.
+    fn document_with_field_type(name: &[u8], on_parent: bool) -> Pdf {
+        let mut pdf = Pdf::new();
+        let value = pdf.doc.add_object(dictionary! { "Type" => "Sig" });
+        let ft = reference_chain(&mut pdf.doc, Object::Name(name.to_vec()), 2);
+        let mut field = Dictionary::new();
+        field.set("T", Object::string_literal("Approval"));
+        field.set("V", value);
+        if on_parent {
+            let mut parent = Dictionary::new();
+            parent.set("FT", ft);
+            field.set("Parent", pdf.doc.add_object(parent));
+        } else {
+            field.set("FT", ft);
+        }
+        pdf.doc.add_object(field);
+        pdf
+    }
+
+    #[test]
     fn a_time_stamp_time_keeps_its_fraction_of_a_second() {
         let whole = gentime_to_utc("20260101000000Z").unwrap();
         let quarter = gentime_to_utc("20260101000000.25Z").unwrap();
