@@ -887,6 +887,33 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn keep_both_stops_at_the_9999th_name() {
+        // Fifty taken names still leave a free one for any limit from 52 up.
+        // Every name through `page (9999).png` is taken, so the next copy is
+        // refused. Freeing that last name uses it, and the original stays.
+        let dir = scratch("keep-both-limit");
+        let path = dir.join("page.png");
+        for n in 1..=9_999 {
+            fs::write(numbered(&path, n), b"taken").unwrap();
+        }
+        assert_eq!(
+            write_file(&path, b"new", Existing::KeepBoth)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"taken");
+        fs::remove_file(numbered(&path, 9_999)).unwrap();
+        assert_eq!(
+            write_file(&path, b"new", Existing::KeepBoth).unwrap(),
+            numbered(&path, 9_999)
+        );
+        assert_eq!(fs::read(numbered(&path, 9_999)).unwrap(), b"new");
+        assert_eq!(fs::read(&path).unwrap(), b"taken");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_temporary_files_are_new_and_only_for_the_user() {

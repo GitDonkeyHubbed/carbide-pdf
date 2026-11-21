@@ -723,3 +723,96 @@ fn prune_pairs(
     }
     held
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::pdf::Pdf;
+    use lopdf::{dictionary, Object};
+
+    fn linked_titles(pdf: &Pdf) -> Vec<String> {
+        let doc = pdf.document();
+        let root = doc
+            .catalog()
+            .unwrap()
+            .get(b"Outlines")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let mut titles = Vec::new();
+        let mut next = doc
+            .get_dictionary(root)
+            .unwrap()
+            .get(b"First")
+            .ok()
+            .and_then(|item| item.as_reference().ok());
+        while let Some(id) = next {
+            let item = doc.get_dictionary(id).unwrap();
+            let title = item.get(b"Title").unwrap().as_str().unwrap();
+            titles.push(String::from_utf8_lossy(title).into_owned());
+            next = item
+                .get(b"Next")
+                .ok()
+                .and_then(|item| item.as_reference().ok());
+            assert!(titles.len() <= 100_002, "the outline loops");
+        }
+        titles
+    }
+
+    /// `count` bookmarks, in order, each leading to the first page.
+    fn bookmarks_to_the_first_page(count: usize) -> Pdf {
+        let mut pdf = Pdf::new();
+        pdf.insert_blank_page(0, Some((200.0, 100.0))).unwrap();
+        pdf.insert_blank_page(1, Some((200.0, 100.0))).unwrap();
+        let stay = pdf.page_ids()[0];
+        let doc = pdf.document_mut();
+        let root = doc.add_object(dictionary! { "Type" => "Outlines" });
+        let catalog = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("Outlines", root);
+        let mut ids = Vec::with_capacity(count);
+        for i in 0..count {
+            ids.push(doc.add_object(dictionary! {
+                "Title" => Object::string_literal(format!("T{i:06}")),
+                "Parent" => root,
+                "Dest" => vec![stay.into(), "Fit".into()],
+            }));
+        }
+        for i in 0..count {
+            let item = doc.get_dictionary_mut(ids[i]).unwrap();
+            if i > 0 {
+                item.set("Prev", ids[i - 1]);
+            }
+            if i + 1 < count {
+                item.set("Next", ids[i + 1]);
+            }
+        }
+        let outline = doc.get_dictionary_mut(root).unwrap();
+        outline.set("First", ids[0]);
+        outline.set("Last", ids[count - 1]);
+        pdf
+    }
+
+    #[test]
+    fn deleting_a_page_keeps_100_000_bookmarks_and_not_one_more() {
+        // The other outline checks are a handful of items long, so a cap
+        // anywhere above that still keeps them. 100_000 bookmarks that lead
+        // to a page which stays are kept when another page is deleted. One
+        // more is left out of the outline.
+        let mut at_limit = bookmarks_to_the_first_page(100_000);
+        at_limit.delete_pages(&[1]).unwrap();
+        assert_eq!(at_limit.page_count(), 1);
+        let titles = linked_titles(&at_limit);
+        assert_eq!(titles.len(), 100_000);
+        assert_eq!(titles.first().map(String::as_str), Some("T000000"));
+        assert_eq!(titles.last().map(String::as_str), Some("T099999"));
+
+        let mut over = bookmarks_to_the_first_page(100_001);
+        over.delete_pages(&[1]).unwrap();
+        assert_eq!(over.page_count(), 1);
+        let titles = linked_titles(&over);
+        assert_eq!(titles.len(), 100_000, "a bookmark past the chain was kept");
+        assert_eq!(titles.last().map(String::as_str), Some("T099999"));
+        assert!(titles.iter().all(|title| title != "T100000"));
+    }
+}

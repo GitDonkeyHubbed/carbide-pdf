@@ -342,4 +342,23 @@ mod tests {
             Err(Error::Pdf(_))
         ));
     }
+
+    #[test]
+    fn the_load_budget_stays_between_256_mb_and_2_gb() {
+        // 256 times the file, and no less than 256 MB or more than 2 GB. A file
+        // one byte under the floor still gets 256 MB. One byte over it is charged
+        // 256 bytes more. The same step at the ceiling stops there.
+        let floor = 256 << 20;
+        let ceiling = 2 << 30;
+        let at_floor = floor / 256;
+        assert_eq!(load_budget(0), floor);
+        assert_eq!(load_budget(at_floor - 1), floor);
+        assert_eq!(load_budget(at_floor), floor);
+        assert_eq!(load_budget(at_floor + 1), floor + 256);
+        let at_ceiling = ceiling / 256;
+        assert_eq!(load_budget(at_ceiling - 1), ceiling - 256);
+        assert_eq!(load_budget(at_ceiling), ceiling);
+        assert_eq!(load_budget(at_ceiling + 1), ceiling);
+        assert_eq!(load_budget(usize::MAX), ceiling);
+    }
 }

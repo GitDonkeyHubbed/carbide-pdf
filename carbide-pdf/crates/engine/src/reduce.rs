@@ -1229,6 +1229,56 @@ mod tests {
     }
 
     #[test]
+    fn an_image_of_128_megabytes_is_charged_and_one_byte_more_is_not() {
+        // The tests above use a 100 by 100 image, so any cap from its 10_000
+        // bytes up to the real one still passes. 128 MB is charged even though
+        // the stream is only a few bytes and the decode is then given up. One
+        // byte more is not an image this will decode, and it spends nothing.
+        let doc = Document::with_version("1.5");
+        let gray = |width: i64, height: i64| {
+            Stream::new(
+                dictionary! {
+                    "Subtype" => "Image",
+                    "Width" => width,
+                    "Height" => height,
+                    "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8,
+                    "Filter" => "FlateDecode",
+                },
+                flate(&[0, 1, 2, 3]),
+            )
+        };
+        // 128 MB is written out, not taken from the constant, so moving that
+        // constant by one fails here.
+        let cap: u64 = 128 << 20;
+        let mut budget = usize::MAX;
+        assert!(decode_image(&doc, &gray(cap as i64, 1), &mut budget).is_none());
+        assert_eq!(budget, usize::MAX - cap as usize);
+        let mut budget = usize::MAX;
+        assert!(decode_image(&doc, &gray(cap as i64 + 1, 1), &mut budget).is_none());
+        assert_eq!(budget, usize::MAX);
+
+        // A side of zero is not decoded, and it spends nothing. An empty raw
+        // stream of that size would otherwise match and come back as an image.
+        let zero = |width: i64, height: i64| {
+            Stream::new(
+                dictionary! {
+                    "Subtype" => "Image",
+                    "Width" => width,
+                    "Height" => height,
+                    "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8,
+                },
+                Vec::<u8>::new(),
+            )
+        };
+        let mut budget = 10;
+        assert!(decode_image(&doc, &zero(0, 1), &mut budget).is_none());
+        assert!(decode_image(&doc, &zero(1, 0), &mut budget).is_none());
+        assert_eq!(budget, 10);
+    }
+
+    #[test]
     fn slider_maps_like_the_original() {
         let at = |v| ReduceOptions { image_factor: v };
         assert!((at(50).f() - 0.5).abs() < 1e-6);
