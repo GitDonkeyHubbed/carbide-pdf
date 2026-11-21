@@ -564,6 +564,73 @@ fn colour_spaces_a_transparency_group_blends_in_stay_with_it() {
 }
 
 #[test]
+fn colour_space_a_shading_dictionary_names_stays_with_it() {
+    // The kept page paints an axial shading stored as a dictionary. The dictionary names the
+    // colour space, and the content never selects it with `cs`. A shading that only shares that
+    // name, and a colour space only the deleted page's shading names, do not stay. The default
+    // spaces are a different path: nothing here paints with `rg`, `g` or `k`.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let space = |doc: &mut Document, marker: &str| {
+                doc.add_object(Stream::new(dictionary! {}, marker.as_bytes().to_vec()))
+            };
+            let shading = |colour: &str| {
+                dictionary! {
+                    "ShadingType" => 2,
+                    "ColorSpace" => Object::Name(colour.as_bytes().to_vec()),
+                    "Coords" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                    "Function" => dictionary! {
+                        "FunctionType" => 2,
+                        "Domain" => vec![0.into(), 1.into()],
+                        "C0" => vec![0.into()],
+                        "C1" => vec![1.into()],
+                        "N" => 1,
+                    },
+                }
+            };
+            let shade = space(doc, "KEEP-SHADE-SPACE");
+            let gone = space(doc, "DROP-GONE-SPACE");
+            let same_name = doc.add_object(Stream::new(
+                dictionary! {
+                    "ShadingType" => 6,
+                    "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8,
+                },
+                b"DROP-SAME-NAME-SHADING".to_vec(),
+            ));
+            dictionary! {
+                "ColorSpace" => dictionary! { "ShadeCS" => shade, "GoneCS" => gone },
+                "Shading" => dictionary! {
+                    "ShAxial" => doc.add_object(shading("ShadeCS")),
+                    "ShGone" => doc.add_object(shading("GoneCS")),
+                    "ShadeCS" => same_name,
+                },
+                "XObject" => dictionary! { "Im1" => secret_image(doc) },
+            }
+        },
+        &["/ShAxial sh", "/ShGone sh q 100 0 0 100 0 0 cm /Im1 Do Q"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, b"KEEP-SHADE-SPACE"),
+        "the shading's colour space was dropped"
+    );
+    assert!(
+        !contains(&saved, b"DROP-SAME-NAME-SHADING"),
+        "a shading that only shares the colour space's name was kept"
+    );
+    assert!(
+        !contains(&saved, b"DROP-GONE-SPACE"),
+        "a colour space only the deleted page's shading names was kept"
+    );
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+}
+
+#[test]
 fn deleted_page_image_does_not_survive_in_a_soft_mask_form() {
     // The kept page paints through a graphics state whose soft mask draws a form; the form's
     // resources are shared with the image only the deleted page drew.
@@ -726,6 +793,94 @@ fn an_appearance_with_null_resources_keeps_what_it_draws_from_the_page() {
     appearance_keeps_what_it_draws_from_the_page(|doc| {
         Some(Object::Reference(doc.add_object(Object::Null)))
     });
+}
+
+#[test]
+fn rollover_and_indirect_appearance_states_draw_the_pages_fonts() {
+    // Normal appearances are a dictionary of states stored as its own object, and rollover is a
+    // stream. Neither has resources, so the fonts they draw are the page's; the page's content
+    // draws neither. The older normal appearance is one stream, and the one with states writes
+    // that dictionary on the annotation and gives each appearance resources of its own.
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let font = |doc: &mut Document, name: &str| {
+        let mut dict = dictionary! { "Type" => "Font", "Subtype" => "Type1" };
+        dict.set("BaseFont", Object::Name(name.as_bytes().to_vec()));
+        doc.add_object(dict)
+    };
+    let bare = |doc: &mut Document, content: &str| {
+        doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+            },
+            content.as_bytes().to_vec(),
+        ))
+    };
+    let state = bare(&mut doc, "BT /Fstate 12 Tf (on) Tj ET");
+    let states = doc.add_object(dictionary! { "Off" => state });
+    let rollover = bare(&mut doc, "BT /Froll 12 Tf (over) Tj ET");
+    let annotation = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget",
+        "Rect" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        "AP" => dictionary! { "N" => states, "R" => rollover },
+        "AS" => "Off",
+    });
+    let state_font = font(&mut doc, "KEEP-STATE-FONT");
+    let rollover_font = font(&mut doc, "KEEP-ROLLOVER-FONT");
+    let unused_font = font(&mut doc, "DROP-UNUSED-FONT");
+    let image = secret_image(&mut doc);
+    let shared = doc.add_object(dictionary! {
+        "Font" => dictionary! {
+            "Fstate" => state_font,
+            "Froll" => rollover_font,
+            "Fgone" => unused_font,
+        },
+        "XObject" => dictionary! { "Im1" => image },
+    });
+    let mut kids = Vec::new();
+    for (content, annots) in [
+        ("BT ET", vec![annotation.into()]),
+        ("q 100 0 0 100 0 0 cm /Im1 Do Q", vec![]),
+    ] {
+        let contents = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            content.as_bytes().to_vec(),
+        ));
+        kids.push(Object::Reference(doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+            "Contents" => contents, "Resources" => shared, "Annots" => annots,
+        })));
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 2 }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, b"KEEP-STATE-FONT"),
+        "the normal state's font was dropped"
+    );
+    assert!(
+        contains(&saved, b"KEEP-ROLLOVER-FONT"),
+        "the rollover appearance's font was dropped"
+    );
+    assert!(
+        !contains(&saved, b"DROP-UNUSED-FONT"),
+        "a font nothing draws was kept"
+    );
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
 }
 
 // ---- legacy passwords ----------------------------------------------------------------------
