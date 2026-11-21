@@ -628,4 +628,26 @@ mod tests {
             &name("Acme Corp".as_bytes())
         ));
     }
+
+    #[test]
+    fn names_match_ignoring_a_byte_order_mark() {
+        let name = |value: &[u8]| {
+            sequence(&[&set(&[&sequence(&[
+                &oid(&[2, 5, 4, 10]),
+                &tlv(0x0C, value),
+            ])])])
+        };
+        // U+FEFF is mapped to nothing on its own. The test above uses a soft hyphen, a
+        // zero-width space, a variation selector and U+0001, so dropping only this character
+        // from that set still passes.
+        assert!(names_match(
+            &name("Acme\u{FEFF} Corp".as_bytes()),
+            &name("Acme Corp".as_bytes())
+        ));
+        // The mark is not a space: the words still need one between them.
+        assert!(!names_match(
+            &name("Acme\u{FEFF}Corp".as_bytes()),
+            &name("Acme Corp".as_bytes())
+        ));
+    }
 }

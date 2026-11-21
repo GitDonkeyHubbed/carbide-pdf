@@ -5738,6 +5738,58 @@ fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
     );
 }
 
+/// Width of the photo after reducing a page that draws it only through form `/F`. The form paints
+/// the photo in a 100 by 75 pt square and then applies the matrix `make` builds.
+fn width_of_scaled_form(make: impl FnOnce(&mut Document) -> Object) -> i64 {
+    let mut pdf = photo_page(b"/F Do", move |doc, photo| {
+        let matrix = make(doc);
+        let form = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                "Matrix" => matrix,
+                "Resources" => dictionary! { "XObject" => dictionary! { "Im" => photo } },
+            },
+            b"q 100 0 0 75 0 0 cm /Im Do Q".to_vec(),
+        ));
+        dictionary! { "F" => form }
+    });
+    let (reduced, _) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    let widths = image_widths(&reduced);
+    assert_eq!(widths.len(), 1, "{widths:?}");
+    widths[0]
+}
+
+#[test]
+fn a_form_matrix_that_is_one_number_is_not_a_scale_of_four() {
+    // The matrix is an object of its own, and that object is the integer 4, not an array of six
+    // numbers. Taking a lone number as a uniform scale keeps the photo near 833 pixels. It is
+    // not a matrix, so the photo is sized for the 100 by 75 pt square, about 208 pixels. The
+    // indirect matrix of six positive integers still passes.
+    let width = width_of_scaled_form(|doc| Object::Reference(doc.add_object(Object::Integer(4))));
+    assert!((150..350).contains(&width), "{width}");
+}
+
+#[test]
+fn a_reflected_form_matrix_keeps_its_scale() {
+    // The photo is painted in a 100 by 75 pt square, and the form's /Matrix scales that by four
+    // and turns it over: both diagonal numbers are -4. Treating a negative number as no matrix
+    // sizes the photo for the unscaled square, about 208 pixels. Zeroing a negative component
+    // leaves the full 1200. The indirect matrix of positive fours still passes.
+    let width = width_of_scaled_form(|_| {
+        Object::Array(vec![
+            Object::Integer(-4),
+            0.into(),
+            0.into(),
+            Object::Integer(-4),
+            0.into(),
+            0.into(),
+        ])
+    });
+    assert!((700..1000).contains(&width), "{width}");
+}
+
 #[test]
 fn slider_trades_size_for_quality() {
     let mut pdf = photo_pdf();

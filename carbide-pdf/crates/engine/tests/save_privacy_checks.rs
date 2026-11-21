@@ -924,6 +924,76 @@ fn updates_before_and_after_one_more(file: Vec<u8>) -> (usize, usize) {
     (before, saved.appended_updates())
 }
 
+/// One cross-reference section. `objects` are written in the order given, so the first of them
+/// is the file's first object. Their numbers are 1 to 4.
+fn file_of_objects(objects: &[(usize, &str)]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = [0usize; 5];
+    for (number, body) in objects {
+        offsets[*number] = bytes.len();
+        bytes.extend(format!("{number} 0 obj\n{body}\nendobj\n").into_bytes());
+    }
+    let main = bytes.len();
+    bytes.extend(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in &offsets[1..] {
+        bytes.extend(format!("{:010} 00000 n \n", offset).into_bytes());
+    }
+    bytes.extend(
+        format!("trailer\n<</Size 5/Root 1 0 R>>\nstartxref\n{main}\n%%EOF\n").into_bytes(),
+    );
+    bytes
+}
+
+#[test]
+fn a_fractional_linearization_version_still_hides_an_update() {
+    // One half is still a positive version, so the appended update is not counted. Requiring an
+    // integer, or keeping only the whole part, counts it. The test of a complete dictionary
+    // accepts the integer version 1 and refuses version 0, so either change still passes.
+    let dict = "<</Linearized 0.5/L 0/H [0000000000 30]/O 3/E 0/N 1/T 0>>";
+    assert_eq!(
+        updates_before_and_after_one_more(file_starting_with(dict, 0, false)),
+        (0, 0)
+    );
+}
+
+#[test]
+fn a_linearization_dictionary_missing_only_t_does_not_hide_an_update() {
+    // Every required entry is present except /T, so the appended update is counted. The test of
+    // a complete dictionary drops /H instead, so a dictionary that no longer requires /T still
+    // passes it.
+    let dict = "<</Linearized 1/L 0/H [0000000000 30]/O 3/E 0/N 1>>";
+    assert_eq!(
+        updates_before_and_after_one_more(file_starting_with(dict, 0, false)),
+        (0, 1)
+    );
+}
+
+#[test]
+fn a_linearization_dictionary_that_is_not_the_first_object_does_not_hide_an_update() {
+    // The page tree is the first object and is not rewritten by the update. A complete
+    // linearization dictionary follows it, still inside the first 1024 bytes. Accepting any
+    // such dictionary in that window hides the appended update. The test of a complete
+    // dictionary puts that dictionary first, so it still passes.
+    let dict = "<</Linearized 1/L 0/H [0000000000 30]/O 3/E 0/N 1/T 0>>";
+    let file = file_of_objects(&[
+        (2, "<</Type/Pages/Kids [3 0 R]/Count 1>>"),
+        (4, dict),
+        (1, "<</Type/Catalog/Pages 2 0 R>>"),
+        (3, "<</Type/Page/Parent 2 0 R/MediaBox [0 0 300 300]>>"),
+    ]);
+    let at = |marker: &[u8]| {
+        file.windows(marker.len())
+            .position(|window| window == marker)
+    };
+    let pages = at(b"2 0 obj").unwrap();
+    let dictionary = at(b"4 0 obj").unwrap();
+    assert!(
+        pages < dictionary && dictionary < 1024,
+        "page tree at {pages}, dictionary at {dictionary}"
+    );
+    assert_eq!(updates_before_and_after_one_more(file), (0, 1));
+}
+
 #[test]
 fn a_linearization_dictionary_must_be_complete_and_near_the_start_to_hide_an_update() {
     const WHOLE: &str = "<</Linearized 1/L 0/H [0000000000 30]/O 3/E 0/N 1/T 0>>";
@@ -1114,6 +1184,108 @@ fn removals_that_were_the_only_hidden_information_are_reported() {
         .remove_hidden_information(&[HiddenItem::FormData])
         .unwrap();
     assert_eq!(report.count(HiddenItem::FormData), 2);
+}
+
+/// The name a check box or radio button shows.
+fn shown_name(pdf: &Pdf, id: lopdf::ObjectId) -> Vec<u8> {
+    pdf.document()
+        .get_dictionary(id)
+        .unwrap()
+        .get(b"AS")
+        .unwrap()
+        .as_name()
+        .unwrap()
+        .to_vec()
+}
+
+#[test]
+fn a_check_box_shown_as_1_is_cleared() {
+    use carbide_engine::HiddenItem;
+    // A checked box is often shown as /1, not /Yes. Counting only /Yes leaves it checked, and
+    // the test that uses /Yes still passes. Clearing writes /Off and counts the field.
+    let check = std::cell::Cell::new((0, 0));
+    let mut pdf = one_page(|doc, catalog, page| {
+        let id = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Btn",
+            "T" => Object::string_literal("c"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page,
+            "AS" => Object::Name(b"1".to_vec()),
+        });
+        check.set(id);
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![id.into()]);
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("AcroForm", dictionary! { "Fields" => vec![id.into()] });
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    assert_eq!(shown_name(&pdf, check.get()).as_slice(), b"Off");
+}
+
+#[test]
+fn a_check_box_already_showing_off_is_not_form_data() {
+    use carbide_engine::HiddenItem;
+    // The shown state is the name /Off in the field itself, and there is no value. Counting
+    // every button reports form data that is not there. The test that uses /Yes still passes.
+    let mut pdf = one_page(|doc, catalog, page| {
+        let id = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Btn",
+            "T" => Object::string_literal("c"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page, "AS" => "Off",
+        });
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![id.into()]);
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("AcroForm", dictionary! { "Fields" => vec![id.into()] });
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 0);
+}
+
+#[test]
+fn a_kids_array_two_objects_away_is_still_cleared() {
+    use carbide_engine::HiddenItem;
+    // The button type is on the parent. The kid shows /Yes, and the parent's /Kids array is two
+    // objects away. Reading /Kids once finds a reference, so the kid stays /Yes and nothing is
+    // counted. A field cleared from its own value does not need /Kids, so that test still passes.
+    let kid_id = std::cell::Cell::new((0, 0));
+    let mut pdf = one_page(|doc, catalog, page| {
+        let parent = doc.new_object_id();
+        let kid = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "Parent" => parent,
+            "Rect" => vec![0.into(), 0.into(), 12.into(), 12.into()],
+            "P" => page, "AS" => "Yes",
+        });
+        kid_id.set(kid);
+        let array = doc.add_object(Object::Array(vec![kid.into()]));
+        let middle = doc.add_object(Object::Reference(array));
+        doc.objects.insert(
+            parent,
+            Object::Dictionary(dictionary! {
+                "FT" => "Btn", "T" => Object::string_literal("group"),
+                "Kids" => Object::Reference(middle),
+            }),
+        );
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![kid.into()]);
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("AcroForm", dictionary! { "Fields" => vec![parent.into()] });
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    assert_eq!(shown_name(&pdf, kid_id.get()).as_slice(), b"Off");
 }
 
 #[test]
