@@ -728,6 +728,96 @@ fn an_appearance_with_null_resources_keeps_what_it_draws_from_the_page() {
     });
 }
 
+#[test]
+fn a_down_state_the_widget_is_not_showing_still_draws_the_pages_fonts() {
+    // The down appearance is an object of its own: two states, and the widget shows Off. Yes
+    // draws a different font. Neither state has a resource dictionary, so the fonts are the
+    // page's, and the page's content chooses neither. A font nothing draws is removed, and so
+    // is the deleted page's image. The older down appearance is one stream, written on the
+    // annotation, with a resource dictionary of its own, and it draws the same font as the
+    // normal appearance.
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let font = |doc: &mut Document, name: &str| {
+        let mut dict = dictionary! { "Type" => "Font", "Subtype" => "Type1" };
+        dict.set("BaseFont", Object::Name(name.as_bytes().to_vec()));
+        Object::Reference(doc.add_object(dict))
+    };
+    let state = |doc: &mut Document, content: &str| {
+        Object::Reference(doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+            },
+            content.as_bytes().to_vec(),
+        )))
+    };
+    let off = state(&mut doc, "BT /Foff 12 Tf (off) Tj ET");
+    let yes = state(&mut doc, "BT /Fyes 12 Tf (yes) Tj ET");
+    let down = doc.add_object(dictionary! { "Off" => off, "Yes" => yes });
+    let annotation = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget",
+        "Rect" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        "AP" => dictionary! { "D" => Object::Reference(down) },
+        "AS" => "Off",
+    });
+    let off_font = font(&mut doc, "KEEP-DOWN-OFF");
+    let yes_font = font(&mut doc, "KEEP-DOWN-YES");
+    let unused_font = font(&mut doc, "DROP-DOWN-UNUSED");
+    let image = secret_image(&mut doc);
+    let shared = doc.add_object(dictionary! {
+        "Font" => dictionary! {
+            "Foff" => off_font,
+            "Fyes" => yes_font,
+            "Fgone" => unused_font,
+        },
+        "XObject" => dictionary! { "Im1" => image },
+    });
+    let mut kids = Vec::new();
+    for (content, annots) in [
+        ("BT ET", vec![Object::Reference(annotation)]),
+        ("q 100 0 0 100 0 0 cm /Im1 Do Q", vec![]),
+    ] {
+        let contents = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            content.as_bytes().to_vec(),
+        ));
+        kids.push(Object::Reference(doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+            "Contents" => contents, "Resources" => shared, "Annots" => annots,
+        })));
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 2 }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, b"KEEP-DOWN-OFF"),
+        "the shown down state's font was dropped"
+    );
+    assert!(
+        contains(&saved, b"KEEP-DOWN-YES"),
+        "the other down state's font was dropped"
+    );
+    assert!(
+        !contains(&saved, b"DROP-DOWN-UNUSED"),
+        "a font nothing draws was kept"
+    );
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+}
+
 // ---- legacy passwords ----------------------------------------------------------------------
 
 const PADDING: [u8; 32] = [
