@@ -5598,6 +5598,93 @@ fn image_widths(bytes: &[u8]) -> Vec<i64> {
         .collect()
 }
 
+/// Width, height, and filter of each image in `bytes`.
+fn image_encodings(bytes: &[u8]) -> Vec<(i64, i64, Vec<u8>)> {
+    let pdf = Pdf::from_bytes(bytes).unwrap();
+    let mut images: Vec<_> = pdf
+        .document()
+        .objects
+        .values()
+        .filter_map(|object| {
+            let Object::Stream(stream) = object else {
+                return None;
+            };
+            if stream.dict.get(b"Subtype").and_then(|v| v.as_name()).ok() != Some(b"Image") {
+                return None;
+            }
+            let width = stream.dict.get(b"Width").ok()?.as_i64().ok()?;
+            let height = stream.dict.get(b"Height").ok()?.as_i64().ok()?;
+            let filter = match stream.dict.get(b"Filter") {
+                Ok(Object::Name(name)) => name.clone(),
+                Ok(Object::Array(items)) => items
+                    .iter()
+                    .find_map(|item| item.as_name().ok().map(|name| name.to_vec()))
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            Some((width, height, filter))
+        })
+        .collect();
+    images.sort();
+    images
+}
+
+/// One uncompressed gray image named `/Im`, drawn by `content`. A run of spaces keeps the file
+/// shrinking even when the image itself is left as it is.
+fn gray_page(width: usize, height: usize, samples: Vec<u8>, content: &[u8]) -> Pdf {
+    assert_eq!(samples.len(), width * height);
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let image = doc.add_object(
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => width as i64,
+                "Height" => height as i64,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8,
+            },
+            samples,
+        )
+        .with_compression(false),
+    );
+    let mut body = content.to_vec();
+    body.extend(std::iter::repeat_n(b' ', 4_000));
+    let contents = doc.add_object(Stream::new(lopdf::Dictionary::new(), body));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => contents,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im" => image } },
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page)],
+            "Count" => 1,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
+/// Bytes that barely compress, so a photo-like image is not mistaken for flat artwork.
+fn gray_noise(width: usize, height: usize) -> Vec<u8> {
+    let mut state = 12345u32;
+    (0..width * height)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
 /// `photo_pdf` with its page's XObjects replaced by `xobjects` (the photo is `Im1`, which
 /// `xobjects` gets) and its content by `content`; `make` adds the forms, given the photo.
 fn photo_page(
@@ -5666,6 +5753,119 @@ fn a_form_whose_matrix_is_its_own_object_is_sized_for_the_scaled_drawing() {
     assert!(
         widths.len() == 1 && (700..1000).contains(&widths[0]),
         "{widths:?}"
+    );
+}
+
+#[test]
+fn a_tilted_form_is_sized_from_both_numbers_of_its_wide_edge() {
+    // The photo is painted in a 100 by 400 pt rectangle. The form's matrix maps that width
+    // through 3 and 4, so the edge is 500 pt and the reduced photo is about 1042 pixels across.
+    // Keeping the larger number only leaves about 834, which still sits in the four-times matrix
+    // test's 700 to 1000. Adding the two numbers leaves about 1112. Dropping the 4 leaves about
+    // 625. That older matrix is 4 0 0 4, written as its own objects.
+    let mut pdf = photo_page(b"/F Do", |doc, photo| {
+        let form = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                "Matrix" => vec![3.into(), 4.into(), 0.into(), 1.into(), 0.into(), 0.into()],
+                "Resources" => dictionary! { "XObject" => dictionary! { "Im" => photo } },
+            },
+            b"q 100 0 0 400 0 0 cm /Im Do Q".to_vec(),
+        ));
+        dictionary! { "F" => form }
+    });
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (1000..1100).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
+fn a_tilted_drawing_is_sized_from_both_numbers_of_its_short_edge() {
+    // The content matrix sends the short edge through 180 and 240, which is 300 pt, so the
+    // reduced width is about 833. Keeping the larger of those two numbers leaves about 666.
+    // The four-times matrix test is still about 833, inside 700 to 1000, and it never reads
+    // this stream. The tilted form above carries the wide edge, not this one.
+    let mut pdf = photo_page(b"q 400 0 180 240 0 0 cm /Im1 Do Q", |_, _| dictionary! {});
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (800..900).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
+fn a_flat_image_is_not_stored_as_jpeg() {
+    // A solid 400 by 400 gray square, drawn larger than its pixels, stays Flate and 400 across.
+    // Treating every image of this many pixels as a photo stores it as JPEG. The noisy photos
+    // drawn by the other tests are already photos, so they stay JPEG either way.
+    let mut pdf = gray_page(
+        400,
+        400,
+        vec![40; 400 * 400],
+        b"q 200 0 0 200 0 0 cm /Im Do Q",
+    );
+    let (reduced, _) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    let images = image_encodings(&reduced);
+    assert!(
+        images.len() == 1
+            && images[0].0 == 400
+            && images[0].1 == 400
+            && images[0].2 == b"FlateDecode",
+        "{images:?}"
+    );
+}
+
+#[test]
+fn noise_drawn_down_to_65536_pixels_is_not_stored_as_jpeg() {
+    // 512 by 512 samples drawn at 122.5 pt become 256 by 256, which is 65536 pixels, and stay
+    // Flate. Counting that square as a photo, or deciding from the 512 by 512 samples before
+    // the shrink, stores JPEG. The flat square above has more pixels and still is not a photo.
+    let mut pdf = gray_page(
+        512,
+        512,
+        gray_noise(512, 512),
+        b"q 122.5 0 0 122.5 0 0 cm /Im Do Q",
+    );
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let images = image_encodings(&reduced);
+    assert!(
+        images.len() == 1
+            && images[0].0 == 256
+            && images[0].1 == 256
+            && images[0].2 == b"FlateDecode",
+        "{images:?}"
+    );
+}
+
+#[test]
+fn noise_drawn_down_to_65792_pixels_is_stored_as_jpeg() {
+    // One extra row, 512 by 514 samples drawn at 122.5 by 122.9 pt, becomes 256 by 257, which
+    // is 65792 pixels, and is stored as JPEG. A limit of 65792 or higher leaves it Flate, like
+    // the 65536-pixel square. The flat square is larger than either and is still Flate.
+    let mut pdf = gray_page(
+        512,
+        514,
+        gray_noise(512, 514),
+        b"q 122.5 0 0 122.9 0 0 cm /Im Do Q",
+    );
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let images = image_encodings(&reduced);
+    assert!(
+        images.len() == 1
+            && images[0].0 == 256
+            && images[0].1 == 257
+            && images[0].2 == b"DCTDecode",
+        "{images:?}"
     );
 }
 
