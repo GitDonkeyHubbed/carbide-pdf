@@ -1170,6 +1170,8 @@ pub fn reduce_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
     use lopdf::dictionary;
 
     #[test]
@@ -1290,6 +1292,197 @@ mod tests {
                 m[1] * 1.0 + m[3] * 1.0 + m[5]
             ),
             (12.0, 2.0)
+        );
+    }
+
+    /// A one-page document, so a test can hang images and forms on the page afterwards.
+    fn blank_page() -> crate::pdf::Pdf {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page)],
+                "Count" => 1,
+            }),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        crate::pdf::Pdf::from_bytes(&bytes).unwrap()
+    }
+
+    /// An uncompressed 400 by 300 gray image. Drawn at 100 by 75 pt it is reduced; left
+    /// unmeasured it stays 400 pixels wide.
+    fn gray_image(doc: &mut Document) -> ObjectId {
+        let (width, height) = (400i64, 300i64);
+        let mut samples = Vec::with_capacity((width * height) as usize);
+        let mut state = 1u32;
+        for _ in 0..width * height {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            samples.push((state >> 24) as u8);
+        }
+        doc.add_object(
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Image",
+                    "Width" => width,
+                    "Height" => height,
+                    "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8,
+                },
+                samples,
+            )
+            .with_compression(false),
+        )
+    }
+
+    fn sole_image_width(bytes: &[u8]) -> i64 {
+        let pdf = crate::pdf::Pdf::from_bytes(bytes).unwrap();
+        let mut widths = Vec::new();
+        for object in pdf.document().objects.values() {
+            let Object::Stream(stream) = object else {
+                continue;
+            };
+            if stream.dict.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"Image") {
+                continue;
+            }
+            widths.push(stream.dict.get(b"Width").unwrap().as_i64().unwrap());
+        }
+        assert_eq!(widths.len(), 1, "{widths:?}");
+        widths[0]
+    }
+
+    /// 999 draws of a form that itself draws one photo in 9,999 different ways, then
+    /// `empty_draws` draws of an empty form. The photo is drawn at about 100 by 75 pt.
+    fn width_after_draw_work(empty_draws: usize) -> (i64, usize) {
+        let mut pdf = blank_page();
+        let page = pdf.page_ids()[0];
+        let doc = pdf.document_mut();
+        let image = gray_image(doc);
+        let mut body = Vec::new();
+        for i in 0..9_999 {
+            // Same drawn size, different matrix, so each one is counted.
+            let shear = i as f32 * 0.0001;
+            writeln!(body, "q 100 {shear:.8} 0 75 0 0 cm /Im Do Q").unwrap();
+        }
+        let big = doc.add_object(
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                    "Resources" => dictionary! { "XObject" => dictionary! { "Im" => image } },
+                },
+                body,
+            )
+            .with_compression(false),
+        );
+        let empty = doc.add_object(
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                },
+                Vec::new(),
+            )
+            .with_compression(false),
+        );
+        let mut content = Vec::new();
+        for _ in 0..999 {
+            content.extend_from_slice(b"/Big Do\n");
+        }
+        for _ in 0..empty_draws {
+            content.extend_from_slice(b"/E Do\n");
+        }
+        let content =
+            doc.add_object(Stream::new(Dictionary::new(), content).with_compression(false));
+        let page = doc.get_dictionary_mut(page).unwrap();
+        page.set("Contents", content);
+        page.set(
+            "Resources",
+            dictionary! { "XObject" => dictionary! { "Big" => big, "E" => empty } },
+        );
+        let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+        (sole_image_width(&reduced), report.images_downsampled)
+    }
+
+    #[test]
+    fn ten_million_units_of_draw_work_still_size_the_photo_and_one_more_does_not() {
+        // 999 * (9,999 + 1) + 10,000 = 10,000,000. One more empty draw is one past
+        // that. The older test draws an empty form 30,000 times and still finds the
+        // photo's size, so this bound can move by one and that test stays green.
+        // 10,000,000 is written here, not taken from the limit.
+        let (kept, downsampled) = width_after_draw_work(10_000);
+        assert!(
+            (150..350).contains(&kept) && downsampled >= 1,
+            "width {kept}, downsampled {downsampled}"
+        );
+        let (left, downsampled) = width_after_draw_work(10_001);
+        assert_eq!(
+            (left, downsampled),
+            (400, 0),
+            "one past the limit still sized the photo"
+        );
+    }
+
+    fn width_when_the_form_holds(bytes: usize) -> (i64, usize) {
+        let mut pdf = blank_page();
+        let page = pdf.page_ids()[0];
+        let doc = pdf.document_mut();
+        let image = gray_image(doc);
+        let form = doc.add_object(
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                },
+                vec![b' '; bytes],
+            )
+            .with_compression(false),
+        );
+        let content = doc.add_object(
+            Stream::new(
+                Dictionary::new(),
+                b"q 100 0 0 75 0 0 cm /Im Do Q\n/Big Do\n".to_vec(),
+            )
+            .with_compression(false),
+        );
+        let page = doc.get_dictionary_mut(page).unwrap();
+        page.set("Contents", content);
+        page.set(
+            "Resources",
+            dictionary! { "XObject" => dictionary! { "Im" => image, "Big" => form } },
+        );
+        let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+        (sole_image_width(&reduced), report.images_downsampled)
+    }
+
+    #[test]
+    fn a_form_of_67108864_bytes_is_read_and_one_more_byte_is_not() {
+        // 67,108,864 is 64 MiB. The older test builds a form of that size and only
+        // checks that reducing it returns, so a limit one byte either way still
+        // passes it. The number is written here.
+        let (kept, downsampled) = width_when_the_form_holds(67_108_864);
+        assert!(
+            (150..350).contains(&kept) && downsampled >= 1,
+            "width {kept}, downsampled {downsampled}"
+        );
+        let (left, downsampled) = width_when_the_form_holds(67_108_865);
+        assert_eq!(
+            (left, downsampled),
+            (400, 0),
+            "one byte past the limit still sized the photo"
         );
     }
 }
