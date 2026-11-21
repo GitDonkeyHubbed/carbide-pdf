@@ -1139,6 +1139,160 @@ fn a_check_box_whose_state_is_a_reference_to_a_name_counts_as_cleared() {
     assert_eq!(report.count(HiddenItem::FormData), 1);
 }
 
+/// The catalog's AcroForm dictionary, whether it is stored directly or as its own object.
+fn acro_form(pdf: &Pdf) -> lopdf::Dictionary {
+    let doc = pdf.document();
+    match doc.catalog().unwrap().get(b"AcroForm").unwrap() {
+        Object::Reference(id) => doc.get_dictionary(*id).unwrap().clone(),
+        Object::Dictionary(dict) => dict.clone(),
+        other => panic!("AcroForm is {other:?}"),
+    }
+}
+
+#[test]
+fn rich_text_with_no_plain_value_is_cleared() {
+    use carbide_engine::HiddenItem;
+    // The field holds only /RV, the rich-text value, and no plain /V. The list test removes
+    // /V, /I and /DV together, so dropping /RV from that list still passes it and leaves this
+    // text in the file. Clearing asks the viewer to draw the field again.
+    let field_id = std::cell::Cell::new((0, 0));
+    let mut pdf = one_page(|doc, catalog, page| {
+        let field = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx",
+            "T" => Object::string_literal("notes"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page,
+            "RV" => Object::string_literal("SECRET-RICH-TEXT"),
+        });
+        field_id.set(field);
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![field.into()]);
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("AcroForm", dictionary! { "Fields" => vec![field.into()] });
+    });
+    assert!(contains(&pdf.to_bytes().unwrap(), b"SECRET-RICH-TEXT"));
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    let field = pdf.document().get_dictionary(field_id.get()).unwrap();
+    assert!(!field.has(b"RV"));
+    assert!(field.has(b"T"), "the field name is part of the form");
+    assert!(matches!(
+        acro_form(&pdf).get(b"NeedAppearances"),
+        Ok(Object::Boolean(true))
+    ));
+    assert!(!contains(&pdf.to_bytes().unwrap(), b"SECRET-RICH-TEXT"));
+}
+
+#[test]
+fn an_xfa_packet_is_removed_even_when_no_field_holds_a_value() {
+    use carbide_engine::HiddenItem;
+    // The datasets packet is a stream the form's /XFA entry points at. No field holds a value,
+    // so the list and check-box tests still pass when /XFA is left in place. The default
+    // appearance is not form data and stays.
+    let mut pdf = one_page(|doc, catalog, _| {
+        let packet = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            b"SECRET-XFA-PACKET".to_vec(),
+        ));
+        doc.get_dictionary_mut(catalog).unwrap().set(
+            "AcroForm",
+            dictionary! {
+                "Fields" => Object::Array(vec![]),
+                "DA" => Object::string_literal("DA-KEPT-7f3a"),
+                "XFA" => Object::Array(vec![Object::string_literal("datasets"), packet.into()]),
+            },
+        );
+    });
+    let before = pdf.to_bytes().unwrap();
+    assert!(contains(&before, b"SECRET-XFA-PACKET"));
+    assert!(contains(&before, b"DA-KEPT-7f3a"));
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    let form = acro_form(&pdf);
+    assert!(!form.has(b"XFA"));
+    assert!(form.has(b"Fields"));
+    assert!(
+        form.has(b"DA"),
+        "the default appearance is part of the form"
+    );
+    assert!(matches!(
+        form.get(b"NeedAppearances"),
+        Ok(Object::Boolean(true))
+    ));
+    let after = pdf.to_bytes().unwrap();
+    assert!(!contains(&after, b"SECRET-XFA-PACKET"));
+    assert!(contains(&after, b"DA-KEPT-7f3a"));
+}
+
+#[test]
+fn clearing_form_data_leaves_a_signature_value_in_place() {
+    use carbide_engine::HiddenItem;
+    // A signature field and a text field. The typed value is form data; the signature value is
+    // not. The other form-data tests have no signature, so clearing this field still passes them.
+    let sig_field = std::cell::Cell::new((0, 0));
+    let text_field = std::cell::Cell::new((0, 0));
+    let mut pdf = one_page(|doc, catalog, page| {
+        let signature = doc.add_object(dictionary! {
+            "Type" => "Sig",
+            "Contents" => Object::string_literal("SECRET-SIGNATURE-VALUE"),
+        });
+        let signed = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Sig",
+            "T" => Object::string_literal("sig"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page,
+            "V" => signature,
+        });
+        let text = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx",
+            "T" => Object::string_literal("notes"),
+            "Rect" => vec![0.into(), 20.into(), 10.into(), 30.into()], "P" => page,
+            "V" => Object::string_literal("SECRET-TYPED-VALUE"),
+        });
+        sig_field.set(signed);
+        text_field.set(text);
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![signed.into(), text.into()]);
+        doc.get_dictionary_mut(catalog).unwrap().set(
+            "AcroForm",
+            dictionary! { "Fields" => vec![signed.into(), text.into()] },
+        );
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    let (contents, text_cleared) = {
+        let doc = pdf.document();
+        let signed = doc.get_dictionary(sig_field.get()).unwrap();
+        let value = signed.get(b"V").unwrap().as_reference().unwrap();
+        let contents = doc
+            .get_dictionary(value)
+            .unwrap()
+            .get(b"Contents")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_vec();
+        let text_cleared = doc
+            .get_dictionary(text_field.get())
+            .unwrap()
+            .get(b"V")
+            .is_err();
+        (contents, text_cleared)
+    };
+    assert_eq!(contents, b"SECRET-SIGNATURE-VALUE");
+    assert!(text_cleared);
+    let bytes = pdf.to_bytes().unwrap();
+    assert!(contains(&bytes, b"SECRET-SIGNATURE-VALUE"));
+    assert!(!contains(&bytes, b"SECRET-TYPED-VALUE"));
+}
+
 // ---- changes to annotations ----------------------------------------------------------------
 
 #[test]
