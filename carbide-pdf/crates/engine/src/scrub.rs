@@ -1292,3 +1292,44 @@ fn prune_tree(
         None => *node = Object::Dictionary(dict),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{uses_in, MAX_NAMES};
+
+    fn content(count: usize, suffix: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in 0..count {
+            out.extend(format!("/N{i} {suffix}").bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn content_may_name_exactly_the_most_different_resources_it_is_allowed() {
+        // 100,000 different names are allowed and one more is not. A page that refuses
+        // 200,000 names still passes for any limit from a few thousand up to that.
+        assert_eq!(MAX_NAMES, 100_000);
+        let mut left = 100_000;
+        let used = uses_in(&content(100_000, "Do "), &mut left).unwrap();
+        assert_eq!(used.len(), 100_000);
+        assert_eq!(left, 0);
+        let mut left = 100_000;
+        assert!(uses_in(&content(100_001, "Do "), &mut left).is_err());
+
+        // The same count of names given to an operator that looks nothing up. They are not
+        // resources, so the count above does not see them. Dropping the cap on names held
+        // before one operator leaves that count, and the 200,000-name page, green.
+        let before = |count: usize| {
+            let mut out = content(count, "");
+            out.push(b'q');
+            out
+        };
+        let mut left = 100_000;
+        let used = uses_in(&before(100_000), &mut left).unwrap();
+        assert!(used.is_empty());
+        assert_eq!(left, 100_000);
+        let mut left = 100_000;
+        assert!(uses_in(&before(100_001), &mut left).is_err());
+    }
+}

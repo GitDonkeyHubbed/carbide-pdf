@@ -2529,4 +2529,22 @@ mod tests {
         let fine = gentime_to_utc("20260101000000.0000000019Z").unwrap();
         assert_eq!(fine - whole, chrono::Duration::nanoseconds(1));
     }
+
+    #[test]
+    fn a_time_stamp_time_rejects_an_impossible_clock_and_a_short_one() {
+        // The fraction test uses a valid 14-digit clock, so clamping hour 24 or accepting a
+        // time that stops at the minute still passes it. Neither is a time stamp's time.
+        for bad in [
+            "20260101240000Z",
+            "20260101006000Z",
+            "20260101000060Z",
+            "202601010000Z",
+        ] {
+            assert!(gentime_to_utc(bad).is_none(), "{bad}");
+        }
+        assert_eq!(
+            gentime_to_utc("20260101235959Z").unwrap().to_rfc3339(),
+            "2026-01-01T23:59:59+00:00"
+        );
+    }
 }
