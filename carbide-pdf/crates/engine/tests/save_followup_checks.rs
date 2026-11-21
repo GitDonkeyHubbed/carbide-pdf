@@ -141,3 +141,35 @@ fn ink_points_changed_beyond_the_reference_depth_limit_count_as_removed() {
         "ink points removed behind a long reference chain went unnoticed"
     );
 }
+
+#[test]
+fn an_unchanged_ink_list_past_the_reference_limit_counts_as_removed() {
+    // The points sit behind the ink list's own reference and one more for each link.
+    // A change behind 12 links counts as removed whether or not the walk reaches the
+    // points, so a higher or lower limit still passes that test. Seven links are
+    // eight references and are still followed: the same points are not a removal,
+    // and shortening them is. Eight links are nine references, which are not
+    // followed, so the list cannot be compared and counts as removed even when
+    // nothing in it changed.
+    let (bytes, points) = ink_behind_a_reference_chain(7);
+    let (mut pdf, saved) = SavedFile::open(bytes, None).unwrap();
+    assert!(
+        !saved.removed_from(&pdf),
+        "an unchanged ink list behind seven links counted as removed"
+    );
+    pdf.document_mut().objects.insert(
+        points,
+        Object::Array([10, 10, 50, 50].into_iter().map(Object::from).collect()),
+    );
+    assert!(
+        saved.removed_from(&pdf),
+        "a change behind seven links went unnoticed"
+    );
+
+    let (bytes, _) = ink_behind_a_reference_chain(8);
+    let (pdf, saved) = SavedFile::open(bytes, None).unwrap();
+    assert!(
+        saved.removed_from(&pdf),
+        "an unchanged ink list behind eight links was treated as the same"
+    );
+}
