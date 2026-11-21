@@ -1069,6 +1069,62 @@ fn page_labels_carry_on_where_a_page_was_deleted() {
     );
 }
 
+/// A document whose outline has one leaf, `depth` items below the outline root, and that leaf
+/// points only at the second page.
+fn outline_leaf_at(depth: usize) -> Pdf {
+    let mut pdf = text_pdf(&[&["KEEP"], &["GONE"]]);
+    let gone = pdf.page_ids()[1];
+    let root = pdf
+        .document()
+        .catalog()
+        .unwrap()
+        .get(b"Outlines")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let doc = pdf.document_mut();
+    let leaf = doc.add_object(dictionary! {
+        "Title" => Object::string_literal("SECRET CHAPTER"),
+        "Dest" => Object::Array(vec![gone.into(), "Fit".into()]),
+    });
+    let mut current = leaf;
+    for _ in 1..depth {
+        let node = doc.add_object(dictionary! {
+            "Title" => Object::string_literal("kept"),
+            "First" => current,
+            "Last" => current,
+        });
+        doc.get_dictionary_mut(current).unwrap().set("Parent", node);
+        current = node;
+    }
+    doc.get_dictionary_mut(current).unwrap().set("Parent", root);
+    let outlines = doc.get_dictionary_mut(root).unwrap();
+    outlines.set("First", current);
+    outlines.set("Last", current);
+    pdf
+}
+
+#[test]
+fn a_bookmark_is_removed_with_its_page_only_as_deep_as_the_outline_is_read() {
+    // The bookmarks removed above sit directly under the outline root, so that test stays
+    // green however soon the walk stops. A leaf 65 below the root is the last one removed
+    // with its page. One at 66 is left, title and all: that part of the tree is damaged,
+    // and walking it further is what a hostile file would use to overflow the stack.
+    let removed = |depth: usize| {
+        let mut pdf = outline_leaf_at(depth);
+        pdf.delete_pages(&[1]).unwrap();
+        assert_eq!(pdf.page_count(), 1, "depth {depth}");
+        let bytes = pdf.to_bytes().unwrap();
+        assert!(contains(&bytes, b"KEEP"), "depth {depth}");
+        contains(&bytes, b"SECRET CHAPTER")
+    };
+    assert!(
+        !removed(65),
+        "a bookmark 65 deep was left pointing at a deleted page"
+    );
+    assert!(removed(66), "a bookmark 66 deep was followed and removed");
+}
+
 /// The node `id` of a name tree: its /Limits as text, and how many kids it has.
 fn tree_node(pdf: &Pdf, id: lopdf::ObjectId) -> (Vec<String>, usize) {
     let dict = pdf.document().get_dictionary(id).unwrap();
@@ -3820,6 +3876,36 @@ fn page_trees_that_cannot_be_read_safely_are_refused() {
 }
 
 #[test]
+fn a_page_tree_is_refused_only_past_the_depth_a_tree_can_be() {
+    // The test above builds MAX_DEPTH + 5 nodes, and the inheritance test stops at
+    // MAX_DEPTH - 2. Either check stays green if this limit moves by four. The root is
+    // already one node, so 127 more are read and 128 are not.
+    let nested = |nodes: usize| {
+        damaged_tree(|doc, root, ids| {
+            let mut below: Object = ids[0].into();
+            for _ in 0..nodes {
+                below = doc
+                    .add_object(
+                        dictionary! { "Type" => "Pages", "Kids" => vec![below], "Count" => 1 },
+                    )
+                    .into();
+            }
+            set_kids(doc, root, vec![below]);
+        })
+    };
+    let mut pdf = Pdf::from_bytes(&nested(127)).unwrap();
+    assert_eq!(pdf.page_count(), 1);
+    assert!(
+        contains(&pdf.to_bytes().unwrap(), b"AAA first"),
+        "the page at the bottom of a tree 128 nodes deep was dropped"
+    );
+    assert_eq!(
+        Pdf::from_bytes(&nested(128)).unwrap_err().to_string(),
+        carbide_engine::pagetree::messages::TOO_DEEP
+    );
+}
+
+#[test]
 fn a_sound_page_tree_is_not_rewritten_by_the_repair() {
     // Nested nodes with inherited values: opening changes no object, and saving writes nothing new.
     let bytes = inherited_geometry(false).to_bytes().unwrap();
@@ -4433,6 +4519,125 @@ fn trees_that_list_themselves_do_not_stop_edits() {
         .as_reference()
         .unwrap();
     assert!(sound.document().get_dictionary(tree).unwrap().has(b"Kids"));
+}
+
+/// Page labels as one chain of `wrappers` nodes above a roman label for page 0.
+fn page_label_chain(wrappers: usize) -> Pdf {
+    let base = text_pdf(&[&["ONE"]]);
+    with_catalog(&base, |doc, catalog, _| {
+        let mut next = doc.add_object(
+            dictionary! { "Nums" => vec![0.into(), dictionary! { "S" => "r" }.into()] },
+        );
+        for _ in 0..wrappers {
+            next = doc.add_object(dictionary! { "Kids" => vec![next.into()] });
+        }
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("PageLabels", next);
+    })
+}
+
+fn page_label_root(pdf: &Pdf) -> lopdf::Dictionary {
+    let id = pdf
+        .document()
+        .catalog()
+        .unwrap()
+        .get(b"PageLabels")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    pdf.document().get_dictionary(id).unwrap().clone()
+}
+
+/// The numbering style at the bottom of a page-label chain, or of the flat tree a repair writes.
+fn page_label_style(pdf: &Pdf) -> Vec<u8> {
+    let mut dict = page_label_root(pdf);
+    for _ in 0..40 {
+        let Some(kids) = dict.get(b"Kids").ok().and_then(|k| k.as_array().ok()) else {
+            break;
+        };
+        let id = kids[0].as_reference().unwrap();
+        dict = pdf.document().get_dictionary(id).unwrap().clone();
+    }
+    dict.get(b"Nums").unwrap().as_array().unwrap()[1]
+        .as_dict()
+        .unwrap()
+        .get(b"S")
+        .unwrap()
+        .as_name()
+        .unwrap()
+        .to_vec()
+}
+
+#[test]
+fn a_page_label_tree_is_rebuilt_only_past_32_nodes() {
+    // The self-listing and 64-deep trees above are rebuilt for any limit from 1 to 63, and
+    // one node under the root is kept for any limit from 1 up. A chain of 32 is the last
+    // one left as written. A chain of 33 is flattened.
+    let kept = page_label_chain(32);
+    assert!(
+        page_label_root(&kept).has(b"Kids"),
+        "a page-label chain 32 deep was rebuilt"
+    );
+    assert_eq!(page_label_style(&kept), b"r");
+
+    let rebuilt = page_label_chain(33);
+    let root = page_label_root(&rebuilt);
+    assert!(
+        !root.has(b"Kids"),
+        "a page-label chain 33 deep was left for a reader to walk"
+    );
+    assert_eq!(page_label_style(&rebuilt), b"r");
+}
+
+/// A form field tree whose deepest array, `depth` levels below `/Fields`, lists one field twice.
+fn field_listed_twice_at(depth: usize) -> Pdf {
+    let base = text_pdf(&[&["ONE"]]);
+    with_catalog(&base, |doc, catalog, _| {
+        let widget = doc.add_object(dictionary! { "T" => Object::string_literal("widget") });
+        let mut current = doc.add_object(dictionary! {
+            "T" => Object::string_literal("deep"),
+            "Kids" => vec![widget.into(), widget.into()],
+        });
+        for _ in 1..depth {
+            current = doc.add_object(dictionary! { "Kids" => vec![current.into()] });
+        }
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("AcroForm", dictionary! { "Fields" => vec![current.into()] });
+    })
+}
+
+fn deep_field_kids(pdf: &Pdf) -> Vec<Object> {
+    pdf.document()
+        .objects
+        .values()
+        .find_map(|object| {
+            let dict = object.as_dict().ok()?;
+            let name = dict.get(b"T").ok()?.as_str().ok()?;
+            (name == b"deep").then(|| dict.get(b"Kids").unwrap().as_array().unwrap().clone())
+        })
+        .expect("the deep field is missing")
+}
+
+#[test]
+fn a_field_listed_twice_is_dropped_only_as_deep_as_the_field_tree_is_read() {
+    // The doubled field tree above lists the same node twice at the root, so it is repaired
+    // however shallow the walk is. The second listing 32 levels down is the last one
+    // removed. One level further is left: a reader does not go there, and neither does this.
+    let at_limit = deep_field_kids(&field_listed_twice_at(32));
+    assert_eq!(
+        at_limit.len(),
+        1,
+        "a field listed twice 32 levels down was kept: {at_limit:?}"
+    );
+    let past = deep_field_kids(&field_listed_twice_at(33));
+    assert_eq!(
+        past.len(),
+        2,
+        "a field listed twice 33 levels down was followed"
+    );
+    assert_eq!(past[0], past[1]);
 }
 
 // ---- resource limits -----------------------------------------------------------------------
