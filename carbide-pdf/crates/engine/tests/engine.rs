@@ -5598,6 +5598,29 @@ fn image_widths(bytes: &[u8]) -> Vec<i64> {
         .collect()
 }
 
+/// Width and height of each image in `bytes`, sorted.
+fn image_sizes(bytes: &[u8]) -> Vec<(i64, i64)> {
+    let pdf = Pdf::from_bytes(bytes).unwrap();
+    let mut sizes: Vec<(i64, i64)> = pdf
+        .document()
+        .objects
+        .values()
+        .filter_map(|object| {
+            let Object::Stream(stream) = object else {
+                return None;
+            };
+            if stream.dict.get(b"Subtype").and_then(|v| v.as_name()).ok() != Some(b"Image") {
+                return None;
+            }
+            let width = stream.dict.get(b"Width").ok()?.as_i64().ok()?;
+            let height = stream.dict.get(b"Height").ok()?.as_i64().ok()?;
+            Some((width, height))
+        })
+        .collect();
+    sizes.sort_unstable();
+    sizes
+}
+
 /// `photo_pdf` with its page's XObjects replaced by `xobjects` (the photo is `Im1`, which
 /// `xobjects` gets) and its content by `content`; `make` adds the forms, given the photo.
 fn photo_page(
@@ -5754,6 +5777,119 @@ fn slider_trades_size_for_quality() {
     assert!(
         small < high,
         "slider at 0 gives {small} bytes, at 100 gives {high}"
+    );
+}
+
+#[test]
+fn the_slider_changes_how_far_a_photo_is_shrunk() {
+    // The 1200 by 900 photo in `photo_pdf` is drawn at 200 by 150 pt. The target is that
+    // rectangle at 150 ppi, multiplied by 0.55 at slider 0, by 1 at slider 50, and by 1.45 at
+    // slider 100, then limited by the shorter side: 229 by 172, 417 by 312, and 605 by 453.
+    // Hardcoding the multiplier at 1 keeps every position at 417 by 312. The byte-size test
+    // still passes, because a lower JPEG quality writes fewer bytes at that same size.
+    let mut pdf = photo_pdf();
+    let shrunk = |pdf: &mut Pdf, factor: u8| {
+        let (reduced, report) = pdf
+            .reduce(
+                &ReduceOptions {
+                    image_factor: factor,
+                },
+                None,
+            )
+            .unwrap();
+        assert!(report.images_downsampled >= 1, "{report:?}");
+        image_sizes(&reduced)
+    };
+    let low = shrunk(&mut pdf, 0);
+    let mid = shrunk(&mut pdf, 50);
+    let high = shrunk(&mut pdf, 100);
+    assert_eq!(low, vec![(229, 172)], "{low:?}");
+    assert_eq!(mid, vec![(417, 312)], "{mid:?}");
+    assert_eq!(high, vec![(605, 453)], "{high:?}");
+}
+
+/// Two photos, each drawn at 400 by 300 pt on one page and 100 by 75 pt on the other.
+fn photos_drawn_large_on_opposite_pages() -> Pdf {
+    let (w, h) = (1200usize, 900usize);
+    let samples = |seed: u32| {
+        let mut state = seed;
+        let mut bytes = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let noise = ((state >> 24) % 40) as usize;
+                let base = (x * 255 / w + y * 120 / h) % 256;
+                bytes.push(((base + noise) % 256) as u8);
+                bytes.push(((255 - base / 2 + noise) % 256) as u8);
+                bytes.push(((base / 3 + 2 * noise) % 256) as u8);
+            }
+        }
+        bytes
+    };
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let image = |doc: &mut Document, data: Vec<u8>| {
+        doc.add_object(
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Image", "Width" => w as i64, "Height" => h as i64,
+                    "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+                },
+                data,
+            )
+            .with_compression(false),
+        )
+    };
+    let a = image(&mut doc, samples(1));
+    let b = image(&mut doc, samples(2));
+    let add_page = |doc: &mut Document, content: &[u8]| {
+        let content_id = doc.add_object(Stream::new(lopdf::Dictionary::new(), content.to_vec()));
+        doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => content_id,
+            "Resources" => dictionary! { "XObject" => dictionary! { "A" => a, "B" => b } },
+        })
+    };
+    let first = add_page(
+        &mut doc,
+        b"q 400 0 0 300 0 0 cm /A Do Q q 100 0 0 75 0 0 cm /B Do Q",
+    );
+    let second = add_page(
+        &mut doc,
+        b"q 100 0 0 75 0 0 cm /A Do Q q 400 0 0 300 0 0 cm /B Do Q",
+    );
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(first), Object::Reference(second)],
+            "Count" => 2,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
+#[test]
+fn an_image_keeps_the_largest_size_it_is_drawn_on_any_page() {
+    // Each photo is 1200 by 900. Drawn at 400 by 300 pt it is kept at 833 by 625. Drawn at
+    // 100 by 75 pt it would be 209 by 156. One photo is large on the first page and small on
+    // the second. The other is large on the second page and small on the first. Reading only
+    // the first page, or only the last, leaves one of them at 209 by 156. The repeated-form
+    // test draws its larger copy last, on a single page, so keeping the latest size instead
+    // of the largest still passes it.
+    let mut pdf = photos_drawn_large_on_opposite_pages();
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert_eq!(report.images_downsampled, 2, "{report:?}");
+    assert_eq!(
+        image_sizes(&reduced),
+        vec![(833, 625), (833, 625)],
+        "both photos are sized for 400 by 300 pt"
     );
 }
 
