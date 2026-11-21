@@ -71,6 +71,70 @@ fn a_moved_page_keeps_its_page_label() {
 }
 
 #[test]
+fn a_moved_page_keeps_labels_whose_list_is_its_own_object() {
+    // The same i, ii, 1, 2 as the older move, but the list of labels is an
+    // object of its own. Moving the last page to the front still leaves
+    // 2, i, ii, 1. Leaving that list unread keeps the old numbers on the
+    // old pages. The older move writes the list in the catalog.
+    let mut pdf = blank(4);
+    let doc = pdf.document_mut();
+    let nums = doc.add_object(Object::Array(vec![
+        0.into(),
+        dictionary! { "S" => "r" }.into(),
+        2.into(),
+        dictionary! { "S" => "D" }.into(),
+    ]));
+    doc.catalog_mut().unwrap().set(
+        "PageLabels",
+        dictionary! { "Nums" => Object::Reference(nums) },
+    );
+
+    pdf.move_page(3, 0).unwrap();
+    let stored = pdf
+        .document()
+        .catalog()
+        .unwrap()
+        .get(b"PageLabels")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"Nums")
+        .unwrap();
+    assert!(
+        stored.as_array().is_ok(),
+        "the label list was not read, so the pages kept the old numbers: {stored:?}"
+    );
+    assert_eq!(
+        label_ranges(&pdf),
+        vec![(0, "D".into(), 2), (1, "r".into(), 1), (3, "D".into(), 1)]
+    );
+}
+
+#[test]
+fn deleting_a_later_page_before_an_earlier_one_keeps_the_labels_that_stay() {
+    // i, ii, 1, 2. The first decimal page and the first roman page are
+    // deleted, with the later page named first. What stays is ii, 2.
+    // Treating that request as already ordered keeps number 1 on the page
+    // that stayed. The older deletion removes one page, so the order of
+    // the request cannot matter.
+    let mut pdf = blank(4);
+    pdf.document_mut().catalog_mut().unwrap().set(
+        "PageLabels",
+        dictionary! { "Nums" => vec![
+            0.into(), dictionary! { "S" => "r" }.into(),
+            2.into(), dictionary! { "S" => "D" }.into(),
+        ] },
+    );
+
+    pdf.delete_pages(&[2, 0]).unwrap();
+    assert_eq!(pdf.page_count(), 2);
+    assert_eq!(
+        label_ranges(&pdf),
+        vec![(0, "r".into(), 2), (1, "D".into(), 2)]
+    );
+}
+
+#[test]
 fn moving_a_page_of_a_document_without_page_labels_adds_none() {
     let mut pdf = blank(3);
     pdf.move_page(0, 2).unwrap();
