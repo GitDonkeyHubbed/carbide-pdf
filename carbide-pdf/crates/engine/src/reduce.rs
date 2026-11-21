@@ -1229,6 +1229,118 @@ mod tests {
     }
 
     #[test]
+    fn the_image_budget_is_one_gigabyte_plus_32_times_what_is_stored() {
+        // The older check compares the budget with the named limit, so changing
+        // either number leaves it green. Both numbers are written here.
+        assert_eq!(image_budget(0), 1 << 30);
+        assert_eq!(image_budget(1), (1 << 30) + 32);
+        assert_eq!(image_budget(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn only_plain_eight_bit_gray_and_rgb_images_are_decoded() {
+        // A 100 by 100 gray image is the older check. It still passes when a
+        // sample count equal to the budget is refused, when another bit depth
+        // is decoded, or when a predictor, a second filter, or CMYK is.
+        let samples = vec![1, 2, 3, 4];
+        let gray = |extra: Dictionary, data: Vec<u8>| {
+            let mut dict = dictionary! {
+                "Subtype" => "Image", "Width" => 2, "Height" => 2,
+                "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8,
+            };
+            for (key, value) in extra.into_iter() {
+                dict.set(key, value);
+            }
+            Stream::new(dict, data)
+        };
+        let doc = Document::with_version("1.5");
+        let mut budget = samples.len();
+        let decoded =
+            decode_image(&doc, &gray(Dictionary::new(), samples.clone()), &mut budget).unwrap();
+        assert_eq!(decoded.samples, samples);
+        assert_eq!(budget, 0);
+        let mut budget = samples.len() - 1;
+        assert!(
+            decode_image(&doc, &gray(Dictionary::new(), samples.clone()), &mut budget).is_none()
+        );
+        assert_eq!(budget, samples.len() - 1);
+
+        let untouched = |image: Stream| {
+            let mut budget = 50;
+            assert!(
+                decode_image(&doc, &image, &mut budget).is_none(),
+                "decoded {:?}",
+                image.dict
+            );
+            assert_eq!(budget, 50);
+        };
+        untouched(gray(Dictionary::new(), vec![1, 2, 3]));
+        untouched(gray(Dictionary::new(), vec![1, 2, 3, 4, 5]));
+        for bits in [1, 16] {
+            untouched(gray(
+                dictionary! { "BitsPerComponent" => bits, "Filter" => "FlateDecode" },
+                flate(&samples),
+            ));
+        }
+        untouched(gray(
+            dictionary! { "Filter" => "FlateDecode", "DecodeParms" => dictionary! { "Predictor" => 15 } },
+            flate(&samples),
+        ));
+        untouched(gray(
+            dictionary! { "Filter" => vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"ASCII85Decode".to_vec()),
+            ] },
+            flate(&samples),
+        ));
+        untouched(gray(
+            dictionary! { "ColorSpace" => "DeviceCMYK" },
+            vec![0; 16],
+        ));
+        untouched(gray(
+            dictionary! { "ColorSpace" => vec![Object::Name(b"DeviceGray".to_vec())] },
+            samples.clone(),
+        ));
+
+        // One filter in an array is still that filter, and a missing bit depth is 8.
+        let mut budget = 50;
+        assert_eq!(
+            decode_image(
+                &doc,
+                &gray(
+                    dictionary! { "Filter" => vec![Object::Name(b"FlateDecode".to_vec())] },
+                    flate(&samples),
+                ),
+                &mut budget,
+            )
+            .unwrap()
+            .samples,
+            samples
+        );
+        assert_eq!(budget, 46);
+        let mut bare = gray(Dictionary::new(), samples.clone());
+        bare.dict.remove(b"BitsPerComponent");
+        let mut budget = 50;
+        assert_eq!(
+            decode_image(&doc, &bare, &mut budget).unwrap().samples,
+            samples
+        );
+
+        // CalGray named by its own object is gray. The direct name is what the
+        // older images use; they never follow a reference.
+        let mut named = Document::with_version("1.5");
+        let space = named.add_object(Object::Name(b"CalGray".to_vec()));
+        let mut image = gray(Dictionary::new(), samples.clone());
+        image.dict.set("ColorSpace", space);
+        let mut budget = 50;
+        assert_eq!(
+            decode_image(&named, &image, &mut budget).unwrap().samples,
+            samples
+        );
+        assert_eq!(budget, 46);
+    }
+
+    #[test]
     fn slider_maps_like_the_original() {
         let at = |v| ReduceOptions { image_factor: v };
         assert!((at(50).f() - 0.5).abs() < 1e-6);

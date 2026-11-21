@@ -452,6 +452,29 @@ mod tests {
     }
 
     #[test]
+    fn an_integer_of_eight_bytes_is_read_and_a_ninth_is_not() {
+        // A high bit in the first byte is a negative integer, so eight positive
+        // bytes are the longest value with no leading zero. Nine bytes are read
+        // only when that leading zero is what makes room for it, which is how
+        // the largest value is written. The older examples use one and two
+        // bytes, so this bound can move without them noticing.
+        assert_eq!(
+            small_unsigned(&[0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            Some(i64::MAX as u64)
+        );
+        assert_eq!(small_unsigned(&[0x80, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(
+            small_unsigned(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            Some(u64::MAX)
+        );
+        assert_eq!(small_unsigned(&[0x01, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(
+            small_unsigned(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            None
+        );
+    }
+
+    #[test]
     fn oid_round_trip() {
         // sha256: 2.16.840.1.101.3.4.2.1
         let encoded = oid(&[2, 16, 840, 1, 101, 3, 4, 2, 1]);
