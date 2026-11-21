@@ -5598,6 +5598,122 @@ fn image_widths(bytes: &[u8]) -> Vec<i64> {
         .collect()
 }
 
+/// Width, height, filter, and encoded bytes of each image in `bytes`.
+fn image_records(bytes: &[u8]) -> Vec<(i64, i64, Vec<u8>, Vec<u8>)> {
+    let pdf = Pdf::from_bytes(bytes).unwrap();
+    let mut images: Vec<_> = pdf
+        .document()
+        .objects
+        .values()
+        .filter_map(|object| {
+            let Object::Stream(stream) = object else {
+                return None;
+            };
+            if stream.dict.get(b"Subtype").and_then(|v| v.as_name()).ok() != Some(b"Image") {
+                return None;
+            }
+            let width = stream.dict.get(b"Width").ok()?.as_i64().ok()?;
+            let height = stream.dict.get(b"Height").ok()?.as_i64().ok()?;
+            let filter = match stream.dict.get(b"Filter") {
+                Ok(Object::Name(name)) => name.clone(),
+                Ok(Object::Array(items)) => items
+                    .iter()
+                    .find_map(|item| item.as_name().ok().map(|name| name.to_vec()))
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            Some((width, height, filter, stream.content.clone()))
+        })
+        .collect();
+    images.sort();
+    images
+}
+
+/// Bytes that barely compress, so a photo-like image is not mistaken for flat artwork.
+fn noise_bytes(count: usize) -> Vec<u8> {
+    let mut state = 12345u32;
+    (0..count)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// One image named `/Im`, drawn by `content`. A run of spaces keeps the file shrinking even when
+/// the image itself is left as it is. `filter` absent stores the samples uncompressed.
+fn single_image_page(
+    width: i64,
+    height: i64,
+    color: &[u8],
+    filter: Option<&[u8]>,
+    data: Vec<u8>,
+    content: &[u8],
+) -> Pdf {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let mut dict = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Image",
+        "Width" => width,
+        "Height" => height,
+        "BitsPerComponent" => 8,
+    };
+    dict.set("ColorSpace", Object::Name(color.to_vec()));
+    if let Some(filter) = filter {
+        dict.set("Filter", Object::Name(filter.to_vec()));
+    }
+    let image = doc.add_object(Stream::new(dict, data).with_compression(false));
+    let mut body = content.to_vec();
+    body.extend(std::iter::repeat_n(b' ', 4_000));
+    let contents = doc.add_object(Stream::new(lopdf::Dictionary::new(), body));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => contents,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im" => image } },
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page)],
+            "Count" => 1,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
+/// A gray JPEG of noise, with comment segments stuffed in so that writing it again without those
+/// comments is smaller than keeping them. A noisy JPEG re-encoded one quality step down can
+/// otherwise come out larger, and the reducer then leaves the original bytes in place.
+fn stuffed_noise_jpeg(width: u32, height: u32) -> Vec<u8> {
+    let samples = noise_bytes((width * height) as usize);
+    let mut jpeg = std::io::Cursor::new(Vec::new());
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100)
+        .encode(&samples, width, height, image::ExtendedColorType::L8)
+        .unwrap();
+    let mut jpeg = jpeg.into_inner();
+    let comment = vec![b'x'; 60_000];
+    for _ in 0..4 {
+        assert!(jpeg.starts_with(&[0xFF, 0xD8]));
+        let mut stuffed = Vec::with_capacity(jpeg.len() + comment.len() + 4);
+        stuffed.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xFE]);
+        let len = (comment.len() + 2) as u16;
+        stuffed.push((len >> 8) as u8);
+        stuffed.push((len & 0xFF) as u8);
+        stuffed.extend_from_slice(&comment);
+        stuffed.extend_from_slice(&jpeg[2..]);
+        jpeg = stuffed;
+    }
+    jpeg
+}
+
 /// `photo_pdf` with its page's XObjects replaced by `xobjects` (the photo is `Im1`, which
 /// `xobjects` gets) and its content by `content`; `make` adds the forms, given the photo.
 fn photo_page(
@@ -5666,6 +5782,140 @@ fn a_form_whose_matrix_is_its_own_object_is_sized_for_the_scaled_drawing() {
     assert!(
         widths.len() == 1 && (700..1000).contains(&widths[0]),
         "{widths:?}"
+    );
+}
+
+#[test]
+fn color_noise_of_65536_pixels_stays_lossless() {
+    // 256 by 256 RGB noise is 65,536 pixels and 196,608 samples. Drawn at 200 pt, which is
+    // more than those pixels at 150 ppi, it is not shrunk. Flate is not smaller than the
+    // samples, so they stay as they are. Counting samples instead of pixels, or treating
+    // 65,536 as already over the limit, stores JPEG, which is smaller and replaces them.
+    // The photo in the matrix test above is 1,080,000 pixels, so it is a photo either way
+    // and that width stays inside 700 to 1000.
+    let samples = noise_bytes(256 * 256 * 3);
+    let mut pdf = single_image_page(
+        256,
+        256,
+        b"DeviceRGB",
+        None,
+        samples.clone(),
+        b"q 200 0 0 200 0 0 cm /Im Do Q",
+    );
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert_eq!(report.images_recompressed, 0, "{report:?}");
+    assert_eq!(report.images_downsampled, 0, "{report:?}");
+    let images = image_records(&reduced);
+    assert!(
+        images.len() == 1
+            && images[0].0 == 256
+            && images[0].1 == 256
+            && images[0].2.is_empty()
+            && images[0].3 == samples,
+        "{:?}",
+        images
+            .iter()
+            .map(|image| (image.0, image.1, image.2.clone(), image.3.len()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn an_unresized_jpeg_is_reencoded_only_below_the_default_slider() {
+    // A 400 by 400 noisy JPEG, drawn at 400 pt, is larger than its pixels at every slider
+    // position, so it is not shrunk. At 50 the encoded bytes stay, comments included. At 49
+    // they are written again, without the comments, and the result is smaller. Treating 50
+    // as low enough rewrites the bytes. Treating 49 as not leaves them. The matrix photo is
+    // shrunk, so it is written again at either position. The slider test only compares 0
+    // with 100.
+    let jpeg = stuffed_noise_jpeg(400, 400);
+    let page = |factor: u8| {
+        let mut pdf = single_image_page(
+            400,
+            400,
+            b"DeviceGray",
+            Some(b"DCTDecode"),
+            jpeg.clone(),
+            b"q 400 0 0 400 0 0 cm /Im Do Q",
+        );
+        let (reduced, report) = pdf
+            .reduce(
+                &ReduceOptions {
+                    image_factor: factor,
+                },
+                None,
+            )
+            .unwrap();
+        (image_records(&reduced), report)
+    };
+    let (kept, kept_report) = page(50);
+    assert_eq!(kept_report.images_downsampled, 0, "{kept_report:?}");
+    assert_eq!(kept_report.images_recompressed, 0, "{kept_report:?}");
+    assert!(
+        kept.len() == 1
+            && kept[0].0 == 400
+            && kept[0].1 == 400
+            && kept[0].2 == b"DCTDecode"
+            && kept[0].3 == jpeg,
+        "kept {:?}",
+        kept.iter()
+            .map(|image| (image.0, image.1, image.2.clone(), image.3.len()))
+            .collect::<Vec<_>>()
+    );
+    let (rewritten, rewritten_report) = page(49);
+    assert_eq!(
+        rewritten_report.images_downsampled, 0,
+        "{rewritten_report:?}"
+    );
+    assert!(
+        rewritten_report.images_recompressed >= 1,
+        "{rewritten_report:?}"
+    );
+    assert!(
+        rewritten.len() == 1
+            && rewritten[0].0 == 400
+            && rewritten[0].1 == 400
+            && rewritten[0].2 == b"DCTDecode"
+            && rewritten[0].3 != jpeg
+            && rewritten[0].3.len() < jpeg.len(),
+        "rewritten {:?}",
+        rewritten
+            .iter()
+            .map(|image| (image.0, image.1, image.2.clone(), image.3.len()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_flat_million_sample_prefix_keeps_the_image_lossless() {
+    // The first 1,048,576 samples are one gray and the next 1,048,576 are noise, so the
+    // picture is 1024 by 2048. Drawn at 600 by 1200 pt it is not shrunk. The estimate uses
+    // only that flat prefix, and the image stays Flate at its stored size. Estimating from
+    // the whole image stores JPEG. The matrix photo's first million samples are already a
+    // photo, so that test does not read this split.
+    let mut samples = vec![40u8; 1_048_576];
+    samples.extend(noise_bytes(1_048_576));
+    let mut pdf = single_image_page(
+        1024,
+        2048,
+        b"DeviceGray",
+        None,
+        samples,
+        b"q 600 0 0 1200 0 0 cm /Im Do Q",
+    );
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert_eq!(report.images_downsampled, 0, "{report:?}");
+    let images = image_records(&reduced);
+    assert!(
+        images.len() == 1
+            && images[0].0 == 1024
+            && images[0].1 == 2048
+            && images[0].2 == b"FlateDecode",
+        "{:?}",
+        images
+            .iter()
+            .map(|image| (image.0, image.1, image.2.clone(), image.3.len()))
+            .collect::<Vec<_>>()
     );
 }
 
