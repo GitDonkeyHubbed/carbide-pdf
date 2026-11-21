@@ -385,4 +385,12 @@ mod tests {
             assert_eq!(decode_text(&encode_text(s)), s);
         }
     }
+
+    #[test]
+    fn a_short_mark_is_not_a_text_string_prefix() {
+        // A UTF-16 string starts with both FE and FF, and a UTF-8 one with
+        // all three mark bytes. One byte less is text, not a prefix.
+        assert_eq!(decode_text(&[0xFE, 0x00]), "\u{00FE}\u{0000}");
+        assert_eq!(decode_text(&[0xEF, 0xBB, 0x00]), "\u{00EF}\u{00BB}\u{0000}");
+    }
 }

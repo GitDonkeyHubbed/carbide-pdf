@@ -2529,4 +2529,23 @@ mod tests {
         let fine = gentime_to_utc("20260101000000.0000000019Z").unwrap();
         assert_eq!(fine - whole, chrono::Duration::nanoseconds(1));
     }
+
+    #[test]
+    fn a_time_stamp_time_is_fourteen_digits_of_a_real_day() {
+        let utc = |text: &str| gentime_to_utc(text).map(|d| d.to_rfc3339());
+        // The fraction sample is fourteen digits in January. One extra digit,
+        // a day that month does not have, or a trailing space is not a time.
+        assert_eq!(
+            utc("20240229000000Z").as_deref(),
+            Some("2024-02-29T00:00:00+00:00")
+        );
+        for bad in [
+            "202601010000000Z",
+            "20230229000000Z",
+            "20260230000000Z",
+            "20260101000000Z ",
+        ] {
+            assert_eq!(gentime_to_utc(bad), None, "{bad}");
+        }
+    }
 }

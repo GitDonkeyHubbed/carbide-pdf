@@ -288,4 +288,14 @@ mod tests {
         assert_eq!(fmt(0.5), "0.5");
         assert_eq!(fmt(-1.25), "-1.25");
     }
+
+    #[test]
+    fn numbers_keep_four_decimal_places_and_do_not_saturate() {
+        // 0.5 and -1.25 look the same at two places or at six, once trailing
+        // zeros are removed. A signed zero would show if it were written as a real.
+        assert_eq!(fmt(1.23456), "1.2346");
+        assert_eq!(fmt(-0.0), "0");
+        // A whole number past what an integer can hold is written in full.
+        assert_eq!(fmt(1.0e20), "100000002004087734272");
+    }
 }
