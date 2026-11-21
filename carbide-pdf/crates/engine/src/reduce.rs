@@ -1229,6 +1229,34 @@ mod tests {
     }
 
     #[test]
+    fn a_calibrated_colour_image_is_charged_for_every_component() {
+        let doc = Document::with_version("1.5");
+        let image = |space: &[u8]| {
+            let mut dict = dictionary! {
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 2,
+                "BitsPerComponent" => 8,
+            };
+            dict.set("ColorSpace", lopdf::Object::Name(space.to_vec()));
+            Stream::new(dict, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+        };
+        // The samples above are gray. Calibrated RGB is three bytes a pixel,
+        // and a separation is not decoded.
+        let mut budget = 12;
+        let decoded = decode_image(&doc, &image(b"CalRGB"), &mut budget).unwrap();
+        assert_eq!(decoded.components, 3);
+        assert_eq!(decoded.samples, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(budget, 0);
+        let mut short = 11;
+        assert!(decode_image(&doc, &image(b"CalRGB"), &mut short).is_none());
+        assert_eq!(short, 11);
+        let mut budget = 12;
+        assert!(decode_image(&doc, &image(b"Separation"), &mut budget).is_none());
+        assert_eq!(budget, 12);
+    }
+
+    #[test]
     fn slider_maps_like_the_original() {
         let at = |v| ReduceOptions { image_factor: v };
         assert!((at(50).f() - 0.5).abs() < 1e-6);

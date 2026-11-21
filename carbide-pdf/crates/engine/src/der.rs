@@ -452,6 +452,24 @@ mod tests {
     }
 
     #[test]
+    fn a_definite_length_may_be_four_bytes_and_not_five() {
+        // The lengths above are one or two bytes. Four bytes still name a
+        // length. Five are refused even when the buffer holds the content.
+        let four = [0x04, 0x84, 0x00, 0x00, 0x00, 0x01, 0xAB, 0xFF];
+        let (element, rest) = read(&four).unwrap();
+        assert_eq!(element.content, &[0xAB]);
+        assert_eq!(rest, &[0xFF]);
+        assert!(read(&[0x04, 0x85, 0x00, 0x00, 0x00, 0x00, 0x01, 0xAB]).is_none());
+    }
+
+    #[test]
+    fn an_unfinished_oid_arc_is_not_emitted() {
+        // 0x2A is the arcs 1.2. The next byte continues an arc and does not
+        // finish it. The identifiers above all end on a final byte.
+        assert_eq!(oid_to_string(&[0x2A, 0x81]), "1.2");
+    }
+
+    #[test]
     fn oid_round_trip() {
         // sha256: 2.16.840.1.101.3.4.2.1
         let encoded = oid(&[2, 16, 840, 1, 101, 3, 4, 2, 1]);

@@ -636,4 +636,19 @@ mod tests {
         assert_eq!(count, 2);
         assert!(rename_key(b"<< /Root 1 0 R >>", ENCRYPT, HIDDEN_ENCRYPT).is_none());
     }
+
+    #[test]
+    fn an_encryption_name_ends_at_a_parenthesis_or_a_brace() {
+        // The sample above ends the name with a space or '<'. A parenthesis,
+        // a '>', or a brace ends it too. A dot stays inside the name.
+        for end in [b'(', b')', b'>', b'{', b'}'] {
+            let mut bytes = b"/Encrypt".to_vec();
+            bytes.push(end);
+            let (renamed, count) = rename_key(&bytes, ENCRYPT, HIDDEN_ENCRYPT).unwrap();
+            assert_eq!(count, 1, "{}", end as char);
+            assert!(renamed.starts_with(b"/Cb-Encr"), "{}", end as char);
+            assert_eq!(renamed[8], end, "{}", end as char);
+        }
+        assert!(rename_key(b"/Encrypt.x", ENCRYPT, HIDDEN_ENCRYPT).is_none());
+    }
 }

@@ -315,4 +315,20 @@ mod tests {
             .collect();
         assert_eq!(names, vec![&b"W"[..], b"H", b"CS", b"RGB", b"After"]);
     }
+
+    #[test]
+    fn a_name_ends_at_a_comment_and_an_unclosed_hex_string_runs_on() {
+        // The sample above has a space before `%`, and its hex string is closed.
+        // Two names can also sit against each other.
+        assert_eq!(
+            all(b"/Name%hidden\n/Shown Do"),
+            vec![
+                Token::Name(b"Name"),
+                Token::Name(b"Shown"),
+                Token::Operator(b"Do"),
+            ]
+        );
+        assert_eq!(all(b"/A/B"), vec![Token::Name(b"A"), Token::Name(b"B")]);
+        assert_eq!(all(b"<41 42 3 Tj"), vec![Token::Other]);
+    }
 }
