@@ -315,4 +315,39 @@ mod tests {
             .collect();
         assert_eq!(names, vec![&b"W"[..], b"H", b"CS", b"RGB", b"After"]);
     }
+
+    fn words(data: &[u8], want_names: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        tokens(data, |token| {
+            let word = match token {
+                Token::Operator(word) if !want_names => Some(word),
+                Token::Name(word) if want_names => Some(word),
+                _ => None,
+            };
+            if let Some(word) = word {
+                out.push(String::from_utf8_lossy(word).into_owned());
+            }
+        });
+        out
+    }
+
+    #[test]
+    fn an_inline_image_ends_only_when_ei_stands_alone() {
+        // The older sample ends the image at `EI` followed by a newline, and
+        // checks the name after that. `EI` is reported even when the data runs
+        // to the end of the stream, so the operators after it are the check.
+        // `[` may follow `EI` with no space. A letter may not: `EIQ` keeps the
+        // name and operator after it inside the image.
+        assert_eq!(
+            words(b"q BI /W 1 ID x EI[0] Do", false),
+            ["q", "BI", "ID", "EI", "Do"]
+        );
+        assert_eq!(words(b"q BI /W 1 ID x EI[0] Do", true), ["W"]);
+
+        assert_eq!(
+            words(b"q BI /W 1 ID x EIQ /After Do", false),
+            ["q", "BI", "ID", "EI"]
+        );
+        assert_eq!(words(b"q BI /W 1 ID x EIQ /After Do", true), ["W"]);
+    }
 }

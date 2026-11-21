@@ -427,6 +427,25 @@ mod tests {
     }
 
     #[test]
+    fn rendering_stays_under_fifty_million_pixels_and_twenty_thousand_on_a_side() {
+        // The older check compares the result with the named caps, so raising
+        // either cap still passes it. A square page over the pixel cap is
+        // 0.999 of the square root of 50,000,000 pixels on a side. A long page
+        // is 0.999 of 20,000 pixels on its long side. Both numbers, and 0.999,
+        // are written here.
+        assert_eq!(
+            14400.0 * render_scale(14400.0, 14400.0, 300.0),
+            0.999 * 50_000_000.0f32.sqrt()
+        );
+        let scale_in = 300.0f32 / 72.0;
+        let width = 14400.0f32 * scale_in;
+        assert_eq!(
+            render_scale(14400.0, 100.0, 300.0),
+            scale_in * ((20_000.0f32 / width) * 0.999)
+        );
+    }
+
+    #[test]
     fn the_configured_library_comes_first() {
         let file = Path::new("/somewhere/lib/libpdfium-custom.dylib");
         let candidates =
