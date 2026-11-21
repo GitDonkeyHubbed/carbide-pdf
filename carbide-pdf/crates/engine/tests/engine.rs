@@ -1030,6 +1030,91 @@ fn deleting_a_page_takes_out_what_leads_only_to_it() {
 }
 
 #[test]
+fn a_remote_goto_is_not_a_page_of_this_file() {
+    // GoTo of the deleted page goes. GoToR starts with the same letters and names that page in
+    // its destination, but the page is in another file, so the bookmark stays. A destination
+    // written as a dictionary with no action type is still this file's page.
+    let mut pdf = text_pdf(&[&["kept page"], &["deleted page"]]);
+    let pages = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let root = doc
+        .catalog()
+        .unwrap()
+        .get(b"Outlines")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let dest = |page| Object::Array(vec![Object::Reference(page), "Fit".into()]);
+    let local = doc.add_object(dictionary! {
+        "Title" => Object::string_literal("LOCAL-GOTO"),
+        "Parent" => root,
+        "A" => dictionary! { "S" => "GoTo", "D" => dest(pages[1]) },
+    });
+    let remote = doc.add_object(dictionary! {
+        "Title" => Object::string_literal("REMOTE-GOTO"),
+        "Parent" => root,
+        "A" => dictionary! {
+            "S" => "GoToR",
+            "F" => Object::string_literal("other.pdf"),
+            "D" => dest(pages[1]),
+        },
+    });
+    let bare = doc.add_object(dictionary! {
+        "Title" => Object::string_literal("BARE-DEST"),
+        "Parent" => root,
+        "Dest" => dictionary! { "D" => dest(pages[1]) },
+    });
+    doc.get_dictionary_mut(local).unwrap().set("Next", remote);
+    {
+        let item = doc.get_dictionary_mut(remote).unwrap();
+        item.set("Prev", local);
+        item.set("Next", bare);
+    }
+    doc.get_dictionary_mut(bare).unwrap().set("Prev", remote);
+    let outlines = doc.get_dictionary_mut(root).unwrap();
+    outlines.set("First", local);
+    outlines.set("Last", bare);
+    outlines.set("Count", 3);
+
+    pdf.delete_pages(&[1]).unwrap();
+    let bytes = file_bytes(&mut pdf);
+    assert_gone(&bytes, "LOCAL-GOTO");
+    assert_gone(&bytes, "BARE-DEST");
+    let pdf = Pdf::from_bytes(&bytes).unwrap();
+    let root = pdf
+        .document()
+        .catalog()
+        .unwrap()
+        .get(b"Outlines")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    assert_eq!(outline(&pdf, root), [("REMOTE-GOTO".into(), vec![])]);
+    let item = pdf
+        .document()
+        .get_dictionary(root)
+        .unwrap()
+        .get(b"First")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    assert_eq!(
+        pdf.document()
+            .get_dictionary(item)
+            .unwrap()
+            .get(b"A")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"S")
+            .unwrap()
+            .as_name()
+            .unwrap(),
+        b"GoToR"
+    );
+}
+
+#[test]
 fn page_labels_carry_on_where_a_page_was_deleted() {
     let mut pdf = navigable_pdf();
     // i, ii, 1, 2 without the "1": i, ii, 2.
@@ -5800,6 +5885,47 @@ fn reduce_refuses_when_nothing_gets_smaller_and_for_protected_documents() {
             .unwrap_err()
             .to_string(),
         reduce_messages::PORTFOLIO
+    );
+}
+
+#[test]
+fn signature_flags_block_reduce_only_when_both_bits_are_set() {
+    // The lock is SignaturesExist and AppendOnly together (bits 0 and 1). Either bit alone
+    // still reduces. Both bits refuse, including when further bits are set, and when the
+    // integer is stored as its own object. The older check uses the integer 3 written on
+    // the form.
+    let with_flags = |flags: Object| {
+        let mut pdf = text_pdf(&[&["a page of text"]]);
+        let doc = pdf.document_mut();
+        let form = doc.add_object(dictionary! {});
+        doc.get_dictionary_mut(form).unwrap().set("SigFlags", flags);
+        doc.catalog_mut().unwrap().set("AcroForm", form);
+        pdf
+    };
+    let refusal = |pdf: &mut Pdf| {
+        pdf.reduce(&ReduceOptions::default(), None)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    };
+    for flags in [1, 2] {
+        let mut pdf = with_flags(Object::Integer(flags));
+        let result = refusal(&mut pdf);
+        assert!(result.is_ok(), "SigFlags {flags} was refused: {result:?}");
+    }
+    let mut both_and_more = with_flags(Object::Integer(7));
+    assert_eq!(
+        refusal(&mut both_and_more).unwrap_err(),
+        reduce_messages::NO_PERMISSION
+    );
+
+    let mut pdf = text_pdf(&[&["a page of text"]]);
+    let doc = pdf.document_mut();
+    let flags = doc.add_object(Object::Integer(3));
+    let form = doc.add_object(dictionary! { "SigFlags" => Object::Reference(flags) });
+    doc.catalog_mut().unwrap().set("AcroForm", form);
+    assert_eq!(
+        refusal(&mut pdf).unwrap_err(),
+        reduce_messages::NO_PERMISSION
     );
 }
 
