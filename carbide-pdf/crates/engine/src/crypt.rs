@@ -636,4 +636,46 @@ mod tests {
         assert_eq!(count, 2);
         assert!(rename_key(b"<< /Root 1 0 R >>", ENCRYPT, HIDDEN_ENCRYPT).is_none());
     }
+
+    #[test]
+    fn the_encryption_name_ends_at_a_break_a_comment_or_the_next_name() {
+        let renamed = |tail: &[u8]| {
+            let mut bytes = b"/Encrypt".to_vec();
+            bytes.extend_from_slice(tail);
+            rename_key(&bytes, ENCRYPT, HIDDEN_ENCRYPT)
+        };
+        // The older sample ends the name with a space or `<<`. These end
+        // it too: a form feed, a null, a tab, a line break, a comment,
+        // and the next name or bracket.
+        for tail in [
+            &b"\x0c7 0 R"[..],
+            b"\x007 0 R",
+            b"\t7 0 R",
+            b"\n7 0 R",
+            b"\r7 0 R",
+            b"% comment",
+            b"/P 1",
+            b"(x)",
+            b")",
+            b">",
+            b"[0]",
+            b"]",
+            b"{",
+            b"}",
+        ] {
+            let (out, count) = renamed(tail).expect("the name should end");
+            assert_eq!(count, 1, "{}", String::from_utf8_lossy(tail));
+            assert!(out.starts_with(HIDDEN_ENCRYPT), "{out:?}");
+            assert_eq!(&out[HIDDEN_ENCRYPT.len()..], tail);
+        }
+        // A vertical tab, a digit, or a hex escape stays inside the name.
+        // The older sample only continues into a letter.
+        for tail in [b"\x0b7".as_slice(), b"0", b"#20"] {
+            assert!(
+                renamed(tail).is_none(),
+                "{} ended the name",
+                String::from_utf8_lossy(tail)
+            );
+        }
+    }
 }

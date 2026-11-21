@@ -264,6 +264,44 @@ fn font_chosen_across_two_content_streams_of_a_page_is_kept() {
     );
 }
 
+#[test]
+fn a_font_named_inside_a_multiline_string_is_not_kept() {
+    // The older check splits two streams between the font's name and `Tf`,
+    // on one line. A newline does not end a string, so `/F2` is text and
+    // `/F1` after the string is the font the page draws.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let font = helvetica(doc);
+            let other = Object::Reference(doc.add_object(dictionary! {
+                "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Courier",
+            }));
+            let image = secret_image(doc);
+            dictionary! {
+                "Font" => dictionary! { "F1" => font, "F2" => other },
+                "XObject" => dictionary! { "Im1" => image },
+            }
+        },
+        &[
+            "BT (hello\n/F2 12 Tf) Tj /F1 12 Tf (kept) Tj ET",
+            "q /Im1 Do Q",
+        ],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the kept page lost its font"
+    );
+    assert!(
+        !contains(&saved, b"Courier"),
+        "a name inside a string was kept as a font"
+    );
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+}
+
 /// A document whose first page draws `levels` forms inside one another, each with resources of
 /// its own; the innermost one's hold an image nothing draws.
 fn nested_forms_pdf(levels: usize) -> Pdf {

@@ -380,9 +380,37 @@ mod tests {
     }
 
     #[test]
+    fn pdf_dates_omit_a_whole_field_and_refuse_a_partial_one() {
+        let utc = |text: &str| parse_pdf_date(text).map(|d| d.to_rfc3339());
+        // The older short date is a year alone. The hour and the minute
+        // are read when they are there, and an omitted second is the
+        // start of that minute.
+        assert_eq!(
+            utc("D:202603040506").as_deref(),
+            Some("2026-03-04T05:06:00+00:00")
+        );
+        // A field that has begun must be two digits. One digit of the
+        // month, or one of the minute, is not a date. The prefix is the
+        // capital D the format writes.
+        for bad in ["D:20261", "D:20260304050", "d:20260304050607Z"] {
+            assert_eq!(parse_pdf_date(bad), None, "{bad}");
+            assert_eq!(pdf_date_to_local(bad), "", "{bad}");
+        }
+    }
+
+    #[test]
     fn text_strings_round_trip() {
         for s in ["plain", "Überarbeitung 修正", ""] {
             assert_eq!(decode_text(&encode_text(s)), s);
         }
+    }
+
+    #[test]
+    fn text_strings_drop_a_utf8_mark_and_a_leftover_byte() {
+        // The older samples are ASCII or UTF-16 with an even length. A
+        // UTF-8 mark is not part of the text, and a leftover byte at the
+        // end of UTF-16 is not another character.
+        assert_eq!(decode_text(&[0xEF, 0xBB, 0xBF, b'A']), "A");
+        assert_eq!(decode_text(&[0xFE, 0xFF, 0x00, b'A', b'B']), "A");
     }
 }
