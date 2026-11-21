@@ -380,6 +380,30 @@ fn chain_outcome(identity: &Identity, root: &[u8]) -> (Validity, Detail) {
 
 const REJECTED: (Validity, Detail) = (Validity::ValidityUnknown, Detail::ChainRejected);
 const VIA_CHAIN: (Validity, Detail) = (Validity::Valid, Detail::TrustedViaChain);
+const UNTRUSTED: (Validity, Detail) = (Validity::ValidityUnknown, Detail::DigestOkUntrusted);
+
+/// How a signature reads when `above` certificates, the trusted root included, stand
+/// above the signer. The intermediates are embedded; only the root is trusted.
+fn outcome_with_certificates_above(above: usize) -> (Validity, Detail) {
+    let (root, mut issuer) = ca("Root CA", None, |_| {});
+    let mut embedded = Vec::new();
+    for n in 1..above {
+        let (der, next) = ca(&format!("Intermediate {n}"), Some(&issuer), |_| {});
+        embedded.push(der);
+        issuer = next;
+    }
+    chain_outcome(&leaf(&issuer, &embedded, |_| {}), &root)
+}
+
+#[test]
+fn a_chain_may_have_exactly_eight_certificates_above_the_signer() {
+    // A signer issued straight by the trusted root is accepted, so any cap of at least
+    // one still passes that test. Eight certificates above the signer are trusted.
+    // Nine are not followed, and the signature is left untrusted rather than refused
+    // for a rule the certificates themselves break.
+    assert_eq!(outcome_with_certificates_above(8), VIA_CHAIN);
+    assert_eq!(outcome_with_certificates_above(9), UNTRUSTED);
+}
 
 /// A critical extension of a kind nothing here checks.
 fn unknown_critical_extension() -> rcgen::CustomExtension {

@@ -315,6 +315,31 @@ fn unused_image_deep_in_nested_forms_does_not_survive() {
 }
 
 #[test]
+fn forms_may_nest_exactly_as_deep_as_trimming_will_follow() {
+    // 100 nested forms are trimmed and 140 are refused, so a limit anywhere from 101
+    // to 139 still passes that test. The outermost form is reached at depth 0, so 128
+    // forms are still trimmed and 129 are refused. The unused image goes and the font
+    // the innermost form draws stays.
+    let mut pdf = nested_forms_pdf(128);
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the unused image is still in the file"
+    );
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the innermost form lost its font"
+    );
+
+    let mut pdf = nested_forms_pdf(129);
+    assert!(matches!(
+        pdf.delete_pages(&[1]),
+        Err(carbide_engine::Error::TooLarge(_))
+    ));
+}
+
+#[test]
 fn default_colour_spaces_stay_with_content_that_paints_in_device_colours() {
     // `rg`, `g` and `k` paint in the device colour spaces, which the page's /DefaultRGB,
     // /DefaultGray and /DefaultCMYK stand in for without the content naming them.

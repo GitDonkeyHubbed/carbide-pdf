@@ -171,6 +171,22 @@ fn forms_nested_as_real_documents_do_are_drawable() {
 }
 
 #[test]
+fn forms_may_nest_exactly_as_deep_as_a_page_may_draw_them() {
+    // A chain of 100 forms is drawn and one of 20,000 is refused, so any limit from 101
+    // to 20,000 still passes those tests. `chain` adds one empty form under the wrappers,
+    // and that many forms may be drawn inside one another: 128 in all, and not 129.
+    let mut allowed = blank_page_pdf();
+    let allowed_forms = chain(&mut allowed, 127);
+    page_drawing(&mut allowed, b"/F Do", allowed_forms);
+    allowed.check_drawable(0).unwrap();
+
+    let mut refused = blank_page_pdf();
+    let refused_forms = chain(&mut refused, 128);
+    page_drawing(&mut refused, b"/F Do", refused_forms);
+    assert!(matches!(refused.check_drawable(0), Err(Error::TooLarge(_))));
+}
+
+#[test]
 fn a_form_found_again_is_as_deep_as_it_was_where_it_was_first_drawn() {
     // A form with 100 forms inside it is drawn first on its own, then 40 forms down, which makes
     // 140 forms nested, though the page is only walked into the second place as far as the first.

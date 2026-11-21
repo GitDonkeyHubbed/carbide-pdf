@@ -5738,6 +5738,52 @@ fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
     );
 }
 
+/// The photo drawn at 200 by 150 pt through `forms` forms, each with resources of its own.
+fn photo_through_forms(forms: usize) -> Pdf {
+    photo_page(b"/F Do", |doc, photo| {
+        let mut drawn = photo;
+        for depth in 0..forms {
+            let (name, body): (&str, &[u8]) = if depth == 0 {
+                ("Im", b"q 200 0 0 150 0 0 cm /Im Do Q")
+            } else {
+                ("N", b"/N Do")
+            };
+            drawn = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "Resources" => dictionary! { "XObject" => dictionary! { name => drawn } },
+                },
+                body.to_vec(),
+            ));
+        }
+        dictionary! { "F" => drawn }
+    })
+}
+
+#[test]
+fn a_photo_nested_just_past_the_form_limit_keeps_its_size() {
+    // A photo on the page, or one form down, is sized for how it is drawn. The chain of
+    // seven forms is only too deep together with the forms under it, so a limit from 2
+    // up well past 8 still passes those tests. Eight forms are followed and the photo is
+    // sized for 200 by 150 pt. Nine are not, so no size is known and it stays 1200 wide.
+    let mut shallow = photo_through_forms(8);
+    let (reduced, report) = shallow.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (300..600).contains(&widths[0]),
+        "{widths:?}"
+    );
+
+    let mut deep = photo_through_forms(9);
+    let (reduced, report) = deep.reduce(&ReduceOptions::default(), None).unwrap();
+    assert_eq!(report.images_downsampled, 0, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(widths.len() == 1 && widths[0] == 1200, "{widths:?}");
+}
+
 #[test]
 fn slider_trades_size_for_quality() {
     let mut pdf = photo_pdf();
