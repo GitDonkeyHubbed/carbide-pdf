@@ -138,4 +138,30 @@ mod tests {
         assert_eq!(literal_string(b"a(b)\\"), b"(a\\(b\\)\\\\)".to_vec());
         assert_eq!(literal_string(&[0xE9]), b"(\\351)".to_vec());
     }
+
+    #[test]
+    fn win_ansi_and_literal_strings_keep_their_byte_boundaries() {
+        // The older sample uses é, euro and a byte above 0x7F. Euro is 0x80
+        // in both encodings, so it does not say which table this is. Bullet
+        // is 0x95 here and 0x80 in PDFDocEncoding; an en dash is 0x96 here
+        // and 0x85 there. Space and tilde are the ends of the range that is
+        // copied through, and the next byte on either side is not.
+        assert_eq!(win_ansi(" "), vec![0x20]);
+        assert_eq!(win_ansi("~"), vec![0x7E]);
+        assert_eq!(win_ansi("\u{7F}"), vec![b'?']);
+        assert_eq!(win_ansi("\u{A0}"), vec![0xA0]);
+        assert_eq!(win_ansi("ÿ"), vec![0xFF]);
+        assert_eq!(win_ansi("•"), vec![0x95]);
+        assert_eq!(win_ansi("–"), vec![0x96]);
+
+        // A short octal escape runs into a following digit: byte 1 then
+        // '0' has to be \0010, or a reader takes \10 and drops the '0'.
+        // The older sample's \351 has no digit after it. 0x1F and 0x7F are
+        // outside the range written raw; space and tilde are its ends.
+        assert_eq!(literal_string(&[0x01, b'0']), b"(\\0010)");
+        assert_eq!(literal_string(&[0x1F]), b"(\\037)");
+        assert_eq!(literal_string(b" "), b"( )");
+        assert_eq!(literal_string(b"~"), b"(~)");
+        assert_eq!(literal_string(&[0x7F]), b"(\\177)");
+    }
 }
