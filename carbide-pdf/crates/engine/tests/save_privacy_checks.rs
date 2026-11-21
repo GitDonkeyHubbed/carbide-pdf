@@ -809,6 +809,67 @@ fn legacy_password_with_a_tab_and_an_accent_opens_the_file() {
     assert_eq!(pdf.page_count(), 1);
 }
 
+#[test]
+fn legacy_passwords_use_the_other_pdf_doc_specials() {
+    // é and a tab already open a file. These are the other characters the
+    // encoding stores as one byte of their own. A key uses at most 32 bytes,
+    // so the list is opened in two pieces. The bytes are that encoding, not
+    // UTF-8. Breve, bullet, an en dash and the euro are not in this list.
+    let specials: &[(char, u8)] = &[
+        ('\u{02C7}', 0x19),
+        ('\u{02C6}', 0x1A),
+        ('\u{02D9}', 0x1B),
+        ('\u{02DD}', 0x1C),
+        ('\u{02DB}', 0x1D),
+        ('\u{02DA}', 0x1E),
+        ('\u{02DC}', 0x1F),
+        ('\u{2020}', 0x81),
+        ('\u{2021}', 0x82),
+        ('\u{2026}', 0x83),
+        ('\u{2014}', 0x84),
+        ('\u{0192}', 0x86),
+        ('\u{2044}', 0x87),
+        ('\u{2039}', 0x88),
+        ('\u{203A}', 0x89),
+        ('\u{2212}', 0x8A),
+        ('\u{2030}', 0x8B),
+        ('\u{201E}', 0x8C),
+        ('\u{201C}', 0x8D),
+        ('\u{201D}', 0x8E),
+        ('\u{2018}', 0x8F),
+        ('\u{2019}', 0x90),
+        ('\u{201A}', 0x91),
+        ('\u{2122}', 0x92),
+        ('\u{FB01}', 0x93),
+        ('\u{FB02}', 0x94),
+        ('\u{0141}', 0x95),
+        ('\u{0152}', 0x96),
+        ('\u{0160}', 0x97),
+        ('\u{0178}', 0x98),
+        ('\u{017D}', 0x99),
+        ('\u{0131}', 0x9A),
+        ('\u{0142}', 0x9B),
+        ('\u{0153}', 0x9C),
+        ('\u{0161}', 0x9D),
+        ('\u{017E}', 0x9E),
+    ];
+    let open = |pairs: &[(char, u8)]| {
+        let text: String = pairs.iter().map(|(c, _)| *c).collect();
+        let bytes: Vec<u8> = pairs.iter().map(|(_, byte)| *byte).collect();
+        assert!(bytes.len() <= 32, "{}", bytes.len());
+        let file = rc4_file(&bytes);
+        Pdf::from_bytes_with_password(&file, &text).expect("the password is right");
+    };
+    open(&specials[..18]);
+    open(&specials[18..]);
+
+    // The character just before a special is not that special. A dagger is
+    // 0x81 here; WinAnsi stores the same character as 0x86.
+    assert!(Pdf::from_bytes_with_password(&rc4_file(&[0x18]), "\u{02D7}").is_err());
+    assert!(Pdf::from_bytes_with_password(&rc4_file(&[0x93]), "\u{FB00}").is_err());
+    assert!(Pdf::from_bytes_with_password(&rc4_file(&[0x86]), "\u{2020}").is_err());
+}
+
 // ---- linearization -------------------------------------------------------------------------
 
 #[test]

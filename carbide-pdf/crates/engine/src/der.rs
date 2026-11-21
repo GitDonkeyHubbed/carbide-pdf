@@ -628,4 +628,74 @@ mod tests {
             &name("Acme Corp".as_bytes())
         ));
     }
+
+    #[test]
+    fn names_match_across_the_other_invisible_ranges() {
+        let name = |value: &str| {
+            sequence(&[&set(&[&sequence(&[
+                &oid(&[2, 5, 4, 10]),
+                &tlv(0x0C, value.as_bytes()),
+            ])])])
+        };
+        // The sample above uses U+0001, a soft hyphen, U+200B and U+FE0F,
+        // and tab and next line are spaces. These sit in ranges that sample
+        // never touches, at the end of a range whose other end is already
+        // covered, or at the start of one. Each one is removed, and none of
+        // them is a space.
+        for c in [
+            '\u{0000}',
+            '\u{001F}',
+            '\u{0084}',
+            '\u{009F}',
+            '\u{034F}',
+            '\u{06DD}',
+            '\u{070F}',
+            '\u{1806}',
+            '\u{180B}',
+            '\u{202A}',
+            '\u{2060}',
+            '\u{2063}',
+            '\u{206A}',
+            '\u{206F}',
+            '\u{FFF9}',
+            '\u{FFFC}',
+            '\u{1D17A}',
+            '\u{E0001}',
+            '\u{E0020}',
+        ] {
+            let with = name(&format!("A{c}B"));
+            assert!(names_match(&with, &name("AB")), "{c:?} should be ignored");
+            assert!(!names_match(&with, &name("A B")), "{c:?} is not a space");
+        }
+        // The character just outside each of those ranges stays, and it is
+        // not a space either. Widening a range by one fails only this case.
+        for c in [
+            '\u{034E}',
+            '\u{0350}',
+            '\u{06DC}',
+            '\u{06DE}',
+            '\u{070E}',
+            '\u{0710}',
+            '\u{1805}',
+            '\u{1807}',
+            '\u{2064}',
+            '\u{2069}',
+            '\u{FFF8}',
+            '\u{FFFD}',
+            '\u{1D172}',
+            '\u{1D17B}',
+            '\u{E0000}',
+            '\u{E0002}',
+            '\u{E001F}',
+        ] {
+            let with = name(&format!("A{c}B"));
+            assert!(!names_match(&with, &name("AB")), "{c:?} should stay");
+            assert!(!names_match(&with, &name("A B")), "{c:?} is not a space");
+        }
+        // U+2029 is a space, and it sits just before the embedding range.
+        // Taking that range one character earlier would delete it instead.
+        let separator = name("A\u{2029}B");
+        assert!(names_match(&separator, &name("A B")));
+        assert!(!names_match(&separator, &name("AB")));
+    }
 }
