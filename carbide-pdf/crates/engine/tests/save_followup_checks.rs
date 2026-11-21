@@ -141,3 +141,45 @@ fn ink_points_changed_beyond_the_reference_depth_limit_count_as_removed() {
         "ink points removed behind a long reference chain went unnoticed"
     );
 }
+
+/// True when an ink point stored as the integer `real as i64` counts as removed once that
+/// point is the real `real` instead. The two are the same number when the real is hashed as
+/// that integer.
+fn real_point_counts_as_removed(real: f32) -> bool {
+    let (bytes, _, points, _) = ink_with_referenced_points();
+    let (mut pdf, _) = SavedFile::open(bytes, None).unwrap();
+    pdf.document_mut().objects.insert(
+        points,
+        Object::Array(vec![Object::Integer(real as i64), 10.into()]),
+    );
+    let saved = SavedFile::new(Vec::new(), &pdf, None);
+    pdf.document_mut()
+        .objects
+        .insert(points, Object::Array(vec![Object::Real(real), 10.into()]));
+    saved.removed_from(&pdf)
+}
+
+#[test]
+fn a_whole_real_matches_its_integer_only_below_9e18() {
+    // A real is an f32. 9e18 is the first whole value that is not hashed as the integer it
+    // casts to; the next smaller real still is. Both cast back to that integer. 16,777,217 is
+    // a different limit: a real cannot hold that integer at all.
+    let below = 8_999_999_652_602_314_752.0f32;
+    let bound = 9_000_000_000_000_000_000.0f32;
+    assert!(
+        !real_point_counts_as_removed(below),
+        "a whole real just below 9e18 was not its integer"
+    );
+    assert!(
+        !real_point_counts_as_removed(-below),
+        "a negative whole real just below 9e18 was not its integer"
+    );
+    assert!(
+        real_point_counts_as_removed(bound),
+        "9e18 was treated as the integer it casts to"
+    );
+    assert!(
+        real_point_counts_as_removed(-bound),
+        "negative 9e18 was treated as the integer it casts to"
+    );
+}

@@ -751,6 +751,13 @@ fn an_rsa_pss_key_restricted_to_other_parameters_does_not_verify_the_signature()
         with(key_with(Some(pss_params(SHA256_OID, 64)))),
         Validity::Invalid
     );
+    // 32 bytes of salt is the signature's own length. One more is the first the key refuses.
+    // A key that asks for 64 already refuses 32, so this is the bound next to the accepted length.
+    assert_eq!(
+        with(key_with(Some(pss_params(SHA256_OID, 33)))),
+        Validity::Invalid,
+        "a key that requires 33 bytes of salt accepted a 32-byte salt"
+    );
 }
 
 #[test]
