@@ -205,6 +205,26 @@ fn page_ranges_parse_and_validate() {
     }
 }
 
+#[test]
+fn page_ranges_keep_spaces_empty_slots_and_a_repeated_page() {
+    // The older list has no space around the hyphen and no empty slot.
+    // A repeated page stays in a range list and is collapsed when each
+    // page is edited once.
+    for text in ["1 - 3", "1\t-\t3"] {
+        assert_eq!(
+            Pdf::parse_ranges(text, 10).unwrap(),
+            vec![0..=2],
+            "{text:?}"
+        );
+    }
+    assert_eq!(Pdf::parse_ranges("1,,3,", 5).unwrap(), vec![0..=0, 2..=2]);
+    assert_eq!(Pdf::parse_ranges("2, 2", 4).unwrap(), vec![1..=1, 1..=1]);
+    assert_eq!(Pdf::parse_pages("2, 2", 4).unwrap(), vec![1]);
+    for bad in ["1-", "-2"] {
+        assert!(Pdf::parse_ranges(bad, 10).is_err(), "{bad:?}");
+    }
+}
+
 // ---- stamping ------------------------------------------------------------------------------
 
 #[test]

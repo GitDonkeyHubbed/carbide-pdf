@@ -301,6 +301,23 @@ mod tests {
     }
 
     #[test]
+    fn a_literal_string_runs_across_a_line_break() {
+        // The older sample's string stays on one line, and its escaped
+        // parenthesis is a closing one. A line break does not end a string,
+        // so a name on the next line is not a name.
+        for break_byte in [b'\n', b'\r'] {
+            let mut data = b"(hello".to_vec();
+            data.push(break_byte);
+            data.extend_from_slice(b"/F2 12 Tf) Tj");
+            assert_eq!(
+                all(&data),
+                vec![Token::Other, Token::Operator(b"Tj")],
+                "line break {break_byte:02x}"
+            );
+        }
+    }
+
+    #[test]
     fn inline_image_data_is_skipped() {
         let data = b"BI /W 2 /H 1 /CS /RGB ID \x00/Fake EI\xffEI Q EI\n/After Do";
         let names: Vec<_> = all(data)
