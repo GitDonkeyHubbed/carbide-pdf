@@ -606,6 +606,180 @@ fn deleted_page_image_does_not_survive_in_a_soft_mask_form() {
 }
 
 #[test]
+fn colour_spaces_named_inside_a_drawn_image_stay() {
+    // The kept page never selects these with `cs`. The image names one, an indexed space
+    // written on the image names its base, and a DeviceN space stored as its own object names
+    // its alternate. A space that only shares the image's width key, a pattern of the same
+    // name, and a space only the deleted page's image names do not stay.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let space = |doc: &mut Document, marker: &str| {
+                doc.add_object(Stream::new(dictionary! {}, marker.as_bytes().to_vec()))
+            };
+            let ink = space(doc, "KEEP-IMAGE-SPACE");
+            let base = space(doc, "KEEP-INDEX-BASE");
+            let alternate = space(doc, "KEEP-DEVICE-ALT");
+            let width = space(doc, "DROP-WIDTH-KEY");
+            let gone = space(doc, "DROP-GONE-SPACE");
+            let same_name = doc.add_object(Stream::new(
+                dictionary! { "Type" => "Pattern", "PatternType" => 1 },
+                b"DROP-PATTERN-SAME-NAME".to_vec(),
+            ));
+            let device_n = doc.add_object(Object::Array(vec![
+                Object::Name(b"DeviceN".to_vec()),
+                Object::Array(vec![Object::Name(b"Gold".to_vec())]),
+                Object::Name(b"AltInk".to_vec()),
+                Object::Name(b"Tint".to_vec()),
+            ]));
+            let image = |doc: &mut Document, colour: Object| {
+                let mut dict = dictionary! {
+                    "Type" => "XObject", "Subtype" => "Image", "Width" => 8, "Height" => 8,
+                    "BitsPerComponent" => 8,
+                };
+                dict.set("ColorSpace", colour);
+                doc.add_object(Stream::new(dict, vec![0; 8]))
+            };
+            dictionary! {
+                "ColorSpace" => dictionary! {
+                    "Ink" => ink,
+                    "BaseInk" => base,
+                    "DeviceNCS" => device_n,
+                    "AltInk" => alternate,
+                    "Width" => width,
+                    "GoneCS" => gone,
+                },
+                "Pattern" => dictionary! { "Ink" => same_name },
+                "XObject" => dictionary! {
+                    "ImInk" => image(doc, Object::Name(b"Ink".to_vec())),
+                    "ImIndex" => image(doc, Object::Array(vec![
+                        Object::Name(b"Indexed".to_vec()),
+                        Object::Name(b"BaseInk".to_vec()),
+                        1.into(),
+                        Object::String(vec![0x00, 0xFF], lopdf::StringFormat::Hexadecimal),
+                    ])),
+                    "ImDevice" => image(doc, Object::Name(b"DeviceNCS".to_vec())),
+                    "ImGone" => image(doc, Object::Name(b"GoneCS".to_vec())),
+                },
+            }
+        },
+        &["/ImInk Do /ImIndex Do /ImDevice Do", "/ImGone Do"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    for marker in ["KEEP-IMAGE-SPACE", "KEEP-INDEX-BASE", "KEEP-DEVICE-ALT"] {
+        assert!(contains(&saved, marker.as_bytes()), "{marker} was dropped");
+    }
+    for marker in [
+        "DROP-WIDTH-KEY",
+        "DROP-GONE-SPACE",
+        "DROP-PATTERN-SAME-NAME",
+    ] {
+        assert!(!contains(&saved, marker.as_bytes()), "{marker} was kept");
+    }
+}
+
+#[test]
+fn content_without_resources_of_its_own_draws_with_the_pages() {
+    // The kept page draws a form, a tiling pattern, a Type 3 font and a soft mask, and none of
+    // those has a resource dictionary. The mask dictionary and the font's character procedures
+    // are each stored as their own object. What they draw is in the page's resources. A font
+    // only an undrawn form uses, and the deleted page's image, are not.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let font = |doc: &mut Document, name: &str| {
+                let mut dict = dictionary! { "Type" => "Font", "Subtype" => "Type1" };
+                dict.set("BaseFont", Object::Name(name.as_bytes().to_vec()));
+                doc.add_object(dict)
+            };
+            let image = |doc: &mut Document, marker: &str| {
+                doc.add_object(Stream::new(
+                    dictionary! {
+                        "Type" => "XObject", "Subtype" => "Image", "Width" => 8, "Height" => 8,
+                        "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8,
+                    },
+                    marker.as_bytes().to_vec(),
+                ))
+            };
+            let bare_form = |doc: &mut Document, content: &str| {
+                doc.add_object(Stream::new(
+                    dictionary! {
+                        "Type" => "XObject", "Subtype" => "Form",
+                        "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+                    },
+                    content.as_bytes().to_vec(),
+                ))
+            };
+            let glyph = doc.add_object(Stream::new(dictionary! {}, b"/ImGlyph Do\n".to_vec()));
+            let procs = doc.add_object(dictionary! { "a" => glyph });
+            let type3 = doc.add_object(dictionary! {
+                "Type" => "Font", "Subtype" => "Type3",
+                "FontBBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+                "FontMatrix" => vec![0.1.into(), 0.into(), 0.into(), 0.1.into(), 0.into(), 0.into()],
+                "CharProcs" => procs,
+                "Encoding" => dictionary! {
+                    "Differences" => vec![97.into(), Object::Name(b"a".to_vec())],
+                },
+                "FirstChar" => 97, "LastChar" => 97, "Widths" => vec![10.into()],
+            });
+            let mask = bare_form(doc, "BT /Fmask 12 Tf (mask) Tj ET");
+            let smask = doc.add_object(dictionary! {
+                "Type" => "Mask", "S" => "Luminosity", "G" => mask,
+            });
+            dictionary! {
+                "Font" => dictionary! {
+                    "Fkeep" => font(doc, "KEEP-FORM-FONT"),
+                    "Fmask" => font(doc, "KEEP-MASK-FONT"),
+                    "Fgone" => font(doc, "DROP-UNUSED-FONT"),
+                    "T3" => type3,
+                },
+                "XObject" => dictionary! {
+                    "FmKeep" => bare_form(doc, "BT /Fkeep 12 Tf (form) Tj ET"),
+                    "FmGone" => bare_form(doc, "BT /Fgone 12 Tf (gone) Tj ET"),
+                    "ImPat" => image(doc, "KEEP-PATTERN-IMAGE"),
+                    "ImGlyph" => image(doc, "KEEP-GLYPH-IMAGE"),
+                    "ImGone" => secret_image(doc),
+                },
+                "Pattern" => dictionary! {
+                    "Pat1" => doc.add_object(Stream::new(
+                        dictionary! {
+                            "Type" => "Pattern", "PatternType" => 1, "PaintType" => 1,
+                            "TilingType" => 1, "XStep" => 10, "YStep" => 10,
+                            "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+                        },
+                        b"/ImPat Do\n".to_vec(),
+                    )),
+                },
+                "ExtGState" => dictionary! {
+                    "GS1" => dictionary! { "Type" => "ExtGState", "SMask" => smask },
+                },
+            }
+        },
+        &[
+            "/FmKeep Do /Pat1 scn BT /T3 12 Tf (a) Tj ET /GS1 gs",
+            "q 100 0 0 100 0 0 cm /ImGone Do Q",
+        ],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    for marker in [
+        "KEEP-FORM-FONT",
+        "KEEP-MASK-FONT",
+        "KEEP-PATTERN-IMAGE",
+        "KEEP-GLYPH-IMAGE",
+    ] {
+        assert!(contains(&saved, marker.as_bytes()), "{marker} was dropped");
+    }
+    assert!(
+        !contains(&saved, b"DROP-UNUSED-FONT"),
+        "a font only an undrawn form uses was kept"
+    );
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+}
+
+#[test]
 fn deleting_a_page_does_not_copy_the_images_of_the_pages_that_stay() {
     // The page that stays draws a 16 MB image; deleting the other one need not copy it, as
     // copying the document to put it back on failure would.
