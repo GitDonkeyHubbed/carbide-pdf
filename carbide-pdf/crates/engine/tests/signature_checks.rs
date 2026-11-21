@@ -548,7 +548,185 @@ fn a_ca_restricted_to_other_purposes_cannot_vouch_for_a_signer() {
     assert_eq!(restricted(vec![ExtendedKeyUsagePurpose::Any]), VIA_CHAIN);
 }
 
-// ---- the signature value in the file -------------------------------------------------------
+/// How a directly trusted certificate for the test key reads.
+fn direct_outcome(identity: &Identity, cert: &[u8]) -> (Validity, Detail) {
+    let signed = sign(identity, SubFilter::Pkcs7Detached, None);
+    let trust = TrustStore {
+        certificates: vec![cert.to_vec()],
+    };
+    outcome(&verify(&signed, &trust)[0])
+}
+
+/// A self-signed end-entity certificate for the test key, adjusted by `adjust`.
+fn direct_certificate(adjust: impl FnOnce(&mut CertificateParams)) -> (Vec<u8>, Identity) {
+    let pair = KeyPair::try_from(signer().pkcs8.as_slice()).unwrap();
+    let mut params = cert_params(
+        "Direct Signer",
+        IsCa::ExplicitNoCa,
+        &[KeyUsagePurpose::DigitalSignature],
+    );
+    adjust(&mut params);
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+    let identity = Identity::new(vec![cert.clone()], signer().key.clone()).unwrap();
+    (cert, identity)
+}
+
+#[test]
+fn an_empty_extended_key_usage_names_no_purpose() {
+    // A certificate with no extended key usage may sign. One whose list is present and empty
+    // names nothing, so it may not. The list decodes and is not critical: the refusal for a
+    // critical extension that does not decode, and the refusal for server authentication, both
+    // stay green if an empty list is treated as if the extension were missing.
+    let (cert, identity) = direct_certificate(|_| {});
+    assert_eq!(
+        direct_outcome(&identity, &cert),
+        (Validity::Valid, Detail::TrustedDirectly),
+        "no extended key usage"
+    );
+
+    let (cert, identity) = direct_certificate(|params| {
+        let mut extension = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], seq(&[]));
+        extension.set_criticality(false);
+        params.custom_extensions.push(extension);
+    });
+    let parsed = x509_cert::Certificate::from_der(&cert).unwrap();
+    let extension = parsed
+        .tbs_certificate
+        .extensions
+        .as_ref()
+        .and_then(|extensions| {
+            extensions
+                .iter()
+                .find(|extension| extension.extn_id.to_string() == "2.5.29.37")
+        })
+        .expect("extended key usage");
+    assert!(!extension.critical);
+    let usage = x509_cert::ext::pkix::ExtendedKeyUsage::from_der(extension.extn_value.as_bytes())
+        .expect("an empty purpose list decodes");
+    assert!(usage.0.is_empty());
+    assert_eq!(
+        direct_outcome(&identity, &cert),
+        (Validity::ValidityUnknown, Detail::NotPermitted),
+        "empty extended key usage"
+    );
+}
+
+/// How a document time stamp from an authority with `usages` reads when that certificate is trusted.
+fn timestamp_outcome(usages: &[KeyUsagePurpose]) -> (Validity, Detail) {
+    let pair = KeyPair::try_from(signer().pkcs8.as_slice()).unwrap();
+    let mut params = cert_params("Usage TSA", IsCa::ExplicitNoCa, usages);
+    let mut purpose = rcgen::CustomExtension::from_oid_content(
+        &[2, 5, 29, 37],
+        seq(&[&oid(&[1, 3, 6, 1, 5, 5, 7, 3, 8])]),
+    );
+    purpose.set_criticality(true);
+    params.custom_extensions.push(purpose);
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+    let tsa = Tsa {
+        cert: cert.clone(),
+        gen_time: "20260101000000Z",
+    };
+    let (pdf, base) = document();
+    let stamped = pdf
+        .sign(
+            &base,
+            &SignOptions {
+                sub_filter: SubFilter::DocumentTimeStamp,
+                timestamp: Some(&tsa),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let trust = TrustStore {
+        certificates: vec![cert],
+    };
+    outcome(&verify(&stamped, &trust)[0])
+}
+
+/// How a directly trusted end entity with `usages` reads.
+fn signer_outcome(usages: &[KeyUsagePurpose]) -> (Validity, Detail) {
+    let (cert, identity) = direct_certificate(|params| {
+        params.key_usages = usages.to_vec();
+    });
+    direct_outcome(&identity, &cert)
+}
+
+/// How a leaf reads when its only trusted issuer has `usages`.
+fn issued_outcome(usages: &[KeyUsagePurpose]) -> (Validity, Detail) {
+    let (root, issuer) = ca("Usage CA", None, |params| {
+        params.key_usages = usages.to_vec();
+    });
+    chain_outcome(&leaf(&issuer, &[], |_| {}), &root)
+}
+
+#[test]
+fn data_encipherment_and_key_agreement_do_not_authorize_signing() {
+    // Neither bit is digitalSignature or contentCommitment, and neither lets a CA issue.
+    // The older signer refusal is key encipherment, and the older CA refusal is a CA limited
+    // to digitalSignature. Accepting either new bit on a signer, on a time stamp, or on a CA
+    // leaves those older refusals green. A certificate that also holds the bit that does
+    // authorize the operation still does.
+    let refused = (Validity::ValidityUnknown, Detail::NotPermitted);
+    let accepted = (Validity::Valid, Detail::TrustedDirectly);
+    assert_eq!(
+        signer_outcome(&[KeyUsagePurpose::DataEncipherment]),
+        refused,
+        "dataEncipherment"
+    );
+    assert_eq!(
+        signer_outcome(&[KeyUsagePurpose::KeyAgreement]),
+        refused,
+        "keyAgreement"
+    );
+    assert_eq!(
+        signer_outcome(&[
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::DataEncipherment,
+            KeyUsagePurpose::KeyAgreement,
+        ]),
+        accepted,
+        "digitalSignature beside them"
+    );
+
+    assert_eq!(
+        timestamp_outcome(&[KeyUsagePurpose::DataEncipherment]),
+        refused,
+        "time stamp dataEncipherment"
+    );
+    assert_eq!(
+        timestamp_outcome(&[KeyUsagePurpose::KeyAgreement]),
+        refused,
+        "time stamp keyAgreement"
+    );
+    assert_eq!(
+        timestamp_outcome(&[
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::DataEncipherment,
+        ]),
+        accepted,
+        "time stamp digitalSignature beside dataEncipherment"
+    );
+
+    assert_eq!(
+        issued_outcome(&[KeyUsagePurpose::DataEncipherment]),
+        REJECTED,
+        "CA dataEncipherment"
+    );
+    assert_eq!(
+        issued_outcome(&[KeyUsagePurpose::KeyAgreement]),
+        REJECTED,
+        "CA keyAgreement"
+    );
+    assert_eq!(
+        issued_outcome(&[
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DataEncipherment,
+            KeyUsagePurpose::KeyAgreement,
+        ]),
+        VIA_CHAIN,
+        "CA keyCertSign beside them"
+    );
+}
 
 #[test]
 fn a_hex_signature_value_with_line_breaks_and_an_odd_last_digit_verifies() {
@@ -746,6 +924,14 @@ fn an_rsa_pss_key_restricted_to_other_parameters_does_not_verify_the_signature()
     assert_eq!(
         with(key_with(Some(pss_params(SHA384_OID, 48)))),
         Validity::Invalid
+    );
+    // The signature uses 32 bytes of salt, so this key's salt is long enough. The refusal is
+    // the hash. The salt-48 case above still fails if only the salt check remains, and a salt
+    // of 64 still fails if only the hash check remains.
+    assert_eq!(
+        with(key_with(Some(pss_params(SHA384_OID, 32)))),
+        Validity::Invalid,
+        "SHA-384 with a long enough salt"
     );
     assert_eq!(
         with(key_with(Some(pss_params(SHA256_OID, 64)))),
