@@ -4218,6 +4218,81 @@ fn numbers_too_large_to_write_are_brought_within_range() {
 }
 
 #[test]
+fn a_print_box_past_the_limit_is_brought_in_when_the_page_size_is_not() {
+    // The checks above put an oversized coordinate on /MediaBox, which changes the page size.
+    // Crop, bleed, trim, and art boxes are brought within the same limit. A crop past the media
+    // edge does not change the size the page shows, and the other three are not part of that
+    // size, so those checks stay green when only /MediaBox is rewritten. A name is not a
+    // coordinate: it is read as 0, and the oversized number beside it is still brought in.
+    // Leaving the name, or skipping the box because of it, keeps 1_000_001. The sound page tree
+    // has an in-range crop, so it stays green when that happens.
+    let mut pdf = text_pdf(&[&["BOX"]]);
+    let id = pdf.page_ids()[0];
+    pdf.document_mut().get_dictionary_mut(id).unwrap().set(
+        "CropBox",
+        vec![0.into(), 0.into(), 1_000_001.into(), 792.into()],
+    );
+    pdf.document_mut().get_dictionary_mut(id).unwrap().set(
+        "BleedBox",
+        vec![
+            0.into(),
+            0.into(),
+            1_000_001.into(),
+            Object::Name(b"Outside".to_vec()),
+        ],
+    );
+    pdf.document_mut().get_dictionary_mut(id).unwrap().set(
+        "TrimBox",
+        vec![0.into(), 0.into(), 1_000_001.into(), 792.into()],
+    );
+    pdf.document_mut().get_dictionary_mut(id).unwrap().set(
+        "ArtBox",
+        vec![0.into(), 0.into(), 1_000_001.into(), 792.into()],
+    );
+    let pdf = Pdf::from_bytes(&pdf.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        pdf.page_geometry(0).unwrap().display_size(),
+        (612.0, 792.0),
+        "the page stays letter size"
+    );
+    let stored = |key: &[u8]| -> Vec<Object> {
+        pdf.document()
+            .get_dictionary(pdf.page_ids()[0])
+            .unwrap()
+            .get(key)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        stored(b"CropBox")[2],
+        Object::Real(1_000_000.0),
+        "crop: {:?}",
+        stored(b"CropBox")
+    );
+    let bleed = stored(b"BleedBox");
+    assert_eq!(bleed[2], Object::Real(1_000_000.0), "bleed: {bleed:?}");
+    assert_eq!(
+        bleed[3],
+        Object::Integer(0),
+        "a name in an oversized box is read as 0: {bleed:?}"
+    );
+    assert_eq!(
+        stored(b"TrimBox")[2],
+        Object::Real(1_000_000.0),
+        "trim: {:?}",
+        stored(b"TrimBox")
+    );
+    assert_eq!(
+        stored(b"ArtBox")[2],
+        Object::Real(1_000_000.0),
+        "art: {:?}",
+        stored(b"ArtBox")
+    );
+}
+
+#[test]
 fn a_media_box_without_an_area_is_a_letter_page() {
     for media_box in [
         "[0 0 0 0]",
