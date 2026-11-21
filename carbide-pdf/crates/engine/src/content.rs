@@ -301,6 +301,27 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_and_comments_end_where_the_syntax_says() {
+        // The older sample separates tokens with spaces and ends a comment
+        // with a line feed. Form feed and NUL are whitespace too; a vertical
+        // tab is not, so it stays inside the name. A comment ends at a
+        // carriage return, and the name after it is still read.
+        assert_eq!(
+            all(b"1\x0c2\x003"),
+            vec![Token::Number(1.0), Token::Number(2.0), Token::Number(3.0),]
+        );
+        assert_eq!(
+            all(b"/A\x0cDo"),
+            vec![Token::Name(b"A"), Token::Operator(b"Do")]
+        );
+        assert_eq!(all(b"/A\x0bB"), vec![Token::Name(b"A\x0bB")]);
+        assert_eq!(
+            all(b"% hidden\r/After Do"),
+            vec![Token::Name(b"After"), Token::Operator(b"Do")]
+        );
+    }
+
+    #[test]
     fn inline_image_data_is_skipped() {
         let data = b"BI /W 2 /H 1 /CS /RGB ID \x00/Fake EI\xffEI Q EI\n/After Do";
         let names: Vec<_> = all(data)

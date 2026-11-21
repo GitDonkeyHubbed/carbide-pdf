@@ -809,6 +809,160 @@ fn legacy_password_with_a_tab_and_an_accent_opens_the_file() {
     assert_eq!(pdf.page_count(), 1);
 }
 
+const OWNER_MARKER: &[u8] = b"OWNER-KEY-SECRET";
+
+/// A one-page file sealed the older way, with `user` as the open password and `owner` as the
+/// owner password. `drop_length` takes `/Length` back out after it is written.
+fn legacy_sealed(aes: bool, bits: usize, drop_length: bool, user: &str, owner: &str) -> Vec<u8> {
+    use lopdf::encryption::crypt_filters::{Aes128CryptFilter, CryptFilter};
+    use lopdf::{EncryptionState, EncryptionVersion, Permissions};
+    use std::sync::Arc;
+
+    let mut doc = Document::with_version("1.4");
+    let pages_id = doc.new_object_id();
+    let content = doc.add_object(Stream::new(
+        lopdf::Dictionary::new(),
+        format!("BT ({}) Tj ET", std::str::from_utf8(OWNER_MARKER).unwrap()).into_bytes(),
+    ));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+        "Contents" => content,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(
+            dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 },
+        ),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    doc.trailer.set("ID", file_id());
+    let permissions = Permissions::PRINTABLE;
+    let state = if aes {
+        let mut filters = std::collections::BTreeMap::new();
+        filters.insert(
+            b"StdCF".to_vec(),
+            Arc::new(Aes128CryptFilter) as Arc<dyn CryptFilter>,
+        );
+        EncryptionState::try_from(EncryptionVersion::V4 {
+            document: &doc,
+            encrypt_metadata: true,
+            crypt_filters: filters,
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: owner,
+            user_password: user,
+            permissions,
+        })
+        .unwrap()
+    } else {
+        EncryptionState::try_from(EncryptionVersion::V2 {
+            document: &doc,
+            owner_password: owner,
+            user_password: user,
+            key_length: bits,
+            permissions,
+        })
+        .unwrap()
+    };
+    let mut sealed = doc.clone();
+    sealed.encrypt(&state).unwrap();
+    if drop_length {
+        let id = sealed
+            .trailer
+            .get(b"Encrypt")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        sealed.get_dictionary_mut(id).unwrap().remove(b"Length");
+    }
+    let mut bytes = Vec::new();
+    sealed
+        .save_with_options(
+            &mut bytes,
+            lopdf::SaveOptions::builder()
+                .use_object_streams(false)
+                .use_xref_streams(false)
+                .build(),
+        )
+        .unwrap();
+    bytes
+}
+
+fn opened_content(bytes: &[u8], password: &str) -> Vec<u8> {
+    let pdf = Pdf::from_bytes_with_password(bytes, password)
+        .unwrap_or_else(|error| panic!("{password:?} should open the file: {error}"));
+    pdf.document().get_page_content(pdf.page_id(0).unwrap())
+}
+
+#[test]
+fn owner_password_recovers_the_open_password_at_its_real_limits() {
+    // The older checks open a revision-2 file with the open password, and a
+    // revision-3 or 4 file whose /Length is still in the dictionary, with a
+    // short owner password. None of them asks the owner password to recover
+    // the open password when /Length was left out, or to ignore bytes past
+    // the 32 that the key is derived from.
+    let opens = |bytes: &[u8], password: &str| {
+        let content = opened_content(bytes, password);
+        assert!(
+            content
+                .windows(OWNER_MARKER.len())
+                .any(|w| w == OWNER_MARKER),
+            "{password:?} decrypted to {}",
+            String::from_utf8_lossy(&content)
+        );
+    };
+    let refuses = |bytes: &[u8], password: &str| {
+        let error = match Pdf::from_bytes_with_password(bytes, password) {
+            Err(error) => error,
+            Ok(_) => panic!("{password:?} should not open the file"),
+        };
+        assert!(
+            matches!(error, carbide_engine::Error::WrongPassword),
+            "{password:?}: {error}"
+        );
+    };
+
+    // Revision 2 keeps a 5-byte key even though the dictionary has no /Length.
+    // The open password is what the older test uses; this one uses the owner password.
+    let revision2 = rc4_file(b"secret");
+    let pdf = Pdf::from_bytes_with_password(&revision2, "owner").unwrap();
+    assert_eq!(pdf.page_count(), 1);
+    refuses(&revision2, "ownes");
+
+    // A 40-bit revision-3 file whose /Length was left out is still 40-bit.
+    // Reading a missing length as 128 decrypts the owner entry with the wrong key.
+    let forty = legacy_sealed(false, 40, true, "user", "owner");
+    assert!(
+        !contains(&forty, b"/Length 40"),
+        "the key length stayed in the dictionary"
+    );
+    assert!(!contains(&forty, OWNER_MARKER));
+    opens(&forty, "user");
+    opens(&forty, "owner");
+
+    // AES-128 leaves /Length out often. A missing length there is 128 bits, not 40.
+    let aes = legacy_sealed(true, 128, true, "user", "owner");
+    assert!(
+        !contains(&aes, b"/Length 128"),
+        "the key length stayed in the dictionary"
+    );
+    assert!(!contains(&aes, OWNER_MARKER));
+    opens(&aes, "user");
+    opens(&aes, "owner");
+
+    // Only the first 32 bytes of an owner password are part of the key.
+    // The older passwords are shorter than that, so keeping the 33rd byte
+    // still opens them. The 32nd byte is part of the key.
+    let owner = "A".repeat(32);
+    let long = legacy_sealed(false, 128, false, "user", &owner);
+    opens(&long, &owner);
+    opens(&long, &format!("{owner}B"));
+    refuses(&long, &"A".repeat(31));
+    refuses(&long, &format!("{}B", "A".repeat(31)));
+}
+
 // ---- linearization -------------------------------------------------------------------------
 
 #[test]

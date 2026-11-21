@@ -380,6 +380,33 @@ mod tests {
     }
 
     #[test]
+    fn pdf_dates_keep_the_year_and_calendar_edges() {
+        let utc = |text: &str| parse_pdf_date(text).map(|d| d.to_rfc3339());
+        // 1970 is already refused, and a date in March is already accepted.
+        // 1971 is the first year that is a date. 3000 is the last, including
+        // its last month, its last day and its last second. The next year is not.
+        assert_eq!(
+            utc("D:19710101000000Z").as_deref(),
+            Some("1971-01-01T00:00:00+00:00")
+        );
+        assert_eq!(
+            utc("D:30001231235959Z").as_deref(),
+            Some("3000-12-31T23:59:59+00:00")
+        );
+        assert_eq!(parse_pdf_date("D:30010101000000Z"), None);
+        assert_eq!(pdf_date_to_local("D:30010101000000Z"), "");
+        // February 29 is a date in a leap year. The older check refuses
+        // February 30, which is never a date, so a February of 29 days in
+        // every year still passes it.
+        assert_eq!(
+            utc("D:20240229000000Z").as_deref(),
+            Some("2024-02-29T00:00:00+00:00")
+        );
+        assert_eq!(parse_pdf_date("D:20230229000000Z"), None);
+        assert_eq!(pdf_date_to_local("D:20230229000000Z"), "");
+    }
+
+    #[test]
     fn text_strings_round_trip() {
         for s in ["plain", "Überarbeitung 修正", ""] {
             assert_eq!(decode_text(&encode_text(s)), s);
