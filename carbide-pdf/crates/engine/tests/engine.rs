@@ -8915,6 +8915,295 @@ fn signer_key_usage_and_future_dates_are_named_as_such() {
         .contains(&sig_messages::SIGNED_IN_FUTURE));
 }
 
+/// Whether `der` carries extension `oid`, and whether that extension is critical.
+fn extension_critical(der: &[u8], oid: &str) -> Option<bool> {
+    use x509_cert::der::Decode;
+    x509_cert::Certificate::from_der(der)
+        .unwrap()
+        .tbs_certificate
+        .extensions
+        .as_ref()
+        .and_then(|extensions| {
+            extensions
+                .iter()
+                .find(|extension| extension.extn_id.to_string() == oid)
+                .map(|extension| extension.critical)
+        })
+}
+
+/// How a directly trusted end-entity certificate with `usages` reads.
+fn trusted_signer(usages: &[KeyUsagePurpose]) -> (Validity, Detail) {
+    let (pair, key) = rsa_key();
+    let params = cert_params("Usage Signer", IsCa::ExplicitNoCa, usages);
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+    let identity = Identity::new(vec![cert.clone()], key).unwrap();
+    let report = verify(
+        &sign_with(&identity),
+        &TrustStore {
+            certificates: vec![cert],
+        },
+    )
+    .remove(0);
+    (report.validity, report.detail)
+}
+
+/// How a leaf issued by a CA with `usages` reads when only that CA is trusted.
+fn issued_by_ca(usages: &[KeyUsagePurpose]) -> (Vec<u8>, Validity, Detail) {
+    let (pair, _) = rsa_key();
+    let params = cert_params(
+        "Usage CA",
+        IsCa::Ca(BasicConstraints::Unconstrained),
+        usages,
+    );
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+    let issuer = Issuer::new(params, pair);
+    let (identity, _) = chain_identity(&issuer, &[]);
+    let report = verify(
+        &sign_with(&identity),
+        &TrustStore {
+            certificates: vec![cert.clone()],
+        },
+    )
+    .remove(0);
+    (cert, report.validity, report.detail)
+}
+
+#[test]
+fn key_cert_sign_does_not_let_an_end_entity_sign() {
+    // keyCertSign is what lets a CA issue certificates. On a signer or a time stamp authority it
+    // is not a substitute for digitalSignature or contentCommitment. The older refusal is key
+    // encipherment, which sets neither of those bits, so accepting keyCertSign leaves it green.
+    let refused = (Validity::ValidityUnknown, Detail::NotPermitted);
+    assert_eq!(
+        trusted_signer(&[KeyUsagePurpose::KeyCertSign]),
+        refused,
+        "keyCertSign alone"
+    );
+
+    let (validity, detail) = trusted_signer(&[
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+    ]);
+    assert_eq!(
+        (validity, detail),
+        (Validity::Valid, Detail::TrustedDirectly),
+        "digitalSignature beside keyCertSign"
+    );
+
+    // The time-stamp check is a separate copy of the same two bits.
+    use rsa::pkcs8::EncodePrivateKey;
+    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let mut params = cert_params(
+        "Cert-sign TSA",
+        IsCa::ExplicitNoCa,
+        &[KeyUsagePurpose::KeyCertSign],
+    );
+    let mut eku = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], timestamping_purpose());
+    eku.set_criticality(true);
+    params.custom_extensions.push(eku);
+    let tsa = TestTsa {
+        key,
+        cert: params.self_signed(&pair).unwrap().der().to_vec(),
+        gen_time: "20260101000000Z",
+    };
+    let mut doc = text_pdf(&[&["cert sign tsa"]]);
+    let base = file_bytes(&mut doc);
+    let stamped = doc
+        .sign(
+            &base,
+            &SignOptions {
+                sub_filter: SubFilter::DocumentTimeStamp,
+                timestamp: Some(&tsa),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let report = verify(
+        &stamped,
+        &TrustStore {
+            certificates: vec![tsa.cert],
+        },
+    )
+    .remove(0);
+    assert_eq!(
+        (report.validity, report.detail),
+        refused,
+        "time stamp keyCertSign"
+    );
+    let lines = report.description_lines();
+    assert!(
+        lines.contains(&sig_messages::TIMESTAMP_AUTHORITY_NOT_PERMITTED)
+            && !lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_ca_may_issue_without_a_key_usage_but_crl_sign_is_not_enough() {
+    // No key usage means the CA is not restricted. cRLSign does not include keyCertSign, and
+    // having both is still keyCertSign. The older refusal is a CA limited to digitalSignature.
+    let (cert, validity, detail) = issued_by_ca(&[]);
+    assert_eq!(
+        extension_critical(&cert, "2.5.29.15"),
+        None,
+        "this CA must not carry a key usage"
+    );
+    assert_eq!(
+        (validity, detail),
+        (Validity::Valid, Detail::TrustedViaChain),
+        "no key usage"
+    );
+
+    let (_, validity, detail) = issued_by_ca(&[KeyUsagePurpose::CrlSign]);
+    assert_eq!(
+        (validity, detail),
+        (Validity::ValidityUnknown, Detail::ChainRejected),
+        "cRLSign alone"
+    );
+
+    let (_, validity, detail) =
+        issued_by_ca(&[KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign]);
+    assert_eq!(
+        (validity, detail),
+        (Validity::Valid, Detail::TrustedViaChain),
+        "keyCertSign and cRLSign"
+    );
+}
+
+#[test]
+fn an_extension_that_does_not_decode_is_not_the_same_as_one_that_is_absent() {
+    // A missing key usage or extended key usage leaves the certificate unrestricted. One that is
+    // present and cannot be read does not: otherwise a damaged restriction is ignored. Neither
+    // extension is critical, so the chain rule for unknown critical extensions does not reach
+    // them. The older malformed extension is a critical subjectAltName, which is refused as a
+    // broken chain even if these two are treated as absent.
+    let refused = (Validity::ValidityUnknown, Detail::NotPermitted);
+    let broken = |oid: &[u64], usages: &[KeyUsagePurpose]| {
+        let (pair, key) = rsa_key();
+        let mut params = cert_params("Undecodable", IsCa::ExplicitNoCa, usages);
+        let mut extension = rcgen::CustomExtension::from_oid_content(oid, algo::null());
+        extension.set_criticality(false);
+        params.custom_extensions.push(extension);
+        let cert = params.self_signed(&pair).unwrap().der().to_vec();
+        assert_eq!(extension_critical(&cert, &oid_text(oid)), Some(false));
+        let identity = Identity::new(vec![cert.clone()], key).unwrap();
+        let report = verify(
+            &sign_with(&identity),
+            &TrustStore {
+                certificates: vec![cert],
+            },
+        )
+        .remove(0);
+        (report.validity, report.detail)
+    };
+    assert_eq!(
+        broken(&[2, 5, 29, 15], &[]),
+        refused,
+        "key usage that does not decode"
+    );
+    assert_eq!(
+        broken(&[2, 5, 29, 37], &[KeyUsagePurpose::DigitalSignature]),
+        refused,
+        "extended key usage that does not decode"
+    );
+
+    // A time stamp authority is held to its own read of that extension. An unreadable one is not
+    // id-kp-timeStamping. The document-signer check above does not call this one.
+    use rsa::pkcs8::EncodePrivateKey;
+    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let mut params = cert_params(
+        "Undecodable TSA",
+        IsCa::ExplicitNoCa,
+        &[KeyUsagePurpose::DigitalSignature],
+    );
+    let mut eku = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], algo::null());
+    eku.set_criticality(false);
+    params.custom_extensions.push(eku);
+    let tsa = TestTsa {
+        key,
+        cert: params.self_signed(&pair).unwrap().der().to_vec(),
+        gen_time: "20260101000000Z",
+    };
+    assert_eq!(extension_critical(&tsa.cert, "2.5.29.37"), Some(false));
+    let mut doc = text_pdf(&[&["undecodable tsa"]]);
+    let base = file_bytes(&mut doc);
+    let stamped = doc
+        .sign(
+            &base,
+            &SignOptions {
+                sub_filter: SubFilter::DocumentTimeStamp,
+                timestamp: Some(&tsa),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let report = verify(
+        &stamped,
+        &TrustStore {
+            certificates: vec![tsa.cert],
+        },
+    )
+    .remove(0);
+    assert_eq!(
+        (report.validity, report.detail),
+        refused,
+        "time stamp extended key usage that does not decode"
+    );
+
+    // basicConstraints is not a usage. A critical one that does not decode still has to be
+    // understood, so the certificate is not confirmed. The same value, not critical, is ignored.
+    // Accepting every basicConstraints extension confirms only the critical one.
+    let constraints = |critical: bool| {
+        let (pair, key) = rsa_key();
+        let mut params = cert_params(
+            "Undecodable constraints",
+            IsCa::NoCa,
+            &[KeyUsagePurpose::DigitalSignature],
+        );
+        let mut extension = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 19], algo::null());
+        extension.set_criticality(critical);
+        params.custom_extensions.push(extension);
+        let cert = params.self_signed(&pair).unwrap().der().to_vec();
+        assert_eq!(
+            extension_critical(&cert, "2.5.29.19"),
+            Some(critical),
+            "critical={critical}"
+        );
+        let identity = Identity::new(vec![cert.clone()], key).unwrap();
+        verify(
+            &sign_with(&identity),
+            &TrustStore {
+                certificates: vec![cert],
+            },
+        )
+        .remove(0)
+    };
+    let report = constraints(true);
+    assert_eq!(
+        (report.validity, report.detail),
+        (Validity::ValidityUnknown, Detail::ChainRejected),
+        "critical basicConstraints"
+    );
+    assert!(report
+        .description_lines()
+        .contains(&sig_messages::CHAIN_REJECTED));
+    let report = constraints(false);
+    assert_eq!(
+        (report.validity, report.detail),
+        (Validity::Valid, Detail::TrustedDirectly),
+        "non-critical basicConstraints"
+    );
+}
+
+fn oid_text(arcs: &[u64]) -> String {
+    arcs.iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 #[test]
 fn the_signing_time_a_signature_claims_does_not_bring_back_a_lapsed_certificate() {
     let backdated = |identity: &Identity| {
