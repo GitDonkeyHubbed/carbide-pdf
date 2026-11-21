@@ -4218,6 +4218,73 @@ fn numbers_too_large_to_write_are_brought_within_range() {
 }
 
 #[test]
+fn a_page_box_past_the_limit_is_brought_in_when_it_is_stored_as_its_own_object() {
+    // 1_000_001 is one past the largest page-box coordinate that is left as written. The older
+    // check puts that coordinate in the page dictionary, so it still passes when a reference is
+    // not followed. Here the box, or just the coordinate, is an object of its own. Either one
+    // left unread keeps 1_000_001, and the page is that wide instead of 1_000_000.
+    let open = |install: fn(&mut Document, lopdf::ObjectId)| {
+        Pdf::from_bytes(&damaged_tree(move |doc, _, ids| install(doc, ids[0]))).unwrap()
+    };
+    let width = |pdf: &Pdf| pdf.page_geometry(0).unwrap().display_size().0;
+    let stored = |pdf: &Pdf| -> Object {
+        let id = pdf.page_ids()[0];
+        pdf.document()
+            .get_dictionary(id)
+            .unwrap()
+            .get(b"MediaBox")
+            .unwrap()
+            .clone()
+    };
+    let number = |object: &Object| -> f32 {
+        let Object::Array(items) = object else {
+            panic!("the media box is not four numbers: {object:?}");
+        };
+        items[2].as_float().expect("the width is still a reference")
+    };
+
+    let array = open(|doc, page| {
+        let array = doc.add_object(Object::Array(vec![
+            0.into(),
+            0.into(),
+            1_000_001.into(),
+            792.into(),
+        ]));
+        doc.get_dictionary_mut(page).unwrap().set("MediaBox", array);
+    });
+    assert_eq!(width(&array), 1_000_000.0, "{:?}", stored(&array));
+    assert_eq!(number(&stored(&array)), 1_000_000.0);
+
+    let coordinate = open(|doc, page| {
+        let wide = doc.add_object(Object::Integer(1_000_001));
+        doc.get_dictionary_mut(page).unwrap().set(
+            "MediaBox",
+            vec![0.into(), 0.into(), wide.into(), 792.into()],
+        );
+    });
+    assert_eq!(width(&coordinate), 1_000_000.0, "{:?}", stored(&coordinate));
+    assert_eq!(number(&stored(&coordinate)), 1_000_000.0);
+
+    // 400 is inside the limit, so the reference is left in place. Rewriting every box that
+    // names its width this way would put a plain number there instead.
+    let kept = open(|doc, page| {
+        let wide = doc.add_object(Object::Integer(400));
+        doc.get_dictionary_mut(page).unwrap().set(
+            "MediaBox",
+            vec![0.into(), 0.into(), wide.into(), 792.into()],
+        );
+    });
+    assert_eq!(width(&kept), 400.0, "{:?}", stored(&kept));
+    let Object::Array(items) = stored(&kept) else {
+        panic!("a box inside the limit was replaced: {:?}", stored(&kept));
+    };
+    assert!(
+        matches!(items[2], Object::Reference(_)),
+        "a width inside the limit was copied out of its object: {items:?}"
+    );
+}
+
+#[test]
 fn a_media_box_without_an_area_is_a_letter_page() {
     for media_box in [
         "[0 0 0 0]",
