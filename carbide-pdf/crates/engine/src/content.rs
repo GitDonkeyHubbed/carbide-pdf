@@ -301,6 +301,33 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_runs_to_the_line_break_and_a_sign_starts_a_number() {
+        // The older sample ends a comment with a line feed and writes a
+        // number with a minus or a leading dot. A form feed or a NUL does
+        // not end a comment, so the name after one is not a name. A plus
+        // starts a number. A word that only looks like a number is not an
+        // operator, and neither are `true`, `false` and `null`.
+        assert!(all(b"% hidden\x0c/After Do").is_empty());
+        assert!(all(b"% hidden\x00/After Do").is_empty());
+        assert_eq!(
+            all(b"/F1 +12 Tf"),
+            vec![
+                Token::Name(b"F1"),
+                Token::Number(12.0),
+                Token::Operator(b"Tf"),
+            ]
+        );
+        assert_eq!(all(b"+0.5"), vec![Token::Number(0.5)]);
+        assert_eq!(all(b"+"), vec![Token::Other]);
+        assert_eq!(all(b"1.2.3"), vec![Token::Other]);
+        assert_eq!(
+            all(b"true false null"),
+            vec![Token::Other, Token::Other, Token::Other]
+        );
+        assert_eq!(all(b"True"), vec![Token::Operator(b"True")]);
+    }
+
+    #[test]
     fn inline_image_data_is_skipped() {
         let data = b"BI /W 2 /H 1 /CS /RGB ID \x00/Fake EI\xffEI Q EI\n/After Do";
         let names: Vec<_> = all(data)

@@ -264,6 +264,44 @@ fn font_chosen_across_two_content_streams_of_a_page_is_kept() {
     );
 }
 
+/// The kept page draws `content`; the other page draws the shared image and is deleted.
+fn kept_page_keeps_its_font(content: &str) {
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let font = helvetica(doc);
+            let image = secret_image(doc);
+            dictionary! {
+                "Font" => dictionary! { "F1" => font },
+                "XObject" => dictionary! { "Im1" => image },
+            }
+        },
+        &[content, "q /Im1 Do Q"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the kept page lost its font ({content})"
+    );
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+}
+
+#[test]
+fn a_font_chosen_with_a_signed_size_is_kept() {
+    // The older check writes the size as `12`. A plus starts a number, so
+    // `+12` is not an operator that drops the font's name before `Tf`.
+    kept_page_keeps_its_font("BT /F1 +12 Tf (kept) Tj ET");
+}
+
+#[test]
+fn a_font_chosen_by_an_escaped_name_is_kept() {
+    // The older check writes the name as `/F1`. `#31` is the digit 1.
+    kept_page_keeps_its_font("BT /F#31 12 Tf (kept) Tj ET");
+}
+
 /// A document whose first page draws `levels` forms inside one another, each with resources of
 /// its own; the innermost one's hold an image nothing draws.
 fn nested_forms_pdf(levels: usize) -> Pdf {

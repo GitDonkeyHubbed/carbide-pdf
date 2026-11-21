@@ -380,6 +380,31 @@ mod tests {
     }
 
     #[test]
+    fn pdf_dates_keep_the_gregorian_century_and_the_written_year() {
+        let utc = |text: &str| parse_pdf_date(text).map(|d| d.to_rfc3339());
+        // February 30 is already refused, in every year. 2000 is a leap
+        // year and 2100 is not. A February of 29 days every fourth year
+        // still refuses February 30.
+        assert_eq!(
+            utc("D:20000229000000Z").as_deref(),
+            Some("2000-02-29T00:00:00+00:00")
+        );
+        assert_eq!(parse_pdf_date("D:21000229000000Z"), None);
+        assert_eq!(pdf_date_to_local("D:21000229000000Z"), "");
+        // The year is the one written in the date. An offset can put the
+        // same instant in 1970 or 3001, and it is still a date. The older
+        // offsets stay inside one year.
+        assert_eq!(
+            utc("D:19710101000000+01'00'").as_deref(),
+            Some("1970-12-31T23:00:00+00:00")
+        );
+        assert_eq!(
+            utc("D:30001231235959-01'00'").as_deref(),
+            Some("3001-01-01T00:59:59+00:00")
+        );
+    }
+
+    #[test]
     fn text_strings_round_trip() {
         for s in ["plain", "Überarbeitung 修正", ""] {
             assert_eq!(decode_text(&encode_text(s)), s);
