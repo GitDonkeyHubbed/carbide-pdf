@@ -467,6 +467,21 @@ mod tests {
     }
 
     #[test]
+    fn an_oid_keeps_a_second_arc_of_40() {
+        // The first subidentifier is 40 times the first arc plus the
+        // second. Dividing the samples above by 40 already yields their
+        // first arc (2.16 and 1.2). Arc 2.40 does not: 120 / 40 is 3.
+        let text = |arcs: &[u32]| {
+            let encoded = oid(arcs);
+            let (element, rest) = read(&encoded).unwrap();
+            assert!(rest.is_empty());
+            oid_to_string(element.content)
+        };
+        assert_eq!(text(&[2, 39]), "2.39");
+        assert_eq!(text(&[2, 40]), "2.40");
+    }
+
+    #[test]
     fn indefinite_lengths_are_read_as_ber_only() {
         let ber = [0x30, 0x80, 0x02, 0x01, 0x07, 0x00, 0x00, 0xAA];
         assert!(read(&ber).is_none(), "DER has no indefinite lengths");
@@ -627,5 +642,42 @@ mod tests {
             &name("Acme\t\u{85}Corp".as_bytes()),
             &name("Acme Corp".as_bytes())
         ));
+    }
+
+    #[test]
+    fn attributes_of_one_name_match_in_any_order_and_only_once() {
+        let cn: &[u32] = &[2, 5, 4, 3];
+        let org: &[u32] = &[2, 5, 4, 10];
+        let rdn = |attributes: &[(&[u32], &[u8])]| {
+            let encoded: Vec<Vec<u8>> = attributes
+                .iter()
+                .map(|(kind, value)| sequence(&[&oid(kind), &tlv(0x0C, value)]))
+                .collect();
+            let refs: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+            sequence(&[&set(&refs)])
+        };
+        // Each attribute of the samples above is its own relative name,
+        // and that order has to agree. Inside one relative name it does not.
+        assert!(names_match(
+            &rdn(&[(org, b"Acme"), (cn, b"Root")]),
+            &rdn(&[(cn, b"Root"), (org, b"Acme")])
+        ));
+        // One value cannot be used for two attributes of the same type.
+        assert!(!names_match(
+            &rdn(&[(cn, b"Ann"), (cn, b"Ann")]),
+            &rdn(&[(cn, b"Ann"), (cn, b"Bob")])
+        ));
+        // Nor is a name a prefix of a longer one.
+        assert!(!names_match(
+            &rdn(&[(cn, b"Ann")]),
+            &rdn(&[(cn, b"Ann"), (cn, b"Bob")])
+        ));
+        // An extra component keeps the attribute from being read.
+        let extra = sequence(&[&set(&[&sequence(&[
+            &oid(cn),
+            &tlv(0x0C, b"Root"),
+            &null(),
+        ])])]);
+        assert!(!names_match(&rdn(&[(cn, b"Root")]), &extra));
     }
 }

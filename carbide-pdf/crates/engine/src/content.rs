@@ -315,4 +315,56 @@ mod tests {
             .collect();
         assert_eq!(names, vec![&b"W"[..], b"H", b"CS", b"RGB", b"After"]);
     }
+
+    #[test]
+    fn an_exponent_is_an_operator_and_a_hex_string_keeps_its_spaces() {
+        // The sample above uses a sign and a leading dot. Those stay
+        // numbers if an exponent is accepted too, and `1e2` would then be
+        // the number 100. A hex string in that sample has no space in it.
+        assert_eq!(
+            all(b"1e2 1E2 Tf"),
+            vec![
+                Token::Operator(b"1e2"),
+                Token::Operator(b"1E2"),
+                Token::Operator(b"Tf"),
+            ]
+        );
+        for data in [b"<41 42> 3 Tj".as_slice(), b"<41\n42> 3 Tj"] {
+            assert_eq!(
+                all(data),
+                vec![Token::Other, Token::Number(3.0), Token::Operator(b"Tj")],
+                "{}",
+                String::from_utf8_lossy(data)
+            );
+        }
+    }
+
+    #[test]
+    fn an_inline_image_starts_after_bi_and_ei_needs_a_space_before_it() {
+        // `ID` on its own is an operator. The other image sample begins
+        // with `BI`, so it is skipped either way.
+        assert_eq!(
+            all(b"ID /Shown Do"),
+            vec![
+                Token::Operator(b"ID"),
+                Token::Name(b"Shown"),
+                Token::Operator(b"Do"),
+            ]
+        );
+        // `EI` ends the image only when the byte before it is a space.
+        // The other sample's early `EI` is followed by a byte that is not
+        // a space, and no name sits between that `EI` and the real end.
+        assert_eq!(
+            all(b"BI /W 1 ID (EI /Hidden Q EI\n/After Do"),
+            vec![
+                Token::Operator(b"BI"),
+                Token::Name(b"W"),
+                Token::Number(1.0),
+                Token::Operator(b"ID"),
+                Token::Operator(b"EI"),
+                Token::Name(b"After"),
+                Token::Operator(b"Do"),
+            ]
+        );
+    }
 }

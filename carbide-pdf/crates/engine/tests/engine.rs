@@ -205,6 +205,17 @@ fn page_ranges_parse_and_validate() {
     }
 }
 
+#[test]
+fn page_ranges_include_the_last_page_and_skip_a_slot_of_spaces() {
+    // The list above stops at page 5 of 10 and rejects a range past the
+    // end, so page 10 of 10 is untested. The space in "1-3, 5" sits beside
+    // a page number; a slot that is only spaces has nothing to parse.
+    assert_eq!(Pdf::parse_ranges("10", 10).unwrap(), vec![9..=9]);
+    assert_eq!(Pdf::parse_ranges("1-10", 10).unwrap(), vec![0..=9]);
+    assert!(Pdf::parse_ranges("10", 9).is_err());
+    assert_eq!(Pdf::parse_ranges("1,  ,3", 5).unwrap(), vec![0..=0, 2..=2]);
+}
+
 // ---- stamping ------------------------------------------------------------------------------
 
 #[test]
