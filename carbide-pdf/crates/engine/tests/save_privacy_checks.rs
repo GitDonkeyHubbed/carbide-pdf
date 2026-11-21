@@ -963,6 +963,50 @@ fn a_linearization_dictionary_must_be_complete_and_near_the_start_to_hide_an_upd
     }
 }
 
+#[test]
+fn a_linearization_dictionary_on_the_1024_byte_boundary_is_the_last_that_hides_an_update() {
+    const WHOLE: &str = "<</Linearized 1/L 0/H [0000000000 30]/O 3/E 0/N 1/T 0>>";
+    // Object 4 starts at padding + 11. A dictionary at byte 1023 still excuses the one link an
+    // appended update adds, so that update is not counted. Byte 1024 does not, and the update
+    // is. The older test only puts the dictionary at byte 9, where it does count, and past
+    // 1100 bytes of padding, where it does not, so a limit anywhere from 10 to 1110 still passes.
+    let at_edge = file_starting_with(WHOLE, 1012, false);
+    let past_edge = file_starting_with(WHOLE, 1013, false);
+    let start = |file: &[u8]| file.windows(7).position(|w| w == b"4 0 obj").unwrap();
+    assert_eq!(start(&at_edge), 1023, "the included edge is byte 1023");
+    assert_eq!(start(&past_edge), 1024, "the excluded edge is byte 1024");
+    assert_eq!(updates_before_and_after_one_more(at_edge), (0, 0));
+    assert_eq!(updates_before_and_after_one_more(past_edge), (0, 1));
+}
+
+#[test]
+fn a_negative_version_or_a_real_or_a_non_array_hint_does_not_hide_an_update() {
+    // One cross-reference section, so a dictionary that is accepted excuses the appended
+    // update and the count afterwards is 0. These are not accepted, so it stays 1. Version 0
+    // is already refused. A negative version still passes that test if any non-zero version
+    // is accepted. A string entry is already refused; a real number still passes that test if
+    // any number is accepted. A missing /H is already refused; /H present but not an array
+    // still passes that test if the key only has to be there.
+    let whole = "<</Linearized 1/L 0/H [0000000000 30]/O 3/E 0/N 1/T 0>>";
+    for (what, dict) in [
+        (
+            "a negative version",
+            whole.replace("Linearized 1", "Linearized -1"),
+        ),
+        ("a real number", whole.replace("/L 0", "/L 1.0")),
+        (
+            "an /H that is not an array",
+            whole.replace("/H [0000000000 30]", "/H 30"),
+        ),
+    ] {
+        assert_eq!(
+            updates_before_and_after_one_more(file_starting_with(&dict, 0, false)),
+            (0, 1),
+            "{what}"
+        );
+    }
+}
+
 // ---- comparing protections -----------------------------------------------------------------
 
 /// The encryption dictionary of an AES-128 (revision 4) file with an empty open password.
@@ -1137,6 +1181,119 @@ fn a_check_box_whose_state_is_a_reference_to_a_name_counts_as_cleared() {
         .remove_hidden_information(&[HiddenItem::FormData])
         .unwrap();
     assert_eq!(report.count(HiddenItem::FormData), 1);
+}
+
+/// A check box shown as `state`, with no stored value. Returns its id.
+fn check_box(doc: &mut Document, page: lopdf::ObjectId, state: Object) -> lopdf::ObjectId {
+    doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Btn", "T" => Object::string_literal("c"),
+        "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page, "AS" => state,
+    })
+}
+
+/// An object reached only by following two references.
+fn object_two_references_away(doc: &mut Document, object: Object) -> Object {
+    let inner = doc.add_object(object);
+    Object::Reference(doc.add_object(Object::Reference(inner)))
+}
+
+/// The shown state of check box `id`.
+fn shown_state(pdf: &Pdf, id: lopdf::ObjectId) -> Object {
+    pdf.document()
+        .get_dictionary(id)
+        .unwrap()
+        .get(b"AS")
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn a_form_field_list_two_references_away_is_still_cleared() {
+    use carbide_engine::HiddenItem;
+    // The check box is shown as Yes. The field list is an array stored two objects away, so
+    // reading /Fields once finds a reference where the array should be and clears nothing. The
+    // check box test above writes that list in the form dictionary.
+    let check = std::cell::Cell::new((0, 0));
+    let mut pdf = one_page(|doc, catalog, page| {
+        let id = check_box(doc, page, Object::Name(b"Yes".to_vec()));
+        check.set(id);
+        let fields = object_two_references_away(doc, Object::Array(vec![id.into()]));
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![id.into()]);
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("AcroForm", dictionary! { "Fields" => fields });
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    assert_eq!(shown_state(&pdf, check.get()).as_name().unwrap(), b"Off");
+}
+
+#[test]
+fn a_check_box_state_two_references_away_is_still_cleared() {
+    use carbide_engine::HiddenItem;
+    // /AS points at a reference that points at the name Yes. Following one reference finds
+    // another reference, which is not a name, so the box is not counted and stays Yes. The
+    // one-reference test stops at the name itself. Counting it without writing /Off also fails.
+    let check = std::cell::Cell::new((0, 0));
+    let mut pdf = one_page(|doc, catalog, page| {
+        let state = object_two_references_away(doc, Object::Name(b"Yes".to_vec()));
+        let id = check_box(doc, page, state);
+        check.set(id);
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![id.into()]);
+        doc.get_dictionary_mut(catalog).unwrap().set(
+            "AcroForm",
+            dictionary! { "Fields" => vec![id.into()] },
+        );
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    assert_eq!(shown_state(&pdf, check.get()).as_name().unwrap(), b"Off");
+}
+
+#[test]
+fn a_circled_form_field_list_is_not_cleared_and_the_walk_returns() {
+    use carbide_engine::HiddenItem;
+    // /Fields is two objects that point at each other, so it is not a list: nothing is cleared
+    // and the check box stays Yes. Following that circle through the object map with no bound
+    // never returns. get_object itself errors at its deref limit and does not hang.
+    let check = std::cell::Cell::new((0, 0));
+    let mut pdf = one_page(|doc, catalog, page| {
+        let id = check_box(doc, page, Object::Name(b"Yes".to_vec()));
+        check.set(id);
+        let left = doc.new_object_id();
+        let right = doc.new_object_id();
+        doc.objects.insert(left, Object::Reference(right));
+        doc.objects.insert(right, Object::Reference(left));
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![id.into()]);
+        doc.get_dictionary_mut(catalog).unwrap().set(
+            "AcroForm",
+            dictionary! { "Fields" => Object::Reference(left) },
+        );
+    });
+    let id = check.get();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let report = pdf
+            .remove_hidden_information(&[HiddenItem::FormData])
+            .unwrap();
+        let state = shown_state(&pdf, id);
+        let _ = sender.send((report.count(HiddenItem::FormData), state));
+    });
+    let (count, state) = receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("clearing a circled field list did not finish");
+    assert_eq!(count, 0);
+    assert_eq!(state.as_name().unwrap(), b"Yes");
 }
 
 // ---- changes to annotations ----------------------------------------------------------------

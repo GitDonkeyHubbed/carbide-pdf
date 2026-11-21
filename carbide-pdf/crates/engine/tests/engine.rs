@@ -5669,6 +5669,47 @@ fn a_form_whose_matrix_is_its_own_object_is_sized_for_the_scaled_drawing() {
     );
 }
 
+/// Width of the photo after reducing a page that draws it only through form `/F`. The form paints
+/// the photo in a 100 by 75 pt square and then applies `matrix`.
+fn reduced_form_width(matrix: Object) -> i64 {
+    let mut pdf = photo_page(b"/F Do", move |doc, photo| {
+        let form = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                "Matrix" => matrix,
+                "Resources" => dictionary! { "XObject" => dictionary! { "Im" => photo } },
+            },
+            b"q 100 0 0 75 0 0 cm /Im Do Q".to_vec(),
+        ));
+        dictionary! { "F" => form }
+    });
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    let widths = image_widths(&reduced);
+    assert!(
+        report.images_downsampled >= 1 && widths.len() == 1,
+        "{report:?} {widths:?}"
+    );
+    widths[0]
+}
+
+#[test]
+fn a_form_matrix_short_of_six_numbers_is_not_a_scale_of_four() {
+    // Five numbers of a scale of four. Filling the missing one with zero keeps that scale, and
+    // the photo stays near 833 pixels. The matrix is not six numbers, so it is the identity and
+    // the photo is sized for the 100 by 75 pt square, about 208 pixels. The test above writes
+    // exactly six numbers, so it still passes when a short array is kept.
+    let width = reduced_form_width(Object::Array(vec![
+        Object::Real(4.0),
+        0.into(),
+        0.into(),
+        Object::Real(4.0),
+        0.into(),
+    ]));
+    assert!((150..350).contains(&width), "{width}");
+}
+
 #[test]
 fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
     // A form drawing itself, then the photo 170,000 times, drawn 1,000 times by the page.
