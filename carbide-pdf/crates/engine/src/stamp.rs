@@ -307,4 +307,60 @@ mod tests {
             messages::BATES_TEXT
         );
     }
+
+    #[test]
+    fn bates_padding_includes_1_and_20_digits() {
+        // 0 and 21 are already refused. A range of 2 to 19 still refuses those, and
+        // the labels above are five digits wide, so neither check notices 1 or 20.
+        for digits in [1usize, 20] {
+            let options = BatesOptions {
+                digits,
+                start_number: 7,
+                ..Default::default()
+            };
+            assert!(options.validate(1).is_ok(), "{digits}");
+            let label = options.label(0);
+            assert_eq!(label.len(), digits, "{label}");
+            assert!(label.ends_with('7'), "{label}");
+            assert_eq!(label.chars().filter(|c| *c == '0').count(), digits - 1);
+        }
+    }
+
+    #[test]
+    fn watermark_limits_include_a_million_points_and_zero_and_one() {
+        // The older check refuses a size of 1e30, a size of 0, and an opacity of 2.
+        // Raising the size cap, or leaving 0 or 1 out of the colour range, still
+        // passes it. 1,000,000, 0, and 1 are written here.
+        let mut mark = WatermarkOptions::new("HI");
+        mark.font_size = 1_000_000.0;
+        mark.opacity = 0.0;
+        mark.color = [0.0, 1.0, 0.5];
+        assert!(mark.validate().is_ok());
+        mark.opacity = 1.0;
+        mark.color = [1.0, 0.0, 1.0];
+        assert!(mark.validate().is_ok());
+
+        mark.font_size = 1_000_001.0;
+        assert_eq!(
+            mark.validate().unwrap_err().to_string(),
+            messages::WATERMARK
+        );
+        mark.font_size = 1_000_000.0;
+        mark.opacity = 1.0f32.next_up();
+        assert_eq!(
+            mark.validate().unwrap_err().to_string(),
+            messages::WATERMARK
+        );
+        mark.opacity = 0.0f32.next_down();
+        assert_eq!(
+            mark.validate().unwrap_err().to_string(),
+            messages::WATERMARK
+        );
+        mark.opacity = 1.0;
+        mark.color = [0.0f32.next_down(), 1.0, 1.0f32.next_up()];
+        assert_eq!(
+            mark.validate().unwrap_err().to_string(),
+            messages::WATERMARK
+        );
+    }
 }
