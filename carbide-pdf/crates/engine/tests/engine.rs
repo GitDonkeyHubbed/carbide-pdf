@@ -5670,6 +5670,135 @@ fn a_form_whose_matrix_is_its_own_object_is_sized_for_the_scaled_drawing() {
 }
 
 #[test]
+fn successive_content_scales_multiply() {
+    // Two scales, 10 by 10 pt and then 10 by 20 pt. Together the photo is drawn at 100 by 200
+    // pt, about 208 pixels across. Either scale on its own is under 24 pixels, so the photo
+    // stays 1200 wide when the later scale replaces the earlier one, and about 42 wide when
+    // the two are added. Drawings that use one `cm` stay green, because replacing and
+    // multiplying agree until a second scale is applied.
+    let mut pdf = photo_page(
+        b"10 0 0 10 0 0 cm 10 0 0 20 0 0 cm /Im1 Do",
+        |_doc, _photo| lopdf::Dictionary::new(),
+    );
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (170..260).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
+fn a_text_matrix_does_not_scale_an_image() {
+    // `Tm` has six numbers and positions text. It is not a graphics scale. The photo is drawn
+    // at 100 by 75 pt, about 208 pixels. Treating `Tm` as `cm` multiplies that by four, about
+    // 833 pixels. Leaving `Tm`'s numbers in place makes the following `cm` reuse them: a 4 pt
+    // square, and the photo stays 1200 wide. The other drawings have one `cm` and no `Tm`.
+    let mut pdf = photo_page(
+        b"4 0 0 4 0 0 Tm q 100 0 0 75 0 0 cm /Im1 Do Q",
+        |_doc, _photo| lopdf::Dictionary::new(),
+    );
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (150..300).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
+fn a_form_matrix_translation_does_not_change_the_drawn_size() {
+    // The form scales the 100 by 75 pt square by four and then moves it by 10,000 pt. The move
+    // is not part of how large the photo is drawn, so it is still about 833 pixels. The matrix
+    // stored as its own object has no move. Folding this move into the scale leaves the photo
+    // 1200 wide. A content scale moved by 50 pt still lands in that test's range.
+    let mut pdf = photo_page(b"/F Do", |doc, photo| {
+        let form = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                "Matrix" => vec![4.into(), 0.into(), 0.into(), 4.into(), 10000.into(), 10000.into()],
+                "Resources" => dictionary! { "XObject" => dictionary! { "Im" => photo } },
+            },
+            b"q 100 0 0 75 0 0 cm /Im Do Q".to_vec(),
+        ));
+        dictionary! { "F" => form }
+    });
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (700..1000).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
+fn a_merged_stream_is_what_a_stream_dictionary_and_the_trailer_name() {
+    // Two streams hold the same bytes and the same dictionary. The second is named from
+    // another stream's dictionary and from the trailer. Merging keeps one stream, and both
+    // of those names follow it. The identical photos are named from a page's resource
+    // dictionary, so that merge still passes when a stream's own dictionary, or the trailer,
+    // is left pointing at the stream that was removed. The repeated z is what makes the file
+    // smaller.
+    let mut pdf = text_pdf(&[&["pad"]]);
+    let doc = pdf.document_mut();
+    let data = vec![b'q'; 80];
+    let plain = dictionary! { "Marker" => "Plain", "Alpha" => 1 };
+    let first = doc.add_object(Stream::new(plain.clone(), data.clone()).with_compression(false));
+    let second = doc.add_object(Stream::new(plain, data).with_compression(false));
+    let holder = doc.add_object(
+        Stream::new(
+            dictionary! { "Marker" => "Holder", "Also" => second },
+            b"holder".to_vec(),
+        )
+        .with_compression(false),
+    );
+    let pad = doc.add_object(
+        Stream::new(dictionary! { "Marker" => "Pad" }, vec![b'z'; 32_000]).with_compression(false),
+    );
+    doc.trailer.set("Extra", Object::Reference(second));
+    let root = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+    let catalog = doc.get_dictionary_mut(root).unwrap();
+    catalog.set("Holder", Object::Reference(holder));
+    catalog.set("Pad", Object::Reference(pad));
+    catalog.set("Kept", Object::Reference(first));
+
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.streams_merged >= 1, "{report:?}");
+    let pdf = Pdf::from_bytes(&reduced).unwrap();
+    let doc = pdf.document();
+    let mut plain_ids = Vec::new();
+    let mut also = None;
+    for (id, object) in &doc.objects {
+        let Object::Stream(stream) = object else {
+            continue;
+        };
+        let Ok(name) = stream.dict.get(b"Marker").and_then(|o| o.as_name()) else {
+            continue;
+        };
+        if name == b"Plain" {
+            plain_ids.push(*id);
+        } else if name == b"Holder" {
+            also = stream.dict.get(b"Also").unwrap().as_reference().ok();
+        }
+    }
+    assert_eq!(plain_ids.len(), 1, "{plain_ids:?}");
+    assert_eq!(also, Some(plain_ids[0]), "stream dictionary");
+    assert_eq!(
+        doc.trailer
+            .get(b"Extra")
+            .ok()
+            .and_then(|object| object.as_reference().ok()),
+        Some(plain_ids[0]),
+        "trailer"
+    );
+}
+
+#[test]
 fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
     // A form drawing itself, then the photo 170,000 times, drawn 1,000 times by the page.
     let mut content = b"q 200 0 0 150 50 500 cm ".to_vec();
