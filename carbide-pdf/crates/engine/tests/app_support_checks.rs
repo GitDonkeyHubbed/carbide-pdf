@@ -14,6 +14,14 @@ fn blank(pages: usize) -> Pdf {
 
 /// The page labels as (first page, style, first number) per range, in page order.
 fn label_ranges(pdf: &Pdf) -> Vec<(i64, String, i64)> {
+    label_entries(pdf)
+        .into_iter()
+        .map(|(start, style, _prefix, number)| (start, style, number))
+        .collect()
+}
+
+/// The page labels as (first page, style, prefix, first number) per range, in page order.
+fn label_entries(pdf: &Pdf) -> Vec<(i64, String, String, i64)> {
     let catalog = pdf.document().catalog().unwrap();
     let nums = catalog
         .get(b"PageLabels")
@@ -27,12 +35,19 @@ fn label_ranges(pdf: &Pdf) -> Vec<(i64, String, i64)> {
     nums.chunks(2)
         .map(|pair| {
             let style = pair[1].as_dict().unwrap();
+            let prefix = style
+                .get(b"P")
+                .ok()
+                .and_then(|object| object.as_str().ok())
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default();
             (
                 pair[0].as_i64().unwrap(),
                 style
                     .get(b"S")
-                    .map(|s| String::from_utf8_lossy(s.as_name().unwrap()).into_owned())
+                    .map(|name| String::from_utf8_lossy(name.as_name().unwrap()).into_owned())
                     .unwrap_or_default(),
+                prefix,
                 style.get(b"St").and_then(Object::as_i64).unwrap_or(1),
             )
         })
@@ -67,6 +82,74 @@ fn a_moved_page_keeps_its_page_label() {
     assert_eq!(
         label_ranges(&pdf),
         vec![(0, "r".into(), 1), (2, "D".into(), 1)]
+    );
+}
+
+#[test]
+fn a_moved_page_keeps_its_prefix_and_a_number_that_does_not_follow() {
+    // A-5, B-6, B-8, B-9, B-9. B-6's style, prefix and start are each an object of
+    // their own. Moving the first B-9 to the front leaves B-9, A-5, B-6, B-8, B-9.
+    // A-5 and B-6 are the next number with different prefixes, so they stay apart.
+    // B-6 and B-8 share a prefix and skip 7, so B-8 starts again. The last B-9
+    // follows B-8 and stays in that range. The older move uses no prefix, and a
+    // change of style is what starts its later range.
+    let mut pdf = blank(5);
+    let doc = pdf.document_mut();
+    let decimal = doc.add_object(Object::Name(b"D".to_vec()));
+    let prefix = doc.add_object(Object::string_literal("B-"));
+    let start = doc.add_object(Object::Integer(6));
+    let b_six = doc.add_object(dictionary! {
+        "S" => Object::Reference(decimal),
+        "P" => Object::Reference(prefix),
+        "St" => Object::Reference(start),
+    });
+    doc.catalog_mut().unwrap().set(
+        "PageLabels",
+        dictionary! {
+            "Nums" => vec![
+                0.into(),
+                dictionary! {
+                    "S" => "D",
+                    "P" => Object::string_literal("A-"),
+                    "St" => 5,
+                }
+                .into(),
+                1.into(),
+                Object::Reference(b_six),
+                2.into(),
+                dictionary! {
+                    "S" => "D",
+                    "P" => Object::string_literal("B-"),
+                    "St" => 8,
+                }
+                .into(),
+                3.into(),
+                dictionary! {
+                    "S" => "D",
+                    "P" => Object::string_literal("B-"),
+                    "St" => 9,
+                }
+                .into(),
+                4.into(),
+                dictionary! {
+                    "S" => "D",
+                    "P" => Object::string_literal("B-"),
+                    "St" => 9,
+                }
+                .into(),
+            ]
+        },
+    );
+
+    pdf.move_page(3, 0).unwrap();
+    assert_eq!(
+        label_entries(&pdf),
+        vec![
+            (0, "D".into(), "B-".into(), 9),
+            (1, "D".into(), "A-".into(), 5),
+            (2, "D".into(), "B-".into(), 6),
+            (3, "D".into(), "B-".into(), 8),
+        ]
     );
 }
 
