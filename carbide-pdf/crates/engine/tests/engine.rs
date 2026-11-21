@@ -5670,6 +5670,151 @@ fn a_form_whose_matrix_is_its_own_object_is_sized_for_the_scaled_drawing() {
 }
 
 #[test]
+fn a_photo_drawn_wider_than_it_is_tall_is_sized_on_both_axes() {
+    // The photo is 1200 by 900. One content stream scales it to 400 by 75 pt
+    // and the next stream draws it. The short side limits the reduced size,
+    // 209 pixels across. Taking the larger of the two scales leaves 834. The
+    // older form is scaled by four on both axes, so that larger scale still
+    // lands in its 700 to 1000 range. Reading only the first stream does not
+    // shrink the photo. The older drawing is a single stream.
+    let mut pdf = photo_page(b"", |_, _| dictionary! {});
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let scale = doc.add_object(Stream::new(
+        lopdf::Dictionary::new(),
+        b"q 400 0 0 75 0 0 cm\n".to_vec(),
+    ));
+    let draw = doc.add_object(Stream::new(lopdf::Dictionary::new(), b"/Im1 Do Q".to_vec()));
+    doc.get_dictionary_mut(page).unwrap().set(
+        "Contents",
+        vec![Object::Reference(scale), Object::Reference(draw)],
+    );
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (200..220).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
+fn a_form_whose_resources_are_null_is_sized_with_what_draws_it() {
+    // The form's resource entry is null, so the photo it draws is the page's.
+    // Inside the form that photo is 100 by 75 pt, and the page scales the form
+    // by four, about 833 pixels. The page also draws it at 200 by 150 pt.
+    // Treating null as an empty dictionary ignores the larger drawing and
+    // leaves about 417 pixels. A form with no resource entry is a different
+    // file. The older form has a dictionary that names the photo.
+    let mut pdf = photo_page(
+        b"q 200 0 0 150 0 0 cm /Im1 Do Q q 4 0 0 4 0 0 cm /F Do Q",
+        |doc, _photo| {
+            let mut dict = dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+            };
+            dict.set("Resources", Object::Null);
+            let form = doc.add_object(Stream::new(dict, b"q 100 0 0 75 0 0 cm /Im1 Do Q".to_vec()));
+            dictionary! { "F" => form }
+        },
+    );
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (700..1000).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
+fn a_photo_named_with_an_escape_is_still_sized() {
+    // The content draws `/Im#31`, which is the name Im1, at 200 by 150 pt,
+    // about 417 pixels. Looking that name up as it is written finds nothing,
+    // so the photo stays 1200 wide. Decoding the name on its own does not
+    // draw it. The older drawings write `/Im1` with no escape.
+    let mut pdf = photo_page(b"q 200 0 0 150 0 0 cm /Im#31 Do Q", |_, _| dictionary! {});
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (300..600).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
+fn a_soft_mask_keeps_the_size_of_the_image_it_uses() {
+    // One photo is the soft mask of the other, and both are drawn at 200 by
+    // 150 pt. The mask stays 1200 wide and is not stored as JPEG. The other
+    // is reduced to about 417. Down-sampling the mask, or encoding it as
+    // JPEG, changes the one that should have stayed. Their samples differ,
+    // so they are not folded into one object. The older photos are not soft
+    // masks, so both of those are reduced.
+    let mut pdf = photo_pdf();
+    let page = pdf.page_ids()[0];
+    let (mask, photo) = {
+        let xobjects = pdf
+            .document()
+            .get_dictionary(page)
+            .unwrap()
+            .get(b"Resources")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"XObject")
+            .unwrap()
+            .as_dict()
+            .unwrap();
+        (
+            xobjects.get(b"Im1").unwrap().as_reference().unwrap(),
+            xobjects.get(b"Im2").unwrap().as_reference().unwrap(),
+        )
+    };
+    let doc = pdf.document_mut();
+    doc.get_object_mut(mask)
+        .unwrap()
+        .as_stream_mut()
+        .unwrap()
+        .content[0] ^= 0xff;
+    doc.get_object_mut(photo)
+        .unwrap()
+        .as_stream_mut()
+        .unwrap()
+        .dict
+        .set("SMask", Object::Reference(mask));
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let mut images: Vec<(i64, Vec<u8>)> = Pdf::from_bytes(&reduced)
+        .unwrap()
+        .document()
+        .objects
+        .values()
+        .filter_map(|object| {
+            let Object::Stream(stream) = object else {
+                return None;
+            };
+            if stream.dict.get(b"Subtype").and_then(|v| v.as_name()).ok() != Some(b"Image") {
+                return None;
+            }
+            let width = stream.dict.get(b"Width").ok()?.as_i64().ok()?;
+            let filter = match stream.dict.get(b"Filter") {
+                Ok(Object::Name(name)) => name.clone(),
+                _ => Vec::new(),
+            };
+            Some((width, filter))
+        })
+        .collect();
+    images.sort_by_key(|(width, _)| *width);
+    assert!(
+        images.len() == 2 && (300..600).contains(&images[0].0) && images[1].0 == 1200,
+        "{images:?}"
+    );
+    assert_ne!(images[1].1, b"DCTDecode", "{images:?}");
+}
+
+#[test]
 fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
     // A form drawing itself, then the photo 170,000 times, drawn 1,000 times by the page.
     let mut content = b"q 200 0 0 150 50 500 cm ".to_vec();
