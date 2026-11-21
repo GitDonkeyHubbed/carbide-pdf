@@ -71,6 +71,52 @@ fn a_moved_page_keeps_its_page_label() {
 }
 
 #[test]
+fn deleting_a_page_keeps_a_style_when_its_number_follows() {
+    // 1, 2, iii, iv. Roman numerals start at 3, so iii is the next number
+    // after 2, in another style. Deleting iv leaves 1, 2, iii, and iii still
+    // starts its own range. Joining a page to the previous one whenever the
+    // number follows, whatever the style, makes that page decimal 3. The
+    // older deletion keeps decimal 2 after roman ii, and 2 does not follow 2.
+    // The older move keeps roman i after decimal 2, and 1 does not follow 2.
+    let mut pdf = blank(4);
+    pdf.document_mut().catalog_mut().unwrap().set(
+        "PageLabels",
+        dictionary! { "Nums" => vec![
+            0.into(), dictionary! { "S" => "D" }.into(),
+            2.into(), dictionary! { "S" => "r", "St" => 3 }.into(),
+        ] },
+    );
+
+    pdf.delete_pages(&[3]).unwrap();
+    assert_eq!(pdf.page_count(), 3);
+    assert_eq!(
+        label_ranges(&pdf),
+        vec![(0, "D".into(), 1), (2, "r".into(), 3)]
+    );
+}
+
+#[test]
+fn moving_a_page_keeps_a_label_numbered_zero() {
+    // 0, 1. The page numbered 0 goes last: 1, 0. A start is recorded for
+    // every number except 1, so 0 stays 0. Recording a start only when the
+    // number is greater than 1 leaves that page numbered 1. The older move
+    // records a start of 2, which is still recorded either way.
+    let mut pdf = blank(2);
+    pdf.document_mut().catalog_mut().unwrap().set(
+        "PageLabels",
+        dictionary! { "Nums" => vec![
+            0.into(), dictionary! { "S" => "D", "St" => 0 }.into(),
+        ] },
+    );
+
+    pdf.move_page(0, 1).unwrap();
+    assert_eq!(
+        label_ranges(&pdf),
+        vec![(0, "D".into(), 1), (1, "D".into(), 0)]
+    );
+}
+
+#[test]
 fn moving_a_page_of_a_document_without_page_labels_adds_none() {
     let mut pdf = blank(3);
     pdf.move_page(0, 2).unwrap();
