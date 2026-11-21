@@ -315,4 +315,45 @@ mod tests {
             .collect();
         assert_eq!(names, vec![&b"W"[..], b"H", b"CS", b"RGB", b"After"]);
     }
+
+    #[test]
+    fn an_inline_image_ends_after_a_form_feed_or_a_null() {
+        // The image above ends at `EI` with a space before it. A form feed or
+        // a NUL is white space too, so the operator after `EI` is read. A
+        // vertical tab is not, so the name after that `EI` stays in the image.
+        let operators = |data: &[u8]| -> Vec<Vec<u8>> {
+            all(data)
+                .into_iter()
+                .filter_map(|token| match token {
+                    Token::Operator(operator) => Some(operator.to_vec()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            operators(b"BI /W 1 ID x\x0cEI\nQ"),
+            [
+                b"BI".to_vec(),
+                b"ID".to_vec(),
+                b"EI".to_vec(),
+                b"Q".to_vec()
+            ]
+        );
+        assert_eq!(
+            operators(b"BI /W 1 ID x\0EI\nQ"),
+            [
+                b"BI".to_vec(),
+                b"ID".to_vec(),
+                b"EI".to_vec(),
+                b"Q".to_vec()
+            ]
+        );
+        let buried = all(b"BI /W 1 ID x\x0bEI /After Do");
+        assert!(buried
+            .iter()
+            .all(|token| !matches!(token, Token::Name(b"After"))));
+        assert!(buried
+            .iter()
+            .all(|token| !matches!(token, Token::Operator(b"Do"))));
+    }
 }

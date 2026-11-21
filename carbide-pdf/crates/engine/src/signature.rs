@@ -2529,4 +2529,13 @@ mod tests {
         let fine = gentime_to_utc("20260101000000.0000000019Z").unwrap();
         assert_eq!(fine - whole, chrono::Duration::nanoseconds(1));
     }
+
+    #[test]
+    fn a_hex_signature_ignores_a_form_feed_and_a_null() {
+        // The signature written with line breaks uses CR, LF, space and tab.
+        // A form feed and a NUL are white space too. A vertical tab is not a
+        // hex digit, so the value is not read.
+        assert_eq!(hex_value(b"4\x0c1\0"), Some(vec![0x41]));
+        assert_eq!(hex_value(b"4\x0b1"), None);
+    }
 }
