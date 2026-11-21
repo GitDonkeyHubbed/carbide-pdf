@@ -74,6 +74,43 @@ fn ink_points_that_differ_only_past_what_a_real_holds_count_as_removed() {
 }
 
 #[test]
+fn an_ink_point_that_is_a_whole_number_matches_the_same_real() {
+    // 10 and 10.0 are the same point. Both sides of the test above are integers, so hashing
+    // every real by its bits still passes it, and this point then counts as removed. 10.5 is
+    // not 10: casting every real to a whole number would leave that move unnoticed.
+    let (bytes, _, points, _) = ink_with_referenced_points();
+    let (mut pdf, saved) = SavedFile::open(bytes, None).unwrap();
+    let whole = Object::Array(vec![
+        Object::Real(10.0),
+        10.into(),
+        50.into(),
+        50.into(),
+        90.into(),
+        10.into(),
+    ]);
+    pdf.document_mut().objects.insert(points, whole);
+    assert!(
+        !saved.removed_from(&pdf),
+        "a point written as 10 and as 10.0 was taken for removed content"
+    );
+    pdf.document_mut().objects.insert(
+        points,
+        Object::Array(vec![
+            Object::Real(10.5),
+            10.into(),
+            50.into(),
+            50.into(),
+            90.into(),
+            10.into(),
+        ]),
+    );
+    assert!(
+        saved.removed_from(&pdf),
+        "a point moved by half went unnoticed"
+    );
+}
+
+#[test]
 fn changes_to_the_page_an_annotation_sits_on_are_not_removals() {
     let (bytes, _, _, page) = ink_with_referenced_points();
     let (mut pdf, saved) = SavedFile::open(bytes, None).unwrap();

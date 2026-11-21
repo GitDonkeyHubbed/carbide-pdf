@@ -504,6 +504,21 @@ fn a_page_naming_too_many_different_resources_is_refused() {
 }
 
 #[test]
+fn a_page_may_name_exactly_the_most_different_resources_it_is_allowed() {
+    // 100,000 different names are read, and the deleted page's image still goes. One more is
+    // refused. The test above uses 5,000 and 200,000, so a limit anywhere between them passes it.
+    let mut pdf = many_names_pdf(100_000);
+    pdf.delete_pages(&[1]).unwrap();
+    assert!(!contains(&pdf.to_bytes().unwrap(), SECRET));
+
+    let mut pdf = many_names_pdf(100_001);
+    assert!(matches!(
+        pdf.delete_pages(&[1]),
+        Err(carbide_engine::Error::TooLarge(_))
+    ));
+}
+
+#[test]
 fn colour_spaces_a_transparency_group_blends_in_stay_with_it() {
     // The form and the page each blend in a colour space their own resources name, which their
     // content never selects.
@@ -726,6 +741,84 @@ fn an_appearance_with_null_resources_keeps_what_it_draws_from_the_page() {
     appearance_keeps_what_it_draws_from_the_page(|doc| {
         Some(Object::Reference(doc.add_object(Object::Null)))
     });
+}
+
+/// Two pages. The first carries a signature widget whose rectangle is `rect`; the second is
+/// what stays when the first is deleted.
+fn two_pages_with_signature_on_the_first(rect: Vec<Object>) -> Pdf {
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let first = doc.new_object_id();
+    let contents = doc.add_object(Stream::new(lopdf::Dictionary::new(), b"BT ET".to_vec()));
+    let second = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+        "Contents" => contents,
+    });
+    let signature = doc.add_object(dictionary! {
+        "Type" => "Sig",
+        "Contents" => Object::string_literal("SECRET-SIGNATURE-VALUE"),
+    });
+    let widget = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "FT" => "Sig",
+        "T" => Object::string_literal("sig"),
+        "Rect" => rect, "P" => first, "V" => signature,
+    });
+    doc.objects.insert(
+        first,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+            "Contents" => contents, "Annots" => vec![widget.into()],
+        }),
+    );
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => vec![first.into(), second.into()], "Count" => 2,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! {
+        "Type" => "Catalog", "Pages" => pages_id,
+        "AcroForm" => dictionary! { "Fields" => vec![widget.into()] },
+    });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
+#[test]
+fn deleting_a_page_drops_a_signature_drawn_backwards_and_keeps_one_with_no_area() {
+    // The corners are stored bottom-right, then top-left. They still cover an area, so the
+    // signature is part of the page and leaves with it. Reading the corners in the order they
+    // were written makes the width negative, the signature looks invisible, and the value stays
+    // in the file. A rectangle with no width really is invisible: the field stays, because a
+    // field has to sit on some page. No other test deletes a page that holds a signature.
+    let mut drawn =
+        two_pages_with_signature_on_the_first(vec![100.into(), 80.into(), 10.into(), 20.into()]);
+    drawn.delete_pages(&[0]).unwrap();
+    assert_eq!(drawn.page_count(), 1);
+    assert!(drawn
+        .document()
+        .catalog()
+        .unwrap()
+        .get(b"AcroForm")
+        .is_err());
+    assert!(!contains(
+        &drawn.to_bytes().unwrap(),
+        b"SECRET-SIGNATURE-VALUE"
+    ));
+
+    let mut blank =
+        two_pages_with_signature_on_the_first(vec![10.into(), 10.into(), 10.into(), 40.into()]);
+    blank.delete_pages(&[0]).unwrap();
+    assert_eq!(blank.page_count(), 1);
+    assert!(blank.document().catalog().unwrap().has(b"AcroForm"));
+    assert!(contains(
+        &blank.to_bytes().unwrap(),
+        b"SECRET-SIGNATURE-VALUE"
+    ));
 }
 
 // ---- legacy passwords ----------------------------------------------------------------------
@@ -960,6 +1053,22 @@ fn a_linearization_dictionary_must_be_complete_and_near_the_start_to_hide_an_upd
         ),
     ] {
         assert_eq!(updates_before_and_after_one_more(file), (0, 1), "{what}");
+    }
+}
+
+#[test]
+fn a_linearization_dictionary_missing_o_or_n_does_not_hide_an_update() {
+    const WHOLE: &str = "<</Linearized 1/L 0/H [0000000000 30]/O 3/E 0/N 1/T 0>>";
+    // The test above drops /H, or puts a string in /E. /O and /N are only ever present there
+    // as integers, so taking either out of the required keys still passes it, and an appended
+    // update is then hidden.
+    for key in ["/O 3", "/N 1"] {
+        let dict = WHOLE.replace(key, "");
+        assert_eq!(
+            updates_before_and_after_one_more(file_starting_with(&dict, 0, false)),
+            (0, 1),
+            "{key}"
+        );
     }
 }
 

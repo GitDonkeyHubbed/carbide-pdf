@@ -628,4 +628,27 @@ mod tests {
             &name("Acme Corp".as_bytes())
         ));
     }
+
+    #[test]
+    fn names_match_when_a_line_break_inside_a_value_is_a_space() {
+        let name = |value: &[u8]| {
+            sequence(&[&set(&[&sequence(&[
+                &oid(&[2, 5, 4, 10]),
+                &tlv(0x0C, value),
+            ])])])
+        };
+        // Carriage return sits just outside the controls that map to nothing. Counting it
+        // as one of them leaves the tab and next-line test green, and this name then differs
+        // from the one with a space. Line tabulation and form feed are in that same gap.
+        for value in ["Acme\rCorp", "Acme\u{000B}Corp", "Acme\u{000C}Corp"] {
+            assert!(
+                names_match(&name(value.as_bytes()), &name(b"Acme Corp")),
+                "{value:?}"
+            );
+            assert!(
+                !names_match(&name(value.as_bytes()), &name(b"AcmeCorp")),
+                "{value:?}"
+            );
+        }
+    }
 }
