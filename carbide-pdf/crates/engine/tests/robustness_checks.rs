@@ -170,6 +170,32 @@ fn forms_nested_as_real_documents_do_are_drawable() {
     pdf.check_drawable(0).unwrap();
 }
 
+/// A page whose content is `operators` copies of `q`, and nothing else.
+fn page_of_saves(operators: usize) -> Pdf {
+    let mut pdf = blank_page_pdf();
+    let page = pdf.page_id(0).unwrap();
+    let content = pdf
+        .document_mut()
+        .add_object(Stream::new(Dictionary::new(), b"q\n".repeat(operators)));
+    pdf.document_mut()
+        .get_dictionary_mut(page)
+        .unwrap()
+        .set("Contents", Object::Reference(content));
+    pdf
+}
+
+#[test]
+fn a_page_may_draw_exactly_four_million_operators() {
+    // Three million `q` operators are drawn and eight million are refused, so a limit
+    // anywhere from 3,000,001 to 8,000,000 still passes that test. Four million are
+    // allowed, and one more is not.
+    page_of_saves(4_000_000).check_drawable(0).unwrap();
+    assert!(matches!(
+        page_of_saves(4_000_001).check_drawable(0),
+        Err(Error::TooLarge(_))
+    ));
+}
+
 #[test]
 fn a_form_found_again_is_as_deep_as_it_was_where_it_was_first_drawn() {
     // A form with 100 forms inside it is drawn first on its own, then 40 forms down, which makes

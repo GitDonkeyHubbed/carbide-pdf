@@ -5705,6 +5705,73 @@ fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
     );
 }
 
+/// A 200 px gray square drawn with `draws` different matrices, one of them a 72 pt
+/// square and the rest a shear of less than 2 pt.
+fn image_drawn_in_ways(draws: usize) -> Pdf {
+    let side = 200usize;
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let image = doc.add_object(
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image",
+                "Width" => side as i64, "Height" => side as i64,
+                "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8,
+            },
+            vec![0u8; side * side],
+        )
+        .with_compression(false),
+    );
+    let mut content = String::from("q 72 0 0 72 0 0 cm /Im Do Q\n");
+    for i in 1..draws {
+        let shear = i as f32 * 1.0e-5;
+        content.push_str(&format!("q 1 {shear:.8} 0 1 0 0 cm /Im Do Q\n"));
+    }
+    let content = doc.add_object(Stream::new(lopdf::Dictionary::new(), content.into_bytes()));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+        "Contents" => content,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im" => image } },
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(
+            dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 },
+        ),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
+#[test]
+fn an_image_may_be_drawn_in_exactly_one_hundred_thousand_ways() {
+    // Repeating one photo at one size, however often, is a single drawing, and the
+    // self-drawing form is left unmeasured for that other reason. A hundred thousand
+    // different drawings are still measured, so the square is reduced. One more is
+    // not, and it keeps its 200 px.
+    let mut allowed = image_drawn_in_ways(100_000);
+    let (reduced, report) = allowed.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && widths[0] < 200,
+        "100,000 drawings were not sized: {widths:?}"
+    );
+
+    let mut refused = image_drawn_in_ways(100_001);
+    let (reduced, report) = refused.reduce(&ReduceOptions::default(), None).unwrap();
+    assert_eq!(report.images_downsampled, 0, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && widths[0] == 200,
+        "100,001 drawings were still sized: {widths:?}"
+    );
+}
+
 #[test]
 fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
     // The photo drawn small on the page, and large through W, which draws X. A chain of seven

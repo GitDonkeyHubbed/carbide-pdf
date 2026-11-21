@@ -2520,6 +2520,7 @@ impl Pdf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::{dictionary, Document, Object};
 
     #[test]
     fn a_time_stamp_time_keeps_its_fraction_of_a_second() {
@@ -2528,5 +2529,76 @@ mod tests {
         assert_eq!(quarter - whole, chrono::Duration::milliseconds(250));
         let fine = gentime_to_utc("20260101000000.0000000019Z").unwrap();
         assert_eq!(fine - whole, chrono::Duration::nanoseconds(1));
+    }
+
+    /// A one-page document, enough for a file to open.
+    fn one_page() -> Document {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1,
+            }),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        doc
+    }
+
+    fn has_signatures(doc: &mut Document) -> bool {
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        crate::Pdf::from_bytes(&bytes).unwrap().has_signatures()
+    }
+
+    /// A signature field whose `/FT /Sig` sits `levels` dictionaries up from the widget,
+    /// the widget included. True when that field is recognised.
+    fn signature_type_inherited_through(levels: usize) -> bool {
+        let mut doc = one_page();
+        let value = doc.add_object(dictionary! { "Type" => "Sig" });
+        let mut current = doc.add_object(dictionary! { "V" => value });
+        for _ in 1..levels {
+            let parent = doc.add_object(dictionary! { "Kids" => vec![current.into()] });
+            doc.get_dictionary_mut(current)
+                .unwrap()
+                .set("Parent", parent);
+            current = parent;
+        }
+        doc.get_dictionary_mut(current)
+            .unwrap()
+            .set("FT", Object::Name(b"Sig".to_vec()));
+        has_signatures(&mut doc)
+    }
+
+    #[test]
+    fn a_signature_field_may_inherit_its_type_through_exactly_thirty_two_dictionaries() {
+        // A type two dictionaries up is still found, so any limit from 3 to 31 passes
+        // that test. The widget and thirty-one ancestors are followed. One more
+        // ancestor is not, and the field is not a signature.
+        assert!(signature_type_inherited_through(1));
+        assert!(signature_type_inherited_through(32));
+        assert!(!signature_type_inherited_through(33));
+
+        // Two dictionaries that name each other, and no type anywhere, are not a
+        // signature, and the walk comes back.
+        let mut doc = one_page();
+        let value = doc.add_object(dictionary! { "Type" => "Sig" });
+        let first = doc.new_object_id();
+        let second = doc.new_object_id();
+        doc.objects.insert(
+            first,
+            Object::Dictionary(dictionary! { "Parent" => second, "V" => value }),
+        );
+        doc.objects.insert(
+            second,
+            Object::Dictionary(dictionary! { "Parent" => first }),
+        );
+        assert!(!has_signatures(&mut doc));
     }
 }
