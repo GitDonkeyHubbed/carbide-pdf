@@ -1162,6 +1162,46 @@ fn deleted_destinations_leave_no_name_in_the_limits_of_their_name_tree() {
         .has(b"Dests"));
 }
 
+#[test]
+fn a_named_destination_is_removed_only_as_deep_as_the_name_tree_is_read() {
+    // The tree above is three levels, so that test stays green for any limit from 2 up. A
+    // name 64 levels below the tree's root is the last one removed with its page. One at 65
+    // is left: a deeper tree is damaged, and walking it is what a hostile file would use to
+    // overflow the stack. A chain of catalog names is a different walk, with its own limit.
+    let deleted = |levels: usize| {
+        let mut pdf = text_pdf(&[&["KEEP"], &["GONE"]]);
+        let ids = pdf.page_ids();
+        let doc = pdf.document_mut();
+        let name = |text: &str| Object::string_literal(text.to_string());
+        let dest =
+            |page: lopdf::ObjectId| Object::Array(vec![Object::Reference(page), "Fit".into()]);
+        let mut node = doc.add_object(dictionary! {
+            "Names" => vec![name("DeepDest"), dest(ids[1])],
+        });
+        for _ in 0..levels {
+            node = doc.add_object(dictionary! { "Kids" => vec![node.into()] });
+        }
+        doc.get_dictionary_mut(node)
+            .unwrap()
+            .set("Names", vec![name("KeepDest"), dest(ids[0])]);
+        doc.catalog_mut()
+            .unwrap()
+            .set("Names", dictionary! { "Dests" => node });
+        pdf.delete_pages(&[1]).unwrap();
+        assert_eq!(pdf.page_count(), 1);
+        pdf.to_bytes().unwrap()
+    };
+    let at_limit = deleted(64);
+    assert!(holds_string(&at_limit, "KeepDest"), "64 levels");
+    assert_gone(&at_limit, "DeepDest");
+    let past = deleted(65);
+    assert!(holds_string(&past, "KeepDest"), "65 levels");
+    assert!(
+        holds_string(&past, "DeepDest"),
+        "a destination 65 levels down was followed and removed"
+    );
+}
+
 /// One page showing "visible text", and hidden information of every kind, each holding
 /// `SECRET-<kind>`: document information, XMP, an attachment and a file attachment comment,
 /// document JavaScript run on opening and on a page event, a filled text field, a note with its
@@ -4065,6 +4105,78 @@ fn kids_that_name_their_page_another_way_name_it_directly() {
     );
 }
 
+/// The text of each page the engine lists, in order.
+fn listed_page_text(pdf: &Pdf) -> Vec<String> {
+    pdf.page_ids()
+        .iter()
+        .map(|id| String::from_utf8_lossy(&pdf.document().get_page_content(*id)).into_owned())
+        .collect()
+}
+
+#[test]
+fn a_page_is_reached_through_fifteen_references_and_not_sixteen() {
+    // The test above follows one reference, so it stays green for any limit from 2 lookups
+    // to 15. Fifteen references still name the page. Sixteen use up the lookups before the
+    // page is read, and that page is left out of the tree.
+    let through = |hops: usize| {
+        let bytes = damaged_tree(|doc, root, ids| {
+            let mut kid = Object::Reference(ids[1]);
+            for _ in 0..hops {
+                kid = Object::Reference(doc.add_object(kid));
+            }
+            set_kids(doc, root, vec![ids[0].into(), kid, ids[2].into()]);
+        });
+        let pdf = Pdf::from_bytes(&bytes).unwrap();
+        listed_page_text(&pdf)
+    };
+    let reached = through(15);
+    assert_eq!(reached.len(), 3, "fifteen references");
+    assert!(
+        reached[1].contains("BBB SECRET"),
+        "the page fifteen references away was dropped: {reached:?}"
+    );
+    let dropped = through(16);
+    assert_eq!(dropped.len(), 2, "sixteen references still named the page");
+    assert!(
+        dropped.iter().all(|text| !text.contains("BBB SECRET")),
+        "a page sixteen references away was kept: {dropped:?}"
+    );
+}
+
+#[test]
+fn a_second_listing_copies_fifteen_numbers_and_shares_sixteen() {
+    // Listing one page 300 times with an array of 50,000 numbers shares that array for any
+    // limit from 16 up to 50,000. Fifteen numbers are still copied onto each listing. Sixteen
+    // are one array both pages refer to.
+    let bytes = damaged_tree(|doc, root, ids| {
+        let numbers = |count: i64| -> Vec<Object> { (0..count).map(Object::Integer).collect() };
+        let page = doc.get_dictionary_mut(ids[1]).unwrap();
+        page.set("Small", numbers(15));
+        page.set("Big", numbers(16));
+        set_kids(doc, root, vec![ids[1].into(), ids[1].into()]);
+    });
+    let pdf = Pdf::from_bytes(&bytes).unwrap();
+    assert_eq!(pdf.page_count(), 2);
+    let ids = pdf.page_ids();
+    let doc = pdf.document();
+    let value = |page, key: &[u8]| doc.get_dictionary(page).unwrap().get(key).unwrap().clone();
+    for &page in &ids {
+        let small = value(page, b"Small");
+        assert!(
+            small.as_array().is_ok_and(|items| items.len() == 15),
+            "fifteen numbers were shared: {small:?}"
+        );
+    }
+    let shared = value(ids[0], b"Big")
+        .as_reference()
+        .expect("sixteen numbers were copied onto the page");
+    assert_eq!(value(ids[1], b"Big").as_reference().unwrap(), shared);
+    assert_eq!(
+        doc.get_object(shared).unwrap().as_array().unwrap().len(),
+        16
+    );
+}
+
 /// A file of `objects` (object 1 first, the catalog), written by hand: values lopdf cannot read
 /// can be written this way, as other programs might.
 fn handwritten(objects: &[&str]) -> Vec<u8> {
@@ -4215,6 +4327,45 @@ fn numbers_too_large_to_write_are_brought_within_range() {
         .set("Large", Object::Real(1.0e30));
     let mut again = Pdf::from_bytes(&edited.to_bytes().unwrap()).unwrap();
     assert_eq!(texts_seen_by_both(&mut again), ["ONE", "TWO"]);
+}
+
+#[test]
+fn a_page_box_keeps_one_million_and_brings_the_next_value_inside_it() {
+    // The test above uses coordinates far past a million, and it measures against the named
+    // limit, so any limit below those numbers still passes. One million is a coordinate a
+    // page may have and is left as written. The next integer is brought back to one million.
+    let opened = |x0: i64, x1: i64| {
+        let mut pdf = text_pdf(&[&["BOX"]]);
+        let id = pdf.page_ids()[0];
+        pdf.document_mut()
+            .get_dictionary_mut(id)
+            .unwrap()
+            .set("MediaBox", vec![x0.into(), 0.into(), x1.into(), 400.into()]);
+        let pdf = Pdf::from_bytes(&pdf.to_bytes().unwrap()).unwrap();
+        let stored = pdf
+            .document()
+            .get_dictionary(pdf.page_ids()[0])
+            .unwrap()
+            .get(b"MediaBox")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone();
+        let width = pdf.page_geometry(0).unwrap().box_width;
+        (stored, width)
+    };
+    let (kept, width) = opened(0, 1_000_000);
+    assert_eq!(kept[2], Object::Integer(1_000_000), "{kept:?}");
+    assert_eq!(width, 1_000_000.0);
+    let (clamped, width) = opened(0, 1_000_001);
+    assert_eq!(clamped[2], Object::Real(1_000_000.0), "{clamped:?}");
+    assert_eq!(width, 1_000_000.0);
+    let (kept, width) = opened(-1_000_000, 0);
+    assert_eq!(kept[0], Object::Integer(-1_000_000), "{kept:?}");
+    assert_eq!(width, 1_000_000.0);
+    let (clamped, width) = opened(-1_000_001, 0);
+    assert_eq!(clamped[0], Object::Real(-1_000_000.0), "{clamped:?}");
+    assert_eq!(width, 1_000_000.0);
 }
 
 #[test]
@@ -5736,6 +5887,74 @@ fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
         !shallow_first.is_empty() && shallow_first.iter().all(|&w| w >= 1200),
         "{shallow_first:?}"
     );
+}
+
+#[test]
+fn an_image_is_downsampled_at_twenty_four_pixels_and_not_twenty_three() {
+    // A photo drawn at 200 by 150 pt is sized to about 400 pixels, so any cutoff from 2 up
+    // to that still passes. 11.5 pt at 150 ppi is 24 pixels, the smallest size still reduced.
+    // 11.0 pt is 23 pixels and is left at its stored size. A side of 24 does not carry a side
+    // of 23 with it.
+    let size = |width: u32, height: u32, draw_w: &str, draw_h: &str| -> (u32, u32, usize) {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let image = doc.add_object(
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Image",
+                    "Width" => width as i64, "Height" => height as i64,
+                    "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8,
+                },
+                vec![128u8; (width * height) as usize],
+            )
+            .with_compression(false),
+        );
+        let drawing = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            format!("q {draw_w} 0 0 {draw_h} 0 0 cm /Im Do Q").into_bytes(),
+        ));
+        // Uncompressed bytes the save will compress, so the file gets smaller either way.
+        let pad = doc.add_object(Stream::new(lopdf::Dictionary::new(), vec![0u8; 64 * 1024]));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => vec![drawing.into(), pad.into()],
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im" => image } },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(
+                dictionary! { "Type" => "Pages", "Kids" => vec![Object::Reference(page)], "Count" => 1 },
+            ),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+        let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+        let pdf = Pdf::from_bytes(&reduced).unwrap();
+        let image = pdf.document().objects.values().find_map(|object| {
+            let Object::Stream(stream) = object else {
+                return None;
+            };
+            (stream.dict.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Image")).then(
+                || {
+                    (
+                        stream.dict.get(b"Width").unwrap().as_i64().unwrap() as u32,
+                        stream.dict.get(b"Height").unwrap().as_i64().unwrap() as u32,
+                    )
+                },
+            )
+        });
+        let (width, height) = image.expect("the image was dropped");
+        (width, height, report.images_downsampled)
+    };
+    assert_eq!(size(48, 48, "11.5", "11.5"), (24, 24, 1));
+    assert_eq!(size(48, 48, "11.0", "11.0"), (48, 48, 0));
+    // 100 by 48 samples drawn at 24 by 11 pt would be 47 by 23. The short side stays under 24.
+    assert_eq!(size(100, 48, "24", "11.0"), (100, 48, 0));
+    assert_eq!(size(48, 100, "11.0", "24"), (48, 100, 0));
 }
 
 #[test]
