@@ -728,6 +728,104 @@ fn an_appearance_with_null_resources_keeps_what_it_draws_from_the_page() {
     });
 }
 
+#[test]
+fn a_font_and_colour_space_two_forms_down_with_no_resources_are_kept() {
+    // The kept page draws a form that draws another form. Neither form has a resource
+    // dictionary, so both draw with the page's. The inner form uses a font and an image,
+    // and that image names a colour space. A font and a colour space nothing draws are
+    // removed, and so is the deleted page's image. The older appearance draws its image
+    // itself. The older pair of forms each have a resource dictionary of their own.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let font = |doc: &mut Document, name: &str| {
+                Object::Reference(doc.add_object(dictionary! {
+                    "Type" => "Font",
+                    "Subtype" => "Type1",
+                    "BaseFont" => Object::Name(name.as_bytes().to_vec()),
+                }))
+            };
+            let space = |marker: &str| {
+                Object::Array(vec![
+                    Object::Name(b"CalRGB".to_vec()),
+                    Object::string_literal(marker),
+                ])
+            };
+            let mut data = b"KEEP-IMAGE-MARKER".to_vec();
+            data.resize(3 * 8 * 8, 0);
+            let image = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Image",
+                    "Width" => 8,
+                    "Height" => 8,
+                    "ColorSpace" => Object::Name(b"KeptSpace".to_vec()),
+                    "BitsPerComponent" => 8,
+                },
+                data,
+            ));
+            let inner = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+                },
+                b"BT /Fkeep 12 Tf (kept) Tj ET /ImK Do".to_vec(),
+            ));
+            let outer = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+                },
+                b"/In Do".to_vec(),
+            ));
+            dictionary! {
+                "Font" => dictionary! {
+                    "Fkeep" => font(doc, "KEEP-INNER-FONT"),
+                    "Fgone" => font(doc, "DROP-UNDRAWN-FONT"),
+                },
+                "XObject" => dictionary! {
+                    "Out" => outer,
+                    "In" => inner,
+                    "ImK" => image,
+                    "Im1" => secret_image(doc),
+                },
+                "ColorSpace" => dictionary! {
+                    "KeptSpace" => space("KEEP-SPACE-MARKER"),
+                    "GoneSpace" => space("DROP-SPACE-MARKER"),
+                },
+            }
+        },
+        &["/Out Do", "q 100 0 0 100 0 0 cm /Im1 Do Q"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, b"KEEP-INNER-FONT"),
+        "the font the inner form draws was dropped"
+    );
+    assert!(
+        contains(&saved, b"KEEP-IMAGE-MARKER"),
+        "the image the inner form draws was dropped"
+    );
+    assert!(
+        contains(&saved, b"KEEP-SPACE-MARKER"),
+        "the colour space that image names was dropped"
+    );
+    assert!(
+        !contains(&saved, b"DROP-UNDRAWN-FONT"),
+        "a font nothing draws was kept"
+    );
+    assert!(
+        !contains(&saved, b"DROP-SPACE-MARKER"),
+        "a colour space nothing names was kept"
+    );
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+}
+
 // ---- legacy passwords ----------------------------------------------------------------------
 
 const PADDING: [u8; 32] = [
