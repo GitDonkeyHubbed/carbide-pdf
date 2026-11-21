@@ -110,6 +110,81 @@ fn deleted_page_image_does_not_survive_through_a_font_of_the_same_name() {
 }
 
 #[test]
+fn colour_pattern_shading_and_property_operators_keep_only_their_own_resource() {
+    // `Tf` and `Do` already tell a font from an image of the same name. These operators look a
+    // name up in a different category: a colour space (`cs`, `CS`, and the dictionary of an
+    // inline image), a pattern (`scn`, `SCN`), a shading (`sh`) or a property (`BDC`, `DP`).
+    // A colour space that shares a pattern's name is not that pattern. A resource only the
+    // deleted page selects does not stay.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let marked = |doc: &mut Document, marker: &str| {
+                Object::Reference(doc.add_object(Stream::new(
+                    lopdf::Dictionary::new(),
+                    marker.as_bytes().to_vec(),
+                )))
+            };
+            dictionary! {
+                "ColorSpace" => dictionary! {
+                    "FillCs" => marked(doc, "KEEP-FILL-CS"),
+                    "StrokeCs" => marked(doc, "KEEP-STROKE-CS"),
+                    "InlineCs" => marked(doc, "KEEP-INLINE-CS"),
+                    "PatFill" => marked(doc, "DROP-COLOUR-OF-THE-PATTERN"),
+                    "GoneFill" => marked(doc, "DROP-UNUSED-FILL"),
+                    "InlineGone" => marked(doc, "DROP-UNUSED-INLINE"),
+                },
+                "Pattern" => dictionary! {
+                    "PatFill" => marked(doc, "KEEP-PATTERN-FILL"),
+                    "PatStroke" => marked(doc, "KEEP-PATTERN-STROKE"),
+                    "FillCs" => marked(doc, "DROP-PATTERN-OF-THE-COLOUR"),
+                    "GonePat" => marked(doc, "DROP-UNUSED-PATTERN"),
+                },
+                "Shading" => dictionary! {
+                    "Shade" => marked(doc, "KEEP-SHADING"),
+                    "GoneShade" => marked(doc, "DROP-UNUSED-SHADE"),
+                },
+                "Properties" => dictionary! {
+                    "Prop" => marked(doc, "KEEP-PROPERTY-BDC"),
+                    "Point" => marked(doc, "KEEP-PROPERTY-DP"),
+                    "GoneProp" => marked(doc, "DROP-UNUSED-PROPERTY"),
+                },
+            }
+        },
+        &[
+            "/FillCs cs /StrokeCs CS /PatFill scn /PatStroke SCN /Shade sh /Prop BDC /Point DP \
+             BI /W 1 /H 1 /CS /InlineCs ID\n\x00\nEI\n",
+            "/GoneFill cs /GonePat scn /GoneShade sh /GoneProp BDC \
+             BI /W 1 /H 1 /CS /InlineGone ID\n\x00\nEI\n",
+        ],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    for marker in [
+        "KEEP-FILL-CS",
+        "KEEP-STROKE-CS",
+        "KEEP-INLINE-CS",
+        "KEEP-PATTERN-FILL",
+        "KEEP-PATTERN-STROKE",
+        "KEEP-SHADING",
+        "KEEP-PROPERTY-BDC",
+        "KEEP-PROPERTY-DP",
+    ] {
+        assert!(contains(&saved, marker.as_bytes()), "{marker} was dropped");
+    }
+    for marker in [
+        "DROP-COLOUR-OF-THE-PATTERN",
+        "DROP-PATTERN-OF-THE-COLOUR",
+        "DROP-UNUSED-FILL",
+        "DROP-UNUSED-INLINE",
+        "DROP-UNUSED-PATTERN",
+        "DROP-UNUSED-SHADE",
+        "DROP-UNUSED-PROPERTY",
+    ] {
+        assert!(!contains(&saved, marker.as_bytes()), "{marker} was kept");
+    }
+}
+
+#[test]
 fn deleted_page_image_does_not_survive_in_a_form_with_resources_of_its_own() {
     // Each page draws a form; the two forms share one resource dictionary, which holds the image
     // only the deleted page's form drew.
