@@ -5669,6 +5669,52 @@ fn a_form_whose_matrix_is_its_own_object_is_sized_for_the_scaled_drawing() {
     );
 }
 
+/// Widths after reducing a page whose only form paints the photo in a 100 by 75 pt square and
+/// has no `/Matrix` of its own. `content` is how the page draws that form.
+fn widths_after_drawing_form(content: &[u8]) -> Vec<i64> {
+    let mut pdf = photo_page(content, |doc, photo| {
+        let form = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                "Resources" => dictionary! { "XObject" => dictionary! { "Im" => photo } },
+            },
+            b"q 100 0 0 75 0 0 cm /Im Do Q".to_vec(),
+        ));
+        dictionary! { "F" => form }
+    });
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    image_widths(&reduced)
+}
+
+#[test]
+fn a_content_matrix_with_a_name_in_it_is_not_a_scale() {
+    // Six operands, the last a name, are not a matrix. The photo stays the size of the 100 by
+    // 75 pt square. Counting the name as zero leaves the scale of four, about 833 pixels. The
+    // form has no /Matrix. The older matrix is six integers, each an object of its own, and
+    // every other `cm` is six numbers.
+    let widths = widths_after_drawing_form(b"4 0 0 4 0 /No cm /F Do");
+    // 100 pt at 150 ppi is about 208 pixels.
+    assert!(
+        widths.len() == 1 && (150..400).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
+fn a_content_matrix_with_an_extra_operand_is_not_a_scale() {
+    // Seven operands: the six numbers would be a scale of four if the name were skipped and
+    // only the count of numbers mattered. The check whose sixth operand is a name has five
+    // numbers, so that one still passes. A `cm` of six numbers still scales.
+    let widths = widths_after_drawing_form(b"4 0 0 4 0 /No 0 cm /F Do");
+    assert!(
+        widths.len() == 1 && (150..400).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
 #[test]
 fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
     // A form drawing itself, then the photo 170,000 times, drawn 1,000 times by the page.
