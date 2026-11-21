@@ -728,6 +728,184 @@ fn an_appearance_with_null_resources_keeps_what_it_draws_from_the_page() {
     });
 }
 
+#[test]
+fn deleting_a_page_drops_an_image_inherited_from_the_page_tree() {
+    // Neither page has a resource dictionary, and neither does the node above
+    // them. The root does: the font the kept page draws, and the image only
+    // the deleted page draws. The font stays and the image does not. Reading
+    // resources only where a page writes them, or only on the node above the
+    // page, leaves the image in the file. The older pages each name that
+    // dictionary themselves.
+    let mut doc = Document::with_version("1.7");
+    let root_id = doc.new_object_id();
+    let font = helvetica(&mut doc);
+    let image = secret_image(&mut doc);
+    let resources = dictionary! {
+        "Font" => dictionary! { "F1" => font },
+        "XObject" => dictionary! { "Im1" => image },
+    };
+    let mut kids = Vec::new();
+    for content in [
+        "BT /F1 12 Tf 10 10 Td (kept) Tj ET",
+        "q 100 0 0 100 0 0 cm /Im1 Do Q",
+    ] {
+        let contents = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            content.as_bytes().to_vec(),
+        ));
+        kids.push(Object::Reference(doc.add_object(dictionary! {
+            "Type" => "Page",
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+            "Contents" => contents,
+        })));
+    }
+    let middle = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Parent" => root_id,
+        "Kids" => kids.clone(),
+        "Count" => 2,
+    });
+    for kid in &kids {
+        doc.get_dictionary_mut(kid.as_reference().unwrap())
+            .unwrap()
+            .set("Parent", middle);
+    }
+    doc.objects.insert(
+        root_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(middle)],
+            "Count" => 2,
+            "Resources" => resources,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => root_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+    assert_eq!(pdf.page_count(), 2);
+    for id in pdf.page_ids() {
+        assert!(
+            pdf.document()
+                .get_dictionary(id)
+                .unwrap()
+                .get(b"Resources")
+                .is_err(),
+            "a page was given a resource dictionary of its own"
+        );
+    }
+
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the kept page lost its font"
+    );
+}
+
+#[test]
+fn a_form_without_resources_keeps_what_the_form_that_draws_it_lists() {
+    // The kept page draws a form. That form draws another form, which has no
+    // resources of its own, so the logo and the font it names are the outer
+    // form's. The page does not list them. A font and an image the inner form
+    // never uses are removed. Leaving the inner form unread drops the logo and
+    // the font. Keeping every name in the outer form's dictionary leaves the
+    // unused image. The older appearance with no resources draws from the
+    // page, so the names it uses are the page's.
+    const LOGO: &[u8] = b"LOGO-FROM-FORM-4c1e";
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let font = helvetica(&mut doc);
+    let unused_font = Object::Reference(doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "UnusedFace",
+    }));
+    let mut logo_bytes = LOGO.to_vec();
+    logo_bytes.resize(3 * 8 * 8, 0);
+    let logo = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 8, "Height" => 8,
+            "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+        },
+        logo_bytes,
+    ));
+    let secret = secret_image(&mut doc);
+    let inner = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        },
+        b"q 10 0 0 10 0 0 cm /Im Do Q BT /F1 12 Tf (kept) Tj ET".to_vec(),
+    ));
+    let outer = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font, "F2" => unused_font },
+                "XObject" => dictionary! { "In" => inner, "Im" => logo, "ImS" => secret },
+            },
+        },
+        b"/In Do".to_vec(),
+    ));
+    let mut kids = Vec::new();
+    for (content, resources) in [
+        (
+            "/Out Do",
+            Some(dictionary! { "XObject" => dictionary! { "Out" => outer } }),
+        ),
+        ("BT ET", None),
+    ] {
+        let contents = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            content.as_bytes().to_vec(),
+        ));
+        let mut page = dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+            "Contents" => contents,
+        };
+        if let Some(resources) = resources {
+            page.set("Resources", resources);
+        }
+        kids.push(Object::Reference(doc.add_object(page)));
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => kids, "Count" => 2,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, LOGO),
+        "the inner form lost the logo it draws"
+    );
+    assert!(
+        contains(&saved, b"Helvetica"),
+        "the inner form lost its font"
+    );
+    assert!(
+        !contains(&saved, b"UnusedFace"),
+        "a font nothing draws was kept"
+    );
+    assert!(!contains(&saved, SECRET), "an image nothing draws was kept");
+}
+
 // ---- legacy passwords ----------------------------------------------------------------------
 
 const PADDING: [u8; 32] = [
