@@ -5670,6 +5670,24 @@ fn a_form_whose_matrix_is_its_own_object_is_sized_for_the_scaled_drawing() {
 }
 
 #[test]
+fn a_content_translation_does_not_change_how_large_an_image_is_drawn() {
+    // 200 by 150 pt, then moved by 10,000 pt. The move is not part of how large the photo is
+    // drawn, so it is still about 417 pixels. The form matrix that scales by four has no move,
+    // and the usual 200 by 150 drawing is only moved by 50 pt, which still lands in the same
+    // range if the move is folded into the scale. Folding this move in leaves the photo 1200 wide.
+    let mut pdf = photo_page(b"q 200 0 0 150 10000 10000 cm /Im1 Do Q", |_doc, _photo| {
+        lopdf::Dictionary::new()
+    });
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (300..600).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
 fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
     // A form drawing itself, then the photo 170,000 times, drawn 1,000 times by the page.
     let mut content = b"q 200 0 0 150 50 500 cm ".to_vec();
@@ -6019,6 +6037,243 @@ fn batch_reduce_keeps_originals_and_refuses_names_that_collide() {
     assert!(outcomes.iter().all(|o| o.warning.is_none()), "{outcomes:?}");
     assert!(std::fs::read(&inputs[0]).unwrap().len() < before[0].len() / 10);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_output_that_is_a_link_to_another_input_is_not_written() {
+    // photo-out.pdf is a link to victim.pdf, and overwriting is allowed, so the planned name
+    // exists and is not refused as a file that is already there. The link is the same file as
+    // the other input. Writing the result would replace victim.pdf through that link before
+    // victim.pdf is read. The batch stops, and victim.pdf keeps its bytes. Naming the result
+    // victim.pdf directly, with no link, is the older collision check.
+    let dir = scratch_dir("reduce-link-target");
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let photo = a.join("photo.pdf");
+    let victim = b.join("victim.pdf");
+    text_pdf(&[&["photo"]]).save(&photo).unwrap();
+    text_pdf(&[&["victim"]]).save(&victim).unwrap();
+    let victim_before = std::fs::read(&victim).unwrap();
+    let photo_before = std::fs::read(&photo).unwrap();
+    std::os::unix::fs::symlink("../b/victim.pdf", a.join("photo-out.pdf")).unwrap();
+    let outcomes = reduce_files(
+        &[photo.clone(), victim.clone()],
+        &OutputOptions {
+            suffix: "-out".into(),
+            overwrite: true,
+            ..OutputOptions::default()
+        },
+        &ReduceOptions::default(),
+    );
+    assert_eq!(
+        outcomes[0].warning.as_deref(),
+        Some(reduce_messages::OUTPUT_COLLIDES)
+    );
+    assert_eq!(
+        outcomes[1].warning.as_deref(),
+        Some(reduce_messages::BATCH_STOPPED)
+    );
+    assert!(outcomes.iter().all(|o| o.output.is_none()));
+    assert_eq!(std::fs::read(&victim).unwrap(), victim_before);
+    assert_eq!(std::fs::read(&photo).unwrap(), photo_before);
+    assert!(std::fs::symlink_metadata(a.join("photo-out.pdf"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(!b.join("victim-out.pdf").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn one_file_listed_under_its_own_name_and_a_link_is_not_reduced_twice() {
+    // alias.pdf is photo.pdf. The two results would have different names, so this is not the
+    // check that two results share a path, and neither result is the other input. Listing the
+    // same file twice is still refused, and neither reduced file is written. Two different
+    // files that only share an output name still fail the older collision check.
+    let dir = scratch_dir("reduce-link-source");
+    std::fs::create_dir_all(&dir).unwrap();
+    let photo = dir.join("photo.pdf");
+    let alias = dir.join("alias.pdf");
+    text_pdf(&[&["once"]]).save(&photo).unwrap();
+    let before = std::fs::read(&photo).unwrap();
+    std::os::unix::fs::symlink("photo.pdf", &alias).unwrap();
+    let outcomes = reduce_files(
+        &[photo.clone(), alias],
+        &OutputOptions::default(),
+        &ReduceOptions::default(),
+    );
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.warning.as_deref() == Some(reduce_messages::OUTPUT_COLLIDES)),
+        "{outcomes:?}"
+    );
+    assert!(outcomes.iter().all(|o| o.output.is_none()));
+    assert_eq!(std::fs::read(&photo).unwrap(), before);
+    assert!(!dir.join("photo-reduced.pdf").exists());
+    assert!(!dir.join("alias-reduced.pdf").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn add_stream(
+    doc: &mut Document,
+    dict: lopdf::Dictionary,
+    data: &[u8],
+    length: Option<i64>,
+) -> lopdf::ObjectId {
+    let mut stream = Stream::new(dict, data.to_vec()).with_compression(false);
+    if let Some(length) = length {
+        stream.dict.set("Length", Object::Integer(length));
+    }
+    doc.add_object(stream)
+}
+
+fn with_probe(streams: Vec<(lopdf::Dictionary, Vec<u8>, Option<i64>)>) -> Pdf {
+    let mut pdf = text_pdf(&[&["pad"]]);
+    let doc = pdf.document_mut();
+    let mut ids = Vec::new();
+    for (dict, data, length) in streams {
+        ids.push(add_stream(doc, dict, &data, length));
+    }
+    // What makes the file smaller. The streams under test are too small to do that alone.
+    let pad = add_stream(
+        doc,
+        dictionary! { "Marker" => "Pack" },
+        &vec![b'z'; 32_000],
+        None,
+    );
+    ids.push(pad);
+    let root = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+    doc.get_dictionary_mut(root).unwrap().set(
+        "Probe",
+        Object::Array(ids.into_iter().map(Object::Reference).collect()),
+    );
+    pdf
+}
+
+fn probe_ids(pdf: &Pdf) -> Vec<lopdf::ObjectId> {
+    let doc = pdf.document();
+    let catalog = doc.catalog().unwrap();
+    let probe = catalog.get(b"Probe").unwrap();
+    let items = match probe {
+        Object::Reference(id) => doc.get_object(*id).unwrap().as_array().unwrap(),
+        Object::Array(items) => items,
+        other => panic!("probe is {other:?}"),
+    };
+    items
+        .iter()
+        .map(|object| object.as_reference().unwrap())
+        .collect()
+}
+
+fn marked_streams(pdf: &Pdf, marker: &str) -> Vec<(String, Vec<u8>)> {
+    pdf.document()
+        .objects
+        .values()
+        .filter_map(|object| {
+            let Object::Stream(stream) = object else {
+                return None;
+            };
+            let name = stream.dict.get(b"Marker").ok()?.as_name().ok()?;
+            if name != marker.as_bytes() {
+                return None;
+            }
+            let filter = stream
+                .dict
+                .get(b"Filter")
+                .ok()
+                .and_then(|object| object.as_name().ok())
+                .map(|filter| String::from_utf8_lossy(filter).into_owned())
+                .unwrap_or_default();
+            Some((filter, stream.content.clone()))
+        })
+        .collect()
+}
+
+#[test]
+fn a_stream_that_does_not_shrink_is_not_stored_deflated() {
+    // 64 bytes that do not deflate stay as they are. 64 bytes of one letter do deflate, and
+    // that is what shows the pass ran. Storing every deflated copy, including one that grew,
+    // replaces the first stream. A metadata stream of repeated bytes would shrink too, and it
+    // stays as it was: object streams, cross-reference streams and metadata are not deflated.
+    // The repeated z is long enough that the file still gets smaller.
+    let raw: Vec<u8> = (0..64).collect();
+    let mut pdf = with_probe(vec![
+        (dictionary! { "Marker" => "Raw" }, raw.clone(), None),
+        (dictionary! { "Marker" => "Same" }, vec![b'a'; 64], None),
+        (
+            dictionary! { "Type" => "Metadata", "Marker" => "Meta" },
+            vec![b'm'; 4_000],
+            None,
+        ),
+    ]);
+    let (reduced, _) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    let pdf = Pdf::from_bytes(&reduced).unwrap();
+    assert_eq!(marked_streams(&pdf, "Raw"), vec![(String::new(), raw)]);
+    let same = marked_streams(&pdf, "Same");
+    assert_eq!(same.len(), 1);
+    assert_eq!(same[0].0, "FlateDecode");
+    assert!(same[0].1.len() < 64, "{}", same[0].1.len());
+    let meta = marked_streams(&pdf, "Meta");
+    assert_eq!(meta.len(), 1);
+    assert_eq!(meta[0].0, "");
+    assert_eq!(meta[0].1, vec![b'm'; 4_000]);
+}
+
+#[test]
+fn identical_streams_merge_except_length_key_order_and_structural_types() {
+    // The same bytes merge when the only difference is /Length, and when the other keys were
+    // written in the other order. A further key keeps a stream apart. An object stream, a
+    // cross-reference stream and metadata are not merged even when the bytes and the other
+    // keys match. The repeated z is what makes the file smaller.
+    let data = vec![b'q'; 80];
+    // Same keys and values. Only the order they were written differs.
+    let ordered = |first_beta: bool| {
+        let mut dict = lopdf::Dictionary::new();
+        if first_beta {
+            dict.set("Beta", Object::Integer(2));
+            dict.set("Alpha", Object::Integer(1));
+        } else {
+            dict.set("Alpha", Object::Integer(1));
+            dict.set("Beta", Object::Integer(2));
+        }
+        dict.set("Marker", Object::Name(b"Plain".to_vec()));
+        dict
+    };
+    let typed = |kind: &str| {
+        dictionary! { "Type" => kind, "Marker" => kind, "Alpha" => 1 }
+    };
+    let mut pdf = with_probe(vec![
+        (ordered(false), data.clone(), None),
+        (ordered(true), data.clone(), None),
+        (ordered(false), data.clone(), Some(1)),
+        (ordered(false), data.clone(), Some(50_000)),
+        (
+            dictionary! { "Alpha" => 1, "Beta" => 2, "Gamma" => 3, "Marker" => "Plain" },
+            data.clone(),
+            None,
+        ),
+        (typed("ObjStm"), data.clone(), None),
+        (typed("ObjStm"), data.clone(), None),
+        (typed("XRef"), data.clone(), None),
+        (typed("XRef"), data.clone(), None),
+        (typed("Metadata"), data.clone(), None),
+        (typed("Metadata"), data, None),
+    ]);
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    let ids = probe_ids(&Pdf::from_bytes(&reduced).unwrap());
+    assert_eq!(ids.len(), 12, "{ids:?}");
+    assert_eq!(ids[0], ids[1], "key order");
+    assert_eq!(ids[2], ids[3], "length");
+    assert!(report.streams_merged >= 2, "{report:?}");
+    assert_ne!(ids[4], ids[0], "extra key");
+    assert_ne!(ids[5], ids[6], "object stream");
+    assert_ne!(ids[7], ids[8], "cross-reference stream");
+    assert_ne!(ids[9], ids[10], "metadata");
+    assert_ne!(ids[5], ids[0]);
+    assert_ne!(ids[7], ids[0]);
+    assert_ne!(ids[9], ids[0]);
 }
 
 // ---- text selection ------------------------------------------------------------------------
