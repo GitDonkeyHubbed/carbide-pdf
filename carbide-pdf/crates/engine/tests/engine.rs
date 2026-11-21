@@ -5633,6 +5633,43 @@ fn photo_page(
 }
 
 #[test]
+fn a_form_whose_matrix_is_its_own_object_is_sized_for_the_scaled_drawing() {
+    // The photo is painted in a 100 by 75 pt square inside the form, and the form's /Matrix
+    // scales that by four, so the page shows it at 400 by 300 pt. The array, and each number
+    // in it, is an object of its own. Read only as a direct array of direct numbers, that
+    // matrix is missing, the photo is sized for the 100 by 75 pt square, and reducing the file
+    // keeps about 200 pixels across instead of about 800.
+    let mut pdf = photo_page(b"/F Do", |doc, photo| {
+        let numbers: Vec<lopdf::ObjectId> = [4i64, 0, 0, 4, 0, 0]
+            .into_iter()
+            .map(|n| doc.add_object(Object::Integer(n)))
+            .collect();
+        let matrix = doc.add_object(Object::Array(
+            numbers.into_iter().map(Object::Reference).collect(),
+        ));
+        let form = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                "Matrix" => matrix,
+                "Resources" => dictionary! { "XObject" => dictionary! { "Im" => photo } },
+            },
+            b"q 100 0 0 75 0 0 cm /Im Do Q".to_vec(),
+        ));
+        dictionary! { "F" => form }
+    });
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    // 400 pt at 150 ppi is about 833 pixels. The unscaled square would have given about 208.
+    assert!(
+        widths.len() == 1 && (700..1000).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
 fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
     // A form drawing itself, then the photo 170,000 times, drawn 1,000 times by the page.
     let mut content = b"q 200 0 0 150 50 500 cm ".to_vec();

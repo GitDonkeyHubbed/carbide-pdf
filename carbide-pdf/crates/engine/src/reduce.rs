@@ -162,20 +162,30 @@ fn multiply(a: [f32; 6], b: [f32; 6]) -> [f32; 6] {
     ]
 }
 
-fn number(object: &Object) -> Option<f32> {
-    object.as_float().ok()
-}
-
-fn matrix_from(object: Option<&Object>) -> [f32; 6] {
-    if let Some(Object::Array(values)) = object {
-        let numbers: Vec<f32> = values.iter().filter_map(number).collect();
-        if numbers.len() == 6 {
-            return [
-                numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], numbers[5],
-            ];
+/// The six numbers of a form's `/Matrix`, or the identity when the entry is absent or is not six
+/// numbers. The array, and each number in it, may be an object of its own. A direct array of
+/// direct numbers is what most files write. Following those references keeps a scale that enlarges
+/// the form: otherwise every image inside is sized for the form's own square, and reducing the
+/// file throws away detail the page still shows.
+fn matrix_from(pdf: &Pdf, object: Option<&Object>) -> [f32; 6] {
+    let identity = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let Some(object) = object else {
+        return identity;
+    };
+    let Object::Array(values) = pdf.resolve(object) else {
+        return identity;
+    };
+    if values.len() != 6 {
+        return identity;
+    }
+    let mut numbers = [0f32; 6];
+    for (slot, item) in numbers.iter_mut().zip(values) {
+        match pdf.resolve(&item).as_float() {
+            Ok(value) => *slot = value,
+            Err(_) => return identity,
         }
     }
-    [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    numbers
 }
 
 /// The most work finding the sizes images are drawn at may take: one unit for each form drawn,
@@ -463,7 +473,7 @@ impl Pdf {
         if scanned.overflowed || scan.incomplete {
             return Ok(None);
         }
-        let matrix = linear(matrix_from(stream.dict.get(b"Matrix").ok()));
+        let matrix = linear(matrix_from(self, stream.dict.get(b"Matrix").ok()));
         let drawn: FormDraws = Rc::new(
             scanned
                 .list
