@@ -628,4 +628,59 @@ mod tests {
             &name("Acme Corp".as_bytes())
         ));
     }
+
+    #[test]
+    fn names_match_the_edges_of_what_is_invisible_or_a_space() {
+        let name = |value: &[u8]| {
+            sequence(&[&set(&[&sequence(&[
+                &oid(&[2, 5, 4, 10]),
+                &tlv(0x0C, value),
+            ])])])
+        };
+        // U+0008 is the last character removed before tab, which the older
+        // check maps to a space. U+0086 is the first removed after next
+        // line. Neither one is a space.
+        for mark in ['\u{0008}', '\u{0086}'] {
+            let written = format!("Acme{mark}Corp");
+            assert!(
+                names_match(&name(written.as_bytes()), &name(b"AcmeCorp")),
+                "{mark:?} was kept"
+            );
+            assert!(
+                !names_match(&name(written.as_bytes()), &name(b"Acme Corp")),
+                "{mark:?} was read as a space"
+            );
+        }
+    }
+
+    #[test]
+    fn names_match_teletex_and_universal_strings_by_their_characters() {
+        let name = |tag: u8, value: &[u8]| {
+            sequence(&[&set(&[&sequence(&[
+                &oid(&[2, 5, 4, 10]),
+                &tlv(tag, value),
+            ])])])
+        };
+        // TeletexString is Latin-1. The same bytes in IA5String are not
+        // UTF-8, so they are not a name. The older samples are ASCII.
+        assert!(names_match(
+            &name(0x14, b"Caf\xE9"),
+            &name(0x0C, "Caf\u{E9}".as_bytes())
+        ));
+        assert!(!names_match(
+            &name(0x16, b"Caf\xE9"),
+            &name(0x0C, "Caf\u{E9}".as_bytes())
+        ));
+        // UniversalString is UTF-32BE. Four bytes are one character. Five
+        // are not a character, even when the first four would be.
+        let beyond = "\u{10000}";
+        assert!(names_match(
+            &name(0x1C, &[0x00, 0x01, 0x00, 0x00]),
+            &name(0x0C, beyond.as_bytes())
+        ));
+        assert!(!names_match(
+            &name(0x1C, &[0x00, 0x01, 0x00, 0x00, 0x00]),
+            &name(0x0C, beyond.as_bytes())
+        ));
+    }
 }
