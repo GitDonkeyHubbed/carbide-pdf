@@ -1229,6 +1229,88 @@ mod tests {
     }
 
     #[test]
+    fn images_that_are_masks_or_carry_a_decode_array_are_not_charged() {
+        let doc = Document::with_version("1.5");
+        let samples = flate(&[0u8; 10_000]);
+        let image = |extra: &[(&str, Object)]| {
+            let mut dict = dictionary! {
+                "Subtype" => "Image", "Width" => 100, "Height" => 100, "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8, "Filter" => "FlateDecode",
+            };
+            for item in extra {
+                dict.set(item.0, item.1.clone());
+            }
+            Stream::new(dict, samples.clone())
+        };
+        // The same samples with none of those entries are decoded, and the charge is what they take.
+        let mut budget = 10_000;
+        assert!(decode_image(&doc, &image(&[]), &mut budget).is_some());
+        assert_eq!(budget, 0);
+        // A mask, a decode array, or decode parameters: left alone, and nothing is charged. The
+        // test above only uses an unknown filter, so dropping these checks still passes it.
+        for extra in [
+            &[("ImageMask", Object::Boolean(true))][..],
+            &[("Mask", Object::Name(b"Im1".to_vec()))],
+            &[("Decode", Object::Array(vec![0.into(), 1.into()]))],
+            &[("DecodeParms", Object::Dictionary(Dictionary::new()))],
+        ] {
+            let mut budget = 10_000;
+            assert!(
+                decode_image(&doc, &image(extra), &mut budget).is_none(),
+                "{extra:?}"
+            );
+            assert_eq!(budget, 10_000, "{extra:?}");
+        }
+        // ImageMask false is an ordinary image. Any entry at all being enough to skip it leaves
+        // this one uncharged.
+        let mut budget = 10_000;
+        let ordinary = image(&[("ImageMask", Object::Boolean(false))]);
+        assert!(decode_image(&doc, &ordinary, &mut budget).is_some());
+        assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn a_jpeg_that_cannot_be_used_keeps_its_charge() {
+        let doc = Document::with_version("1.5");
+        let jpeg = |data: Vec<u8>| {
+            Stream::new(
+                dictionary! {
+                    "Subtype" => "Image", "Width" => 100, "Height" => 100, "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8, "Filter" => "DCTDecode",
+                },
+                data,
+            )
+        };
+        // One real pixel, so it decodes, but not to the 100 by 100 the dictionary claims.
+        let wrong = jpeg(encode_jpeg(&[0], 1, 1, 1, 80).unwrap());
+        let garbage = jpeg(b"not a jpeg".to_vec());
+        let fine = Stream::new(
+            dictionary! {
+                "Subtype" => "Image", "Width" => 100, "Height" => 100, "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8, "Filter" => "FlateDecode",
+            },
+            flate(&[0u8; 10_000]),
+        );
+        let mut budget = 25_000;
+        assert!(decode_image(&doc, &wrong, &mut budget).is_none());
+        assert_eq!(budget, 15_000);
+        assert!(decode_image(&doc, &garbage, &mut budget).is_none());
+        assert_eq!(budget, 5_000);
+        // What is left cannot pay for the next image. Giving either JPEG its charge back would,
+        // and the short-flate test above never enters this arm.
+        assert!(decode_image(&doc, &fine, &mut budget).is_none());
+        assert_eq!(budget, 5_000);
+        let mut budget = 10_000;
+        assert_eq!(
+            decode_image(&doc, &fine, &mut budget)
+                .unwrap()
+                .samples
+                .len(),
+            10_000
+        );
+    }
+
+    #[test]
     fn slider_maps_like_the_original() {
         let at = |v| ReduceOptions { image_factor: v };
         assert!((at(50).f() - 0.5).abs() < 1e-6);
