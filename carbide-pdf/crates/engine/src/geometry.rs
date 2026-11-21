@@ -288,4 +288,12 @@ mod tests {
         assert_eq!(fmt(0.5), "0.5");
         assert_eq!(fmt(-1.25), "-1.25");
     }
+
+    #[test]
+    fn a_rounded_whole_number_is_written_without_a_dot() {
+        // 12, 0.5 and -1.25 never end in a dot. 1.00004 is not a whole
+        // number, and four places round it to one. Six places would keep a
+        // digit, and leaving the dot after the zeros would write "1.".
+        assert_eq!(fmt(1.00004), "1");
+    }
 }

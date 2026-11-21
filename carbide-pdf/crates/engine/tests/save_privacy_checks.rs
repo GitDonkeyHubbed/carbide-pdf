@@ -564,6 +564,68 @@ fn colour_spaces_a_transparency_group_blends_in_stay_with_it() {
 }
 
 #[test]
+fn a_blending_space_stored_as_its_own_object_stays_with_the_form() {
+    // The other group's dictionary is written on the form. This one is its
+    // own object. Reading the group only as it is written drops 0.9505 and
+    // leaves the page's own space, which is written on the page.
+    let blend = |white: f32| {
+        Object::Array(vec![
+            Object::Name(b"CalRGB".to_vec()),
+            Object::Dictionary(dictionary! {
+                "WhitePoint" => vec![white.into(), 1.into(), 1.0889.into()],
+            }),
+        ])
+    };
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let group = doc.add_object(dictionary! { "S" => "Transparency", "CS" => "FormBlend" });
+    let grouped = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+            "Group" => Object::Reference(group),
+            "Resources" => dictionary! {
+                "ColorSpace" => dictionary! { "FormBlend" => blend(0.9505) },
+            },
+        },
+        b"0 0 1 rg 0 0 10 10 re f".to_vec(),
+    ));
+    let resources = doc.add_object(dictionary! {
+        "XObject" => dictionary! { "Fm1" => grouped },
+        "ColorSpace" => dictionary! { "PageBlend" => blend(0.9642) },
+    });
+    let mut kids = Vec::new();
+    for content in ["/Fm1 Do", "BT ET"] {
+        let contents = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+        kids.push(Object::Reference(doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+            "Contents" => contents, "Resources" => resources,
+            "Group" => dictionary! { "S" => "Transparency", "CS" => "PageBlend" },
+        })));
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 2 }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, b"0.9505"),
+        "the form's blending space was dropped"
+    );
+    assert!(
+        contains(&saved, b"0.9642"),
+        "the page's blending space was dropped"
+    );
+}
+
+#[test]
 fn deleted_page_image_does_not_survive_in_a_soft_mask_form() {
     // The kept page paints through a graphics state whose soft mask draws a form; the form's
     // resources are shared with the image only the deleted page drew.
@@ -592,6 +654,51 @@ fn deleted_page_image_does_not_survive_in_a_soft_mask_form() {
                     },
                 },
                 "XObject" => dictionary! { "Im1" => image.clone() },
+            }
+        },
+        &["/GS1 gs 0 0 10 10 re f", "q 100 0 0 100 0 0 cm /Im1 Do Q"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+    assert!(contains(&saved, b"Helvetica"), "the mask lost its font");
+}
+
+#[test]
+fn a_soft_mask_stored_as_its_own_object_still_drops_the_deleted_image() {
+    // The other mask is written inside the graphics state. Here the state
+    // and the mask are each their own object. Reading either one only as it
+    // is written keeps the deleted page's image.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let font = helvetica(doc);
+            let image = secret_image(doc);
+            let shared = doc.add_object(dictionary! {
+                "Font" => dictionary! { "F1" => font },
+                "XObject" => dictionary! { "Im1" => image.clone() },
+            });
+            let mask = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                    "Group" => dictionary! { "S" => "Transparency", "CS" => "DeviceGray" },
+                    "Resources" => shared,
+                },
+                b"BT /F1 12 Tf (mask) Tj ET".to_vec(),
+            ));
+            let smask = doc.add_object(dictionary! {
+                "Type" => "Mask", "S" => "Luminosity", "G" => mask,
+            });
+            let state = doc.add_object(dictionary! {
+                "Type" => "ExtGState",
+                "SMask" => Object::Reference(smask),
+            });
+            dictionary! {
+                "ExtGState" => dictionary! { "GS1" => Object::Reference(state) },
+                "XObject" => dictionary! { "Im1" => image },
             }
         },
         &["/GS1 gs 0 0 10 10 re f", "q 100 0 0 100 0 0 cm /Im1 Do Q"],

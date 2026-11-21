@@ -628,4 +628,33 @@ mod tests {
             &name("Acme Corp".as_bytes())
         ));
     }
+
+    #[test]
+    fn names_match_at_the_edges_of_characters_that_map_to_nothing() {
+        let name = |value: &str| {
+            sequence(&[&set(&[&sequence(&[
+                &oid(&[2, 5, 4, 10]),
+                &tlv(0x0C, value.as_bytes()),
+            ])])])
+        };
+        // The sample above uses U+0001, a soft hyphen, U+200B and U+FE0F.
+        // These sit at the other end of those ranges, or in a range that
+        // sample never touches. Each one is removed, and none of them is a
+        // space. The character just past the last range stays.
+        for c in [
+            '\u{000E}',
+            '\u{007F}',
+            '\u{180E}',
+            '\u{200F}',
+            '\u{202E}',
+            '\u{FE00}',
+            '\u{1D173}',
+            '\u{E007F}',
+        ] {
+            let with = name(&format!("A{c}B"));
+            assert!(names_match(&with, &name("AB")), "{c:?} should be ignored");
+            assert!(!names_match(&with, &name("A B")), "{c:?} is not a space");
+        }
+        assert!(!names_match(&name("A\u{E0080}B"), &name("AB")));
+    }
 }
