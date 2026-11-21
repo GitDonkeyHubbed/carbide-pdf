@@ -138,4 +138,45 @@ mod tests {
         assert_eq!(literal_string(b"a(b)\\"), b"(a\\(b\\)\\\\)".to_vec());
         assert_eq!(literal_string(&[0xE9]), b"(\\351)".to_vec());
     }
+
+    #[test]
+    fn win_ansi_keeps_the_other_specials_apart_from_pdf_doc() {
+        // é, euro, a bullet and an en dash are already encoded. These are the
+        // other WinAnsi specials. A dagger is 0x86 here and 0x81 in
+        // PDFDocEncoding. A fi ligature is a question mark here and 0x93
+        // there, which is a left double quote in this encoding.
+        let mapped = [
+            ('\u{201A}', 0x82u8),
+            ('\u{0192}', 0x83),
+            ('\u{201E}', 0x84),
+            ('\u{2026}', 0x85),
+            ('\u{2020}', 0x86),
+            ('\u{2021}', 0x87),
+            ('\u{02C6}', 0x88),
+            ('\u{2030}', 0x89),
+            ('\u{0160}', 0x8A),
+            ('\u{2039}', 0x8B),
+            ('\u{0152}', 0x8C),
+            ('\u{017D}', 0x8E),
+            ('\u{2018}', 0x91),
+            ('\u{2019}', 0x92),
+            ('\u{201C}', 0x93),
+            ('\u{201D}', 0x94),
+            ('\u{2014}', 0x97),
+            ('\u{02DC}', 0x98),
+            ('\u{2122}', 0x99),
+            ('\u{0161}', 0x9A),
+            ('\u{203A}', 0x9B),
+            ('\u{0153}', 0x9C),
+            ('\u{017E}', 0x9E),
+            ('\u{0178}', 0x9F),
+        ];
+        let text: String = mapped.iter().map(|(c, _)| *c).collect();
+        let bytes: Vec<u8> = mapped.iter().map(|(_, byte)| *byte).collect();
+        assert_eq!(win_ansi(&text), bytes);
+        assert_eq!(
+            win_ansi("\u{FB01}\u{FB02}\u{0141}\u{0142}\u{0131}\u{2212}\u{2044}\u{02D8}"),
+            b"????????"
+        );
+    }
 }

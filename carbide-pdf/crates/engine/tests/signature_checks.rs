@@ -616,6 +616,36 @@ fn an_escaped_contents_key_is_still_the_signature_value() {
     assert_eq!(outcome(&report), (Validity::Valid, Detail::TrustedDirectly));
 }
 
+#[test]
+fn an_escaped_contents_key_accepts_either_hex_case() {
+    // `/#43ontents` uses only digits. `o` is `#6F` and `n` is `#6e`, so a
+    // decoder that takes only one case still verifies that file.
+    let mut file = sign(&signer().identity, SubFilter::Pkcs7Detached, None);
+    let [_, b, ..] = byte_range(&file);
+    let key = file[..b]
+        .windows(9)
+        .rposition(|w| w == b"/Contents")
+        .unwrap();
+    let range = file[..b]
+        .windows(10)
+        .rposition(|w| w == b"/ByteRange")
+        .unwrap();
+    assert!(range < key, "the byte range is written before the value");
+    let open = range + file[range..].iter().position(|x| *x == b'[').unwrap();
+    assert_eq!(&file[open..open + 12], b"[0000000000 ");
+    // `/#43#6F#6etents` is six bytes longer than `/Contents`.
+    let mut edited = file[..open + 1].to_vec();
+    edited.extend_from_slice(&file[open + 7..key]);
+    edited.extend_from_slice(b"/#43#6F#6etents");
+    edited.extend_from_slice(&file[key + 9..]);
+    assert_eq!(edited.len(), file.len());
+    file = edited;
+    let value = signer_cms(&covered_bytes(&file), None, None);
+    put_signature_value(&mut file, &value);
+    let report = verify(&file, &trust_signer()).remove(0);
+    assert_eq!(outcome(&report), (Validity::Valid, Detail::TrustedDirectly));
+}
+
 // ---- signed attributes ---------------------------------------------------------------------
 
 #[test]
