@@ -8610,7 +8610,10 @@ fn identities_load_from_pem_and_pkcs12() {
 
 // ---- certificate chain rules ---------------------------------------------------------------
 
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
+};
 
 /// A fresh RSA key as both an rcgen key pair (for issuing certificates) and an engine signing key.
 fn rsa_key() -> (KeyPair, rsa::RsaPrivateKey) {
@@ -9006,6 +9009,264 @@ fn the_signing_time_a_signature_claims_does_not_bring_back_a_lapsed_certificate(
     assert_eq!(
         (reports[0].validity, reports[0].detail),
         (Validity::Valid, Detail::TrustedDirectly)
+    );
+}
+
+/// What a document time stamp from `tsa` reports when `trust` is the only trusted certificate.
+fn document_stamp(tsa: &TestTsa, trust: &[u8]) -> (Validity, Detail, Vec<&'static str>) {
+    let mut doc = text_pdf(&[&["authority"]]);
+    let base = file_bytes(&mut doc);
+    let stamped = doc
+        .sign(
+            &base,
+            &SignOptions {
+                sub_filter: SubFilter::DocumentTimeStamp,
+                timestamp: Some(tsa),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let report = verify(
+        &stamped,
+        &TrustStore {
+            certificates: vec![trust.to_vec()],
+        },
+    )
+    .remove(0);
+    (report.validity, report.detail, report.description_lines())
+}
+
+#[test]
+fn a_certificate_is_valid_on_both_edges_of_its_period() {
+    // The certificate runs from 2020-01-01 00:00:00Z through 2021-01-01 00:00:00Z. A trusted
+    // time stamp at either instant still counts; the next second outside does not. A stamp in
+    // June 2020, which the older check uses, stays inside if either comparison loses its equals.
+    let (pair, key) = rsa_key();
+    let mut params = cert_params(
+        "Bounded Signer",
+        IsCa::ExplicitNoCa,
+        &[KeyUsagePurpose::DigitalSignature],
+    );
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+    let identity = Identity::new(vec![cert.clone()], key).unwrap();
+    let tsa = TestTsa::new("Window TSA", (2019, 2040), true, "20200601000000Z");
+    let mut doc = text_pdf(&[&["edges"]]);
+    let base = file_bytes(&mut doc);
+    let trust = TrustStore {
+        certificates: vec![cert, tsa.cert.clone()],
+    };
+    let outcome = |gen_time: &'static str| {
+        let stamped = TestTsa {
+            key: tsa.key.clone(),
+            cert: tsa.cert.clone(),
+            gen_time,
+        };
+        let signed = doc
+            .sign(
+                &base,
+                &SignOptions {
+                    identity: Some(&identity),
+                    timestamp: Some(&stamped),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let report = verify(&signed, &trust).remove(0);
+        (report.validity, report.detail)
+    };
+    let valid = (Validity::Valid, Detail::TrustedDirectly);
+    let expired = (Validity::ValidityUnknown, Detail::Expired);
+    assert_eq!(outcome("20200101000000Z"), valid, "first second");
+    assert_eq!(outcome("20210101000000Z"), valid, "last second");
+    assert_eq!(outcome("20191231235959Z"), expired, "one second early");
+    assert_eq!(outcome("20210101000001Z"), expired, "one second late");
+}
+
+#[test]
+fn a_time_stamp_authority_must_name_time_stamping_alone() {
+    // RFC 3161: the extended key usage is critical and its only purpose is id-kp-timeStamping.
+    // A non-critical purpose is already refused. These two are critical, so dropping the
+    // single-purpose check accepts the first, and treating anyPurpose as time stamping accepts
+    // the second. Neither is the older case.
+    let (pair, key) = rsa_key();
+    let authority = |name: &str, purposes: Vec<u8>| {
+        let mut params = cert_params(
+            name,
+            IsCa::ExplicitNoCa,
+            &[KeyUsagePurpose::DigitalSignature],
+        );
+        let mut eku = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], purposes);
+        eku.set_criticality(true);
+        params.custom_extensions.push(eku);
+        TestTsa {
+            key: key.clone(),
+            cert: params.self_signed(&pair).unwrap().der().to_vec(),
+            gen_time: "20260101000000Z",
+        }
+    };
+    let refused = (Validity::ValidityUnknown, Detail::NotPermitted);
+    let combined = authority(
+        "Combined TSA",
+        algo::seq(&[
+            &algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 8]),
+            &algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 1]),
+        ]),
+    );
+    let (validity, detail, lines) = document_stamp(&combined, &combined.cert);
+    assert_eq!((validity, detail), refused, "time stamping and server auth");
+    assert!(
+        lines.contains(&sig_messages::TIMESTAMP_AUTHORITY_NOT_PERMITTED)
+            && !lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED),
+        "{lines:?}"
+    );
+    let any = authority(
+        "Any-purpose TSA",
+        algo::seq(&[&algo::oid(&[2, 5, 29, 37, 0])]),
+    );
+    let (validity, detail, lines) = document_stamp(&any, &any.cert);
+    assert_eq!((validity, detail), refused, "anyExtendedKeyUsage alone");
+    assert!(
+        !lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn content_commitment_counts_as_signing() {
+    // Key usage with only contentCommitment (nonRepudiation) may sign. Key encipherment, the
+    // older refusal, still does not. A time stamp authority is held to the same two bits, on
+    // its own check.
+    let (pair, key) = rsa_key();
+    let params = cert_params(
+        "Commitment Signer",
+        IsCa::ExplicitNoCa,
+        &[KeyUsagePurpose::ContentCommitment],
+    );
+    let cert = params.self_signed(&pair).unwrap().der().to_vec();
+    let identity = Identity::new(vec![cert.clone()], key.clone()).unwrap();
+    let report = verify(
+        &sign_with(&identity),
+        &TrustStore {
+            certificates: vec![cert],
+        },
+    )
+    .remove(0);
+    assert_eq!(
+        (report.validity, report.detail),
+        (Validity::Valid, Detail::TrustedDirectly)
+    );
+    assert!(!report
+        .description_lines()
+        .contains(&sig_messages::SIGNER_NOT_PERMITTED));
+
+    let tsa_with = |name: &str, usage: KeyUsagePurpose| {
+        let mut params = cert_params(name, IsCa::ExplicitNoCa, &[usage]);
+        let mut eku =
+            rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], timestamping_purpose());
+        eku.set_criticality(true);
+        params.custom_extensions.push(eku);
+        TestTsa {
+            key: key.clone(),
+            cert: params.self_signed(&pair).unwrap().der().to_vec(),
+            gen_time: "20260101000000Z",
+        }
+    };
+    let commitment = tsa_with("Commitment TSA", KeyUsagePurpose::ContentCommitment);
+    let (validity, detail, lines) = document_stamp(&commitment, &commitment.cert);
+    assert_eq!(
+        (validity, detail),
+        (Validity::Valid, Detail::TrustedDirectly),
+        "content commitment"
+    );
+    assert!(lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED));
+
+    let encryption = tsa_with("Encryption TSA", KeyUsagePurpose::KeyEncipherment);
+    let (validity, detail, lines) = document_stamp(&encryption, &encryption.cert);
+    assert_eq!(
+        (validity, detail),
+        (Validity::ValidityUnknown, Detail::NotPermitted),
+        "key encipherment"
+    );
+    assert!(
+        lines.contains(&sig_messages::TIMESTAMP_AUTHORITY_NOT_PERMITTED)
+            && !lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_ca_may_vouch_for_a_time_stamp_only_when_its_purposes_allow_that() {
+    // A CA's extended key usage is checked against the time-stamping list, not the list for
+    // document signers. Time stamping and anyPurpose are on it. Document signing is not, though
+    // that same CA still confirms a document signer. The older CA check refuses time stamping
+    // for a document signer and allows anyPurpose there, so neither pins this list.
+    let ca = |purposes: Vec<ExtendedKeyUsagePurpose>| {
+        let (pair, _) = rsa_key();
+        let mut params = cert_params(
+            "TSA CA",
+            IsCa::Ca(BasicConstraints::Unconstrained),
+            &[KeyUsagePurpose::KeyCertSign],
+        );
+        params.extended_key_usages = purposes;
+        let der = params.self_signed(&pair).unwrap().der().to_vec();
+        (der, Issuer::new(params, pair))
+    };
+    let trusted = (Validity::Valid, Detail::TrustedViaChain);
+    for (label, purposes) in [
+        ("time stamping", vec![ExtendedKeyUsagePurpose::TimeStamping]),
+        ("any purpose", vec![ExtendedKeyUsagePurpose::Any]),
+    ] {
+        let (der, issuer) = ca(purposes);
+        let tsa = TestTsa::issued_by("Issued TSA", (2020, 2040), "20260101000000Z", &issuer);
+        let (validity, detail, lines) = document_stamp(&tsa, &der);
+        assert_eq!((validity, detail), trusted, "{label}");
+        assert!(
+            lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED),
+            "{label}: {lines:?}"
+        );
+    }
+
+    let (pair, _) = rsa_key();
+    let mut params = cert_params(
+        "Document CA",
+        IsCa::Ca(BasicConstraints::Unconstrained),
+        &[KeyUsagePurpose::KeyCertSign],
+    );
+    let mut eku = rcgen::CustomExtension::from_oid_content(
+        &[2, 5, 29, 37],
+        algo::seq(&[&algo::oid(&[1, 3, 6, 1, 5, 5, 7, 3, 36])]),
+    );
+    eku.set_criticality(true);
+    params.custom_extensions.push(eku);
+    let der = params.self_signed(&pair).unwrap().der().to_vec();
+    let issuer = Issuer::new(params, pair);
+    let (identity, _) = chain_identity(&issuer, &[]);
+    let report = verify(
+        &sign_with(&identity),
+        &TrustStore {
+            certificates: vec![der.clone()],
+        },
+    )
+    .remove(0);
+    assert_eq!(
+        (report.validity, report.detail),
+        trusted,
+        "document signing still confirms a document signer"
+    );
+
+    let tsa = TestTsa::issued_by("Issued TSA", (2020, 2040), "20260101000000Z", &issuer);
+    let (validity, detail, lines) = document_stamp(&tsa, &der);
+    assert_eq!(
+        (validity, detail),
+        (Validity::ValidityUnknown, Detail::ChainRejected),
+        "document signing does not confirm a time stamp"
+    );
+    assert!(
+        lines.contains(&sig_messages::TIMESTAMP_CHAIN_REJECTED)
+            && !lines.contains(&sig_messages::DOCUMENT_TIME_STAMPED),
+        "{lines:?}"
     );
 }
 
