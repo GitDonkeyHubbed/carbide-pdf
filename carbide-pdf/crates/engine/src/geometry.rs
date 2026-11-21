@@ -270,6 +270,20 @@ mod tests {
     }
 
     #[test]
+    fn rotate_integers_stop_at_a_32_bit_range() {
+        use lopdf::Object::Integer;
+        // The value above already accepts -2_147_483_648 (a quarter turn) and
+        // rejects -3_000_000_000. One below the signed 32-bit range is no turn.
+        // Casting that integer would make it a quarter turn the other way.
+        assert_eq!(rotation_value(&Integer(-2_147_483_648)), 270);
+        assert_eq!(rotation_value(&Integer(-2_147_483_649)), 0);
+        // 3_000_000_000 still wraps, which that test checks. The next value that
+        // would wrap to a quarter turn does not fit in 32 unsigned bits, so it
+        // is no turn.
+        assert_eq!(rotation_value(&Integer(4_294_967_386)), 0);
+    }
+
+    #[test]
     fn rects_given_from_the_other_corner_are_normalized() {
         assert_eq!(
             Rect::new(500.0, 700.0, -200.0, -50.0).normalized(),

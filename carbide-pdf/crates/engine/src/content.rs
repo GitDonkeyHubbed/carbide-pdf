@@ -301,6 +301,21 @@ mod tests {
     }
 
     #[test]
+    fn a_name_decodes_two_hex_digits_and_keeps_a_broken_escape() {
+        // The token test above only uses `#20`. Upper case is the same byte.
+        // A `#` with one digit, or with a digit that is not hex, stays a `#`
+        // and the following bytes stay too.
+        assert_eq!(&*name(b"Im#2F"), b"Im/");
+        assert_eq!(&*name(b"Im#2f"), b"Im/");
+        assert_eq!(&*name(b"#00"), &b"\0"[..]);
+        assert_eq!(&*name(b"A#20B"), b"A B");
+        assert_eq!(&*name(b"Im#"), b"Im#");
+        assert_eq!(&*name(b"Im#2"), b"Im#2");
+        assert_eq!(&*name(b"Im#2G"), b"Im#2G");
+        assert_eq!(&*name(b"Im#GG"), b"Im#GG");
+    }
+
+    #[test]
     fn inline_image_data_is_skipped() {
         let data = b"BI /W 2 /H 1 /CS /RGB ID \x00/Fake EI\xffEI Q EI\n/After Do";
         let names: Vec<_> = all(data)

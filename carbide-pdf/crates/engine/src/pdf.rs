@@ -734,3 +734,64 @@ impl Default for Pdf {
         Pdf::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::Object;
+
+    #[test]
+    fn a_new_page_may_be_one_point_or_a_million_on_a_side() {
+        // Sizes that are not numbers, zero, or far past a million are already
+        // refused. One point and one million points are pages. The next value
+        // below one point, and the next value above one million, are not, and
+        // nothing is added when they are refused.
+        let mut pdf = Pdf::new();
+        pdf.insert_blank_page(0, Some((1.0, 1_000_000.0))).unwrap();
+        assert_eq!(
+            pdf.page_geometry(0).unwrap().display_size(),
+            (1.0, 1_000_000.0)
+        );
+        pdf.insert_blank_page(1, Some((1_000_000.0, 1.0))).unwrap();
+        assert_eq!(
+            pdf.page_geometry(1).unwrap().display_size(),
+            (1_000_000.0, 1.0)
+        );
+
+        let mut pdf = Pdf::new();
+        let too_small = f32::from_bits(1.0f32.to_bits() - 1);
+        assert!(pdf.insert_blank_page(0, Some((too_small, 1.0))).is_err());
+        assert_eq!(pdf.page_count(), 0);
+        let too_big = f32::from_bits(1_000_000.0f32.to_bits() + 1);
+        assert!(pdf.insert_blank_page(0, Some((1.0, too_big))).is_err());
+        assert_eq!(pdf.page_count(), 0);
+    }
+
+    #[test]
+    fn reals_larger_than_what_can_be_written_are_brought_back() {
+        // A real of 1e30 is already brought back far enough that the page
+        // still opens. 1e15 is the largest real that is kept. The next larger
+        // value this type can hold is brought back to it, on either side of
+        // zero. One that is not a number becomes 0, not that largest real.
+        let mut kept = Object::Real(1.0e15);
+        writable(&mut kept);
+        assert_eq!(kept, Object::Real(1.0e15));
+        let mut kept = Object::Real(-1.0e15);
+        writable(&mut kept);
+        assert_eq!(kept, Object::Real(-1.0e15));
+
+        let past = f32::from_bits(1.0e15f32.to_bits() + 1);
+        let mut large = Object::Array(vec![Object::Real(past), Object::Real(-past)]);
+        writable(&mut large);
+        assert_eq!(
+            large,
+            Object::Array(vec![Object::Real(1.0e15), Object::Real(-1.0e15)])
+        );
+        let mut infinite = Object::Real(f32::INFINITY);
+        writable(&mut infinite);
+        assert_eq!(infinite, Object::Real(0.0));
+        let mut missing = Object::Real(f32::NAN);
+        writable(&mut missing);
+        assert_eq!(missing, Object::Real(0.0));
+    }
+}

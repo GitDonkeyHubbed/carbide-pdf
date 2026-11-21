@@ -1014,4 +1014,77 @@ mod tests {
         );
         assert!(ImpositionOptions::from_ini("[Layout]\nColumns=abc\n").is_err());
     }
+
+    #[test]
+    fn sheet_spacing_and_scale_stop_on_the_stated_numbers() {
+        // The test above rejects 0, a negative, and numbers far past the
+        // limits, so a limit anywhere between those still passes.
+        let below = |value: f32| f32::from_bits(value.to_bits() - 1);
+        let above = |value: f32| f32::from_bits(value.to_bits() + 1);
+        let sheet = |width: f32, height: f32| ImpositionOptions {
+            media: Media::Custom { width, height },
+            ..ImpositionOptions::default()
+        };
+        // 14400 is written out, not taken from the constant, so moving that
+        // constant fails here.
+        let largest = 14400.0;
+        assert!(sheet(1.0, 1.0).validate().is_ok());
+        assert!(sheet(largest, largest).validate().is_ok());
+        assert_eq!(
+            sheet(below(1.0), 1.0).validate().unwrap_err().to_string(),
+            messages::MEDIA_SIZE
+        );
+        assert_eq!(
+            sheet(largest, above(largest))
+                .validate()
+                .unwrap_err()
+                .to_string(),
+            messages::MEDIA_SIZE
+        );
+
+        let mut spacing = ImpositionOptions {
+            creep: largest,
+            ..ImpositionOptions::default()
+        };
+        assert!(spacing.validate().is_ok());
+        spacing.creep = -largest;
+        assert!(spacing.validate().is_ok());
+        // One step past either end. For a negative number the next smaller
+        // value is the next bit pattern up.
+        spacing.creep = above(largest);
+        assert_eq!(
+            spacing.validate().unwrap_err().to_string(),
+            messages::SPACING
+        );
+        spacing.creep = f32::from_bits((-largest).to_bits() + 1);
+        assert_eq!(
+            spacing.validate().unwrap_err().to_string(),
+            messages::SPACING
+        );
+        // 14400 points of margin is a legal gap, and then the sheet has no
+        // room. The next larger gap is refused as a gap.
+        spacing.creep = 0.0;
+        spacing.margins.left = largest;
+        assert_eq!(
+            spacing.validate().unwrap_err().to_string(),
+            messages::MARGINS
+        );
+        spacing.margins.left = above(largest);
+        assert_eq!(
+            spacing.validate().unwrap_err().to_string(),
+            messages::SPACING
+        );
+
+        let mut scale = ImpositionOptions {
+            scale_x_percent: 1.0,
+            scale_y_percent: 1000.0,
+            ..ImpositionOptions::default()
+        };
+        assert!(scale.validate().is_ok());
+        scale.scale_x_percent = below(1.0);
+        assert_eq!(scale.validate().unwrap_err().to_string(), messages::SCALE);
+        scale.scale_x_percent = 1.0;
+        scale.scale_y_percent = above(1000.0);
+        assert_eq!(scale.validate().unwrap_err().to_string(), messages::SCALE);
+    }
 }
