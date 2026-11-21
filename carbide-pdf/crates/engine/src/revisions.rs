@@ -380,6 +380,34 @@ mod tests {
     }
 
     #[test]
+    fn pdf_dates_keep_the_length_of_june_and_september() {
+        let utc = |text: &str| parse_pdf_date(text).map(|d| d.to_rfc3339());
+        // February 30 and day 32 are already refused. March and May have a
+        // 31st. June and September stop at the 30th. Capping every month at
+        // 30 days, or rejecting only February, fails only this case.
+        assert_eq!(
+            utc("D:20260331").as_deref(),
+            Some("2026-03-31T00:00:00+00:00")
+        );
+        assert_eq!(
+            utc("D:20260531").as_deref(),
+            Some("2026-05-31T00:00:00+00:00")
+        );
+        assert_eq!(
+            utc("D:20260630").as_deref(),
+            Some("2026-06-30T00:00:00+00:00")
+        );
+        assert_eq!(
+            utc("D:20260930").as_deref(),
+            Some("2026-09-30T00:00:00+00:00")
+        );
+        for bad in ["D:20260631", "D:20260931"] {
+            assert_eq!(parse_pdf_date(bad), None, "{bad}");
+            assert_eq!(pdf_date_to_local(bad), "", "{bad}");
+        }
+    }
+
+    #[test]
     fn text_strings_round_trip() {
         for s in ["plain", "Überarbeitung 修正", ""] {
             assert_eq!(decode_text(&encode_text(s)), s);
