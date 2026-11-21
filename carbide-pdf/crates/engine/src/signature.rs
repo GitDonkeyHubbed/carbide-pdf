@@ -2529,4 +2529,24 @@ mod tests {
         let fine = gentime_to_utc("20260101000000.0000000019Z").unwrap();
         assert_eq!(fine - whole, chrono::Duration::nanoseconds(1));
     }
+
+    #[test]
+    fn a_one_digit_time_stamp_fraction_is_tenths_and_other_shapes_are_not_times() {
+        let whole = gentime_to_utc("20260101000000Z").unwrap();
+        // One digit is tenths of a second. Reading it as milliseconds, or refusing a fraction
+        // that is not two digits, still leaves the .25 case green.
+        let tenth = gentime_to_utc("20260101000000.5Z").unwrap();
+        assert_eq!(tenth - whole, chrono::Duration::milliseconds(500));
+        // A trailing zero is not a time-stamp time, nor is a dot with nothing after it, a time
+        // with no zone, an offset, or a lowercase z. The .25Z case uses none of these.
+        for text in [
+            "20260101000000.50Z",
+            "20260101000000.Z",
+            "20260101000000",
+            "20260101000000+0000",
+            "20260101000000z",
+        ] {
+            assert!(gentime_to_utc(text).is_none(), "{text}");
+        }
+    }
 }
