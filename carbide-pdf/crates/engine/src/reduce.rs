@@ -1243,6 +1243,19 @@ mod tests {
     }
 
     #[test]
+    fn slider_quality_follows_the_original_curve() {
+        let at = |factor| ReduceOptions {
+            image_factor: factor,
+        };
+        // 30 + 65*f, rounded. f is clamped to 0.05, 0.5, and 0.95: 33, 63, and 92.
+        // Changing 65 to 60 still increases with the slider (33, 60, and 87), so the
+        // ordering check stays green, and so does comparing the file sizes.
+        assert_eq!(at(0).jpeg_quality(), 33);
+        assert_eq!(at(50).jpeg_quality(), 63);
+        assert_eq!(at(100).jpeg_quality(), 92);
+    }
+
+    #[test]
     fn output_paths_follow_the_dialog_rules() {
         let dir = std::env::temp_dir();
         let input = dir.join("report.pdf");
