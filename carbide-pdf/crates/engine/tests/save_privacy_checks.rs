@@ -638,10 +638,11 @@ fn deleting_a_page_does_not_copy_the_images_of_the_pages_that_stay() {
 }
 
 /// Deletes the second page of a document whose first page has an annotation appearance that draws
-/// a logo found only in the page's resources, and checks the logo stays. The appearance's
-/// `/Resources` entry is whatever `entry` makes: none at all, or one that is no dictionary.
+/// a logo found only in the page's resources. The appearance's `/Resources` entry is whatever
+/// `entry` makes. `keeps_logo` is whether that drawing is looked up in the page's resources.
 fn appearance_keeps_what_it_draws_from_the_page(
     entry: impl FnOnce(&mut Document) -> Option<Object>,
+    keeps_logo: bool,
 ) {
     const LOGO: &[u8] = b"LOGO-PAYLOAD-91c2";
     let mut doc = Document::with_version("1.7");
@@ -702,9 +703,11 @@ fn appearance_keeps_what_it_draws_from_the_page(
 
     pdf.delete_pages(&[1]).unwrap();
     let saved = pdf.to_bytes().unwrap();
-    assert!(
+    assert_eq!(
         contains(&saved, LOGO),
-        "the annotation's appearance lost the logo it draws"
+        keeps_logo,
+        "the appearance {} the page logo",
+        if keeps_logo { "lost" } else { "kept" }
     );
     assert!(
         !contains(&saved, SECRET),
@@ -716,16 +719,28 @@ fn appearance_keeps_what_it_draws_from_the_page(
 fn an_appearance_without_resources_keeps_what_it_draws_from_the_page() {
     // The kept page's annotation has an appearance with no resources of its own, so the logo it
     // draws is looked up in the page's resources; the page's content never draws it.
-    appearance_keeps_what_it_draws_from_the_page(|_| None);
+    appearance_keeps_what_it_draws_from_the_page(|_| None, true);
 }
 
 #[test]
 fn an_appearance_with_null_resources_keeps_what_it_draws_from_the_page() {
     // A null entry, or a reference to nothing, is the same as none.
-    appearance_keeps_what_it_draws_from_the_page(|_| Some(Object::Null));
-    appearance_keeps_what_it_draws_from_the_page(|doc| {
-        Some(Object::Reference(doc.add_object(Object::Null)))
-    });
+    appearance_keeps_what_it_draws_from_the_page(|_| Some(Object::Null), true);
+    appearance_keeps_what_it_draws_from_the_page(
+        |doc| Some(Object::Reference(doc.add_object(Object::Null))),
+        true,
+    );
+}
+
+#[test]
+fn an_appearance_with_an_empty_resource_dictionary_drops_the_page_logo() {
+    // An empty dictionary is a resource list of its own, so the logo the appearance names
+    // is not on it and leaves with the deleted page. Treating empty as none, the way a
+    // missing entry or null is, keeps the logo.
+    appearance_keeps_what_it_draws_from_the_page(
+        |_| Some(Object::Dictionary(lopdf::Dictionary::new())),
+        false,
+    );
 }
 
 // ---- legacy passwords ----------------------------------------------------------------------
