@@ -5581,6 +5581,103 @@ fn forms_drawn_over_and_over_are_worked_out_once() {
     );
 }
 
+#[derive(Debug)]
+struct StoredImage {
+    width: i64,
+    height: i64,
+    color: String,
+    filter: String,
+    data: Vec<u8>,
+}
+
+fn dict_name(dict: &lopdf::Dictionary, key: &[u8]) -> String {
+    dict.get(key)
+        .ok()
+        .and_then(|object| object.as_name().ok())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .unwrap_or_default()
+}
+
+fn stored_images(pdf: &Pdf) -> Vec<StoredImage> {
+    let mut images: Vec<StoredImage> = pdf
+        .document()
+        .objects
+        .values()
+        .filter_map(|object| {
+            let Object::Stream(stream) = object else {
+                return None;
+            };
+            if stream
+                .dict
+                .get(b"Subtype")
+                .and_then(|value| value.as_name())
+                .ok()
+                != Some(b"Image")
+            {
+                return None;
+            }
+            Some(StoredImage {
+                width: stream
+                    .dict
+                    .get(b"Width")
+                    .and_then(|object| object.as_i64())
+                    .unwrap_or(0),
+                height: stream
+                    .dict
+                    .get(b"Height")
+                    .and_then(|object| object.as_i64())
+                    .unwrap_or(0),
+                color: dict_name(&stream.dict, b"ColorSpace"),
+                filter: dict_name(&stream.dict, b"Filter"),
+                data: stream.content.clone(),
+            })
+        })
+        .collect();
+    images.sort_by_key(|image| (image.width, image.height, image.filter.clone()));
+    images
+}
+
+/// Gradient plus noise. `spread` is how far the noise moves each sample.
+fn noisy_rgb(width: usize, height: usize, spread: usize, seed: u32) -> Vec<u8> {
+    let mut state = seed;
+    let mut samples = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        for x in 0..width {
+            for channel in 0..3 {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let noise = ((state >> 24) as usize) % spread;
+                let base = (x * 255 / width + y * 120 / height + channel * 30) % 256;
+                samples.push(((base + noise) % 256) as u8);
+            }
+        }
+    }
+    samples
+}
+
+fn jpeg_rgb(samples: &[u8], width: u32, height: u32, quality: u8) -> Vec<u8> {
+    let mut jpeg = std::io::Cursor::new(Vec::new());
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality)
+        .encode(samples, width, height, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    jpeg.into_inner()
+}
+
+fn finish_document(doc: &mut Document, pages_id: lopdf::ObjectId, page: lopdf::ObjectId) -> Pdf {
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page)],
+            "Count" => 1,
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    Pdf::from_bytes(&bytes).unwrap()
+}
+
 /// The widths of the images in the file `bytes`.
 fn image_widths(bytes: &[u8]) -> Vec<i64> {
     let pdf = Pdf::from_bytes(bytes).unwrap();
@@ -5755,6 +5852,315 @@ fn slider_trades_size_for_quality() {
         small < high,
         "slider at 0 gives {small} bytes, at 100 gives {high}"
     );
+}
+
+#[test]
+fn a_jpeg_whose_frame_differs_from_its_dictionary_is_left_unchanged() {
+    // The frame is 1200 by 900 and the dictionary says 2000 by 1500. Those sizes disagree, so
+    // the JPEG is not decoded and its bytes stay. Accepting the frame's own size draws it at
+    // 200 by 150 pt and stores about 417 pixels, the same as the raw photo beside it. That raw
+    // photo matches its dictionary, so it is reduced either way. The budget check still passes
+    // when the frame is accepted, because the charge is taken before the sizes are compared.
+    let (width, height) = (1200u32, 900u32);
+    let jpeg = jpeg_rgb(
+        &noisy_rgb(width as usize, height as usize, 40, 3),
+        width,
+        height,
+        70,
+    );
+    let raw = noisy_rgb(width as usize, height as usize, 40, 5);
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let mismatched = doc.add_object(
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 2000,
+                "Height" => 1500,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+                "Filter" => "DCTDecode",
+            },
+            jpeg,
+        )
+        .with_compression(false),
+    );
+    let photo = doc.add_object(
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => width as i64,
+                "Height" => height as i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+            },
+            raw,
+        )
+        .with_compression(false),
+    );
+    let content = doc.add_object(Stream::new(
+        lopdf::Dictionary::new(),
+        b"q 200 0 0 150 40 500 cm /Bad Do Q q 200 0 0 150 280 500 cm /Im Do Q".to_vec(),
+    ));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content,
+        "Resources" => dictionary! {
+            "XObject" => dictionary! { "Bad" => mismatched, "Im" => photo },
+        },
+    });
+    let mut pdf = finish_document(&mut doc, pages_id, page);
+    let original = stored_images(&pdf)
+        .into_iter()
+        .find(|image| image.width == 2000)
+        .unwrap();
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    let images = stored_images(&Pdf::from_bytes(&reduced).unwrap());
+    let kept = images
+        .iter()
+        .find(|image| image.width == 2000)
+        .expect("dictionary size");
+    assert_eq!(kept.height, 1500);
+    assert_eq!(kept.filter, "DCTDecode");
+    assert_eq!(kept.color, "DeviceRGB");
+    assert_eq!(kept.data, original.data);
+    assert!(
+        images
+            .iter()
+            .any(|image| (300..700).contains(&image.width) && image.filter == "DCTDecode"),
+        "the matching photo was not reduced: {images:?}"
+    );
+    assert_eq!(report.images_downsampled, 1, "{report:?}");
+    assert_eq!(report.images_recompressed, 1, "{report:?}");
+}
+
+#[test]
+fn an_image_drawn_at_its_own_pixel_size_is_not_downsampled() {
+    // 400 by 300 pixels drawn at 192 by 144 pt is 150 ppi, so the target scale is exactly 1.
+    // Shrinking starts only below 1. Treating 1 as small enough resamples the image and counts
+    // a downsample, while the width stays 400. The photos drawn at 200 by 150 pt are already
+    // below their pixel size, so they are shrunk either way.
+    let samples = noisy_rgb(400, 300, 40, 11);
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let image = doc.add_object(
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 400,
+                "Height" => 300,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+            },
+            samples,
+        )
+        .with_compression(false),
+    );
+    let content = doc.add_object(Stream::new(
+        lopdf::Dictionary::new(),
+        b"q 192 0 0 144 0 0 cm /Im Do Q".to_vec(),
+    ));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im" => image } },
+    });
+    let mut pdf = finish_document(&mut doc, pages_id, page);
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    let images = stored_images(&Pdf::from_bytes(&reduced).unwrap());
+    assert_eq!(images.len(), 1);
+    assert_eq!(
+        (
+            images[0].width,
+            images[0].height,
+            images[0].color.as_str(),
+            images[0].filter.as_str()
+        ),
+        (400, 300, "DeviceRGB", "DCTDecode")
+    );
+    assert_eq!(report.images_downsampled, 0, "{report:?}");
+    assert_eq!(report.images_recompressed, 1, "{report:?}");
+}
+
+#[test]
+fn a_resized_jpeg_is_replaced_even_when_the_new_one_is_larger() {
+    // A noisy JPEG stored at a low quality, drawn at 191 by 144 pt, becomes 398 by 298. The
+    // decoded samples are still a photograph, so they are written again at the slider's
+    // quality, and that copy is larger than the one it replaces. It is stored anyway: the
+    // pixels changed. Refusing every replacement that is not smaller leaves the image 400
+    // wide. The uncompressed photos become smaller when they are re-encoded, so they are
+    // stored either way. The repeated comment is what makes the file smaller while the image
+    // grows.
+    let (width, height) = (400u32, 300u32);
+    let jpeg = jpeg_rgb(
+        &noisy_rgb(width as usize, height as usize, 40, 9),
+        width,
+        height,
+        20,
+    );
+    let mut content = b"q 191 0 0 144 0 0 cm /Im Do Q\n%".to_vec();
+    content.extend(std::iter::repeat_n(b'x', 80_000));
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let image = doc.add_object(
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => width as i64,
+                "Height" => height as i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+                "Filter" => "DCTDecode",
+            },
+            jpeg,
+        )
+        .with_compression(false),
+    );
+    let content =
+        doc.add_object(Stream::new(lopdf::Dictionary::new(), content).with_compression(false));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im" => image } },
+    });
+    let mut pdf = finish_document(&mut doc, pages_id, page);
+    let original = stored_images(&pdf);
+    assert_eq!(original.len(), 1);
+    let original_len = original[0].data.len();
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    let images = stored_images(&Pdf::from_bytes(&reduced).unwrap());
+    assert_eq!(images.len(), 1);
+    assert_eq!(
+        (
+            images[0].width,
+            images[0].height,
+            images[0].color.as_str(),
+            images[0].filter.as_str()
+        ),
+        (398, 298, "DeviceRGB", "DCTDecode"),
+        "got {} by {} {}",
+        images[0].width,
+        images[0].height,
+        images[0].filter
+    );
+    assert!(
+        images[0].data.len() > original_len,
+        "new {} bytes, original {original_len}",
+        images[0].data.len()
+    );
+    assert_eq!(report.images_downsampled, 1, "{report:?}");
+    assert_eq!(report.images_recompressed, 1, "{report:?}");
+}
+
+#[test]
+fn a_stream_shorter_than_64_bytes_is_not_recompressed() {
+    // 63 identical bytes would shrink under deflate, and so would 64. Only the 64-byte stream
+    // is compressed. The long stream is what makes the file smaller either way. The content of
+    // the photo tests is not measured, so moving the cutoff by one leaves those green.
+    let short = vec![b'A'; 63];
+    let edge = vec![b'B'; 64];
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let short_id = doc
+        .add_object(Stream::new(lopdf::Dictionary::new(), short.clone()).with_compression(false));
+    let edge_id =
+        doc.add_object(Stream::new(lopdf::Dictionary::new(), edge.clone()).with_compression(false));
+    let bulky = doc.add_object(
+        Stream::new(lopdf::Dictionary::new(), vec![b'C'; 20_000]).with_compression(false),
+    );
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => vec![
+            Object::Reference(short_id),
+            Object::Reference(edge_id),
+            Object::Reference(bulky),
+        ],
+    });
+    let mut pdf = finish_document(&mut doc, pages_id, page);
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    let pdf = Pdf::from_bytes(&reduced).unwrap();
+    let mut saw_short = false;
+    let mut saw_edge = false;
+    for object in pdf.document().objects.values() {
+        let Object::Stream(stream) = object else {
+            continue;
+        };
+        if stream.content == short && stream.dict.get(b"Filter").is_err() {
+            saw_short = true;
+        }
+        if stream
+            .dict
+            .get(b"Filter")
+            .and_then(|value| value.as_name())
+            .ok()
+            == Some(b"FlateDecode")
+            && stream.decompressed_content().ok().as_deref() == Some(edge.as_slice())
+        {
+            saw_edge = true;
+        }
+    }
+    assert!(saw_short, "the 63-byte stream was compressed");
+    assert!(saw_edge, "the 64-byte stream was not compressed");
+    assert!(report.streams_recompressed >= 2, "{report:?}");
+}
+
+#[test]
+fn a_stream_that_already_names_a_filter_is_not_deflated_again() {
+    // The bytes would shrink, but they already name a filter, so they stay ASCII hexadecimal
+    // and the marker is still there. Deflating them anyway stores FlateDecode and the marker
+    // is gone. Images are skipped before this check. The streams in the length test have no
+    // filter, so they are still compressed.
+    let marker = b"filtered-stream-marker.".repeat(16);
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let filtered = doc.add_object(
+        Stream::new(dictionary! { "Filter" => "ASCIIHexDecode" }, marker.clone())
+            .with_compression(false),
+    );
+    let content = doc.add_object(
+        Stream::new(lopdf::Dictionary::new(), vec![b'D'; 20_000]).with_compression(false),
+    );
+    let mut page = dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content,
+    };
+    page.set("PieceInfo", Object::Reference(filtered));
+    let page = doc.add_object(page);
+    let mut pdf = finish_document(&mut doc, pages_id, page);
+    let (reduced, _) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    let pdf = Pdf::from_bytes(&reduced).unwrap();
+    let mut found = false;
+    for object in pdf.document().objects.values() {
+        let Object::Stream(stream) = object else {
+            continue;
+        };
+        if stream.content == marker {
+            assert_eq!(
+                stream
+                    .dict
+                    .get(b"Filter")
+                    .and_then(|value| value.as_name())
+                    .ok(),
+                Some(b"ASCIIHexDecode".as_slice())
+            );
+            found = true;
+        }
+    }
+    assert!(found, "the filtered stream was rewritten");
 }
 
 #[test]
