@@ -315,4 +315,63 @@ mod tests {
             .collect();
         assert_eq!(names, vec![&b"W"[..], b"H", b"CS", b"RGB", b"After"]);
     }
+
+    #[test]
+    fn a_name_ends_at_a_bracket_and_a_signed_number_may_start_with_a_dot() {
+        // The sample above ends `/Y` with `]` and a number with `>`. A name
+        // also ends at `<`, `[`, `{`, `}`, `(`, and `)`. Its numbers put a
+        // digit on at least one side of the dot: a sign may stand against
+        // the dot, and a trailing dot is still that number.
+        assert_eq!(
+            all(b"/A<</B[0]/C{1}/D}2/E)3/F>4"),
+            vec![
+                Token::Name(b"A"),
+                Token::Other,
+                Token::Name(b"B"),
+                Token::Other,
+                Token::Number(0.0),
+                Token::Other,
+                Token::Name(b"C"),
+                Token::Other,
+                Token::Number(1.0),
+                Token::Other,
+                Token::Name(b"D"),
+                Token::Other,
+                Token::Number(2.0),
+                Token::Name(b"E"),
+                Token::Other,
+                Token::Number(3.0),
+                Token::Name(b"F"),
+                Token::Other,
+                Token::Number(4.0),
+            ]
+        );
+        assert_eq!(
+            all(b"-.5 +.5 1. Tf"),
+            vec![
+                Token::Number(-0.5),
+                Token::Number(0.5),
+                Token::Number(1.0),
+                Token::Operator(b"Tf"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_inline_image_ends_when_ei_is_followed_by_a_name() {
+        // The other image ends at `EI` followed by a line break. A name may
+        // follow `EI` with no space, and that name is still read.
+        assert_eq!(
+            all(b"BI /W 1 ID x EI/After Do"),
+            vec![
+                Token::Operator(b"BI"),
+                Token::Name(b"W"),
+                Token::Number(1.0),
+                Token::Operator(b"ID"),
+                Token::Operator(b"EI"),
+                Token::Name(b"After"),
+                Token::Operator(b"Do"),
+            ]
+        );
+    }
 }

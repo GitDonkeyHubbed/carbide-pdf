@@ -1278,6 +1278,35 @@ mod tests {
     }
 
     #[test]
+    fn a_lab_or_device_n_image_is_not_decoded() {
+        let doc = Document::with_version("1.5");
+        let image = |space: &[u8], n: usize| {
+            let mut dict = dictionary! {
+                "Subtype" => "Image",
+                "Width" => 2,
+                "Height" => 2,
+                "BitsPerComponent" => 8,
+            };
+            dict.set("ColorSpace", lopdf::Object::Name(space.to_vec()));
+            Stream::new(dict, vec![9; n])
+        };
+        // The images above are gray, one byte a pixel. Lab and DeviceN are
+        // left as stored whether the buffer holds one component or three,
+        // and nothing is spent.
+        for space in [b"Lab".as_slice(), b"DeviceN"] {
+            for n in [4, 12] {
+                let mut budget = 12;
+                assert!(
+                    decode_image(&doc, &image(space, n), &mut budget).is_none(),
+                    "{} with {n} bytes was decoded",
+                    String::from_utf8_lossy(space)
+                );
+                assert_eq!(budget, 12, "{}", String::from_utf8_lossy(space));
+            }
+        }
+    }
+
+    #[test]
     fn matrices_multiply_in_pdf_order() {
         // Scale by 2 then translate by (10, 0): the point (1, 1) lands on (12, 2).
         let m = multiply(

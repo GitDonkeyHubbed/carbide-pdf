@@ -2529,4 +2529,36 @@ mod tests {
         let fine = gentime_to_utc("20260101000000.0000000019Z").unwrap();
         assert_eq!(fine - whole, chrono::Duration::nanoseconds(1));
     }
+
+    #[test]
+    fn a_time_stamp_time_keeps_the_length_of_each_month() {
+        let utc = |text: &str| gentime_to_utc(text).map(|d| d.to_rfc3339());
+        // The fraction sample is a day in January. March and May have a
+        // 31st. June and September do not, and neither does month 13 or a
+        // day numbered 0.
+        assert_eq!(
+            utc("20260331000000Z").as_deref(),
+            Some("2026-03-31T00:00:00+00:00")
+        );
+        assert_eq!(
+            utc("20260531000000Z").as_deref(),
+            Some("2026-05-31T00:00:00+00:00")
+        );
+        assert_eq!(
+            utc("20260630000000Z").as_deref(),
+            Some("2026-06-30T00:00:00+00:00")
+        );
+        assert_eq!(
+            utc("20260930000000Z").as_deref(),
+            Some("2026-09-30T00:00:00+00:00")
+        );
+        for bad in [
+            "20260631000000Z",
+            "20260931000000Z",
+            "20261301000000Z",
+            "20260600000000Z",
+        ] {
+            assert_eq!(gentime_to_utc(bad), None, "{bad}");
+        }
+    }
 }

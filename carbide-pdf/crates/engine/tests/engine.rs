@@ -7172,6 +7172,62 @@ fn rsa_pss_parameters_are_honoured_or_reported_as_unsupported() {
     }
 }
 
+/// SHA-256 PSS parameters with an explicit trailer field.
+fn pss_params_with_trailer(trailer: u8) -> Vec<u8> {
+    use algo::*;
+    let hash = seq(&[&oid(SHA256_OID), &null()]);
+    seq(&[
+        &ctx(0, &hash),
+        &ctx(1, &seq(&[&oid(&[1, 2, 840, 113549, 1, 1, 8]), &hash])),
+        &ctx(2, &[0x02, 0x01, 32]),
+        &ctx(3, &[0x02, 0x01, trailer]),
+    ])
+}
+
+#[test]
+fn a_pss_trailer_of_one_verifies_and_any_other_does_not() {
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+    let pair = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let cert = self_signed(&pair, "PSS Trailer");
+    let trust = TrustStore {
+        certificates: vec![cert.clone()],
+    };
+    let mut doc = text_pdf(&[&["pss trailer"]]);
+    let base = file_bytes(&mut doc);
+    let covered = covered_bytes(&resign_with(&doc, &base, &[0x30, 0x00]));
+    let signature = rsa::pss::SigningKey::<sha2::Sha256>::new(key)
+        .sign_with_rng(&mut rand::rngs::OsRng, &covered)
+        .to_vec();
+    let check = |trailer: u8| {
+        let cms = detached_cms(
+            &cert,
+            SHA256_OID,
+            RSA_PSS_OID,
+            Some(pss_params_with_trailer(trailer)),
+            &signature,
+        );
+        verify(&resign_with(&doc, &base, &cms), &trust).remove(0)
+    };
+    // Parameters that omit the trailer still verify, and that omission means
+    // trailer 1. Writing the 1 still verifies. Trailer 2 is not accepted,
+    // and it is not reported as a document that was altered.
+    let accepted = check(1);
+    assert_eq!(
+        (accepted.validity, accepted.detail),
+        (Validity::Valid, Detail::TrustedDirectly)
+    );
+    let refused = check(2);
+    assert_eq!(
+        (refused.validity, refused.detail),
+        (Validity::ValidityUnknown, Detail::UnsupportedAlgorithm)
+    );
+    assert!(!refused
+        .description_lines()
+        .contains(&sig_messages::DOCUMENT_ALTERED));
+}
+
 #[test]
 fn certificates_with_rsassa_pss_keys_verify_pss_signatures() {
     use rsa::pkcs8::EncodePrivateKey;
