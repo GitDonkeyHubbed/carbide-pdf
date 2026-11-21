@@ -5669,6 +5669,56 @@ fn a_form_whose_matrix_is_its_own_object_is_sized_for_the_scaled_drawing() {
     );
 }
 
+/// Widths after reducing a page whose only form paints the photo in a 100 by 75 pt square and
+/// has no `/Matrix` of its own. `content` is how the page draws that form.
+fn widths_after_drawing_form(content: &[u8]) -> Vec<i64> {
+    let mut pdf = photo_page(content, |doc, photo| {
+        let form = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                "Resources" => dictionary! { "XObject" => dictionary! { "Im" => photo } },
+            },
+            b"q 100 0 0 75 0 0 cm /Im Do Q".to_vec(),
+        ));
+        dictionary! { "F" => form }
+    });
+    image_widths(&pdf.reduce(&ReduceOptions::default(), None).unwrap().0)
+}
+
+#[test]
+fn restoring_a_graphics_state_keeps_the_scale_that_was_saved() {
+    // A scale of four, then a scale of two saved inside it and thrown away by Q. The photo
+    // is sized for the scale of four, about 833 pixels. Leaving the inner scale on draws it
+    // at 800 pt, larger than the photo, so the width stays 1200. Q with nothing saved does
+    // not throw a scale away. The older matrix is the form's own, and the drawing there is
+    // `/F Do` with no Q in front of it.
+    let restored = widths_after_drawing_form(b"q 4 0 0 4 0 0 cm q 2 0 0 2 0 0 cm Q /F Do");
+    let unmatched = widths_after_drawing_form(b"4 0 0 4 0 0 cm Q /F Do");
+    assert!(
+        restored.len() == 1 && (700..1000).contains(&restored[0]),
+        "{restored:?}"
+    );
+    assert!(
+        unmatched.len() == 1 && (700..1000).contains(&unmatched[0]),
+        "{unmatched:?}"
+    );
+}
+
+#[test]
+fn a_turned_content_matrix_sizes_the_photo_for_the_turned_drawing() {
+    // `0 4 -4 0` turns the 100 by 75 pt square a quarter turn and scales it by four, so the
+    // page shows it 400 pt wide, about 833 pixels. Keeping only the diagonal leaves nothing,
+    // and the photo stays 1200 wide. Applying the turn before the square, instead of after,
+    // shows it 300 pt wide, about 625 pixels. The older matrix is six numbers on the diagonal.
+    let widths = widths_after_drawing_form(b"0 4 -4 0 0 0 cm /F Do");
+    assert!(
+        widths.len() == 1 && (700..1000).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
 #[test]
 fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
     // A form drawing itself, then the photo 170,000 times, drawn 1,000 times by the page.
