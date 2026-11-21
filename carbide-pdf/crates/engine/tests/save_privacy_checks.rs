@@ -728,6 +728,93 @@ fn an_appearance_with_null_resources_keeps_what_it_draws_from_the_page() {
     });
 }
 
+#[test]
+fn an_appearance_keeps_the_font_a_form_with_no_resources_draws() {
+    // The appearance has no resources of its own, and the only thing it draws is a form that
+    // also has none. That form uses a font from the page. The page's content draws neither.
+    // A form nothing draws uses another font and the deleted page's image; both go. The older
+    // appearance draws its image itself, so not reading a form it names still passes that one.
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let font = |doc: &mut Document, name: &str| {
+        let mut dict = dictionary! { "Type" => "Font", "Subtype" => "Type1" };
+        dict.set("BaseFont", Object::Name(name.as_bytes().to_vec()));
+        Object::Reference(doc.add_object(dict))
+    };
+    let form = |doc: &mut Document, content: &str| {
+        Object::Reference(doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+            },
+            content.as_bytes().to_vec(),
+        )))
+    };
+    let kept = font(&mut doc, "KEEP-FORM-FONT");
+    let unused = font(&mut doc, "DROP-UNDRAWN-FONT");
+    let image = secret_image(&mut doc);
+    let drawn = form(&mut doc, "BT /Fkeep 12 Tf (kept) Tj ET");
+    let idle = form(
+        &mut doc,
+        "q 100 0 0 100 0 0 cm /Im1 Do Q BT /Fgone 12 Tf (idle) Tj ET",
+    );
+    let shared = doc.add_object(dictionary! {
+        "Font" => dictionary! { "Fkeep" => kept, "Fgone" => unused },
+        "XObject" => dictionary! { "FmYes" => drawn, "FmNo" => idle, "Im1" => image },
+    });
+    let appearance = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        },
+        b"/FmYes Do".to_vec(),
+    ));
+    let annotation = doc.add_object(dictionary! {
+        "Type" => "Annot", "Subtype" => "Stamp",
+        "Rect" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        "AP" => dictionary! { "N" => appearance },
+    });
+    let mut kids = Vec::new();
+    for (content, annots) in [
+        ("BT ET", vec![Object::Reference(annotation)]),
+        ("q 100 0 0 100 0 0 cm /Im1 Do Q", vec![]),
+    ] {
+        let contents = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            content.as_bytes().to_vec(),
+        ));
+        kids.push(Object::Reference(doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 300.into()],
+            "Contents" => contents, "Resources" => shared, "Annots" => annots,
+        })));
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 2 }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let mut pdf = Pdf::from_bytes(&bytes).unwrap();
+
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, b"KEEP-FORM-FONT"),
+        "the font the appearance's form draws was dropped"
+    );
+    assert!(
+        !contains(&saved, b"DROP-UNDRAWN-FONT"),
+        "a font nothing draws was kept"
+    );
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+}
+
 // ---- legacy passwords ----------------------------------------------------------------------
 
 const PADDING: [u8; 32] = [
