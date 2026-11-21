@@ -809,6 +809,58 @@ fn legacy_password_with_a_tab_and_an_accent_opens_the_file() {
     assert_eq!(pdf.page_count(), 1);
 }
 
+#[test]
+fn legacy_passwords_use_pdf_doc_bytes_including_the_gaps() {
+    // The older password is é and a tab: both are bytes of their own, so a
+    // table that stored euro as 0x80 (WinAnsi) or filled the gaps at 0x7F,
+    // 0xA0 and 0xAD would still open it. Here euro is 0xA0 and bullet is
+    // 0x80. An en dash is 0x85, not WinAnsi's 0x96. A character this encoding
+    // does not have is left out, not written as a question mark.
+    let opens = |bytes: &[u8], password: &str| {
+        Pdf::from_bytes_with_password(&rc4_file(bytes), password)
+            .unwrap_or_else(|error| panic!("{password:?} should open {bytes:02x?}: {error}"));
+    };
+    let refuses = |bytes: &[u8], password: &str| {
+        let error = match Pdf::from_bytes_with_password(&rc4_file(bytes), password) {
+            Err(error) => error,
+            Ok(_) => panic!("{password:?} should not open {bytes:02x?}"),
+        };
+        assert!(
+            matches!(error, carbide_engine::Error::WrongPassword),
+            "{password:?} / {bytes:02x?}: {error}"
+        );
+    };
+
+    opens(&[0x00, 0xE9], "\u{0000}é");
+    opens(&[0x17, 0xE9], "\u{0017}é");
+    opens(&[0x20, 0xE9], " é");
+    opens(&[0x7E, 0xE9], "~é");
+    opens(&[0xA1], "\u{00A1}");
+    opens(&[0xAC], "\u{00AC}");
+    opens(&[0xAE], "\u{00AE}");
+    opens(&[0xFF], "ÿ");
+
+    opens(&[0xE9], "\u{0018}é");
+    refuses(&[0x18, 0xE9], "\u{0018}é");
+    opens(&[0x18], "\u{02D8}");
+    opens(&[0xE9], "\u{007F}é");
+    refuses(&[0x7F, 0xE9], "\u{007F}é");
+
+    opens(&[0x80], "\u{2022}");
+    refuses(&[0x80], "\u{20AC}");
+    refuses(&[0x95], "\u{2022}");
+    opens(&[0xA0], "\u{20AC}");
+    refuses(&[0xA0], "\u{2022}");
+    refuses(&[0xA0], "\u{00A0}");
+    opens(&[0x85], "\u{2013}");
+    refuses(&[0x96], "\u{2013}");
+
+    opens(b"a", "a\u{00A0}");
+    opens(b"a", "a\u{00AD}");
+    opens(b"a", "a\u{0100}");
+    refuses(b"?", "\u{0100}");
+}
+
 // ---- linearization -------------------------------------------------------------------------
 
 #[test]
