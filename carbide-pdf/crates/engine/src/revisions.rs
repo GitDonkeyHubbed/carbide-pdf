@@ -380,6 +380,41 @@ mod tests {
     }
 
     #[test]
+    fn pdf_dates_allow_the_31st_only_in_a_month_that_has_one() {
+        let utc = |text: &str| parse_pdf_date(text).map(|d| d.to_rfc3339());
+        // The dates above fall on the 1st or the 4th. Day 32 is already
+        // out of range, and February 30 does not say that the 31st exists.
+        // August is a 31-day month that is not an odd month.
+        assert_eq!(
+            utc("D:20260131").as_deref(),
+            Some("2026-01-31T00:00:00+00:00")
+        );
+        assert_eq!(
+            utc("D:20260831").as_deref(),
+            Some("2026-08-31T00:00:00+00:00")
+        );
+        assert_eq!(
+            utc("D:20260430").as_deref(),
+            Some("2026-04-30T00:00:00+00:00")
+        );
+        for bad in ["D:20260431", "D:20261131"] {
+            assert_eq!(parse_pdf_date(bad), None, "{bad}");
+            assert_eq!(pdf_date_to_local(bad), "", "{bad}");
+        }
+    }
+
+    #[test]
+    fn pdf_date_offsets_may_omit_the_minutes() {
+        let utc = |text: &str| parse_pdf_date(text).map(|d| d.to_rfc3339());
+        // The offsets above all write the minutes. An omitted minute is zero.
+        assert_eq!(
+            utc("D:20260304050607+02").as_deref(),
+            Some("2026-03-04T03:06:07+00:00")
+        );
+        assert!(!pdf_date_to_local("D:20260304050607+02").is_empty());
+    }
+
+    #[test]
     fn text_strings_round_trip() {
         for s in ["plain", "Überarbeitung 修正", ""] {
             assert_eq!(decode_text(&encode_text(s)), s);
