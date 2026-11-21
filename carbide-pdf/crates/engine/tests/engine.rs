@@ -8034,6 +8034,64 @@ fn a_certificate_for_other_purposes_cannot_sign_documents() {
 }
 
 #[test]
+fn adobe_and_microsoft_document_signing_purposes_may_sign() {
+    // Those two purposes are not the standard document-signing id. A certificate that names
+    // only one of them is still a signer's. E-mail protection and id-kp-documentSigning are
+    // covered beside a server purpose above; neither of those cases names these.
+    let mut doc = text_pdf(&[&["vendor purposes"]]);
+    let base = file_bytes(&mut doc);
+    let signer = |purpose: &[u32]| {
+        let (pair, key) = rsa_key();
+        let mut params = cert_params(
+            "Vendor Signer",
+            IsCa::ExplicitNoCa,
+            &[KeyUsagePurpose::DigitalSignature],
+        );
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[2, 5, 29, 37],
+                algo::seq(&[&algo::oid(purpose)]),
+            ));
+        let cert = params.self_signed(&pair).unwrap().der().to_vec();
+        let identity = Identity::new(vec![cert.clone()], key).unwrap();
+        let signed = doc
+            .sign(
+                &base,
+                &SignOptions {
+                    identity: Some(&identity),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        verify(
+            &signed,
+            &TrustStore {
+                certificates: vec![cert],
+            },
+        )
+        .remove(0)
+    };
+    for (label, purpose) in [
+        (
+            "Adobe Authentic Documents Trust",
+            &[1, 2, 840, 113583, 1, 1, 5][..],
+        ),
+        (
+            "Microsoft document signing",
+            &[1, 3, 6, 1, 4, 1, 311, 10, 3, 12][..],
+        ),
+    ] {
+        let report = signer(purpose);
+        assert_eq!(
+            (report.validity, report.detail),
+            (Validity::Valid, Detail::TrustedDirectly),
+            "{label}"
+        );
+    }
+}
+
+#[test]
 fn a_document_time_stamp_verifies_as_a_time_stamp() {
     let mut doc = text_pdf(&[&["stamped document"]]);
     let base = file_bytes(&mut doc);
