@@ -645,4 +645,63 @@ mod tests {
             b"Page"
         );
     }
+
+    /// A page listed twice, with `extra` keys besides Type, Parent and MediaBox.
+    fn listed_twice(extra: usize) -> Document {
+        let mut page = Dictionary::new();
+        page.set("Type", "Page");
+        page.set("Parent", Object::Reference((1, 0)));
+        page.set(
+            "MediaBox",
+            vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(100),
+            ],
+        );
+        for n in 0..extra {
+            page.set(format!("A{n}"), Object::Integer(0));
+        }
+        document(vec![
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                    "Count" => 2,
+                }),
+            ),
+            (2, Object::Dictionary(page)),
+        ])
+    }
+
+    #[test]
+    fn a_duplicated_page_may_copy_a_million_values_and_not_one_more() {
+        // The older check lists one page 10,000 times. That is over a million
+        // values, so a cap a little above a million still refuses it. Copying
+        // counts every key and one more for the page. 1,000,000 is written here.
+        let mut allowed = listed_twice(999_996);
+        assert_eq!(allowed.get_dictionary((2, 0)).unwrap().len() + 1, 1_000_000);
+        repair(&mut allowed).unwrap();
+        let kids = allowed
+            .get_dictionary((1, 0))
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+        assert_ne!(kids[0], kids[1]);
+
+        let mut one_more = listed_twice(999_997);
+        assert_eq!(
+            one_more.get_dictionary((2, 0)).unwrap().len() + 1,
+            1_000_001
+        );
+        assert_eq!(
+            repair(&mut one_more).unwrap_err().to_string(),
+            messages::TOO_MANY_COPIES
+        );
+    }
 }

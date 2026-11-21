@@ -4678,6 +4678,38 @@ fn object_streams_cannot_unpack_to_gigabytes() {
 }
 
 #[test]
+fn an_object_stream_may_decode_to_16_777_216_bytes_and_not_one_more() {
+    use carbide_engine::limits::messages::TOO_LARGE_TO_READ;
+    // `packed` stores `5 0 ` and then the object in one stream. The older check
+    // refuses 20 MB of spaces, so a cap anywhere from just over this stream up to
+    // that still passes it. 16,777,216 is written here.
+    let stream = |decoded: usize| {
+        let header = b"5 0 ".len();
+        let suffix = b"[1]";
+        let mut object = vec![b' '; decoded - header - suffix.len()];
+        object.extend_from_slice(suffix);
+        assert_eq!(header + object.len(), decoded);
+        packed(&object)
+    };
+
+    let pdf = Pdf::from_bytes(&stream(16_777_216)).unwrap();
+    let catalog = pdf.document().catalog().unwrap();
+    let junk = pdf
+        .document()
+        .get_object(catalog.get(b"Junk").unwrap().as_reference().unwrap())
+        .unwrap();
+    assert_eq!(junk.as_array().unwrap(), &vec![Object::Integer(1)]);
+
+    match Pdf::from_bytes(&stream(16_777_217)) {
+        Err(Error::TooLarge(message)) => assert_eq!(message, TOO_LARGE_TO_READ),
+        other => panic!(
+            "one byte over the cap: {:?}",
+            other.map(|pdf| pdf.page_count())
+        ),
+    }
+}
+
+#[test]
 fn content_of_many_operators_is_read_without_parsing_it_whole() {
     // Eight million `q`: 16 MB decoded, gigabytes as a list of parsed operations.
     let bomb = Stream::new(
