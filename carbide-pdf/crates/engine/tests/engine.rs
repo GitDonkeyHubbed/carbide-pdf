@@ -4065,6 +4065,48 @@ fn kids_that_name_their_page_another_way_name_it_directly() {
     );
 }
 
+/// The text stored in each page's content, in page order.
+fn stored_page_text(pdf: &Pdf) -> Vec<String> {
+    pdf.page_ids()
+        .into_iter()
+        .map(|id| String::from_utf8_lossy(&pdf.document().get_page_content(id)).into_owned())
+        .collect()
+}
+
+#[test]
+fn a_page_fifteen_references_away_is_kept_and_sixteen_is_not() {
+    // The page-tree walk follows one reference per step, sixteen steps, and has to land on the
+    // page itself within those steps. Fifteen references still name the middle page. Sixteen
+    // never reach it, so that kid is left out and the other two pages stay. One reference, and a
+    // generation number the page does not have, are the older check: both still read the page if
+    // this bound moves by one. Lopdf follows a whole chain in one lookup, which is not this walk.
+    let open = |links: usize| {
+        let bytes = damaged_tree(|doc, root, ids| {
+            let mut id = ids[1];
+            for _ in 0..links {
+                id = doc.add_object(Object::Reference(id));
+            }
+            set_kids(doc, root, vec![ids[0].into(), id.into(), ids[2].into()]);
+        });
+        Pdf::from_bytes(&bytes).unwrap()
+    };
+    let kept = open(15);
+    let kept_text = stored_page_text(&kept);
+    assert_eq!(kept.page_count(), 3, "{kept_text:?}");
+    assert!(kept_text[0].contains("AAA first"), "{kept_text:?}");
+    assert!(kept_text[1].contains("BBB SECRET"), "{kept_text:?}");
+    assert!(kept_text[2].contains("CCC third"), "{kept_text:?}");
+    let dropped = open(16);
+    let dropped_text = stored_page_text(&dropped);
+    assert_eq!(dropped.page_count(), 2, "{dropped_text:?}");
+    assert!(dropped_text[0].contains("AAA first"), "{dropped_text:?}");
+    assert!(dropped_text[1].contains("CCC third"), "{dropped_text:?}");
+    assert!(
+        dropped_text.iter().all(|text| !text.contains("BBB SECRET")),
+        "{dropped_text:?}"
+    );
+}
+
 /// A file of `objects` (object 1 first, the catalog), written by hand: values lopdf cannot read
 /// can be written this way, as other programs might.
 fn handwritten(objects: &[&str]) -> Vec<u8> {
