@@ -5669,6 +5669,113 @@ fn a_form_whose_matrix_is_its_own_object_is_sized_for_the_scaled_drawing() {
     );
 }
 
+/// An object reached only by following two references.
+fn object_two_references_away(doc: &mut Document, object: Object) -> Object {
+    let inner = doc.add_object(object);
+    Object::Reference(doc.add_object(Object::Reference(inner)))
+}
+
+/// Two objects that point at each other. Following either one without a bound never returns.
+fn mutual_reference(doc: &mut Document) -> Object {
+    let left = doc.new_object_id();
+    let right = doc.new_object_id();
+    doc.objects.insert(left, Object::Reference(right));
+    doc.objects.insert(right, Object::Reference(left));
+    Object::Reference(left)
+}
+
+/// Width of the photo after reducing a page that draws it only through form `/F`. The form paints
+/// the photo in a 100 by 75 pt square and then applies `matrix`.
+fn reduced_form_width(matrix: impl FnOnce(&mut Document) -> Object) -> i64 {
+    let mut pdf = photo_page(b"/F Do", |doc, photo| {
+        let matrix = matrix(doc);
+        let form = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                "Matrix" => matrix,
+                "Resources" => dictionary! { "XObject" => dictionary! { "Im" => photo } },
+            },
+            b"q 100 0 0 75 0 0 cm /Im Do Q".to_vec(),
+        ));
+        dictionary! { "F" => form }
+    });
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    let widths = image_widths(&reduced);
+    assert!(
+        report.images_downsampled >= 1 && widths.len() == 1,
+        "{report:?} {widths:?}"
+    );
+    widths[0]
+}
+
+#[test]
+fn a_rotated_form_matrix_two_references_deep_keeps_its_scale() {
+    // The photo is painted in a 100 by 75 pt square. The form's /Matrix turns that by a right
+    // angle and scales it by four, so the page shows it at 400 by 300 pt. The array, and each
+    // real number in it, is stored two objects away. Reading the object map only once finds a
+    // reference where the array or the number should be. A reader that only accepts integers
+    // reads no numbers. A reader that keeps only the diagonal keeps two zeros. Each of those
+    // sizes the photo for the unscaled square (about 208 pixels) or leaves the full 1200. The
+    // one-reference test, whose numbers are integers on the diagonal, still passes.
+    let width = reduced_form_width(|doc| {
+        let numbers = [0.0f32, 4.0, -4.0, 0.0, 0.0, 0.0]
+            .into_iter()
+            .map(|n| object_two_references_away(doc, Object::Real(n)))
+            .collect::<Vec<_>>();
+        object_two_references_away(doc, Object::Array(numbers))
+    });
+    // 400 pt at 150 ppi is about 833 pixels.
+    assert!((700..1000).contains(&width), "{width}");
+}
+
+#[test]
+fn a_form_matrix_with_an_extra_entry_is_not_a_scale_of_four() {
+    // Seven entries: the six numbers of a scale of four, then a name. Skipping the name, or
+    // keeping the first six, leaves that scale, and the photo is kept near 833 pixels. The
+    // matrix is not six numbers, so it is the identity and the photo is sized for the 100 by
+    // 75 pt square, about 208 pixels. The one-reference test writes exactly six numbers.
+    let width = reduced_form_width(|_| {
+        Object::Array(vec![
+            Object::Real(4.0),
+            0.into(),
+            0.into(),
+            Object::Real(4.0),
+            0.into(),
+            0.into(),
+            Object::Name(b"Extra".to_vec()),
+        ])
+    });
+    assert!((150..350).contains(&width), "{width}");
+}
+
+#[test]
+fn a_circled_form_matrix_number_does_not_become_zero() {
+    // The first five entries are a scale of four. The sixth is two objects that point at each
+    // other, so it is not a number and the matrix is the identity: the photo stays near 208
+    // pixels. Reading that entry as 0 keeps the scale of four, near 833 pixels. Following the
+    // circle through the object map with no bound never returns. The one-reference test has
+    // no circle to follow.
+    let width = finishes(
+        "reducing a form whose matrix number points in a circle",
+        || {
+            reduced_form_width(|doc| {
+                let circled = mutual_reference(doc);
+                Object::Array(vec![
+                    Object::Real(4.0),
+                    0.into(),
+                    0.into(),
+                    Object::Real(4.0),
+                    0.into(),
+                    circled,
+                ])
+            })
+        },
+    );
+    assert!((150..350).contains(&width), "{width}");
+}
+
 #[test]
 fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
     // A form drawing itself, then the photo 170,000 times, drawn 1,000 times by the page.
