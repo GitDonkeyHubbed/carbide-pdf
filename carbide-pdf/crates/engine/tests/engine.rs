@@ -1069,6 +1069,108 @@ fn page_labels_carry_on_where_a_page_was_deleted() {
     );
 }
 
+/// A bookmark titled `DEEP SECRET` whose destination is `names` catalog names in a row, the last
+/// of them the second page, plus a bookmark that leads to the page that stays.
+fn bookmark_through_names(names: usize) -> Pdf {
+    let mut pdf = text_pdf(&[&["KEEP"], &["GONE"]]);
+    let ids = pdf.page_ids();
+    let root = pdf
+        .document()
+        .catalog()
+        .unwrap()
+        .get(b"Outlines")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let doc = pdf.document_mut();
+    let fit = |page: lopdf::ObjectId| Object::Array(vec![Object::Reference(page), "Fit".into()]);
+    let mut target = fit(ids[1]);
+    let mut dests = lopdf::Dictionary::new();
+    for n in (0..names).rev() {
+        let key = format!("N{n}");
+        dests.set(key.clone(), target);
+        target = Object::string_literal(key);
+    }
+    let secret = doc.add_object(dictionary! {
+        "Title" => Object::string_literal("DEEP SECRET"),
+        "Parent" => root,
+        "Dest" => target,
+    });
+    let kept = doc.add_object(dictionary! {
+        "Title" => Object::string_literal("Kept Chapter"),
+        "Parent" => root,
+        "Dest" => fit(ids[0]),
+    });
+    doc.get_dictionary_mut(secret).unwrap().set("Next", kept);
+    doc.get_dictionary_mut(kept).unwrap().set("Prev", secret);
+    let outlines = doc.get_dictionary_mut(root).unwrap();
+    outlines.set("First", secret);
+    outlines.set("Last", kept);
+    outlines.set("Count", 2);
+    doc.catalog_mut().unwrap().set("Dests", dests);
+    pdf
+}
+
+/// Deletes the second page of a document whose only bookmark names two destinations that point
+/// at each other, and returns the file.
+fn bookmark_on_a_name_cycle_deleted() -> Vec<u8> {
+    let mut pdf = text_pdf(&[&["KEEP"], &["GONE"]]);
+    let root = pdf
+        .document()
+        .catalog()
+        .unwrap()
+        .get(b"Outlines")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let doc = pdf.document_mut();
+    let mut dests = lopdf::Dictionary::new();
+    dests.set("LoopA", Object::string_literal("LoopB"));
+    dests.set("LoopB", Object::string_literal("LoopA"));
+    let item = doc.add_object(dictionary! {
+        "Title" => Object::string_literal("LOOP SECRET"),
+        "Parent" => root,
+        "Dest" => Object::string_literal("LoopA"),
+    });
+    let outlines = doc.get_dictionary_mut(root).unwrap();
+    outlines.set("First", item);
+    outlines.set("Last", item);
+    outlines.set("Count", 1);
+    doc.catalog_mut().unwrap().set("Dests", dests);
+    pdf.delete_pages(&[1]).unwrap();
+    pdf.to_bytes().unwrap()
+}
+
+#[test]
+fn a_bookmark_is_removed_only_through_eight_named_destinations() {
+    // "SECRET CHAPTER" above reaches its page through one name, so that test stays green for
+    // any limit from 1 to 8. Eight names in a row are the last chain still followed to the
+    // page. Nine are left in place: a longer chain is damaged, and following it is what a
+    // hostile file would use to overflow the stack.
+    let mut followed = bookmark_through_names(8);
+    followed.delete_pages(&[1]).unwrap();
+    let bytes = followed.to_bytes().unwrap();
+    assert!(holds_string(&bytes, "Kept Chapter"), "8 names");
+    assert_gone(&bytes, "DEEP SECRET");
+
+    let mut left = bookmark_through_names(9);
+    left.delete_pages(&[1]).unwrap();
+    let bytes = left.to_bytes().unwrap();
+    assert!(holds_string(&bytes, "Kept Chapter"), "9 names");
+    assert!(
+        holds_string(&bytes, "DEEP SECRET"),
+        "a bookmark nine names away was followed and removed"
+    );
+
+    // Two names that point at each other are not a page, and the walk returns.
+    let bytes = finishes(
+        "names that point at each other",
+        bookmark_on_a_name_cycle_deleted,
+    );
+    assert!(holds_string(&bytes, "LOOP SECRET"));
+    assert_eq!(Pdf::from_bytes(&bytes).unwrap().page_count(), 1);
+}
+
 /// The node `id` of a name tree: its /Limits as text, and how many kids it has.
 fn tree_node(pdf: &Pdf, id: lopdf::ObjectId) -> (Vec<String>, usize) {
     let dict = pdf.document().get_dictionary(id).unwrap();
@@ -1704,6 +1806,49 @@ fn clearing_form_data_also_clears_what_a_list_shows_as_picked_and_its_default() 
     );
 }
 
+/// A text field whose value sits `levels` fields below the form.
+fn field_value_at(levels: usize) -> Pdf {
+    let mut pdf = text_pdf(&[&["form"]]);
+    let doc = pdf.document_mut();
+    let mut current = doc.add_object(dictionary! {
+        "FT" => "Tx",
+        "T" => Object::string_literal("deep"),
+        "V" => Object::string_literal("SECRET VALUE"),
+    });
+    for _ in 0..levels {
+        current = doc.add_object(dictionary! { "Kids" => vec![current.into()] });
+    }
+    doc.catalog_mut()
+        .unwrap()
+        .set("AcroForm", dictionary! { "Fields" => vec![current.into()] });
+    pdf
+}
+
+#[test]
+fn form_data_is_cleared_only_as_deep_as_fields_are_read() {
+    // The list above keeps its value on the field the form lists directly, so that test stays
+    // green however soon the walk stops. A value 64 levels down is the last one cleared. One
+    // at 65 is left, and it is not counted: a deeper tree is damaged, and walking it is what
+    // a hostile file would use to overflow the stack.
+    let cleared = |levels: usize| {
+        let mut pdf = field_value_at(levels);
+        let count = pdf
+            .remove_hidden_information(&[HiddenItem::FormData])
+            .unwrap()
+            .count(HiddenItem::FormData);
+        (count, pdf.to_bytes().unwrap())
+    };
+    let (count, bytes) = cleared(64);
+    assert_eq!(count, 1, "a value 64 levels down was not counted");
+    assert_gone(&bytes, "SECRET VALUE");
+    let (count, bytes) = cleared(65);
+    assert_eq!(count, 0, "a value 65 levels down was counted");
+    assert!(
+        holds_string(&bytes, "SECRET VALUE"),
+        "a value 65 levels down was cleared"
+    );
+}
+
 /// One page per label, built the way word processors and form tools write them, so that other
 /// parts of the document point into every page:
 /// - each page draws its label, and a form XObject showing `FORM-<label>` from a resource
@@ -1862,6 +2007,104 @@ fn deleting_a_page_takes_its_fields_tags_and_drawings_along() {
     assert!(
         text.contains("CHARLIE") && text.contains("FORM-CHARLIE"),
         "{text:?}"
+    );
+}
+
+/// A structure element whose text is `SECRET TAG`, `levels` elements below the structure root's
+/// `/K`, on the second page.
+fn secret_tag_at(levels: usize) -> Pdf {
+    let mut pdf = text_pdf(&[&["KEEP"], &["GONE"]]);
+    let gone = pdf.page_ids()[1];
+    let doc = pdf.document_mut();
+    let mut current = doc.add_object(dictionary! {
+        "Type" => "StructElem",
+        "S" => "P",
+        "Pg" => gone,
+        "ActualText" => Object::string_literal("SECRET TAG"),
+    });
+    for _ in 0..levels {
+        current = doc.add_object(dictionary! {
+            "Type" => "StructElem",
+            "S" => "Div",
+            "K" => current,
+        });
+    }
+    let root = doc.add_object(dictionary! { "Type" => "StructTreeRoot", "K" => current });
+    doc.catalog_mut().unwrap().set("StructTreeRoot", root);
+    pdf
+}
+
+/// A text field `levels` fields below the form, on the second page, and another field on the
+/// page that stays.
+fn secret_field_at(levels: usize) -> Pdf {
+    let mut pdf = text_pdf(&[&["KEEP"], &["GONE"]]);
+    let ids = pdf.page_ids();
+    let doc = pdf.document_mut();
+    let secret = doc.add_object(dictionary! {
+        "Subtype" => "Widget", "FT" => "Tx",
+        "T" => Object::string_literal("secret"),
+        "V" => Object::string_literal("SECRET FIELD"),
+        "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+        "P" => ids[1],
+    });
+    doc.get_dictionary_mut(ids[1])
+        .unwrap()
+        .set("Annots", vec![Object::Reference(secret)]);
+    let mut current = secret;
+    for _ in 0..levels {
+        current = doc.add_object(dictionary! { "Kids" => vec![current.into()] });
+    }
+    let kept = doc.add_object(dictionary! {
+        "Subtype" => "Widget", "FT" => "Tx",
+        "T" => Object::string_literal("kept"),
+        "V" => Object::string_literal("KEPT FIELD"),
+        "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+        "P" => ids[0],
+    });
+    doc.get_dictionary_mut(ids[0])
+        .unwrap()
+        .set("Annots", vec![Object::Reference(kept)]);
+    doc.catalog_mut().unwrap().set(
+        "AcroForm",
+        dictionary! { "Fields" => vec![current.into(), Object::Reference(kept)] },
+    );
+    pdf
+}
+
+/// The file after the second page of `pdf` is deleted.
+fn without_second_page(mut pdf: Pdf) -> Vec<u8> {
+    pdf.delete_pages(&[1]).unwrap();
+    assert_eq!(pdf.page_count(), 1);
+    pdf.to_bytes().unwrap()
+}
+
+#[test]
+fn a_page_tag_is_removed_only_as_deep_as_the_structure_tree_is_read() {
+    // The tags taken out with a page above are reached two steps down from the structure root,
+    // so that test stays green for any limit from 2 up. A tag 64 levels below the root's /K
+    // is the last one removed with its page. One at 65 is left, text and all: that part of
+    // the tree is damaged, and walking it further is what a hostile file would use to overflow
+    // the stack.
+    assert_gone(&without_second_page(secret_tag_at(64)), "SECRET TAG");
+    assert!(
+        holds_string(&without_second_page(secret_tag_at(65)), "SECRET TAG"),
+        "a tag 65 levels down was followed and removed"
+    );
+}
+
+#[test]
+fn a_page_field_is_removed_only_as_deep_as_the_field_tree_is_read() {
+    // The fields taken out with a page above are listed directly under the form, so that test
+    // stays green however soon the walk stops. A field 64 levels down is the last one removed
+    // with its page. One at 65 is left, value and all.
+    let at_limit = without_second_page(secret_field_at(64));
+    assert!(holds_string(&at_limit, "KEPT FIELD"));
+    assert_gone(&at_limit, "SECRET FIELD");
+    let past = without_second_page(secret_field_at(65));
+    assert!(holds_string(&past, "KEPT FIELD"));
+    assert!(
+        holds_string(&past, "SECRET FIELD"),
+        "a field 65 levels down was followed and removed"
     );
 }
 
