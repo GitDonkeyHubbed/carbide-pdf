@@ -501,6 +501,29 @@ mod tests {
         assert!(read_ber(&deep).is_none());
     }
 
+    /// `levels` indefinite-length sequences around one integer.
+    fn nested_indefinite(levels: usize) -> Vec<u8> {
+        let mut data = vec![0x02, 0x01, 0x01];
+        for _ in 0..levels {
+            let mut wrapped = vec![0x30, 0x80];
+            wrapped.extend_from_slice(&data);
+            wrapped.extend_from_slice(&[0, 0]);
+            data = wrapped;
+        }
+        data
+    }
+
+    #[test]
+    fn indefinite_lengths_may_nest_exactly_sixty_four_deep() {
+        // Two hundred deep is refused, so any limit from 1 to 199 still passes that
+        // test. Sixty-four sequences are read, and sixty-five are not.
+        let sixty_four = nested_indefinite(64);
+        let (element, rest) = read_ber(&sixty_four).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(element.tag, SEQUENCE);
+        assert!(read_ber(&nested_indefinite(65)).is_none());
+    }
+
     #[test]
     fn small_integers() {
         assert_eq!(small_unsigned(&[0x14]), Some(20));
@@ -627,5 +650,25 @@ mod tests {
             &name("Acme\t\u{85}Corp".as_bytes()),
             &name("Acme Corp".as_bytes())
         ));
+    }
+
+    #[test]
+    fn a_name_may_have_exactly_thirty_two_attributes_in_one_part() {
+        // One or two attributes are compared above. Thirty-two in one relative
+        // distinguished name still are, including a difference only of case.
+        // Thirty-three are not compared, so that difference does not match, while
+        // two copies of the same bytes still do.
+        let name = |count: usize, value: &[u8]| {
+            let attributes: Vec<Vec<u8>> = (1..=count)
+                .map(|n| sequence(&[&oid(&[1, 2, 3, n as u32]), &tlv(0x0C, value)]))
+                .collect();
+            let refs: Vec<&[u8]> = attributes.iter().map(Vec::as_slice).collect();
+            sequence(&[&set(&refs)])
+        };
+        assert!(names_match(&name(32, b"A"), &name(32, b"a")));
+        assert!(!names_match(&name(32, b"A"), &name(32, b"B")));
+        assert!(!names_match(&name(33, b"A"), &name(33, b"a")));
+        let identical = name(33, b"A");
+        assert!(names_match(&identical, &identical));
     }
 }
