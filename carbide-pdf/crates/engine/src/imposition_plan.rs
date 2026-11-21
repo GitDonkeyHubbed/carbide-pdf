@@ -1012,6 +1012,68 @@ mod tests {
         assert!(plan_plates(&largest, 3).is_ok());
     }
 
+    #[test]
+    fn a_grid_of_32_and_64_sheets_per_fold_are_the_largest_accepted() {
+        // The other refusal test measures against the named limits, so changing
+        // those numbers leaves it green. 32 and 64 are written here.
+        let grid = PlanOptions {
+            layout: LayoutKind::StepAndRepeat,
+            ..Default::default()
+        };
+        assert!(plan_plates(
+            &PlanOptions {
+                columns: 32,
+                rows: 32,
+                ..grid
+            },
+            1
+        )
+        .is_ok());
+        for (columns, rows) in [(33, 1), (1, 33)] {
+            assert_eq!(
+                plan_plates(
+                    &PlanOptions {
+                        columns,
+                        rows,
+                        ..grid
+                    },
+                    1
+                )
+                .unwrap_err()
+                .to_string(),
+                messages::GRID,
+                "{columns} x {rows}"
+            );
+        }
+        let fold = PlanOptions {
+            layout: LayoutKind::Booklet4Up,
+            columns: 2,
+            rows: 2,
+            binding: Binding::Perfect,
+            ..Default::default()
+        };
+        assert!(plan_plates(
+            &PlanOptions {
+                sheets_per_fold: 64,
+                ..fold
+            },
+            1
+        )
+        .is_ok());
+        assert_eq!(
+            plan_plates(
+                &PlanOptions {
+                    sheets_per_fold: 65,
+                    ..fold
+                },
+                1
+            )
+            .unwrap_err()
+            .to_string(),
+            messages::SHEETS_PER_FOLD
+        );
+    }
+
     fn plan(
         layout: LayoutKind,
         binding: Binding,

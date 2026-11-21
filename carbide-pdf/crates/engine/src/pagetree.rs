@@ -645,4 +645,108 @@ mod tests {
             b"Page"
         );
     }
+
+    /// `links` parent nodes above a page, the farthest of them holding `/Rotate 90`.
+    fn rotation_inherited_through(links: usize) -> Option<i64> {
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages", "Kids" => vec![(2, 0).into()], "Count" => 1,
+                }),
+            ),
+            (
+                2,
+                Object::Dictionary(dictionary! { "Type" => "Page", "Parent" => (1, 0) }),
+            ),
+        ]);
+        let mut next = doc.add_object(dictionary! { "Type" => "Pages", "Rotate" => 90 });
+        for _ in 1..links {
+            next = doc.add_object(dictionary! { "Type" => "Pages", "Parent" => next });
+        }
+        doc.get_dictionary_mut((2, 0)).unwrap().set("Parent", next);
+        repair(&mut doc).unwrap();
+        doc.get_dictionary((2, 0))
+            .unwrap()
+            .get(b"Rotate")
+            .ok()
+            .and_then(|value| value.as_i64().ok())
+    }
+
+    #[test]
+    fn a_rotation_129_parents_up_is_kept_and_130_is_not() {
+        // The chain is followed while the number of nodes already read is at most
+        // 128, so the 129th node still gives the page its turn and the 130th does
+        // not. A chain of two and a chain of 8000 both stay green if this bound
+        // moves by one. 129 and 130 are written here.
+        assert_eq!(rotation_inherited_through(129), Some(90));
+        assert_eq!(rotation_inherited_through(130), None);
+    }
+
+    #[test]
+    fn a_page_listed_twice_copies_256_bytes_and_shares_257() {
+        // Sharing is decided per value. An array of 50,000 numbers is shared
+        // because of how many values it holds, so the length of one string or
+        // name can change without that test noticing. 256 is written here.
+        let short = vec![b'a'; 256];
+        let long = vec![b'b'; 257];
+        let short_name = vec![b'N'; 256];
+        let long_name = vec![b'M'; 257];
+        let mut page = dictionary! {
+            "Type" => "Page",
+            "Parent" => (1, 0),
+            "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        };
+        page.set(
+            "S",
+            Object::String(short.clone(), lopdf::StringFormat::Literal),
+        );
+        page.set(
+            "L",
+            Object::String(long.clone(), lopdf::StringFormat::Literal),
+        );
+        page.set("NS", Object::Name(short_name.clone()));
+        page.set("NL", Object::Name(long_name.clone()));
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                    "Count" => 2,
+                }),
+            ),
+            (2, Object::Dictionary(page)),
+        ]);
+        repair(&mut doc).unwrap();
+        let listed = pages(&doc);
+        assert_eq!(listed.len(), 2);
+        assert_ne!(listed[0], listed[1]);
+        let first = doc.get_dictionary(listed[0]).unwrap();
+        let second = doc.get_dictionary(listed[1]).unwrap();
+        let copied = |key: &[u8], bytes: &[u8]| {
+            for page in [first, second] {
+                match page.get(key).unwrap() {
+                    Object::String(found, _) | Object::Name(found) => assert_eq!(found, bytes),
+                    other => panic!("{key:?} was shared instead of copied: {other:?}"),
+                }
+            }
+        };
+        copied(b"S", &short);
+        copied(b"NS", &short_name);
+        let shared = |key: &[u8], bytes: &[u8]| {
+            let (Object::Reference(left), Object::Reference(right)) =
+                (first.get(key).unwrap(), second.get(key).unwrap())
+            else {
+                panic!("{key:?} was copied onto both pages");
+            };
+            assert_eq!(left, right);
+            match doc.get_object(*left).unwrap() {
+                Object::String(found, _) | Object::Name(found) => assert_eq!(found, bytes),
+                other => panic!("{key:?} is not the original value: {other:?}"),
+            }
+        };
+        shared(b"L", &long);
+        shared(b"NL", &long_name);
+    }
 }
