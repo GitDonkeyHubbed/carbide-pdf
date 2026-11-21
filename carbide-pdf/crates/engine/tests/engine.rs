@@ -5669,6 +5669,114 @@ fn a_form_whose_matrix_is_its_own_object_is_sized_for_the_scaled_drawing() {
     );
 }
 
+/// The widths left after reducing a page whose only drawing is a form. The form paints the
+/// page's photo in a 400 by 300 pt square. `resources` is the form's own resource dictionary,
+/// when it has one.
+fn widths_when_a_form_draws_the_page_image(resources: Option<lopdf::Dictionary>) -> Vec<i64> {
+    let mut pdf = photo_page(b"/F Do", |doc, _photo| {
+        let mut dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+        };
+        if let Some(resources) = resources {
+            dict.set("Resources", resources);
+        }
+        let form = doc.add_object(Stream::new(
+            dict,
+            b"q 400 0 0 300 0 0 cm /Im1 Do Q".to_vec(),
+        ));
+        dictionary! { "F" => form }
+    });
+    image_widths(&pdf.reduce(&ReduceOptions::default(), None).unwrap().0)
+}
+
+#[test]
+fn a_form_with_no_resources_is_sized_for_the_image_the_page_lists() {
+    // The form has no resource dictionary, so it draws with the page's. The photo is painted
+    // in a 400 by 300 pt square, about 833 pixels. Leaving that drawing out keeps the stored
+    // 1200. The older form writes a resource dictionary of its own.
+    let widths = widths_when_a_form_draws_the_page_image(None);
+    assert!(
+        widths.len() == 1 && (700..1000).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
+fn a_form_with_an_empty_resource_dictionary_is_not_sized_for_the_page_image() {
+    // An empty dictionary is a resource list of its own, so `/Im1` is not the page's photo
+    // and the photo stays 1200 wide. Treating empty as no entry sizes it for the 400 pt
+    // square, about 833 pixels. The form with no entry at all still does that.
+    let widths = widths_when_a_form_draws_the_page_image(Some(lopdf::Dictionary::new()));
+    assert!(widths.len() == 1 && widths[0] == 1200, "{widths:?}");
+}
+
+#[test]
+fn a_page_whose_resources_are_their_own_object_is_still_sized() {
+    // The page's resource dictionary is an object of its own. The photos are drawn at 200 by
+    // 150 pt, about 417 pixels. Read only as it is written, that dictionary is a reference,
+    // the photos are not found, and they stay 1200 wide. The older drawing writes the
+    // dictionary on the page.
+    let mut pdf = photo_pdf();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let resources = doc
+        .get_dictionary(page)
+        .unwrap()
+        .get(b"Resources")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    let resources = doc.add_object(Object::Dictionary(resources));
+    doc.get_dictionary_mut(page)
+        .unwrap()
+        .set("Resources", Object::Reference(resources));
+    let widths = image_widths(&pdf.reduce(&ReduceOptions::default(), None).unwrap().0);
+    assert!(
+        widths.len() == 1 && (300..600).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
+fn a_form_whose_resources_are_their_own_object_is_sized_for_its_drawing() {
+    // The form's resource dictionary is an object of its own and lists the photo as `/Im`.
+    // The photo is painted in a 100 by 75 pt square and the form's matrix scales that by
+    // four, about 833 pixels. Read only as it is written, that dictionary is a reference,
+    // the form is treated as having no resources, `/Im` is not on the page, and the photo
+    // stays 1200 wide. The older matrix writes the dictionary on the form.
+    let mut pdf = photo_page(b"/F Do", |doc, photo| {
+        let resources = doc.add_object(dictionary! {
+            "XObject" => dictionary! { "Im" => photo },
+        });
+        let form = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                "Matrix" => vec![
+                    4i64.into(),
+                    0.into(),
+                    0.into(),
+                    4i64.into(),
+                    0.into(),
+                    0.into(),
+                ],
+                "Resources" => resources,
+            },
+            b"q 100 0 0 75 0 0 cm /Im Do Q".to_vec(),
+        ));
+        dictionary! { "F" => form }
+    });
+    let widths = image_widths(&pdf.reduce(&ReduceOptions::default(), None).unwrap().0);
+    assert!(
+        widths.len() == 1 && (700..1000).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
 #[test]
 fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
     // A form drawing itself, then the photo 170,000 times, drawn 1,000 times by the page.
