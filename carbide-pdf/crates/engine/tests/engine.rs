@@ -5484,6 +5484,31 @@ fn reduce_shrinks_photos_and_merges_duplicates() {
 }
 
 #[test]
+fn a_string_before_a_drawing_does_not_set_the_photo_size() {
+    // A string in front of the name is another operand, so that `Do` paints nothing. The photo
+    // is drawn after it at 100 by 75 pt and sized for that, about 209 px. Counting the string as
+    // nothing also paints the earlier 200 by 150 pt square, and the photo is sized for that,
+    // about 417 px. Dropping the rest of the stream after the string leaves the stored 1200 px.
+    let mut pdf = photo_pdf();
+    let page = pdf.page_ids()[0];
+    let content = pdf.document_mut().add_object(Stream::new(
+        lopdf::Dictionary::new(),
+        b"q 200 0 0 150 0 0 cm (note) /Im1 Do Q q 100 0 0 75 0 0 cm /Im1 Do Q".to_vec(),
+    ));
+    pdf.document_mut()
+        .get_dictionary_mut(page)
+        .unwrap()
+        .set("Contents", content);
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (150..300).contains(&widths[0]),
+        "the photo should be sized for 100 pt, got {widths:?}"
+    );
+}
+
+#[test]
 fn forms_drawn_over_and_over_are_worked_out_once() {
     // A photo drawn through a form whose matrix halves it, and that form drawn once as it is and
     // once twice as large: the photo is drawn at 200 x 150 pt at most, and sized for that.
