@@ -1139,6 +1139,112 @@ fn a_check_box_whose_state_is_a_reference_to_a_name_counts_as_cleared() {
     assert_eq!(report.count(HiddenItem::FormData), 1);
 }
 
+#[test]
+fn clearing_a_value_stored_on_its_own_marks_the_forms_own_dictionary() {
+    use carbide_engine::HiddenItem;
+    // The form dictionary is an object of its own, and so is the text the field holds.
+    // The older checks write the form dictionary on the catalog. Their values sit in the
+    // field, or the field only shows a state. Leaving this form dictionary as it was read
+    // keeps the typed text out of the file and still passes those checks, and the viewer
+    // is never told to draw the field again.
+    let form_of = |pdf: &Pdf| {
+        let doc = pdf.document();
+        match doc.catalog().unwrap().get(b"AcroForm").unwrap() {
+            Object::Reference(id) => doc.get_dictionary(*id).unwrap().clone(),
+            Object::Dictionary(dict) => dict.clone(),
+            other => panic!("AcroForm is {other:?}"),
+        }
+    };
+    let field_id = std::cell::Cell::new((0, 0));
+    let mut pdf = one_page(|doc, catalog, page| {
+        let value = doc.add_object(Object::string_literal("SECRET-INDIRECT-VALUE"));
+        let field = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx",
+            "T" => Object::string_literal("name"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page,
+            "V" => value,
+        });
+        field_id.set(field);
+        let form = doc.add_object(dictionary! {
+            "Fields" => vec![field.into()],
+            "DA" => Object::string_literal("KEEP-DEFAULT-APPEARANCE"),
+        });
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![field.into()]);
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("AcroForm", form);
+    });
+    assert!(
+        matches!(
+            pdf.document().catalog().unwrap().get(b"AcroForm"),
+            Ok(Object::Reference(_))
+        ),
+        "the form dictionary was written into the catalog"
+    );
+    assert!(contains(&pdf.to_bytes().unwrap(), b"SECRET-INDIRECT-VALUE"));
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 1);
+    assert!(
+        pdf.document()
+            .get_dictionary(field_id.get())
+            .unwrap()
+            .get(b"V")
+            .is_err(),
+        "the field still holds its value"
+    );
+    let form = form_of(&pdf);
+    assert!(
+        matches!(form.get(b"NeedAppearances"), Ok(Object::Boolean(true))),
+        "the form was not marked to draw its fields again"
+    );
+    assert!(
+        form.get(b"DA")
+            .and_then(Object::as_str)
+            .is_ok_and(|text| text == b"KEEP-DEFAULT-APPEARANCE"),
+        "the form lost its default appearance"
+    );
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        !contains(&saved, b"SECRET-INDIRECT-VALUE"),
+        "the field value is still in the file"
+    );
+    assert!(
+        contains(&saved, b"KEEP-DEFAULT-APPEARANCE"),
+        "the default appearance is no longer in the file"
+    );
+
+    // Nothing was filled in, so the form is not marked. Setting the mark whenever a form
+    // dictionary is visited would still clear the value above.
+    let mut pdf = one_page(|doc, catalog, page| {
+        let field = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx",
+            "T" => Object::string_literal("empty"),
+            "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()], "P" => page,
+        });
+        let form = doc.add_object(dictionary! {
+            "Fields" => vec![field.into()],
+        });
+        doc.get_dictionary_mut(page)
+            .unwrap()
+            .set("Annots", vec![field.into()]);
+        doc.get_dictionary_mut(catalog)
+            .unwrap()
+            .set("AcroForm", form);
+    });
+    let report = pdf
+        .remove_hidden_information(&[HiddenItem::FormData])
+        .unwrap();
+    assert_eq!(report.count(HiddenItem::FormData), 0);
+    assert!(
+        form_of(&pdf).get(b"NeedAppearances").is_err(),
+        "an empty field was marked to be drawn again"
+    );
+}
+
 // ---- changes to annotations ----------------------------------------------------------------
 
 #[test]
