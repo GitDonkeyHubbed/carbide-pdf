@@ -645,4 +645,106 @@ mod tests {
             b"Page"
         );
     }
+
+    #[test]
+    fn a_duplicated_page_copies_a_small_nested_value_and_shares_a_larger_one() {
+        // The array is one value and the dictionary inside it is another, before the numbers in
+        // that dictionary. Fourteen numbers make sixteen, so the second listing gets its own copy
+        // and the first still names the original object. One more number is seventeen, so both
+        // listings keep the reference. Looking only at the array's length copies both, because
+        // each array holds one value. Treating any nested dictionary as too large to copy shares
+        // the smaller one. A flat array of numbers never enters a dictionary.
+        let nested = |count: i64| {
+            let mut dict = Dictionary::new();
+            for n in 0..count {
+                dict.set(format!("N{n}"), n);
+            }
+            Object::Array(vec![Object::Dictionary(dict)])
+        };
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                    "Count" => 2,
+                }),
+            ),
+            (
+                2,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => (1, 0),
+                    "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                    "Small" => Object::Reference((3, 0)),
+                    "Large" => Object::Reference((4, 0)),
+                }),
+            ),
+            (3, nested(14)),
+            (4, nested(15)),
+        ]);
+        repair(&mut doc).unwrap();
+        let kids = doc
+            .get_dictionary((1, 0))
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+        let first = kids[0].as_reference().unwrap();
+        let second = kids[1].as_reference().unwrap();
+        assert_eq!(first, (2, 0), "the first listing is the original page");
+        assert_ne!(second, first, "the second listing is a page of its own");
+        let entry = |page: ObjectId, key: &[u8]| {
+            doc.get_dictionary(page).unwrap().get(key).unwrap().clone()
+        };
+        let numbers = |object: &Object, count: usize, last: &[u8], value: i64| {
+            let Object::Array(items) = object else {
+                panic!("the nested value is an array, got {object:?}");
+            };
+            assert_eq!(items.len(), 1, "the array still holds one dictionary");
+            let Object::Dictionary(dict) = &items[0] else {
+                panic!(
+                    "the dictionary inside the array was not kept, got {:?}",
+                    items[0]
+                );
+            };
+            assert_eq!(dict.len(), count, "every number in the dictionary was kept");
+            assert_eq!(dict.get(last).unwrap(), &Object::Integer(value));
+        };
+        let Object::Array(copied) = entry(second, b"Small") else {
+            panic!(
+                "an array of a dictionary of 14 numbers is copied onto the second listing, got {:?}",
+                entry(second, b"Small")
+            );
+        };
+        assert_eq!(copied.len(), 1);
+        let Object::Dictionary(copied_dict) = &copied[0] else {
+            panic!(
+                "the copied array holds the dictionary itself, got {:?}",
+                copied[0]
+            );
+        };
+        assert_eq!(copied_dict.len(), 14, "all 14 numbers were copied");
+        assert_eq!(copied_dict.get(b"N0").unwrap(), &Object::Integer(0));
+        assert_eq!(copied_dict.get(b"N13").unwrap(), &Object::Integer(13));
+        assert_eq!(
+            entry(first, b"Small"),
+            Object::Reference((3, 0)),
+            "the first listing still names the original array"
+        );
+        numbers(doc.get_object((3, 0)).unwrap(), 14, b"N13", 13);
+        assert_eq!(
+            entry(first, b"Large"),
+            Object::Reference((4, 0)),
+            "an array of a dictionary of 15 numbers stays a reference"
+        );
+        assert_eq!(
+            entry(second, b"Large"),
+            Object::Reference((4, 0)),
+            "both listings name the same large array"
+        );
+        numbers(doc.get_object((4, 0)).unwrap(), 15, b"N14", 14);
+    }
 }
