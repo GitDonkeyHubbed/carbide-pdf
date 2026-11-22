@@ -5484,6 +5484,60 @@ fn reduce_shrinks_photos_and_merges_duplicates() {
 }
 
 #[test]
+fn a_number_sign_in_a_name_is_read_once() {
+    // `#23` is `#`, so `/Im#234A` is the name `Im#4A`. The photo is drawn at 400 by 300 pt
+    // under that spelling and sized for it, about 833 px. Reading the escape again turns the
+    // `#4A` still in the name into `J`, so it looks up `ImJ` and the photo is not drawn.
+    // Leaving `#23` as written looks up `Im#234A`, which is not the name either, and the
+    // photo stays 1200 px. `#4A` and `#6b` leave no `#`, so that drawing still matches.
+    let mut pdf = photo_pdf();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let photo = doc
+        .get_dictionary(page)
+        .unwrap()
+        .get(b"Resources")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"XObject")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"Im1")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let mut xobjects = doc
+        .get_dictionary(page)
+        .unwrap()
+        .get(b"Resources")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"XObject")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    xobjects.set("Im#4A", photo);
+    let content = doc.add_object(Stream::new(
+        lopdf::Dictionary::new(),
+        b"q 400 0 0 300 0 0 cm /Im#234A Do Q".to_vec(),
+    ));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", dictionary! { "XObject" => xobjects });
+    page.set("Contents", content);
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (700..1000).contains(&widths[0]),
+        "the photo should be sized for 400 pt, got {widths:?}"
+    );
+}
+
+#[test]
 fn forms_drawn_over_and_over_are_worked_out_once() {
     // A photo drawn through a form whose matrix halves it, and that form drawn once as it is and
     // once twice as large: the photo is drawn at 200 x 150 pt at most, and sized for that.
