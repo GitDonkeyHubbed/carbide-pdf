@@ -645,4 +645,167 @@ mod tests {
             b"Page"
         );
     }
+
+    #[test]
+    fn a_duplicated_page_keeps_its_own_attributes_and_counts_only_what_it_inherits() {
+        // The page is listed twice. It already sets Rotate and Resources. Its /Parent names a
+        // node that sets Rotate and MediaBox, and that node's /Parent sets all four, with a
+        // different MediaBox. The repair copies the two attributes the page does not set:
+        // MediaBox from the nearer node, CropBox from the one beyond it. Rotate stays 0 and
+        // Resources stays the page's own dictionary, shared by both listings because it holds
+        // sixteen numbers. The ancestor's resources stay on that node. Those two copies count,
+        // and so do the page and every key on it. 999_991 extra keys are exactly 1_000_000
+        // values and are kept; one more key is refused. Charging for an attribute the page
+        // already has refuses the exact page. Stopping at the nearer node leaves CropBox off
+        // the page and lets the extra key through. Letting the further node win replaces
+        // MediaBox with the smaller box. A page that sets none of the four, or whose parent
+        // is already the node that lists it, does not take this path.
+        fn box_of(width: i64, height: i64) -> Object {
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(width),
+                Object::Integer(height),
+            ])
+        }
+
+        fn resources(marker: i64, prefix: &str) -> Dictionary {
+            let mut resources = Dictionary::new();
+            resources.set("M", Object::Integer(marker));
+            for n in 0..15 {
+                resources.set(format!("{prefix}{n}"), Object::Integer(n));
+            }
+            resources
+        }
+
+        fn duplicated(extra: usize) -> Document {
+            let mut page = Dictionary::new();
+            page.set("Type", Object::Name(b"Page".to_vec()));
+            page.set("Parent", Object::Reference((3, 0)));
+            page.set("Rotate", Object::Integer(0));
+            page.set("Resources", Object::Dictionary(resources(1, "R")));
+            for n in 0..extra {
+                page.set(format!("K{n}"), Object::Integer(1));
+            }
+            document(vec![
+                (
+                    1,
+                    Object::Dictionary(dictionary! {
+                        "Type" => "Pages",
+                        "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                        "Count" => 2,
+                    }),
+                ),
+                (2, Object::Dictionary(page)),
+                (
+                    3,
+                    Object::Dictionary(dictionary! {
+                        "Type" => "Pages",
+                        "Parent" => (4, 0),
+                        "Rotate" => 180,
+                        "MediaBox" => box_of(100, 100),
+                    }),
+                ),
+                (
+                    4,
+                    Object::Dictionary(dictionary! {
+                        "Type" => "Pages",
+                        "Resources" => resources(2, "G"),
+                        "MediaBox" => box_of(9, 9),
+                        "CropBox" => box_of(50, 50),
+                        "Rotate" => 90,
+                    }),
+                ),
+            ])
+        }
+
+        let mut allowed = duplicated(999_991);
+        assert_eq!(
+            allowed.get_dictionary((2, 0)).unwrap().len(),
+            999_995,
+            "the fixture holds Type, Parent, Rotate, Resources, and 999_991 keys"
+        );
+        repair(&mut allowed).unwrap();
+        let kids = allowed
+            .get_dictionary((1, 0))
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+        let first = kids[0].as_reference().unwrap();
+        let second = kids[1].as_reference().unwrap();
+        assert_eq!(first, (2, 0), "the first listing is the original page");
+        assert_ne!(second, first, "the second listing is a page of its own");
+        for id in [first, second] {
+            let page = allowed.get_dictionary(id).unwrap();
+            assert_eq!(
+                page.len(),
+                999_997,
+                "MediaBox and CropBox are copied, and Rotate and Resources stay"
+            );
+            assert_eq!(page.get(b"Rotate").unwrap(), &Object::Integer(0));
+            assert_eq!(page.get(b"MediaBox").unwrap(), &box_of(100, 100));
+            assert_eq!(page.get(b"CropBox").unwrap(), &box_of(50, 50));
+        }
+        let shared = allowed
+            .get_dictionary(first)
+            .unwrap()
+            .get(b"Resources")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        assert_eq!(
+            allowed
+                .get_dictionary(second)
+                .unwrap()
+                .get(b"Resources")
+                .unwrap(),
+            &Object::Reference(shared)
+        );
+        let shared = allowed.get_dictionary(shared).unwrap();
+        assert_eq!(shared.len(), 16);
+        assert_eq!(shared.get(b"M").unwrap(), &Object::Integer(1));
+        match allowed
+            .get_dictionary((4, 0))
+            .unwrap()
+            .get(b"Resources")
+            .unwrap()
+        {
+            Object::Dictionary(dict) => {
+                assert_eq!(dict.get(b"M").unwrap(), &Object::Integer(2));
+            }
+            other => panic!("the ancestor resources were moved: {other:?}"),
+        }
+        assert_eq!(
+            allowed
+                .get_dictionary((3, 0))
+                .unwrap()
+                .get(b"Rotate")
+                .unwrap(),
+            &Object::Integer(180)
+        );
+        assert_eq!(
+            allowed
+                .get_dictionary((3, 0))
+                .unwrap()
+                .get(b"MediaBox")
+                .unwrap(),
+            &box_of(100, 100),
+            "a small inherited value stays on the node it was copied from"
+        );
+        drop(allowed);
+
+        let mut refused = duplicated(999_992);
+        assert_eq!(
+            refused.get_dictionary((2, 0)).unwrap().len(),
+            999_996,
+            "the fixture holds Type, Parent, Rotate, Resources, and 999_992 keys"
+        );
+        assert_eq!(
+            repair(&mut refused).unwrap_err().to_string(),
+            messages::TOO_MANY_COPIES
+        );
+    }
 }
