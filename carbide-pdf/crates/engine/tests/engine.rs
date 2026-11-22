@@ -1866,6 +1866,197 @@ fn deleting_a_page_takes_its_fields_tags_and_drawings_along() {
 }
 
 #[test]
+fn deleting_a_page_drops_a_tag_from_an_array_stored_on_its_own() {
+    // The element that holds the two tags stores its children in an array of its own. One tag
+    // is on the page that stays and one is on the page that is deleted. The older tag checks
+    // write that list directly into the element, or name a single child, so leaving the array
+    // object unread keeps them green and leaves this deleted page's text in the file.
+    let mut pdf = text_pdf(&[&["KEEP"], &["GONE"]]);
+    let pages = pdf.page_ids();
+    let (element, kids, keep, gone) = {
+        let doc = pdf.document_mut();
+        let keep = doc.add_object(dictionary! {
+            "Type" => "StructElem",
+            "S" => "P",
+            "Pg" => pages[0],
+            "ActualText" => Object::string_literal("SECRET-KEEP-TAG"),
+        });
+        let gone = doc.add_object(dictionary! {
+            "Type" => "StructElem",
+            "S" => "P",
+            "Pg" => pages[1],
+            "ActualText" => Object::string_literal("SECRET-GONE-TAG"),
+        });
+        let kids = doc.add_object(Object::Array(vec![keep.into(), gone.into()]));
+        let element = doc.add_object(dictionary! {
+            "Type" => "StructElem",
+            "S" => "Document",
+            "K" => kids,
+        });
+        let root = doc.add_object(dictionary! {
+            "Type" => "StructTreeRoot",
+            "K" => element,
+        });
+        doc.catalog_mut().unwrap().set("StructTreeRoot", root);
+        (element, kids, keep, gone)
+    };
+    {
+        let doc = pdf.document();
+        let listed = doc
+            .get_dictionary(element)
+            .unwrap()
+            .get(b"K")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        assert_eq!(listed, kids, "the child list was written into the element");
+        assert_eq!(doc.get_object(kids).unwrap().as_array().unwrap().len(), 2);
+        assert_eq!(
+            doc.get_dictionary(gone)
+                .unwrap()
+                .get(b"Pg")
+                .unwrap()
+                .as_reference()
+                .unwrap(),
+            pages[1]
+        );
+    }
+
+    pdf.delete_pages(&[1]).unwrap();
+    assert_eq!(pdf.page_count(), 1);
+    {
+        let doc = pdf.document();
+        let k = doc.get_dictionary(element).unwrap().get(b"K").unwrap();
+        let items: &[Object] = match k {
+            Object::Array(items) => items,
+            Object::Reference(id) => doc.get_object(*id).unwrap().as_array().unwrap(),
+            other => panic!("child list became {other:?}"),
+        };
+        assert_eq!(
+            items,
+            &[Object::Reference(keep)],
+            "the tag on the deleted page is still listed, or the one that stays was dropped"
+        );
+    }
+    let saved = pdf.to_bytes().unwrap();
+    assert_gone(&saved, "SECRET-GONE-TAG");
+    assert!(
+        contains(&saved, b"SECRET-KEEP-TAG"),
+        "the tag on the page that stays was dropped"
+    );
+}
+
+#[test]
+fn deleting_a_page_drops_a_note_kept_by_a_tag_on_a_page_that_stays() {
+    // The tag sits on the page that stays. It points at two notes: one on that page, and one
+    // that exists only on the page that is deleted. Neither note is a field. The older tag
+    // checks remove an element whose own page is deleted, so a tag that names the page that
+    // stays still passes them while the deleted note's text remains.
+    let mut pdf = text_pdf(&[&["KEEP"], &["GONE"]]);
+    let pages = pdf.page_ids();
+    let (parent, stay, gone_note) = {
+        let doc = pdf.document_mut();
+        let rect = || vec![10.into(), 10.into(), 40.into(), 40.into()];
+        let note_stay = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Text",
+            "Rect" => rect(),
+            "Contents" => Object::string_literal("STAY-NOTE"),
+            "P" => pages[0],
+        });
+        let note_gone = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Text",
+            "Rect" => rect(),
+            "Contents" => Object::string_literal("SECRET-OBJR-NOTE"),
+            "P" => pages[1],
+        });
+        let objr_stay = doc.add_object(dictionary! {
+            "Type" => "OBJR",
+            "Obj" => note_stay,
+            "ActualText" => Object::string_literal("STAY-OBJR-TAG"),
+        });
+        let objr_gone = doc.add_object(dictionary! {
+            "Type" => "OBJR",
+            "Obj" => note_gone,
+        });
+        let parent = doc.add_object(dictionary! {
+            "Type" => "StructElem",
+            "S" => "P",
+            "Pg" => pages[0],
+            "K" => vec![objr_stay.into(), objr_gone.into()],
+        });
+        let root = doc.add_object(dictionary! {
+            "Type" => "StructTreeRoot",
+            "K" => parent,
+        });
+        doc.catalog_mut().unwrap().set("StructTreeRoot", root);
+        doc.get_dictionary_mut(pages[0])
+            .unwrap()
+            .set("Annots", vec![Object::Reference(note_stay)]);
+        doc.get_dictionary_mut(pages[1])
+            .unwrap()
+            .set("Annots", vec![Object::Reference(note_gone)]);
+        (parent, objr_stay, note_gone)
+    };
+    {
+        let doc = pdf.document();
+        let parent = doc.get_dictionary(parent).unwrap();
+        assert!(
+            parent.get(b"K").unwrap().as_array().is_ok(),
+            "the tag's children were not written into the tag"
+        );
+        assert_eq!(
+            parent.get(b"Pg").unwrap().as_reference().unwrap(),
+            pages[0],
+            "the tag names the page that is deleted"
+        );
+        assert!(
+            doc.get_dictionary(stay).unwrap().get(b"Pg").is_err(),
+            "the reference to the note names a page of its own"
+        );
+        let on_gone = doc
+            .get_dictionary(pages[1])
+            .unwrap()
+            .get(b"Annots")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_reference().unwrap() == gone_note);
+        assert!(on_gone, "the deleted page does not list the note");
+    }
+
+    pdf.delete_pages(&[1]).unwrap();
+    assert_eq!(pdf.page_count(), 1);
+    {
+        let doc = pdf.document();
+        let kids = doc
+            .get_dictionary(parent)
+            .unwrap()
+            .get(b"K")
+            .unwrap()
+            .as_array()
+            .expect("the tag that stays was removed");
+        assert_eq!(
+            kids,
+            &[Object::Reference(stay)],
+            "the note on the deleted page is still tagged, or the note that stays was dropped"
+        );
+    }
+    let saved = pdf.to_bytes().unwrap();
+    assert_gone(&saved, "SECRET-OBJR-NOTE");
+    assert!(
+        contains(&saved, b"STAY-NOTE"),
+        "the note on the page that stays was dropped"
+    );
+    assert!(
+        contains(&saved, b"STAY-OBJR-TAG"),
+        "the tag for the note that stays was dropped"
+    );
+}
+
+#[test]
 fn redaction_takes_the_page_fields_and_drawings_along() {
     let r = renderer();
     let base = layered_pdf(&["ALPHA", "BRAVO", "CHARLIE"]);
