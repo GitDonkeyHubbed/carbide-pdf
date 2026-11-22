@@ -5739,6 +5739,82 @@ fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
 }
 
 #[test]
+fn an_unmeasured_first_page_does_not_let_a_later_page_shrink_the_photo() {
+    // Nine nested forms on the first page draw the photo at 400 by 300 pt. That chain is past
+    // the depth that is followed, so the drawing's size is unknown. The second page draws the
+    // same photo at 200 by 150 pt, which on its own would leave about 417 pixels. The first
+    // page may still show the photo larger than that, so the later size is not used and the
+    // photo stays 1200 px wide. The chain of seven above is one page, and the four-times
+    // matrix is one form deep: neither depends on a later page being left unmeasured.
+    let mut pdf = photo_page(b"/Outer Do", |doc, photo| {
+        let pages_id = doc
+            .objects
+            .iter()
+            .find_map(|(id, object)| match object {
+                Object::Dictionary(dict)
+                    if dict.get(b"Type").and_then(|o| o.as_name()).ok() == Some(b"Pages") =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .expect("page tree");
+        let mut current = photo;
+        for level in 0..9 {
+            let (resources, body): (lopdf::Dictionary, Vec<u8>) = if level == 0 {
+                (
+                    dictionary! { "XObject" => dictionary! { "Im" => current } },
+                    b"q 400 0 0 300 0 0 cm /Im Do Q".to_vec(),
+                )
+            } else {
+                (
+                    dictionary! { "XObject" => dictionary! { "N" => current } },
+                    b"/N Do".to_vec(),
+                )
+            };
+            current = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                    "Resources" => resources,
+                },
+                body,
+            ));
+        }
+        let content = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            b"q 200 0 0 150 0 0 cm /Im1 Do Q".to_vec(),
+        ));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => content,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => photo } },
+        });
+        let kids = doc
+            .get_dictionary_mut(pages_id)
+            .unwrap()
+            .get_mut(b"Kids")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        kids.push(Object::Reference(page));
+        let count = kids.len() as i64;
+        doc.get_dictionary_mut(pages_id)
+            .unwrap()
+            .set("Count", count);
+        dictionary! { "Outer" => current }
+    });
+    let widths = image_widths(&pdf.reduce(&ReduceOptions::default(), None).unwrap().0);
+    assert!(
+        widths.len() == 1 && widths[0] == 1200,
+        "an unmeasured first page should leave the photo at its stored size, got {widths:?}"
+    );
+}
+
+#[test]
 fn slider_trades_size_for_quality() {
     let mut pdf = photo_pdf();
     let small = pdf
