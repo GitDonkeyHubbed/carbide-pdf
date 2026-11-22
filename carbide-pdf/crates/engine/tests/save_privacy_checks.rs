@@ -357,6 +357,57 @@ fn default_colour_spaces_stay_with_content_that_paints_in_device_colours() {
     );
 }
 
+#[test]
+fn a_selected_colour_space_in_its_own_dictionary_stays() {
+    // The colour-space dictionary is an object of its own. The page that stays
+    // selects /KeptSpace, and the page that is deleted selects /GoneSpace.
+    // Neither stands in for a device colour. The older check writes the three
+    // default spaces in the page's resource dictionary, and that content never
+    // names a space. Keeping only those defaults drops KeptSpace and leaves the
+    // older check green. Keeping this dictionary as it is written leaves
+    // GoneSpace in the file.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let image = secret_image(doc);
+            let profile = |doc: &mut Document, marker: &str| {
+                let stream = doc.add_object(Stream::new(
+                    dictionary! { "N" => 3 },
+                    marker.as_bytes().to_vec(),
+                ));
+                Object::Array(vec![Object::Name(b"ICCBased".to_vec()), stream.into()])
+            };
+            let kept = profile(doc, "KEPT-SPACE-PROFILE");
+            let gone = profile(doc, "GONE-SPACE-PROFILE");
+            let spaces = doc.add_object(dictionary! {
+                "KeptSpace" => kept,
+                "GoneSpace" => gone,
+            });
+            dictionary! {
+                "ColorSpace" => spaces,
+                "XObject" => dictionary! { "Im1" => image },
+            }
+        },
+        &[
+            "/KeptSpace cs 0 0 10 10 re f",
+            "/GoneSpace cs q 100 0 0 100 0 0 cm /Im1 Do Q",
+        ],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&saved, b"KEPT-SPACE-PROFILE"),
+        "the kept page lost the colour space it selects"
+    );
+    assert!(
+        !contains(&saved, b"GONE-SPACE-PROFILE"),
+        "a colour space only the deleted page selects was kept"
+    );
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+}
+
 /// The allocator, noting the largest block each thread asks for.
 struct Largest;
 
