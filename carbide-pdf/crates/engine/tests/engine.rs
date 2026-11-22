@@ -5739,6 +5739,56 @@ fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
 }
 
 #[test]
+fn a_form_eight_deep_is_sized_and_nine_deep_keeps_the_stored_photo() {
+    // The page draws the photo in a 100 by 75 pt square, and again at 400 by 300 pt through a
+    // chain of forms. Eight forms are still followed, so the photo is sized for the larger
+    // drawing. One more form is past the limit: how large it is drawn is no longer known, and
+    // the small drawing on the page must not be used on its own. The chain of seven above only
+    // checks that a 600 pt drawing is not made smaller than the stored photo, which is true
+    // whether or not that drawing was found.
+    fn widths(levels: usize) -> Vec<i64> {
+        let mut pdf = photo_page(b"q 100 0 0 75 0 0 cm /Im1 Do Q /Outer Do", |doc, photo| {
+            let mut current = photo;
+            for level in 0..levels {
+                let (resources, body): (lopdf::Dictionary, Vec<u8>) = if level == 0 {
+                    (
+                        dictionary! { "XObject" => dictionary! { "Im" => current } },
+                        b"q 400 0 0 300 0 0 cm /Im Do Q".to_vec(),
+                    )
+                } else {
+                    (
+                        dictionary! { "XObject" => dictionary! { "N" => current } },
+                        b"/N Do".to_vec(),
+                    )
+                };
+                current = doc.add_object(Stream::new(
+                    dictionary! {
+                        "Type" => "XObject",
+                        "Subtype" => "Form",
+                        "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                        "Resources" => resources,
+                    },
+                    body,
+                ));
+            }
+            dictionary! { "Outer" => current }
+        });
+        image_widths(&pdf.reduce(&ReduceOptions::default(), None).unwrap().0)
+    }
+
+    let followed = widths(8);
+    assert!(
+        followed.len() == 1 && (700..1000).contains(&followed[0]),
+        "eight forms should size the photo for 400 pt, got {followed:?}"
+    );
+    let refused = widths(9);
+    assert!(
+        refused.len() == 1 && refused[0] == 1200,
+        "nine forms should leave the photo at its stored size, got {refused:?}"
+    );
+}
+
+#[test]
 fn slider_trades_size_for_quality() {
     let mut pdf = photo_pdf();
     let small = pdf
