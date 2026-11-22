@@ -645,4 +645,94 @@ mod tests {
             b"Page"
         );
     }
+
+    #[test]
+    fn a_duplicated_page_copies_a_small_dictionary_and_shares_a_large_one_or_a_stream() {
+        // A dictionary of 15 numbers is 16 values once the dictionary itself is counted, so each
+        // listing keeps its own. One more number is shared: both listings name one object.
+        // Counting the dictionary and not the numbers inside it copies that larger one. The older
+        // check shares an array of 50,000 numbers, which is large either way.
+        // A stream is never a small value, even when it holds nothing. Both listings name the same
+        // one. Treating a stream as a number copies it onto the second listing.
+        let mut few = Dictionary::new();
+        for n in 0..15 {
+            few.set(format!("N{n}"), i64::from(n));
+        }
+        let mut many = Dictionary::new();
+        for n in 0..16 {
+            many.set(format!("N{n}"), i64::from(n));
+        }
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                    "Count" => 2,
+                }),
+            ),
+            (
+                2,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => (1, 0),
+                    "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                    "Few" => Object::Dictionary(few),
+                    "Many" => Object::Dictionary(many),
+                    "Draw" => Object::Stream(lopdf::Stream::new(Dictionary::new(), b"q Q".to_vec())),
+                }),
+            ),
+        ]);
+        repair(&mut doc).unwrap();
+        let kids = doc
+            .get_dictionary((1, 0))
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+        let first = kids[0].as_reference().unwrap();
+        let second = kids[1].as_reference().unwrap();
+        assert_ne!(first, second, "the second listing is a page of its own");
+        let entry = |page: ObjectId, key: &[u8]| {
+            doc.get_dictionary(page).unwrap().get(key).unwrap().clone()
+        };
+        let few_first = entry(first, b"Few");
+        assert!(
+            matches!(few_first, Object::Dictionary(ref dict) if dict.len() == 15),
+            "a dictionary of 15 numbers stays on the page, got {few_first:?}"
+        );
+        assert_eq!(
+            entry(second, b"Few"),
+            few_first,
+            "the second listing has its own copy of those numbers"
+        );
+        let many_first = entry(first, b"Many");
+        let Object::Reference(shared) = many_first else {
+            panic!("a dictionary of 16 numbers is shared, got {many_first:?}");
+        };
+        assert_eq!(
+            entry(second, b"Many"),
+            Object::Reference(shared),
+            "both listings name the same dictionary"
+        );
+        match doc.get_object(shared).unwrap() {
+            Object::Dictionary(dict) => assert_eq!(dict.len(), 16, "all 16 numbers were kept"),
+            other => panic!("the shared object is the dictionary, got {other:?}"),
+        }
+        let draw_first = entry(first, b"Draw");
+        let Object::Reference(stream_id) = draw_first else {
+            panic!("an empty stream is shared, not copied, got {draw_first:?}");
+        };
+        assert_eq!(
+            entry(second, b"Draw"),
+            Object::Reference(stream_id),
+            "both listings name the same stream"
+        );
+        match doc.get_object(stream_id).unwrap() {
+            Object::Stream(stream) => assert_eq!(stream.content, b"q Q"),
+            other => panic!("the shared object is the stream, got {other:?}"),
+        }
+    }
 }
