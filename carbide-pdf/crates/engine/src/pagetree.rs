@@ -440,6 +440,8 @@ fn plain_boxes(doc: &mut Document, id: ObjectId) -> Result<()> {
 mod tests {
     use super::*;
 
+    use lopdf::{Stream, StringFormat};
+
     /// A catalog whose page tree root is `root`, holding `objects`.
     fn document(objects: Vec<(u32, Object)>) -> Document {
         let mut doc = Document::with_version("1.7");
@@ -644,5 +646,229 @@ mod tests {
             doc.get_dictionary((1, 0)).unwrap().get_type().unwrap(),
             b"Page"
         );
+    }
+
+    #[test]
+    fn a_duplicated_page_copies_a_short_nested_string_and_shares_a_longer_one_or_a_stream() {
+        // The dictionary is one value and the string or name inside it is another. Fourteen
+        // numbers make sixteen, so a 256-byte string is copied onto the second listing. Fifteen
+        // numbers make seventeen, so that dictionary stays one object. A 257-byte string or name
+        // is too long to copy even when the dictionary is otherwise small. A stream inside a
+        // dictionary is never copied. Checking length only on the page's own value copies the
+        // longer string and name. Treating a stream as a number copies the stream.
+        let text = |numbers: usize, len: usize| {
+            let mut dict = Dictionary::new();
+            dict.set("S", Object::String(vec![b'a'; len], StringFormat::Literal));
+            for n in 0..numbers {
+                dict.set(format!("N{n:02}"), n as i64);
+            }
+            Object::Dictionary(dict)
+        };
+        let name = |len: usize| {
+            let mut dict = Dictionary::new();
+            dict.set("N", Object::Name(vec![b'b'; len]));
+            Object::Dictionary(dict)
+        };
+        let mut ink = Dictionary::new();
+        ink.set(
+            "S",
+            Object::Stream(Stream::new(Dictionary::new(), b"q Q".to_vec())),
+        );
+        let mut page = dictionary! {
+            "Type" => "Page",
+            "Parent" => (1, 0),
+            "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        };
+        page.set("Short", text(14, 256));
+        page.set("Wide", text(15, 256));
+        page.set("Long", text(14, 257));
+        page.set("ShortName", name(256));
+        page.set("LongName", name(257));
+        page.set("Ink", Object::Dictionary(ink));
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                    "Count" => 2,
+                }),
+            ),
+            (2, Object::Dictionary(page)),
+        ]);
+        repair(&mut doc).unwrap();
+        let kids = doc
+            .get_dictionary((1, 0))
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+        let first = kids[0].as_reference().unwrap();
+        let second = kids[1].as_reference().unwrap();
+        assert_eq!(first, (2, 0), "the first listing is the original page");
+        assert_ne!(second, first, "the second listing is a page of its own");
+        let entry = |page_id: ObjectId, key: &[u8]| {
+            doc.get_dictionary(page_id)
+                .unwrap()
+                .get(key)
+                .unwrap()
+                .clone()
+        };
+        let expect_text = |object: &Object, numbers: usize, len: usize| {
+            let Object::Dictionary(dict) = object else {
+                panic!("the string's dictionary stayed a dictionary, got {object:?}");
+            };
+            assert_eq!(
+                dict.len(),
+                numbers + 1,
+                "the numbers stayed beside the string"
+            );
+            match dict.get(b"S").unwrap() {
+                Object::String(bytes, _) => {
+                    assert_eq!(bytes.len(), len, "the string is {len} bytes");
+                    assert!(
+                        bytes.iter().all(|byte| *byte == b'a'),
+                        "the string bytes were kept"
+                    );
+                }
+                other => panic!("the string stayed inside the dictionary, got {other:?}"),
+            }
+            for n in 0..numbers {
+                assert_eq!(
+                    dict.get(format!("N{n:02}").as_bytes()).unwrap(),
+                    &Object::Integer(n as i64),
+                    "number {n}"
+                );
+            }
+        };
+        let expect_name = |object: &Object, len: usize| {
+            let Object::Dictionary(dict) = object else {
+                panic!("the name's dictionary stayed a dictionary, got {object:?}");
+            };
+            assert_eq!(dict.len(), 1, "the name's dictionary has one entry");
+            match dict.get(b"N").unwrap() {
+                Object::Name(bytes) => {
+                    assert_eq!(bytes.len(), len, "the name is {len} bytes");
+                    assert!(
+                        bytes.iter().all(|byte| *byte == b'b'),
+                        "the name bytes were kept"
+                    );
+                }
+                other => panic!("the name stayed inside the dictionary, got {other:?}"),
+            }
+        };
+        let short_first = entry(first, b"Short");
+        let short_second = entry(second, b"Short");
+        expect_text(&short_first, 14, 256);
+        expect_text(&short_second, 14, 256);
+        expect_name(&entry(first, b"ShortName"), 256);
+        expect_name(&entry(second, b"ShortName"), 256);
+        let shared = |key: &[u8], label: &str| {
+            let value = entry(first, key);
+            assert_eq!(
+                value,
+                entry(second, key),
+                "both listings name the same {label}"
+            );
+            let Object::Reference(id) = value else {
+                panic!("a {label} stays a reference, got {value:?}");
+            };
+            id
+        };
+        expect_text(
+            doc.get_object(shared(b"Wide", "dictionary of 15 numbers"))
+                .unwrap(),
+            15,
+            256,
+        );
+        expect_text(
+            doc.get_object(shared(b"Long", "dictionary holding a 257-byte string"))
+                .unwrap(),
+            14,
+            257,
+        );
+        expect_name(
+            doc.get_object(shared(b"LongName", "dictionary holding a 257-byte name"))
+                .unwrap(),
+            257,
+        );
+        let ink_id = shared(b"Ink", "dictionary holding a stream");
+        {
+            let Object::Dictionary(ink) = doc.get_object(ink_id).unwrap() else {
+                panic!("the shared stream stayed inside a dictionary");
+            };
+            let Object::Stream(stream) = ink.get(b"S").unwrap() else {
+                panic!("the stream stayed a stream, got {:?}", ink.get(b"S"));
+            };
+            assert_eq!(stream.content, b"q Q", "the stream bytes were kept");
+        }
+        // References are not followed, so a copied value is counted on each page and a shared
+        // value is counted once, on the object both listings name.
+        let contains_text = |object: &Object, len: usize| {
+            let Object::Dictionary(dict) = object else {
+                return false;
+            };
+            dict.iter().any(|(_, value)| {
+                match value {
+                Object::String(bytes, _) => bytes.len() == len,
+                Object::Dictionary(inner) => inner.iter().any(|(_, inner_value)| {
+                    matches!(inner_value, Object::String(bytes, _) if bytes.len() == len)
+                }),
+                _ => false,
+            }
+            })
+        };
+        let contains_name = |object: &Object, len: usize| {
+            let Object::Dictionary(dict) = object else {
+                return false;
+            };
+            dict.iter().any(|(_, value)| {
+                match value {
+                Object::Name(bytes) => bytes.len() == len,
+                Object::Dictionary(inner) => inner.iter().any(|(_, inner_value)| {
+                    matches!(inner_value, Object::Name(bytes) if bytes.len() == len)
+                }),
+                _ => false,
+            }
+            })
+        };
+        let contains_stream = |object: &Object| {
+            let Object::Dictionary(dict) = object else {
+                return false;
+            };
+            dict.iter().any(|(_, value)| match value {
+                Object::Stream(_) => true,
+                Object::Dictionary(inner) => inner
+                    .iter()
+                    .any(|(_, inner_value)| matches!(inner_value, Object::Stream(_))),
+                _ => false,
+            })
+        };
+        let count = |keep: &dyn Fn(&Object) -> bool| {
+            doc.objects.values().filter(|object| keep(object)).count()
+        };
+        assert_eq!(
+            count(&|object| contains_text(object, 256)),
+            3,
+            "the 256-byte string was copied onto both pages and the wider dictionary was not"
+        );
+        assert_eq!(
+            count(&|object| contains_text(object, 257)),
+            1,
+            "the 257-byte string was not copied"
+        );
+        assert_eq!(
+            count(&|object| contains_name(object, 256)),
+            2,
+            "the 256-byte name was copied onto both pages"
+        );
+        assert_eq!(
+            count(&|object| contains_name(object, 257)),
+            1,
+            "the 257-byte name was not copied"
+        );
+        assert_eq!(count(&contains_stream), 1, "the stream was not copied");
     }
 }
