@@ -564,6 +564,63 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_named_aside_and_a_box_that_is_not_a_number_are_rewritten() {
+        // /Rotate names a real of 90.5 kept in its own object. Reading that entry without
+        // following the name stores 0. A real of 90.5 written on the page is already rewritten
+        // by the direct rotation check, and a plain quarter turn is left as it is.
+        // The media box holds a NaN and a negative infinity beside the letter size. Leaving a
+        // non-finite number in place, turning NaN into a million, or dropping the sign of
+        // infinity, stores something other than 0 and -1_000_000. A coordinate of a million
+        // written as an integer, and a crop copied from an old parent, are different checks.
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(
+                    dictionary! { "Type" => "Pages", "Kids" => vec![(2, 0).into()], "Count" => 1 },
+                ),
+            ),
+            (
+                2,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => (1, 0),
+                    "Rotate" => Object::Reference((6, 0)),
+                    "MediaBox" => vec![
+                        Object::Real(f32::NAN),
+                        Object::Real(f32::NEG_INFINITY),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ],
+                }),
+            ),
+            (6, Object::Real(90.5)),
+        ]);
+        repair(&mut doc).unwrap();
+        let page = doc.get_dictionary((2, 0)).unwrap();
+        assert_eq!(
+            page.get(b"Rotate").unwrap(),
+            &Object::Integer(90),
+            "90.5 degrees is one quarter turn"
+        );
+        let media = page.get(b"MediaBox").unwrap().as_array().unwrap();
+        assert_eq!(
+            media[0],
+            Object::Integer(0),
+            "a NaN coordinate is not a number: {media:?}"
+        );
+        assert_eq!(
+            media[1],
+            Object::Real(-1_000_000.0),
+            "infinity keeps its sign and stops at the limit: {media:?}"
+        );
+        assert_eq!(
+            (media[2].as_float().unwrap(), media[3].as_float().unwrap()),
+            (612.0, 792.0),
+            "the letter size stays: {media:?}"
+        );
+    }
+
+    #[test]
     fn rotations_are_rewritten_as_the_turn_viewers_read() {
         let turned = |rotate: Object| {
             Object::Dictionary(
