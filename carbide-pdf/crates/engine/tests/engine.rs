@@ -5739,6 +5739,83 @@ fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
 }
 
 #[test]
+fn a_form_without_resources_keeps_each_set_past_another_form_without_resources() {
+    // Two outer forms each supply their own resources. Both draw one middle form, which has no
+    // resources and draws one inner form, which also has none and draws /N. One outer form's /N
+    // paints the photo at 100 by 75 pt. The other's paints it at 400 by 300 pt. The photo is
+    // sized for the larger drawing, about 833 pixels, whichever outer form comes first.
+    //
+    // Remembering the inner form by the middle form that draws it keeps whichever drawing came
+    // first. That middle form is one object, and the resources belong to the outer forms.
+    // Drawn small first, the photo is then about 209 pixels. The chain of seven and the
+    // four-times matrix each name their own resources, so this middle form is not what
+    // separates their drawings.
+    let widths = |small_first: bool| {
+        let content: &[u8] = if small_first {
+            b"/A Do /B Do"
+        } else {
+            b"/B Do /A Do"
+        };
+        let mut pdf = photo_page(content, |doc, photo| {
+            let paint = |doc: &mut Document, body: &[u8]| {
+                doc.add_object(Stream::new(
+                    dictionary! {
+                        "Type" => "XObject",
+                        "Subtype" => "Form",
+                        "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                        "Resources" => dictionary! { "XObject" => dictionary! { "Im" => photo } },
+                    },
+                    body.to_vec(),
+                ))
+            };
+            let small = paint(doc, b"q 100 0 0 75 0 0 cm /Im Do Q");
+            let large = paint(doc, b"q 400 0 0 300 0 0 cm /Im Do Q");
+            let shared = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                },
+                b"/N Do".to_vec(),
+            ));
+            let middle = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                },
+                b"/S Do".to_vec(),
+            ));
+            let outer = |doc: &mut Document, nested: lopdf::ObjectId| {
+                doc.add_object(Stream::new(
+                    dictionary! {
+                        "Type" => "XObject",
+                        "Subtype" => "Form",
+                        "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                        "Resources" => dictionary! {
+                            "XObject" => dictionary! { "M" => middle, "S" => shared, "N" => nested }
+                        },
+                    },
+                    b"/M Do".to_vec(),
+                ))
+            };
+            dictionary! { "A" => outer(doc, small), "B" => outer(doc, large) }
+        });
+        image_widths(&pdf.reduce(&ReduceOptions::default(), None).unwrap().0)
+    };
+    let small_first = widths(true);
+    let large_first = widths(false);
+    assert_eq!(
+        small_first, large_first,
+        "whose resources came first changed the size: {small_first:?} vs {large_first:?}"
+    );
+    assert!(
+        small_first.len() == 1 && (700..1000).contains(&small_first[0]),
+        "the larger drawing should size the photo, got {small_first:?}"
+    );
+}
+
+#[test]
 fn slider_trades_size_for_quality() {
     let mut pdf = photo_pdf();
     let small = pdf
