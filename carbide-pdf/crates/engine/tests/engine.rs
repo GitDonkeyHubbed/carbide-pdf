@@ -5739,6 +5739,89 @@ fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
 }
 
 #[test]
+fn a_measured_later_page_sizes_the_photo_and_an_unmeasured_one_keeps_it() {
+    // The first page draws the photo at 100 by 75 pt. The second draws it at 400 by 300 pt
+    // through a chain of forms. Eight forms are still followed, so the photo is sized for the
+    // larger drawing. Nine forms are past the limit: that drawing's size is unknown, and the
+    // size already found on the first page is not used, because the photo may be drawn larger
+    // on the page that could not be measured. The chain of seven above is one page, and its
+    // 600 pt drawing is not made smaller than the stored photo whether or not it was found.
+    fn widths(levels: usize) -> Vec<i64> {
+        let mut pdf = photo_page(b"q 100 0 0 75 0 0 cm /Im1 Do Q", |doc, photo| {
+            let pages_id = doc
+                .objects
+                .iter()
+                .find_map(|(id, object)| match object {
+                    Object::Dictionary(dict)
+                        if dict.get(b"Type").and_then(|o| o.as_name()).ok() == Some(b"Pages") =>
+                    {
+                        Some(*id)
+                    }
+                    _ => None,
+                })
+                .expect("page tree");
+            let mut current = photo;
+            for level in 0..levels {
+                let (resources, body): (lopdf::Dictionary, Vec<u8>) = if level == 0 {
+                    (
+                        dictionary! { "XObject" => dictionary! { "Im" => current } },
+                        b"q 400 0 0 300 0 0 cm /Im Do Q".to_vec(),
+                    )
+                } else {
+                    (
+                        dictionary! { "XObject" => dictionary! { "N" => current } },
+                        b"/N Do".to_vec(),
+                    )
+                };
+                current = doc.add_object(Stream::new(
+                    dictionary! {
+                        "Type" => "XObject",
+                        "Subtype" => "Form",
+                        "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                        "Resources" => resources,
+                    },
+                    body,
+                ));
+            }
+            let content =
+                doc.add_object(Stream::new(lopdf::Dictionary::new(), b"/Outer Do".to_vec()));
+            let page = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Contents" => content,
+                "Resources" => dictionary! { "XObject" => dictionary! { "Outer" => current } },
+            });
+            let kids = doc
+                .get_dictionary_mut(pages_id)
+                .unwrap()
+                .get_mut(b"Kids")
+                .unwrap()
+                .as_array_mut()
+                .unwrap();
+            kids.push(Object::Reference(page));
+            let count = kids.len() as i64;
+            doc.get_dictionary_mut(pages_id)
+                .unwrap()
+                .set("Count", count);
+            dictionary! {}
+        });
+        image_widths(&pdf.reduce(&ReduceOptions::default(), None).unwrap().0)
+    }
+
+    let followed = widths(8);
+    assert!(
+        followed.len() == 1 && (700..1000).contains(&followed[0]),
+        "eight forms on the later page should size the photo for 400 pt, got {followed:?}"
+    );
+    let refused = widths(9);
+    assert!(
+        refused.len() == 1 && refused[0] == 1200,
+        "nine forms on the later page should leave the photo at its stored size, got {refused:?}"
+    );
+}
+
+#[test]
 fn slider_trades_size_for_quality() {
     let mut pdf = photo_pdf();
     let small = pdf
