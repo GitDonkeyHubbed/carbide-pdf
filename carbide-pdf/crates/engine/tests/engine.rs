@@ -5484,6 +5484,101 @@ fn reduce_shrinks_photos_and_merges_duplicates() {
 }
 
 #[test]
+fn a_soft_mask_and_a_stencil_mask_keep_their_full_size() {
+    // Im1 is drawn at 200 by 150 pt, so reducing the file stores it at about 417 px. Im2 is
+    // Im1's soft mask and Im3 is a stencil mask, and both are drawn at that same size. They
+    // stay 1200 px and are not stored as JPEG, because resampling or JPEG-encoding a mask
+    // changes the transparency edge. The one-pixel image only names Im3 as its stencil: a
+    // /Mask entry on Im1 would stop Im1 from being decoded. Dropping /SMask from the mask
+    // list shrinks only Im2. Dropping /Mask shrinks only Im3. A photo that is not a mask,
+    // including Im1 and the two copies in the test above, still shrinks.
+    let mut pdf = photo_pdf();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let mut xobjects = doc
+        .get_dictionary(page)
+        .unwrap()
+        .get(b"Resources")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"XObject")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    let im1 = xobjects.get(b"Im1").unwrap().as_reference().unwrap();
+    let im2 = xobjects.get(b"Im2").unwrap().as_reference().unwrap();
+    let mut stencil = doc
+        .get_object(im1)
+        .unwrap()
+        .as_stream()
+        .unwrap()
+        .content
+        .clone();
+    stencil[0] ^= 0xff;
+    let im3 = doc.add_object(
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image",
+                "Width" => 1200i64, "Height" => 900i64,
+                "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+            },
+            stencil,
+        )
+        .with_compression(false),
+    );
+    doc.add_object(
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image",
+                "Width" => 1i64, "Height" => 1i64,
+                "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+                "Mask" => im3,
+            },
+            vec![1, 2, 3],
+        )
+        .with_compression(false),
+    );
+    doc.get_object_mut(im1)
+        .unwrap()
+        .as_stream_mut()
+        .unwrap()
+        .dict
+        .set("SMask", im2);
+    xobjects.set("Im3", im3);
+    let content = doc.add_object(Stream::new(
+        lopdf::Dictionary::new(),
+        b"q 200 0 0 150 50 500 cm /Im1 Do Q \
+q 200 0 0 150 300 500 cm /Im2 Do Q \
+q 200 0 0 150 50 200 cm /Im3 Do Q"
+            .to_vec(),
+    ));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", dictionary! { "XObject" => xobjects });
+    page.set("Contents", content);
+
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert_eq!(report.images_downsampled, 1, "{report:?}");
+    let images = image_encodings(&reduced);
+    let full: Vec<_> = images.iter().filter(|image| image.0 == 1200).collect();
+    let small: Vec<_> = images
+        .iter()
+        .filter(|image| (300..600).contains(&image.0))
+        .collect();
+    assert_eq!(
+        (full.len(), small.len()),
+        (2, 1),
+        "the two masks stay 1200 px and the plain photo is reduced, got {images:?}"
+    );
+    assert!(
+        full.iter()
+            .all(|image| image.1.as_deref() != Some(b"DCTDecode".as_ref())),
+        "a mask should stay out of JPEG, got {images:?}"
+    );
+}
+
+#[test]
 fn forms_drawn_over_and_over_are_worked_out_once() {
     // A photo drawn through a form whose matrix halves it, and that form drawn once as it is and
     // once twice as large: the photo is drawn at 200 x 150 pt at most, and sized for that.
@@ -5579,6 +5674,33 @@ fn forms_drawn_over_and_over_are_worked_out_once() {
         widths.len() == 1 && widths[0] < 600 && widths[0] >= 300,
         "{widths:?}"
     );
+}
+
+/// Width and filter of each image in `bytes`. A missing filter is an image left as stored.
+fn image_encodings(bytes: &[u8]) -> Vec<(i64, Option<Vec<u8>>)> {
+    let pdf = Pdf::from_bytes(bytes).unwrap();
+    let mut images: Vec<_> = pdf
+        .document()
+        .objects
+        .values()
+        .filter_map(|o| match o {
+            Object::Stream(s)
+                if s.dict.get(b"Subtype").and_then(|v| v.as_name()).ok() == Some(b"Image") =>
+            {
+                let width = s.dict.get(b"Width").ok()?.as_i64().ok()?;
+                let filter = s
+                    .dict
+                    .get(b"Filter")
+                    .ok()
+                    .and_then(|v| v.as_name().ok())
+                    .map(|name| name.to_vec());
+                Some((width, filter))
+            }
+            _ => None,
+        })
+        .collect();
+    images.sort();
+    images
 }
 
 /// The widths of the images in the file `bytes`.
