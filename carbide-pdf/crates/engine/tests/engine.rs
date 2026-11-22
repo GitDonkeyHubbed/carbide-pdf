@@ -1866,6 +1866,207 @@ fn deleting_a_page_takes_its_fields_tags_and_drawings_along() {
 }
 
 #[test]
+fn deleting_a_page_drops_a_tag_named_in_an_id_tree_and_a_parent_tree_leaf() {
+    // The id tree and the parent tree are objects of their own. The id tree names one tag on the
+    // page that is deleted and one on the page that stays, each name pointing straight at that
+    // tag. The parent tree keeps its numbers on a leaf below it, and that leaf's only number
+    // points at a list of its own: the deleted tag, then the tag that stays. The older tag check
+    // writes its parent numbers on the tree itself, each an array written there, and it has no id
+    // tree. Leaving the id tree unread, not walking into the leaf, or not writing that list back
+    // keeps the older check green while one of these deleted tags stays in the file.
+    let mut pdf = text_pdf(&[&["KEEP"], &["GONE"]]);
+    let pages = pdf.page_ids();
+    let (root, id_tree, parent_tree, parent_leaf, numbers, keep, id_gone, num_gone) = {
+        let doc = pdf.document_mut();
+        let keep = doc.add_object(dictionary! {
+            "Type" => "StructElem",
+            "S" => "P",
+            "Pg" => pages[0],
+            "ActualText" => Object::string_literal("KEEP-STRUCT-TEXT"),
+        });
+        let id_gone = doc.add_object(dictionary! {
+            "Type" => "StructElem",
+            "S" => "P",
+            "Pg" => pages[1],
+            "ActualText" => Object::string_literal("SECRET-IDTREE-TEXT"),
+        });
+        let num_gone = doc.add_object(dictionary! {
+            "Type" => "StructElem",
+            "S" => "P",
+            "Pg" => pages[1],
+            "ActualText" => Object::string_literal("SECRET-NUMTREE-TEXT"),
+        });
+        let id_tree = doc.add_object(dictionary! {
+            "Names" => vec![
+                Object::string_literal("SECRET-ID-NAME"),
+                id_gone.into(),
+                Object::string_literal("keep-id"),
+                keep.into(),
+            ],
+        });
+        // The removed tag is first, so shortening the list would move the tag that stays.
+        let numbers = doc.add_object(Object::Array(vec![num_gone.into(), keep.into()]));
+        let parent_leaf = doc.add_object(dictionary! {
+            "Nums" => vec![0.into(), numbers.into()],
+        });
+        let parent_tree = doc.add_object(dictionary! {
+            "Kids" => vec![parent_leaf.into()],
+        });
+        let root = doc.add_object(dictionary! {
+            "Type" => "StructTreeRoot",
+            "K" => vec![keep.into(), id_gone.into(), num_gone.into()],
+            "IDTree" => id_tree,
+            "ParentTree" => parent_tree,
+        });
+        doc.catalog_mut().unwrap().set("StructTreeRoot", root);
+        (
+            root,
+            id_tree,
+            parent_tree,
+            parent_leaf,
+            numbers,
+            keep,
+            id_gone,
+            num_gone,
+        )
+    };
+    {
+        let doc = pdf.document();
+        let root = doc.get_dictionary(root).unwrap();
+        assert_eq!(
+            root.get(b"IDTree").unwrap().as_reference().unwrap(),
+            id_tree,
+            "the id tree was written into the structure root"
+        );
+        assert_eq!(
+            root.get(b"ParentTree").unwrap().as_reference().unwrap(),
+            parent_tree,
+            "the parent tree was written into the structure root"
+        );
+        let names = doc
+            .get_dictionary(id_tree)
+            .unwrap()
+            .get(b"Names")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(
+            names[1].as_reference().is_ok() && names[1].as_array().is_err(),
+            "an id names a list of tags instead of the tag itself"
+        );
+        assert_eq!(names[1].as_reference().unwrap(), id_gone);
+        let parent = doc.get_dictionary(parent_tree).unwrap();
+        assert!(
+            !parent.has(b"Nums"),
+            "the parent numbers were written on the tree itself"
+        );
+        assert_eq!(
+            parent
+                .get(b"Kids")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .first()
+                .unwrap()
+                .as_reference()
+                .unwrap(),
+            parent_leaf
+        );
+        let nums = doc
+            .get_dictionary(parent_leaf)
+            .unwrap()
+            .get(b"Nums")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            nums[1].as_reference().unwrap(),
+            numbers,
+            "the numbered tags were written into the leaf"
+        );
+        assert_eq!(
+            doc.get_object(numbers).unwrap().as_array().unwrap(),
+            &[Object::Reference(num_gone), Object::Reference(keep)]
+        );
+        for gone in [id_gone, num_gone] {
+            assert_eq!(
+                doc.get_dictionary(gone)
+                    .unwrap()
+                    .get(b"Pg")
+                    .unwrap()
+                    .as_reference()
+                    .unwrap(),
+                pages[1]
+            );
+        }
+    }
+
+    pdf.delete_pages(&[1]).unwrap();
+    assert_eq!(pdf.page_count(), 1);
+    {
+        let doc = pdf.document();
+        let kids = doc
+            .get_dictionary(root)
+            .unwrap()
+            .get(b"K")
+            .unwrap()
+            .as_array()
+            .expect("the tag on the page that stays was removed");
+        assert_eq!(
+            kids,
+            &[Object::Reference(keep)],
+            "a tag on the deleted page is still in the structure tree"
+        );
+        let names = doc
+            .get_dictionary(id_tree)
+            .unwrap()
+            .get(b"Names")
+            .unwrap()
+            .as_array()
+            .expect("the id tree was removed");
+        assert_eq!(
+            names.len(),
+            2,
+            "the deleted tag's name was kept, or the name of the tag that stays was dropped: {names:?}"
+        );
+        assert_eq!(names[0].as_str().unwrap(), b"keep-id");
+        assert_eq!(names[1].as_reference().unwrap(), keep);
+        let nums = doc
+            .get_dictionary(parent_leaf)
+            .unwrap()
+            .get(b"Nums")
+            .unwrap()
+            .as_array()
+            .expect("the parent-tree leaf was removed")
+            .clone();
+        assert_eq!(
+            nums.len(),
+            2,
+            "the number for the tags that stay was dropped: {nums:?}"
+        );
+        assert_eq!(nums[0].as_i64().unwrap(), 0);
+        let listed = match &nums[1] {
+            Object::Array(items) => items.clone(),
+            Object::Reference(id) => doc.get_object(*id).unwrap().as_array().unwrap().clone(),
+            other => panic!("numbered tags became {other:?}"),
+        };
+        assert_eq!(
+            listed,
+            vec![Object::Null, Object::Reference(keep)],
+            "the deleted tag is still numbered, or the tag that stays moved"
+        );
+    }
+    let saved = pdf.to_bytes().unwrap();
+    assert_gone(&saved, "SECRET-IDTREE-TEXT");
+    assert_gone(&saved, "SECRET-ID-NAME");
+    assert_gone(&saved, "SECRET-NUMTREE-TEXT");
+    assert!(
+        contains(&saved, b"KEEP-STRUCT-TEXT"),
+        "the tag on the page that stays was dropped"
+    );
+}
+
+#[test]
 fn redaction_takes_the_page_fields_and_drawings_along() {
     let r = renderer();
     let base = layered_pdf(&["ALPHA", "BRAVO", "CHARLIE"]);
