@@ -645,4 +645,130 @@ mod tests {
             b"Page"
         );
     }
+
+    #[test]
+    fn a_duplicated_page_copies_a_small_indirect_dictionary_and_shares_a_large_one_or_a_stream() {
+        // The page names these through another object, which is how a content stream is stored.
+        // A dictionary of 15 numbers is 16 values once the dictionary itself is counted, so the
+        // second listing gets its own copy and the first still names the original object. One
+        // more number stays a reference, and so does a stream, even an empty one: both listings
+        // name that one object. Keeping every reference would share the small dictionary, so a
+        // later edit of it would change both pages. Copying every referenced object would put
+        // the large dictionary and the stream onto the second listing. A reference to an object
+        // the file does not hold stays that reference.
+        let mut small = Dictionary::new();
+        for n in 0..15 {
+            small.set(format!("N{n}"), i64::from(n));
+        }
+        let mut large = Dictionary::new();
+        for n in 0..16 {
+            large.set(format!("N{n}"), i64::from(n));
+        }
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                    "Count" => 2,
+                }),
+            ),
+            (
+                2,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => (1, 0),
+                    "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                    "Small" => Object::Reference((3, 0)),
+                    "Large" => Object::Reference((4, 0)),
+                    "Draw" => Object::Reference((5, 0)),
+                    "Lost" => Object::Reference((9, 0)),
+                }),
+            ),
+            (3, Object::Dictionary(small)),
+            (4, Object::Dictionary(large)),
+            (
+                5,
+                Object::Stream(lopdf::Stream::new(Dictionary::new(), b"q Q".to_vec())),
+            ),
+        ]);
+        repair(&mut doc).unwrap();
+        let kids = doc
+            .get_dictionary((1, 0))
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+        let first = kids[0].as_reference().unwrap();
+        let second = kids[1].as_reference().unwrap();
+        assert_eq!(first, (2, 0), "the first listing is the original page");
+        assert_ne!(second, first, "the second listing is a page of its own");
+        let entry = |page: ObjectId, key: &[u8]| {
+            doc.get_dictionary(page).unwrap().get(key).unwrap().clone()
+        };
+        let Object::Dictionary(copied) = entry(second, b"Small") else {
+            panic!(
+                "a dictionary of 15 numbers is copied onto the second listing, got {:?}",
+                entry(second, b"Small")
+            );
+        };
+        let Object::Dictionary(original) = doc.get_object((3, 0)).unwrap() else {
+            panic!("the original small dictionary was not kept");
+        };
+        assert_eq!(copied.len(), 15, "all 15 numbers were copied");
+        assert_eq!(
+            copied.get(b"N0").unwrap(),
+            original.get(b"N0").unwrap(),
+            "the copied numbers match the original"
+        );
+        assert_eq!(copied.get(b"N14").unwrap(), &Object::Integer(14));
+        assert_eq!(
+            entry(first, b"Small"),
+            Object::Reference((3, 0)),
+            "the first listing still names the original dictionary"
+        );
+        assert_eq!(
+            entry(first, b"Large"),
+            Object::Reference((4, 0)),
+            "a dictionary of 16 numbers stays a reference"
+        );
+        assert_eq!(
+            entry(second, b"Large"),
+            Object::Reference((4, 0)),
+            "both listings name the same large dictionary"
+        );
+        match doc.get_object((4, 0)).unwrap() {
+            Object::Dictionary(dict) => {
+                assert_eq!(dict.len(), 16, "all 16 numbers were kept");
+                assert_eq!(dict.get(b"N15").unwrap(), &Object::Integer(15));
+            }
+            other => panic!("the shared object is the dictionary, got {other:?}"),
+        }
+        assert_eq!(
+            entry(first, b"Draw"),
+            Object::Reference((5, 0)),
+            "a stream stays a reference"
+        );
+        assert_eq!(
+            entry(second, b"Draw"),
+            Object::Reference((5, 0)),
+            "both listings name the same stream"
+        );
+        match doc.get_object((5, 0)).unwrap() {
+            Object::Stream(stream) => assert_eq!(stream.content, b"q Q"),
+            other => panic!("the shared object is the stream, got {other:?}"),
+        }
+        assert_eq!(
+            entry(first, b"Lost"),
+            Object::Reference((9, 0)),
+            "a missing object stays a reference"
+        );
+        assert_eq!(
+            entry(second, b"Lost"),
+            Object::Reference((9, 0)),
+            "the second listing keeps the same missing reference"
+        );
+    }
 }
