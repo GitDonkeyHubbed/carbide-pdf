@@ -1162,6 +1162,130 @@ fn deleted_destinations_leave_no_name_in_the_limits_of_their_name_tree() {
         .has(b"Dests"));
 }
 
+#[test]
+fn deleting_a_page_drops_a_destination_stored_in_its_own_arrays() {
+    // The kids of the name tree, the names on one leaf, and the limits of the node above the
+    // leaves are each an object of their own. The older limits check writes all three into the
+    // nodes. Leaving any of those objects unread keeps a deleted page's name in the file and
+    // leaves that check green.
+    let mut pdf = text_pdf(&[&["first"], &["second"], &["third"]]);
+    let pages = pdf.page_ids();
+    let (root, middle, kept_leaf, later_leaf, kids, names, limits) = {
+        let doc = pdf.document_mut();
+        let name = |n: &str| Object::string_literal(n);
+        let to = |page| Object::Array(vec![Object::Reference(page), "Fit".into()]);
+        // The removed name is second, so shortening the list has to drop it rather than the
+        // destination that stays.
+        let names = doc.add_object(Object::Array(vec![
+            name("Alpha"),
+            to(pages[0]),
+            name("SecretNestedName"),
+            to(pages[1]),
+        ]));
+        let kept_leaf = doc.add_object(dictionary! {
+            "Limits" => vec![name("Alpha"), name("SecretNestedName")],
+            "Names" => names,
+        });
+        let gone_leaf = doc.add_object(dictionary! {
+            "Limits" => vec![name("SecretOnlyLeaf"), name("SecretOnlyLeaf")],
+            "Names" => vec![name("SecretOnlyLeaf"), to(pages[1])],
+        });
+        let later_leaf = doc.add_object(dictionary! {
+            "Limits" => vec![name("Zulu"), name("Zulu")],
+            "Names" => vec![name("Zulu"), to(pages[2])],
+        });
+        let kids = doc.add_object(Object::Array(vec![
+            kept_leaf.into(),
+            gone_leaf.into(),
+            later_leaf.into(),
+        ]));
+        let limits = doc.add_object(Object::Array(vec![name("Alpha"), name("SecretOnlyLeaf")]));
+        let middle = doc.add_object(dictionary! {
+            "Limits" => limits,
+            "Kids" => kids,
+        });
+        let root = doc.add_object(dictionary! { "Kids" => vec![middle.into()] });
+        doc.catalog_mut()
+            .unwrap()
+            .set("Names", dictionary! { "Dests" => root });
+        (root, middle, kept_leaf, later_leaf, kids, names, limits)
+    };
+    {
+        let doc = pdf.document();
+        let node = doc.get_dictionary(middle).unwrap();
+        assert_eq!(
+            node.get(b"Kids").unwrap().as_reference().unwrap(),
+            kids,
+            "the kids were written into the node"
+        );
+        assert!(
+            node.get(b"Kids").unwrap().as_array().is_err(),
+            "the kids are an array instead of their own object"
+        );
+        assert_eq!(
+            node.get(b"Limits").unwrap().as_reference().unwrap(),
+            limits,
+            "the limits were written into the node"
+        );
+        assert_eq!(
+            doc.get_dictionary(kept_leaf)
+                .unwrap()
+                .get(b"Names")
+                .unwrap()
+                .as_reference()
+                .unwrap(),
+            names,
+            "the names were written into the leaf"
+        );
+        assert_eq!(doc.get_object(names).unwrap().as_array().unwrap().len(), 4);
+    }
+
+    pdf.delete_pages(&[1]).unwrap();
+    let bytes = file_bytes(&mut pdf);
+    assert_gone(&bytes, "SecretNestedName");
+    assert_gone(&bytes, "SecretOnlyLeaf");
+    assert!(
+        contains(&bytes, b"Alpha") && contains(&bytes, b"Zulu"),
+        "a destination on a page that stays was dropped"
+    );
+    let pdf = Pdf::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        tree_node(&pdf, kept_leaf),
+        (vec!["Alpha".into(), "Alpha".into()], 0),
+        "the deleted name is still a limit of the leaf"
+    );
+    assert_eq!(
+        tree_node(&pdf, later_leaf),
+        (vec!["Zulu".into(), "Zulu".into()], 0)
+    );
+    assert_eq!(
+        tree_node(&pdf, middle),
+        (vec!["Alpha".into(), "Zulu".into()], 2),
+        "the emptied leaf is taken out, or the limits still name it"
+    );
+    assert_eq!(tree_node(&pdf, root), (vec![], 1), "the root has no limits");
+    let listed = pdf
+        .document()
+        .get_dictionary(kept_leaf)
+        .unwrap()
+        .get(b"Names")
+        .unwrap()
+        .as_array()
+        .expect("the names were left unread")
+        .clone();
+    assert_eq!(
+        listed.len(),
+        2,
+        "the deleted name is still listed: {listed:?}"
+    );
+    assert_eq!(listed[0].as_str().unwrap(), b"Alpha");
+    assert_eq!(
+        listed[1].as_array().unwrap()[0].as_reference().unwrap(),
+        pages[0],
+        "the destination that stays no longer points at its page"
+    );
+}
+
 /// One page showing "visible text", and hidden information of every kind, each holding
 /// `SECRET-<kind>`: document information, XMP, an attachment and a file attachment comment,
 /// document JavaScript run on opening and on a page event, a filled text field, a note with its
