@@ -1866,6 +1866,164 @@ fn deleting_a_page_takes_its_fields_tags_and_drawings_along() {
 }
 
 #[test]
+fn deleting_a_page_drops_the_field_from_the_calculation_order_and_its_xfa_copy() {
+    // The form dictionary is an object of its own. Its calculation order is an array of its
+    // own and names the field on the deleted page between two fields that stay. The field list
+    // is in another order, so building the calculation order again from the fields that remain
+    // would put keep-b first. An XFA stream holds a second copy of the value. The older page
+    // deletion writes the form dictionary on the catalog, lists no calculation order, and has
+    // no XFA. Leaving this form object as it was read, or leaving the order and the XFA stream
+    // untouched, still passes that test.
+    fn names(doc: &Document, object: &Object) -> Vec<Vec<u8>> {
+        let items = match object {
+            Object::Reference(id) => doc.get_object(*id).unwrap().as_array().unwrap(),
+            Object::Array(items) => items,
+            other => panic!("not an array: {other:?}"),
+        };
+        items
+            .iter()
+            .map(|item| {
+                let id = item.as_reference().expect("a field");
+                doc.get_dictionary(id)
+                    .unwrap()
+                    .get(b"T")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    let mut pdf = text_pdf(&[&["ONE"], &["TWO"]]);
+    let pages = pdf.page_ids();
+    let gone = {
+        let doc = pdf.document_mut();
+        let field = |doc: &mut Document, page, name: &str, value: &str| {
+            doc.add_object(dictionary! {
+                "Type" => "Annot",
+                "Subtype" => "Widget",
+                "FT" => "Tx",
+                "T" => Object::string_literal(name),
+                "V" => Object::string_literal(value),
+                "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+                "P" => page,
+            })
+        };
+        let keep_a = field(doc, pages[0], "keep-a", "SECRET-KEEP-A");
+        let keep_b = field(doc, pages[0], "keep-b", "SECRET-KEEP-B");
+        let gone = field(doc, pages[1], "gone", "SECRET-GONE");
+        doc.get_dictionary_mut(pages[0])
+            .unwrap()
+            .set("Annots", vec![keep_a.into(), keep_b.into()]);
+        doc.get_dictionary_mut(pages[1])
+            .unwrap()
+            .set("Annots", vec![gone.into()]);
+        let order = doc.add_object(Object::Array(vec![
+            keep_a.into(),
+            gone.into(),
+            keep_b.into(),
+        ]));
+        let xfa = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            b"SECRET-XFA-DATASETS".to_vec(),
+        ));
+        let form = doc.add_object(dictionary! {
+            "Fields" => vec![keep_b.into(), keep_a.into(), gone.into()],
+            "CO" => order,
+            "XFA" => xfa,
+            "DA" => Object::string_literal("KEEP-DEFAULT-APPEARANCE"),
+        });
+        doc.catalog_mut().unwrap().set("AcroForm", form);
+        gone
+    };
+    {
+        let doc = pdf.document();
+        let form_id = doc
+            .catalog()
+            .unwrap()
+            .get(b"AcroForm")
+            .unwrap()
+            .as_reference()
+            .expect("the form dictionary was written into the catalog");
+        let form = doc.get_dictionary(form_id).unwrap();
+        assert!(
+            form.get(b"CO").unwrap().as_reference().is_ok(),
+            "the calculation order was written into the form"
+        );
+        assert!(
+            form.get(b"XFA").unwrap().as_reference().is_ok(),
+            "the XFA stream was written into the form"
+        );
+        assert_eq!(
+            names(doc, form.get(b"Fields").unwrap()),
+            [b"keep-b".to_vec(), b"keep-a".to_vec(), b"gone".to_vec()]
+        );
+        assert_eq!(
+            names(doc, form.get(b"CO").unwrap()),
+            [b"keep-a".to_vec(), b"gone".to_vec(), b"keep-b".to_vec()]
+        );
+        assert_eq!(
+            doc.get_dictionary(gone)
+                .unwrap()
+                .get(b"V")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            b"SECRET-GONE"
+        );
+    }
+
+    pdf.delete_pages(&[1]).unwrap();
+    assert_eq!(pdf.page_count(), 1);
+    {
+        let doc = pdf.document();
+        let form_id = doc
+            .catalog()
+            .unwrap()
+            .get(b"AcroForm")
+            .unwrap()
+            .as_reference()
+            .expect("the form dictionary was dropped with one field");
+        let form = doc.get_dictionary(form_id).unwrap();
+        assert_eq!(
+            names(doc, form.get(b"Fields").unwrap()),
+            [b"keep-b".to_vec(), b"keep-a".to_vec()],
+            "the field on the deleted page is still listed"
+        );
+        assert_eq!(
+            names(doc, form.get(b"CO").unwrap()),
+            [b"keep-a".to_vec(), b"keep-b".to_vec()],
+            "the calculation order still names the deleted page's field, or lost its order"
+        );
+        assert!(
+            form.get(b"XFA").is_err(),
+            "the XFA copy is still part of the form"
+        );
+        assert_eq!(
+            form.get(b"DA").and_then(Object::as_str).unwrap(),
+            b"KEEP-DEFAULT-APPEARANCE",
+            "the form lost its default appearance"
+        );
+    }
+    let saved = pdf.to_bytes().unwrap();
+    assert_gone(&saved, "SECRET-GONE");
+    assert_gone(&saved, "SECRET-XFA-DATASETS");
+    assert!(
+        contains(&saved, b"SECRET-KEEP-A"),
+        "a field that stays lost its value"
+    );
+    assert!(
+        contains(&saved, b"SECRET-KEEP-B"),
+        "a field that stays lost its value"
+    );
+    assert!(
+        contains(&saved, b"KEEP-DEFAULT-APPEARANCE"),
+        "the default appearance is no longer in the file"
+    );
+}
+
+#[test]
 fn redaction_takes_the_page_fields_and_drawings_along() {
     let r = renderer();
     let base = layered_pdf(&["ALPHA", "BRAVO", "CHARLIE"]);
