@@ -645,4 +645,74 @@ mod tests {
             b"Page"
         );
     }
+
+    #[test]
+    fn a_duplicated_page_may_copy_exactly_a_million_values() {
+        // A copy counts one value for the page and one for each key. 999_999 keys are exactly a
+        // million values, so the second listing is its own page and every key is on it. One more
+        // key is 1_000_001 values and is refused. The comparison is `copied > 1_000_000`: a
+        // million is allowed, and the next value is not. Counting only the keys lets that extra
+        // key through. Counting one more than the keys refuses the exact page. Changing `>` to
+        // `>=` refuses it too. A short page listed thousands of times is already past either
+        // bound, so it does not pin this line. The values are plain integers, so nothing nested
+        // is counted again.
+        fn duplicated(keys: usize) -> Document {
+            let mut page = Dictionary::new();
+            page.set("Type", Object::Name(b"Page".to_vec()));
+            page.set("Parent", Object::Reference((1, 0)));
+            for n in 0..keys - 2 {
+                page.set(format!("K{n}"), Object::Integer(1));
+            }
+            document(vec![
+                (
+                    1,
+                    Object::Dictionary(dictionary! {
+                        "Type" => "Pages",
+                        "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                        "Count" => 2,
+                    }),
+                ),
+                (2, Object::Dictionary(page)),
+            ])
+        }
+
+        let mut allowed = duplicated(999_999);
+        assert_eq!(
+            allowed.get_dictionary((2, 0)).unwrap().len(),
+            999_999,
+            "the fixture holds 999_999 keys"
+        );
+        repair(&mut allowed).unwrap();
+        let kids = allowed
+            .get_dictionary((1, 0))
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+        let first = kids[0].as_reference().unwrap();
+        let second = kids[1].as_reference().unwrap();
+        assert_eq!(first, (2, 0), "the first listing is the original page");
+        assert_ne!(second, first, "the second listing is a page of its own");
+        assert_eq!(allowed.get_dictionary(first).unwrap().len(), 999_999);
+        assert_eq!(allowed.get_dictionary(second).unwrap().len(), 999_999);
+        assert_eq!(
+            allowed.objects.len(),
+            4,
+            "the copy adds the page and does not move each integer into its own object"
+        );
+        drop(allowed);
+
+        let mut refused = duplicated(1_000_000);
+        assert_eq!(
+            refused.get_dictionary((2, 0)).unwrap().len(),
+            1_000_000,
+            "the fixture holds 1_000_000 keys"
+        );
+        assert_eq!(
+            repair(&mut refused).unwrap_err().to_string(),
+            messages::TOO_MANY_COPIES
+        );
+    }
 }
