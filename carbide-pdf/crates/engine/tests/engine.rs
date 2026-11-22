@@ -5670,6 +5670,35 @@ fn a_form_whose_matrix_is_its_own_object_is_sized_for_the_scaled_drawing() {
 }
 
 #[test]
+fn a_saved_scale_keeps_the_height_it_had() {
+    // The page scales its height by four, then both axes by ten inside a nested q. That ten ends
+    // at the inner Q. The photo is then drawn at 100 by 20 pt, so the page shows it at 100 by 80
+    // pt and it is sized for the width, about 209 px. The saved scale is 1 by 4. Copying its
+    // width onto its height leaves the drawing at 100 by 20 pt, about 56 px. Copying its height
+    // onto its width draws it at 400 by 80 pt, about 222 px. Keeping the ten draws it at 1000 by
+    // 800 pt, so it is not reduced. The four-times matrix, the repeated form, and the chain of
+    // seven each save a scale that is the same on both axes, or the identity.
+    let mut pdf = photo_page(
+        b"q\n\
+1 0 0 4 0 0 cm\n\
+q\n\
+10 0 0 10 0 0 cm\n\
+Q\n\
+100 0 0 20 0 0 cm /Im1 Do\n\
+Q",
+        |_doc, _photo| lopdf::Dictionary::new(),
+    );
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    // 100 pt at 150 ppi is about 209 pixels. 20 pt would have given about 56, and 400 by 80 about 222.
+    assert!(
+        widths.len() == 1 && (200..220).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
 fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
     // A form drawing itself, then the photo 170,000 times, drawn 1,000 times by the page.
     let mut content = b"q 200 0 0 150 50 500 cm ".to_vec();
