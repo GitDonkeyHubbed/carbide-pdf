@@ -5739,6 +5739,57 @@ fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
 }
 
 #[test]
+fn a_form_without_resources_scales_the_photo_it_paints() {
+    // The page names the photo. A form with no resources of its own paints it at 100 by 75 pt,
+    // and that form's /Matrix scales by four, so the page shows the photo at 400 by 300 pt,
+    // about 833 pixels. The same painting with no /Matrix stays at about 209 pixels.
+    //
+    // Missing the photo, because the form does not name it itself, leaves the stored 1200
+    // pixels. So does ignoring the 100 by 75 pt scale inside the form: the matrix alone
+    // draws it at 4 pt, which is too small to reduce. Leaving the matrix out sizes the
+    // painting for the 100 by 75 pt square. The four-times matrix is on a form that names
+    // its own resources. The chain of seven names each form's resources too, and the form
+    // drawn over and over names its own as well.
+    let widths = |matrix: bool| {
+        let mut pdf = photo_page(b"/F Do", |doc, _photo| {
+            let mut dict = dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+            };
+            if matrix {
+                dict.set(
+                    "Matrix",
+                    Object::Array(vec![
+                        4.into(),
+                        0.into(),
+                        0.into(),
+                        4.into(),
+                        0.into(),
+                        0.into(),
+                    ]),
+                );
+            }
+            let form = doc.add_object(Stream::new(dict, b"q 100 0 0 75 0 0 cm /Im1 Do Q".to_vec()));
+            dictionary! { "F" => form }
+        });
+        let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+        assert!(report.images_downsampled >= 1, "{report:?}");
+        image_widths(&reduced)
+    };
+    let scaled = widths(true);
+    let painted = widths(false);
+    assert!(
+        scaled.len() == 1 && (700..1000).contains(&scaled[0]),
+        "the form should size the photo for 400 pt, got {scaled:?}"
+    );
+    assert!(
+        painted.len() == 1 && (150..300).contains(&painted[0]),
+        "without that matrix the photo is the 100 by 75 pt square, got {painted:?}"
+    );
+}
+
+#[test]
 fn slider_trades_size_for_quality() {
     let mut pdf = photo_pdf();
     let small = pdf
