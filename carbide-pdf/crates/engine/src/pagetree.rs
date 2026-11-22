@@ -440,6 +440,8 @@ fn plain_boxes(doc: &mut Document, id: ObjectId) -> Result<()> {
 mod tests {
     use super::*;
 
+    use lopdf::{Stream, StringFormat};
+
     /// A catalog whose page tree root is `root`, holding `objects`.
     fn document(objects: Vec<(u32, Object)>) -> Document {
         let mut doc = Document::with_version("1.7");
@@ -643,6 +645,284 @@ mod tests {
         assert_eq!(
             doc.get_dictionary((1, 0)).unwrap().get_type().unwrap(),
             b"Page"
+        );
+    }
+
+    #[test]
+    fn a_duplicated_page_copies_a_short_string_inside_an_array_and_shares_a_longer_one() {
+        // The array is one value and the string or name inside it is another. Fourteen numbers
+        // make sixteen, so a 256-byte literal string at the end is copied onto the second
+        // listing. Fifteen numbers make seventeen, so that array stays one object. A 257-byte
+        // literal string is too long at either end of the array. A hex string follows the same
+        // length, and so does a name. A stream after a number is never copied. Checking length
+        // only for a literal string copies the longer hex string. Checking length only at one
+        // end of the array copies the long literal string at the other end. Treating a stream
+        // as a number copies the stream.
+        let text = |numbers: usize, len: usize, byte: u8, string_first: bool| {
+            let string = Object::String(vec![byte; len], StringFormat::Literal);
+            let mut items: Vec<Object> = (0..numbers).map(|n| Object::Integer(n as i64)).collect();
+            if string_first {
+                items.insert(0, string);
+            } else {
+                items.push(string);
+            }
+            Object::Array(items)
+        };
+        let hex = |len: usize| {
+            Object::Array(vec![Object::String(
+                vec![b'c'; len],
+                StringFormat::Hexadecimal,
+            )])
+        };
+        let name = |len: usize| Object::Array(vec![Object::Name(vec![b'b'; len])]);
+        let mut page = dictionary! {
+            "Type" => "Page",
+            "Parent" => (1, 0),
+            "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        };
+        page.set("Short", text(14, 256, b'a', false));
+        page.set("Wide", text(15, 256, b'a', false));
+        page.set("Early", text(14, 257, b'd', true));
+        page.set("Late", text(14, 257, b'e', false));
+        page.set("HexShort", hex(256));
+        page.set("HexLong", hex(257));
+        page.set("ShortName", name(256));
+        page.set("LongName", name(257));
+        page.set(
+            "Ink",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Stream(Stream::new(Dictionary::new(), b"q Q".to_vec())),
+            ]),
+        );
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                    "Count" => 2,
+                }),
+            ),
+            (2, Object::Dictionary(page)),
+        ]);
+        repair(&mut doc).unwrap();
+        let kids = doc
+            .get_dictionary((1, 0))
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+        let first = kids[0].as_reference().unwrap();
+        let second = kids[1].as_reference().unwrap();
+        assert_eq!(first, (2, 0), "the first listing is the original page");
+        assert_ne!(second, first, "the second listing is a page of its own");
+        let entry = |page_id: ObjectId, key: &[u8]| {
+            doc.get_dictionary(page_id)
+                .unwrap()
+                .get(key)
+                .unwrap()
+                .clone()
+        };
+        let expect_text =
+            |object: &Object, numbers: usize, len: usize, byte: u8, string_first: bool| {
+                let Object::Array(items) = object else {
+                    panic!("the string stayed inside an array, got {object:?}");
+                };
+                assert_eq!(
+                    items.len(),
+                    numbers + 1,
+                    "the numbers stayed beside the string"
+                );
+                let string_at = if string_first { 0 } else { numbers };
+                match &items[string_at] {
+                    Object::String(bytes, StringFormat::Literal) => {
+                        assert_eq!(bytes.len(), len, "the literal string is {len} bytes");
+                        assert!(
+                            bytes.iter().all(|item| *item == byte),
+                            "the literal string bytes were kept"
+                        );
+                    }
+                    other => panic!("the literal string stayed in the array, got {other:?}"),
+                }
+                let number_at = |n: usize| if string_first { n + 1 } else { n };
+                for n in 0..numbers {
+                    assert_eq!(
+                        &items[number_at(n)],
+                        &Object::Integer(n as i64),
+                        "number {n}"
+                    );
+                }
+            };
+        let expect_hex = |object: &Object, len: usize| {
+            let Object::Array(items) = object else {
+                panic!("the hex string stayed inside an array, got {object:?}");
+            };
+            assert_eq!(items.len(), 1, "the hex string's array has one entry");
+            match &items[0] {
+                Object::String(bytes, StringFormat::Hexadecimal) => {
+                    assert_eq!(bytes.len(), len, "the hex string is {len} bytes");
+                    assert!(
+                        bytes.iter().all(|byte| *byte == b'c'),
+                        "the hex string bytes were kept"
+                    );
+                }
+                other => panic!("the hex string stayed hexadecimal, got {other:?}"),
+            }
+        };
+        let expect_name = |object: &Object, len: usize| {
+            let Object::Array(items) = object else {
+                panic!("the name stayed inside an array, got {object:?}");
+            };
+            assert_eq!(items.len(), 1, "the name's array has one entry");
+            match &items[0] {
+                Object::Name(bytes) => {
+                    assert_eq!(bytes.len(), len, "the name is {len} bytes");
+                    assert!(
+                        bytes.iter().all(|byte| *byte == b'b'),
+                        "the name bytes were kept"
+                    );
+                }
+                other => panic!("the name stayed inside the array, got {other:?}"),
+            }
+        };
+        let short_first = entry(first, b"Short");
+        let short_second = entry(second, b"Short");
+        expect_text(&short_first, 14, 256, b'a', false);
+        expect_text(&short_second, 14, 256, b'a', false);
+        assert_eq!(
+            short_first, short_second,
+            "the second listing copied the short array"
+        );
+        expect_hex(&entry(first, b"HexShort"), 256);
+        expect_hex(&entry(second, b"HexShort"), 256);
+        expect_name(&entry(first, b"ShortName"), 256);
+        expect_name(&entry(second, b"ShortName"), 256);
+        let shared = |key: &[u8], label: &str| {
+            let value = entry(first, key);
+            assert_eq!(
+                value,
+                entry(second, key),
+                "both listings name the same {label}"
+            );
+            let Object::Reference(id) = value else {
+                panic!("a {label} stays a reference, got {value:?}");
+            };
+            id
+        };
+        expect_text(
+            doc.get_object(shared(b"Wide", "array of 15 numbers and a 256-byte string"))
+                .unwrap(),
+            15,
+            256,
+            b'a',
+            false,
+        );
+        let early = shared(b"Early", "array whose 257-byte string comes first");
+        let late = shared(b"Late", "array whose 257-byte string comes last");
+        assert_ne!(early, late, "the two long strings stay different arrays");
+        expect_text(doc.get_object(early).unwrap(), 14, 257, b'd', true);
+        expect_text(doc.get_object(late).unwrap(), 14, 257, b'e', false);
+        expect_hex(
+            doc.get_object(shared(b"HexLong", "array holding a 257-byte hex string"))
+                .unwrap(),
+            257,
+        );
+        expect_name(
+            doc.get_object(shared(b"LongName", "array holding a 257-byte name"))
+                .unwrap(),
+            257,
+        );
+        let ink_id = shared(b"Ink", "array holding a stream");
+        {
+            let Object::Array(items) = doc.get_object(ink_id).unwrap() else {
+                panic!("the shared stream stayed inside an array");
+            };
+            assert_eq!(items.len(), 2, "the number stayed beside the stream");
+            assert_eq!(items[0], Object::Integer(0), "the number before the stream");
+            let Object::Stream(stream) = &items[1] else {
+                panic!("the stream stayed a stream, got {:?}", items[1]);
+            };
+            assert_eq!(stream.content, b"q Q", "the stream bytes were kept");
+        }
+        // References are not followed, so a copied value is counted on each page and a shared
+        // value is counted once, on the object both listings name.
+        fn contains(object: &Object, keep: &dyn Fn(&Object) -> bool) -> bool {
+            if keep(object) {
+                return true;
+            }
+            match object {
+                Object::Array(items) => items.iter().any(|item| contains(item, keep)),
+                Object::Dictionary(dict) => dict.iter().any(|(_, value)| contains(value, keep)),
+                _ => false,
+            }
+        }
+        let count = |keep: &dyn Fn(&Object) -> bool| {
+            doc.objects
+                .values()
+                .filter(|object| contains(object, keep))
+                .count()
+        };
+        let literal = |len: usize, byte: u8| {
+            move |object: &Object| {
+                matches!(
+                    object,
+                    Object::String(bytes, StringFormat::Literal)
+                        if bytes.len() == len && bytes.iter().all(|item| *item == byte)
+                )
+            }
+        };
+        assert_eq!(
+            count(&literal(256, b'a')),
+            3,
+            "the 256-byte literal string was copied onto both pages and the wider array was not"
+        );
+        assert_eq!(
+            count(&literal(257, b'd')),
+            1,
+            "the 257-byte string at the start of the array was not copied"
+        );
+        assert_eq!(
+            count(&literal(257, b'e')),
+            1,
+            "the 257-byte string at the end of the array was not copied"
+        );
+        let hex_string = |len: usize| {
+            move |object: &Object| {
+                matches!(
+                    object,
+                    Object::String(bytes, StringFormat::Hexadecimal)
+                        if bytes.len() == len && bytes.iter().all(|byte| *byte == b'c')
+                )
+            }
+        };
+        assert_eq!(
+            count(&hex_string(256)),
+            2,
+            "the 256-byte hex string was copied onto both pages"
+        );
+        assert_eq!(
+            count(&hex_string(257)),
+            1,
+            "the 257-byte hex string was not copied"
+        );
+        let name_bytes = |len: usize| move |object: &Object| matches!(object, Object::Name(bytes) if bytes.len() == len && bytes.iter().all(|byte| *byte == b'b'));
+        assert_eq!(
+            count(&name_bytes(256)),
+            2,
+            "the 256-byte name was copied onto both pages"
+        );
+        assert_eq!(
+            count(&name_bytes(257)),
+            1,
+            "the 257-byte name was not copied"
+        );
+        assert_eq!(
+            count(&|object| matches!(object, Object::Stream(_))),
+            1,
+            "the stream was not copied"
         );
     }
 }
