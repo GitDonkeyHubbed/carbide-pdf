@@ -5739,6 +5739,41 @@ fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
 }
 
 #[test]
+fn a_photo_placed_once_more_than_the_list_holds_keeps_its_full_size() {
+    // The page places the photo in 100,000 different ways, each 150 pt tall. A sideways
+    // shove makes each placement different, and it does not change that height, so the
+    // photo is sized for 150 pt, about 417 pixels. One more placement is 300 pt tall.
+    // That one does not fit in the list. It may be the tall one that was left out, so
+    // none of the sizes are used and the photo stays 1200 px wide. Keeping that extra
+    // placement sizes it for 300 pt, about 833 pixels. Stopping one placement short
+    // leaves the 100,000-placement photo at 1200. The four-times matrix is one
+    // placement, and the chain of seven draws the photo once.
+    let widths = |extra: bool| {
+        let mut content = Vec::with_capacity(100_000 * 36);
+        for i in 0..100_000 {
+            content.extend_from_slice(b"q 200 ");
+            content.extend_from_slice(i.to_string().as_bytes());
+            content.extend_from_slice(b" 0 150 0 0 cm /Im1 Do Q\n");
+        }
+        if extra {
+            content.extend_from_slice(b"q 400 0 0 300 0 0 cm /Im1 Do Q\n");
+        }
+        let mut pdf = photo_page(&content, |_doc, _photo| dictionary! {});
+        image_widths(&pdf.reduce(&ReduceOptions::default(), None).unwrap().0)
+    };
+    let counted = widths(false);
+    let past = widths(true);
+    assert!(
+        counted.len() == 1 && (400..500).contains(&counted[0]),
+        "100,000 placements should size the photo for 150 pt, got {counted:?}"
+    );
+    assert!(
+        past.len() == 1 && past[0] == 1200,
+        "one more placement should leave the photo at its stored size, got {past:?}"
+    );
+}
+
+#[test]
 fn slider_trades_size_for_quality() {
     let mut pdf = photo_pdf();
     let small = pdf
