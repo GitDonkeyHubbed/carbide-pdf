@@ -5484,6 +5484,31 @@ fn reduce_shrinks_photos_and_merges_duplicates() {
 }
 
 #[test]
+fn a_number_does_not_reuse_a_name_from_an_earlier_operator() {
+    // The photo is named and then selected with `gs`, which does not draw it. A later `Do` has
+    // one operand and that operand is a number, so it paints nothing. The photo is drawn after
+    // that at 100 by 75 pt and sized for that, about 209 px. Keeping the name from `gs` also
+    // paints the 400 by 300 pt square, and the photo is sized for that, about 833 px.
+    let mut pdf = photo_pdf();
+    let page = pdf.page_ids()[0];
+    let content = pdf.document_mut().add_object(Stream::new(
+        lopdf::Dictionary::new(),
+        b"/Im1 gs q 400 0 0 300 0 0 cm 0 Do Q q 100 0 0 75 0 0 cm /Im1 Do Q".to_vec(),
+    ));
+    pdf.document_mut()
+        .get_dictionary_mut(page)
+        .unwrap()
+        .set("Contents", content);
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (150..300).contains(&widths[0]),
+        "the photo should be sized for 100 pt, got {widths:?}"
+    );
+}
+
+#[test]
 fn forms_drawn_over_and_over_are_worked_out_once() {
     // A photo drawn through a form whose matrix halves it, and that form drawn once as it is and
     // once twice as large: the photo is drawn at 200 x 150 pt at most, and sized for that.
