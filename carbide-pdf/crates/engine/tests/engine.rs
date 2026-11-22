@@ -5739,6 +5739,55 @@ fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
 }
 
 #[test]
+fn a_form_without_resources_scales_what_it_draws_by_its_matrix() {
+    // The photo is painted at 100 by 75 pt by a form that names it. Another form, with no
+    // resources of its own, draws that form, and its /Matrix scales by four. The page shows
+    // the photo at 400 by 300 pt, about 833 pixels. The same painting form drawn on its own
+    // stays at 100 by 75 pt, about 209 pixels.
+    //
+    // Leaving the matrix out, because the form that carries it has no resources, sizes both
+    // drawings for the 100 by 75 pt square. The four-times matrix is on the form that paints
+    // the photo, and that form names its own resources. The chain of seven, and the forms
+    // with no resources that only pass a name along, have no /Matrix.
+    let widths = |content: &[u8]| {
+        let mut pdf = photo_page(content, |doc, photo| {
+            let inner = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                    "Resources" => dictionary! { "XObject" => dictionary! { "Im" => photo } },
+                },
+                b"q 100 0 0 75 0 0 cm /Im Do Q".to_vec(),
+            ));
+            let outer = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                    "Matrix" => vec![4.into(), 0.into(), 0.into(), 4.into(), 0.into(), 0.into()],
+                },
+                b"/G Do".to_vec(),
+            ));
+            dictionary! { "F" => outer, "G" => inner }
+        });
+        let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+        assert!(report.images_downsampled >= 1, "{report:?}");
+        image_widths(&reduced)
+    };
+    let through_matrix = widths(b"/F Do");
+    let painted_alone = widths(b"/G Do");
+    assert!(
+        through_matrix.len() == 1 && (700..1000).contains(&through_matrix[0]),
+        "the matrix should size the photo for 400 pt, got {through_matrix:?}"
+    );
+    assert!(
+        painted_alone.len() == 1 && (150..300).contains(&painted_alone[0]),
+        "without that matrix the photo is the 100 by 75 pt square, got {painted_alone:?}"
+    );
+}
+
+#[test]
 fn slider_trades_size_for_quality() {
     let mut pdf = photo_pdf();
     let small = pdf
