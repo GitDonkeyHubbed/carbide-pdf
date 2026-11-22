@@ -645,4 +645,159 @@ mod tests {
             b"Page"
         );
     }
+
+    #[test]
+    fn a_duplicated_page_copies_a_short_nested_array_and_shares_a_longer_one() {
+        // The outer array is one value and the inner array is another. Fourteen numbers make
+        // sixteen, so that pair is copied onto the second listing. Fifteen numbers make
+        // seventeen, so that pair stays one object. An empty array is still small, and so is a
+        // boolean, a null, or a real stored on the page itself. Skipping the inner array copies
+        // the fifteen numbers. Treating any nested array as too large shares the fourteen
+        // numbers. Treating an empty array as too large shares the empty one. Treating a boolean,
+        // a null, or a real as too large shares that value. Lowering the copy limit to 15 shares
+        // the fourteen numbers. Raising it to 17 copies the fifteen. A flat array of numbers
+        // never takes this path.
+        let nested = |numbers: usize| {
+            Object::Array(vec![Object::Array(
+                (0..numbers).map(|n| Object::Integer(n as i64)).collect(),
+            )])
+        };
+        let mut page = dictionary! {
+            "Type" => "Page",
+            "Parent" => (1, 0),
+            "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        };
+        page.set("Short", nested(14));
+        page.set("Wide", nested(15));
+        page.set("Empty", Object::Array(Vec::new()));
+        page.set("Flag", Object::Boolean(true));
+        page.set("Gap", Object::Null);
+        page.set("Mark", Object::Real(1.5));
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                    "Count" => 2,
+                }),
+            ),
+            (2, Object::Dictionary(page)),
+        ]);
+        repair(&mut doc).unwrap();
+        let kids = doc
+            .get_dictionary((1, 0))
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+        let first = kids[0].as_reference().unwrap();
+        let second = kids[1].as_reference().unwrap();
+        assert_eq!(first, (2, 0), "the first listing is the original page");
+        assert_ne!(second, first, "the second listing is a page of its own");
+        let entry = |page_id: ObjectId, key: &[u8]| {
+            doc.get_dictionary(page_id)
+                .unwrap()
+                .get(key)
+                .unwrap()
+                .clone()
+        };
+        let expect_nested = |object: &Object, numbers: usize| {
+            let Object::Array(outer) = object else {
+                panic!("the inner array stayed inside an array, got {object:?}");
+            };
+            assert_eq!(outer.len(), 1, "the outer array holds the inner array");
+            let Object::Array(inner) = &outer[0] else {
+                panic!("the nested value stayed an array, got {:?}", outer[0]);
+            };
+            assert_eq!(inner.len(), numbers, "the inner array kept its numbers");
+            for (n, item) in inner.iter().enumerate() {
+                assert_eq!(item, &Object::Integer(n as i64), "number {n}");
+            }
+        };
+        let short_first = entry(first, b"Short");
+        let short_second = entry(second, b"Short");
+        expect_nested(&short_first, 14);
+        expect_nested(&short_second, 14);
+        assert_eq!(
+            short_first, short_second,
+            "the second listing copied the short nested array"
+        );
+        assert_eq!(entry(first, b"Empty"), Object::Array(Vec::new()));
+        assert_eq!(entry(second, b"Empty"), Object::Array(Vec::new()));
+        assert_eq!(entry(first, b"Flag"), Object::Boolean(true));
+        assert_eq!(entry(second, b"Flag"), Object::Boolean(true));
+        assert_eq!(entry(first, b"Gap"), Object::Null);
+        assert_eq!(entry(second, b"Gap"), Object::Null);
+        assert_eq!(entry(first, b"Mark"), Object::Real(1.5));
+        assert_eq!(entry(second, b"Mark"), Object::Real(1.5));
+        let shared = |key: &[u8], label: &str| {
+            let value = entry(first, key);
+            assert_eq!(
+                value,
+                entry(second, key),
+                "both listings name the same {label}"
+            );
+            let Object::Reference(id) = value else {
+                panic!("a {label} stays a reference, got {value:?}");
+            };
+            id
+        };
+        expect_nested(
+            doc.get_object(shared(b"Wide", "nested array of 15 numbers"))
+                .unwrap(),
+            15,
+        );
+        // A copied value sits on each page. A shared value sits once, on the object both
+        // listings name. References are not followed, so a shared value is not counted twice.
+        fn contains(object: &Object, keep: &dyn Fn(&Object) -> bool) -> bool {
+            if keep(object) {
+                return true;
+            }
+            match object {
+                Object::Array(items) => items.iter().any(|item| contains(item, keep)),
+                Object::Dictionary(dict) => dict.iter().any(|(_, value)| contains(value, keep)),
+                _ => false,
+            }
+        }
+        let count = |keep: &dyn Fn(&Object) -> bool| {
+            doc.objects
+                .values()
+                .filter(|object| contains(object, keep))
+                .count()
+        };
+        let inner_len = |len: usize| move |object: &Object| matches!(object, Object::Array(items) if items.len() == len);
+        assert_eq!(
+            count(&inner_len(14)),
+            2,
+            "the array of 14 numbers was copied onto both pages"
+        );
+        assert_eq!(
+            count(&inner_len(15)),
+            1,
+            "the array of 15 numbers was not copied"
+        );
+        assert_eq!(
+            count(&inner_len(0)),
+            2,
+            "the empty array was copied onto both pages"
+        );
+        assert_eq!(
+            count(&|object| matches!(object, Object::Boolean(true))),
+            2,
+            "the boolean was copied onto both pages"
+        );
+        assert_eq!(
+            count(&|object| matches!(object, Object::Null)),
+            2,
+            "the null was copied onto both pages"
+        );
+        assert_eq!(
+            count(&|object| matches!(object, Object::Real(value) if *value == 1.5)),
+            2,
+            "the real was copied onto both pages"
+        );
+    }
 }
