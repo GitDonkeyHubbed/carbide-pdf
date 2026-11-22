@@ -598,6 +598,59 @@ mod tests {
     }
 
     #[test]
+    fn a_quarter_turn_inside_i32_stays_and_one_outside_is_rewritten() {
+        // 2_147_483_610 is the largest multiple of 90 that fits in a signed 32-bit integer.
+        // Readers already agree it is one quarter turn, so opening leaves that integer.
+        // Normalizing it stores 90. A turn of -90 is the small case of the same rule. Keeping
+        // only -270, -180, -90, 0, 90, 180, and 270 rewrites this one to 90.
+        // 2_147_483_790 is a multiple of 90 that still fits in 32 unsigned bits. Viewers wrap
+        // it to 90. Leaving every multiple of 90 stores 2_147_483_790. Treating every value
+        // outside i32 as no turn stores 0. The largest i64 is not a quarter turn, so the older
+        // check never takes this path.
+        // -2_147_483_700 is a multiple of 90 below the signed 32-bit range. Viewers read it as
+        // no turn. Keeping every quarter turn that is not too large stores -2_147_483_700.
+        let turned = |rotate: i64| {
+            Object::Dictionary(
+                dictionary! { "Type" => "Page", "Parent" => (1, 0), "Rotate" => Object::Integer(rotate) },
+            )
+        };
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(
+                    dictionary! { "Type" => "Pages", "Kids" => vec![(2, 0).into(), (3, 0).into(), (4, 0).into()], "Count" => 3 },
+                ),
+            ),
+            (2, turned(2_147_483_610)),
+            (3, turned(2_147_483_790)),
+            (4, turned(-2_147_483_700)),
+        ]);
+        repair(&mut doc).unwrap();
+        let rotate = |id: u32| {
+            doc.get_dictionary((id, 0))
+                .unwrap()
+                .get(b"Rotate")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            rotate(2),
+            Object::Integer(2_147_483_610),
+            "a quarter turn that fits in a signed 32-bit integer stays"
+        );
+        assert_eq!(
+            rotate(3),
+            Object::Integer(90),
+            "past the signed range, viewers wrap this quarter turn to 90"
+        );
+        assert_eq!(
+            rotate(4),
+            Object::Integer(0),
+            "below the signed range, a quarter turn is no turn"
+        );
+    }
+
+    #[test]
     fn deep_trees_and_shared_branches_are_refused() {
         let mut objects = vec![];
         for n in 1..=(MAX_DEPTH as u32 + 2) {
