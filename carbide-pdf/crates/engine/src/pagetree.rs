@@ -645,4 +645,134 @@ mod tests {
             b"Page"
         );
     }
+
+    #[test]
+    fn a_duplicated_page_counts_what_it_inherited_toward_the_copy_limit() {
+        // The page is listed twice, and its /Parent names a node outside the tree. The repair
+        // copies the four attributes that node holds onto the page first, one value each, and
+        // then copies the page. The resources dictionary has sixteen numbers, so it is shared
+        // rather than cloned, and it still counts as one. The other three are small and are
+        // cloned. The duplicate counts one value for the page and one for every key, inherited
+        // keys included. 999_989 extra keys make exactly 1_000_000 values, and one more extra
+        // key makes 1_000_001, which is refused. A page whose parent is already the node that
+        // lists it never takes the inherited charge, so a count of its keys alone does not pin
+        // this one. Not counting an inherited value, including one that is shared, lets the
+        // extra key through. Counting one more than the keys, or changing `>` to `>=`, refuses
+        // the exact page. The sixteen numbers inside the shared dictionary are not counted again.
+        fn duplicated(extra: usize) -> Document {
+            let mut resources = Dictionary::new();
+            for n in 0..16 {
+                resources.set(format!("R{n}"), Object::Integer(n));
+            }
+            let mut page = Dictionary::new();
+            page.set("Type", Object::Name(b"Page".to_vec()));
+            page.set("Parent", Object::Reference((3, 0)));
+            for n in 0..extra {
+                page.set(format!("K{n}"), Object::Integer(1));
+            }
+            document(vec![
+                (
+                    1,
+                    Object::Dictionary(dictionary! {
+                        "Type" => "Pages",
+                        "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                        "Count" => 2,
+                    }),
+                ),
+                (2, Object::Dictionary(page)),
+                (
+                    3,
+                    Object::Dictionary(dictionary! {
+                        "Type" => "Pages",
+                        "Resources" => resources,
+                        "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                        "CropBox" => vec![0.into(), 0.into(), 50.into(), 50.into()],
+                        "Rotate" => 90,
+                    }),
+                ),
+            ])
+        }
+
+        let mut allowed = duplicated(999_989);
+        assert_eq!(
+            allowed.get_dictionary((2, 0)).unwrap().len(),
+            999_991,
+            "the fixture holds Type, Parent, and 999_989 keys"
+        );
+        repair(&mut allowed).unwrap();
+        let kids = allowed
+            .get_dictionary((1, 0))
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+        let first = kids[0].as_reference().unwrap();
+        let second = kids[1].as_reference().unwrap();
+        assert_eq!(first, (2, 0), "the first listing is the original page");
+        assert_ne!(second, first, "the second listing is a page of its own");
+        for id in [first, second] {
+            let page = allowed.get_dictionary(id).unwrap();
+            assert_eq!(
+                page.len(),
+                999_995,
+                "the inherited attributes are on the page"
+            );
+            assert_eq!(page.get(b"Rotate").unwrap(), &Object::Integer(90));
+            assert!(matches!(page.get(b"MediaBox").unwrap(), Object::Array(_)));
+            assert!(matches!(page.get(b"CropBox").unwrap(), Object::Array(_)));
+        }
+        let shared = allowed
+            .get_dictionary(first)
+            .unwrap()
+            .get(b"Resources")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        assert_eq!(
+            allowed
+                .get_dictionary(second)
+                .unwrap()
+                .get(b"Resources")
+                .unwrap(),
+            &Object::Reference(shared)
+        );
+        assert_eq!(
+            allowed
+                .get_dictionary((3, 0))
+                .unwrap()
+                .get(b"Resources")
+                .unwrap(),
+            &Object::Reference(shared),
+            "the large resources dictionary is shared, not copied onto each page"
+        );
+        assert_eq!(allowed.get_dictionary(shared).unwrap().len(), 16);
+        assert_eq!(
+            allowed
+                .get_dictionary((3, 0))
+                .unwrap()
+                .get(b"Rotate")
+                .unwrap(),
+            &Object::Integer(90),
+            "a small inherited value stays on the node it was copied from"
+        );
+        assert_eq!(
+            allowed.objects.len(),
+            6,
+            "the copy adds the page and the one shared resources object"
+        );
+        drop(allowed);
+
+        let mut refused = duplicated(999_990);
+        assert_eq!(
+            refused.get_dictionary((2, 0)).unwrap().len(),
+            999_992,
+            "the fixture holds Type, Parent, and 999_990 keys"
+        );
+        assert_eq!(
+            repair(&mut refused).unwrap_err().to_string(),
+            messages::TOO_MANY_COPIES
+        );
+    }
 }
