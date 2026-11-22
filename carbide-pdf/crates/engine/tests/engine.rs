@@ -5484,6 +5484,33 @@ fn reduce_shrinks_photos_and_merges_duplicates() {
 }
 
 #[test]
+fn identical_photos_drawn_at_different_sizes_stay_sharp_for_the_larger_one() {
+    // Two copies of one photo. One is drawn at 100 by 75 pt and the other at 400 by 300 pt.
+    // The bytes match, so reducing the file keeps a single image, sized for the larger
+    // drawing, about 833 pixels. Resizing each copy first makes those bytes differ, so both
+    // copies remain and the smaller one is about 208 pixels. The other reduction draws both
+    // copies at 200 by 150 pt, and the form that is drawn twice is one image, not two copies.
+    let mut pdf = photo_pdf();
+    let page = pdf.page_ids()[0];
+    let content = pdf.document_mut().add_object(Stream::new(
+        lopdf::Dictionary::new(),
+        b"q 100 0 0 75 0 0 cm /Im1 Do Q q 400 0 0 300 0 0 cm /Im2 Do Q".to_vec(),
+    ));
+    pdf.document_mut()
+        .get_dictionary_mut(page)
+        .unwrap()
+        .set("Contents", content);
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.streams_merged >= 1, "{report:?}");
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (700..1000).contains(&widths[0]),
+        "the shared photo should be sized for 400 pt, got {widths:?}"
+    );
+}
+
+#[test]
 fn forms_drawn_over_and_over_are_worked_out_once() {
     // A photo drawn through a form whose matrix halves it, and that form drawn once as it is and
     // once twice as large: the photo is drawn at 200 x 150 pt at most, and sized for that.
