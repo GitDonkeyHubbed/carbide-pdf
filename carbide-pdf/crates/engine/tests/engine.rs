@@ -5670,6 +5670,35 @@ fn a_form_whose_matrix_is_its_own_object_is_sized_for_the_scaled_drawing() {
 }
 
 #[test]
+fn a_scale_ends_where_q_ends_and_the_scale_around_it_remains() {
+    // The page scales by four, then by ten inside a nested q. The ten ends at that q's Q, and
+    // the photo is then drawn in a 100 by 75 pt square, so the page shows it at 400 by 300 pt.
+    // A later drawing, 200 by 150 pt, is outside the four. The photo is sized for the larger
+    // of those, about 833 px. Keeping the ten multiplies the square by forty, and keeping the
+    // four past its Q multiplies the later drawing by the square's matrix: either way the
+    // photo stays 1200 px. Dropping the four before the square leaves the later drawing as
+    // the largest, about 417 px. The four-times matrix, the repeated form, and the chain of
+    // seven each save and restore one matrix, and that matrix is the one they started from.
+    let mut pdf = photo_page(
+        b"q 4 0 0 4 0 0 cm\n\
+q 10 0 0 10 0 0 cm\n\
+Q\n\
+100 0 0 75 0 0 cm /Im1 Do\n\
+Q\n\
+q 200 0 0 150 0 0 cm /Im1 Do Q",
+        |_doc, _photo| lopdf::Dictionary::new(),
+    );
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    // 400 pt at 150 ppi is about 833 pixels. 200 pt would have given about 417, and 100 pt about 208.
+    assert!(
+        widths.len() == 1 && (700..1000).contains(&widths[0]),
+        "{widths:?}"
+    );
+}
+
+#[test]
 fn a_form_that_draws_itself_is_read_once_however_often_it_is_drawn() {
     // A form drawing itself, then the photo 170,000 times, drawn 1,000 times by the page.
     let mut content = b"q 200 0 0 150 50 500 cm ".to_vec();
