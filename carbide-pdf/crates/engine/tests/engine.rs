@@ -5484,6 +5484,60 @@ fn reduce_shrinks_photos_and_merges_duplicates() {
 }
 
 #[test]
+fn a_lowercase_hex_escape_names_the_same_photo() {
+    // `#4A` is `J` and `#6b` is `k`, so `/Im#4A#6b` is the name `ImJk`. The photo is drawn at
+    // 400 by 300 pt under that spelling and at 100 by 75 pt as `/ImJk`, and it is sized for the
+    // larger drawing, about 833 px. Accepting only uppercase hex, or only lowercase, leaves the
+    // escaped spelling unmatched, so the photo is sized for 100 pt, about 209 px. `#31` is only
+    // digits, so that drawing still matches either way.
+    let mut pdf = photo_pdf();
+    let page = pdf.page_ids()[0];
+    let doc = pdf.document_mut();
+    let photo = doc
+        .get_dictionary(page)
+        .unwrap()
+        .get(b"Resources")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"XObject")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"Im1")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let mut xobjects = doc
+        .get_dictionary(page)
+        .unwrap()
+        .get(b"Resources")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"XObject")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .clone();
+    xobjects.set("ImJk", photo);
+    let content = doc.add_object(Stream::new(
+        lopdf::Dictionary::new(),
+        b"q 400 0 0 300 0 0 cm /Im#4A#6b Do Q q 100 0 0 75 0 0 cm /ImJk Do Q".to_vec(),
+    ));
+    let page = doc.get_dictionary_mut(page).unwrap();
+    page.set("Resources", dictionary! { "XObject" => xobjects });
+    page.set("Contents", content);
+    let (reduced, report) = pdf.reduce(&ReduceOptions::default(), None).unwrap();
+    assert!(report.images_downsampled >= 1, "{report:?}");
+    let widths = image_widths(&reduced);
+    assert!(
+        widths.len() == 1 && (700..1000).contains(&widths[0]),
+        "the photo should be sized for 400 pt, got {widths:?}"
+    );
+}
+
+#[test]
 fn forms_drawn_over_and_over_are_worked_out_once() {
     // A photo drawn through a form whose matrix halves it, and that form drawn once as it is and
     // once twice as large: the photo is drawn at 200 x 150 pt at most, and sized for that.
