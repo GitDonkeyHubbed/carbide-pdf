@@ -1866,6 +1866,190 @@ fn deleting_a_page_takes_its_fields_tags_and_drawings_along() {
 }
 
 #[test]
+fn deleting_a_page_keeps_a_field_that_still_shows_on_another_page() {
+    // Neither field is a widget. `shared` has one widget on the page that stays and one on the
+    // page that is deleted. That deleted widget names no page; the page lists it as an
+    // annotation. `orphan` has one widget, which names the deleted page and is on no page's
+    // annotation list. Each value sits on its field, and each widget has its own. The older
+    // page deletion lists every widget as its own field and gives each one a page entry, so
+    // leaving a field's children alone, reading only the page entry, or reading only the
+    // annotation list still passes it. So does keeping a field after its last widget has gone.
+    fn titles(doc: &Document, object: &Object) -> Vec<Vec<u8>> {
+        let items = match object {
+            Object::Reference(id) => doc.get_object(*id).unwrap().as_array().unwrap(),
+            Object::Array(items) => items,
+            other => panic!("not an array: {other:?}"),
+        };
+        items
+            .iter()
+            .map(|item| {
+                let id = item.as_reference().expect("a field");
+                doc.get_dictionary(id)
+                    .unwrap()
+                    .get(b"T")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    let mut pdf = text_pdf(&[&["ONE"], &["TWO"]]);
+    let pages = pdf.page_ids();
+    let (gone, only) = {
+        let doc = pdf.document_mut();
+        let widget =
+            |doc: &mut Document, name: &str, value: &str, page: Option<lopdf::ObjectId>| {
+                let mut dict = dictionary! {
+                    "Type" => "Annot",
+                    "Subtype" => "Widget",
+                    "T" => Object::string_literal(name),
+                    "V" => Object::string_literal(value),
+                    "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+                };
+                if let Some(page) = page {
+                    dict.set("P", page);
+                }
+                doc.add_object(dict)
+            };
+        let keep = widget(doc, "keep", "SECRET-KEEP-WIDGET", Some(pages[0]));
+        let gone = widget(doc, "gone", "SECRET-GONE-WIDGET", None);
+        let only = widget(doc, "only", "SECRET-ORPHAN-WIDGET", Some(pages[1]));
+        let shared = doc.add_object(dictionary! {
+            "FT" => "Tx",
+            "T" => Object::string_literal("shared"),
+            "V" => Object::string_literal("SECRET-SHARED"),
+            "Kids" => vec![keep.into(), gone.into()],
+        });
+        let orphan = doc.add_object(dictionary! {
+            "FT" => "Tx",
+            "T" => Object::string_literal("orphan"),
+            "V" => Object::string_literal("SECRET-ORPHAN"),
+            "Kids" => vec![only.into()],
+        });
+        doc.get_dictionary_mut(pages[0])
+            .unwrap()
+            .set("Annots", vec![keep.into()]);
+        doc.get_dictionary_mut(pages[1])
+            .unwrap()
+            .set("Annots", vec![gone.into()]);
+        doc.catalog_mut().unwrap().set(
+            "AcroForm",
+            dictionary! {
+                "Fields" => vec![orphan.into(), shared.into()],
+                "DA" => Object::string_literal("KEEP-DEFAULT-APPEARANCE"),
+            },
+        );
+        (gone, only)
+    };
+    {
+        let doc = pdf.document();
+        let form = doc.catalog().unwrap().get(b"AcroForm").unwrap();
+        assert!(
+            matches!(form, Object::Dictionary(_)),
+            "the form dictionary was written on the catalog"
+        );
+        assert_eq!(
+            titles(doc, form.as_dict().unwrap().get(b"Fields").unwrap()),
+            [b"orphan".to_vec(), b"shared".to_vec()]
+        );
+        let shared = doc
+            .get_object(
+                form.as_dict()
+                    .unwrap()
+                    .get(b"Fields")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()[1]
+                    .as_reference()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            titles(doc, shared.as_dict().unwrap().get(b"Kids").unwrap()),
+            [b"keep".to_vec(), b"gone".to_vec()]
+        );
+        assert!(
+            doc.get_dictionary(gone).unwrap().get(b"P").is_err(),
+            "the deleted page's widget names a page"
+        );
+        let on_page = |page, id| {
+            doc.get_dictionary(page)
+                .unwrap()
+                .get(b"Annots")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item.as_reference().unwrap() == id)
+        };
+        assert!(on_page(pages[1], gone));
+        assert!(!on_page(pages[0], only) && !on_page(pages[1], only));
+        assert_eq!(
+            doc.get_dictionary(only)
+                .unwrap()
+                .get(b"P")
+                .unwrap()
+                .as_reference()
+                .unwrap(),
+            pages[1]
+        );
+    }
+
+    pdf.delete_pages(&[1]).unwrap();
+    assert_eq!(pdf.page_count(), 1);
+    {
+        let doc = pdf.document();
+        let form = doc
+            .catalog()
+            .unwrap()
+            .get(b"AcroForm")
+            .expect("the form was removed with a field that still shows")
+            .as_dict()
+            .expect("the form dictionary was replaced with a reference");
+        assert_eq!(
+            titles(doc, form.get(b"Fields").unwrap()),
+            [b"shared".to_vec()],
+            "a field whose widgets are all on the deleted page is still listed, or the field that still shows was dropped"
+        );
+        let shared_id = form.get(b"Fields").unwrap().as_array().unwrap()[0]
+            .as_reference()
+            .unwrap();
+        let shared = doc.get_dictionary(shared_id).unwrap();
+        assert_eq!(
+            shared.get(b"V").unwrap().as_str().unwrap(),
+            b"SECRET-SHARED"
+        );
+        assert_eq!(
+            titles(doc, shared.get(b"Kids").unwrap()),
+            [b"keep".to_vec()],
+            "the widget on the deleted page is still a child, or the one that stays was dropped"
+        );
+        assert_eq!(
+            form.get(b"DA").and_then(Object::as_str).unwrap(),
+            b"KEEP-DEFAULT-APPEARANCE"
+        );
+    }
+    let saved = pdf.to_bytes().unwrap();
+    assert_gone(&saved, "SECRET-GONE-WIDGET");
+    assert_gone(&saved, "SECRET-ORPHAN");
+    assert_gone(&saved, "SECRET-ORPHAN-WIDGET");
+    assert!(
+        contains(&saved, b"SECRET-SHARED"),
+        "a field that still shows on another page lost its value"
+    );
+    assert!(
+        contains(&saved, b"SECRET-KEEP-WIDGET"),
+        "the widget on the page that stays lost its value"
+    );
+    assert!(
+        contains(&saved, b"KEEP-DEFAULT-APPEARANCE"),
+        "the form lost its default appearance"
+    );
+}
+
+#[test]
 fn redaction_takes_the_page_fields_and_drawings_along() {
     let r = renderer();
     let base = layered_pdf(&["ALPHA", "BRAVO", "CHARLIE"]);
