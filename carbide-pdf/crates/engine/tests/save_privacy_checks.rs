@@ -357,6 +357,72 @@ fn default_colour_spaces_stay_with_content_that_paints_in_device_colours() {
     );
 }
 
+#[test]
+fn a_form_keeps_default_colour_spaces_its_text_never_selects() {
+    // The form only selects a font. Its own /DefaultRGB, /DefaultGray and /DefaultCMYK still
+    // stand in for device colour, and a colour space nothing uses does not stay. Keeping every
+    // colour space leaves the page test green: that dictionary has no unused space. Dropping
+    // the defaults only while trimming a form leaves it green too, because those three profiles
+    // are on the page.
+    let mut pdf = shared_resources_pdf(
+        |doc| {
+            let font = helvetica(doc);
+            let image = secret_image(doc);
+            let profile = |doc: &mut Document, marker: &str, n: i64| {
+                let stream = doc.add_object(Stream::new(
+                    dictionary! { "N" => n },
+                    marker.as_bytes().to_vec(),
+                ));
+                Object::Array(vec![Object::Name(b"ICCBased".to_vec()), stream.into()])
+            };
+            let rgb = profile(doc, "FORM-DEFAULT-RGB", 3);
+            let gray = profile(doc, "FORM-DEFAULT-GRAY", 1);
+            let cmyk = profile(doc, "FORM-DEFAULT-CMYK", 4);
+            let unused = profile(doc, "FORM-UNUSED-SPACE", 3);
+            let resources = doc.add_object(dictionary! {
+                "Font" => dictionary! { "F1" => font },
+                "ColorSpace" => dictionary! {
+                    "DefaultRGB" => rgb,
+                    "DefaultGray" => gray,
+                    "DefaultCMYK" => cmyk,
+                    "UnusedSpace" => unused,
+                },
+            });
+            let form = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                    "Resources" => resources,
+                },
+                b"BT /F1 12 Tf (kept) Tj ET".to_vec(),
+            ));
+            dictionary! { "XObject" => dictionary! { "Fm1" => form, "Im1" => image } }
+        },
+        &["/Fm1 Do", "q 100 0 0 100 0 0 cm /Im1 Do Q"],
+    );
+    pdf.delete_pages(&[1]).unwrap();
+    let saved = pdf.to_bytes().unwrap();
+    for marker in [
+        "FORM-DEFAULT-RGB",
+        "FORM-DEFAULT-GRAY",
+        "FORM-DEFAULT-CMYK",
+        "Helvetica",
+    ] {
+        assert!(
+            contains(&saved, marker.as_bytes()),
+            "the form lost {marker}"
+        );
+    }
+    assert!(
+        !contains(&saved, b"FORM-UNUSED-SPACE"),
+        "a colour space nothing uses was kept"
+    );
+    assert!(
+        !contains(&saved, SECRET),
+        "the deleted page's image is still in the file"
+    );
+}
+
 /// The allocator, noting the largest block each thread asks for.
 struct Largest;
 
