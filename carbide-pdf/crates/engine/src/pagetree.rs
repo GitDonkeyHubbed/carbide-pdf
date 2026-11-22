@@ -564,6 +564,57 @@ mod tests {
     }
 
     #[test]
+    fn a_value_copied_from_the_old_parent_is_rewritten_for_every_reader() {
+        // Listed under the root, but /Parent names a node that is not in the tree. Its turn and
+        // crop are copied onto the page when that parent is corrected, and only then rewritten.
+        // Rewriting first leaves the copy as it was: a turn of -135, and a crop coordinate of
+        // -1_000_001. A turn of 270 is already the integer every reader uses, so the check above
+        // stays green, and a box or turn written on the page itself never takes this path.
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(
+                    dictionary! { "Type" => "Pages", "Kids" => vec![(2, 0).into()], "Count" => 1 },
+                ),
+            ),
+            (
+                2,
+                Object::Dictionary(dictionary! { "Type" => "Page", "Parent" => (3, 0) }),
+            ),
+            (
+                3,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => Vec::<Object>::new(),
+                    "Count" => 0,
+                    "Parent" => (3, 0),
+                    "Rotate" => -135,
+                    "CropBox" => vec![
+                        Object::Integer(0),
+                        Object::Integer(-1_000_001),
+                        Object::Integer(612),
+                        Object::Integer(792),
+                    ],
+                }),
+            ),
+        ]);
+        repair(&mut doc).unwrap();
+        let page = doc.get_dictionary((2, 0)).unwrap();
+        assert_eq!(page.get(b"Parent").unwrap(), &Object::Reference((1, 0)));
+        assert_eq!(
+            page.get(b"Rotate").unwrap(),
+            &Object::Integer(270),
+            "a turn of -135 is three quarter turns"
+        );
+        let crop = page.get(b"CropBox").unwrap().as_array().unwrap();
+        assert_eq!(
+            crop[1],
+            Object::Real(-1_000_000.0),
+            "one past the limit, the other way, is brought in: {crop:?}"
+        );
+    }
+
+    #[test]
     fn rotations_are_rewritten_as_the_turn_viewers_read() {
         let turned = |rotate: Object| {
             Object::Dictionary(
