@@ -440,6 +440,8 @@ fn plain_boxes(doc: &mut Document, id: ObjectId) -> Result<()> {
 mod tests {
     use super::*;
 
+    use lopdf::Stream;
+
     /// A catalog whose page tree root is `root`, holding `objects`.
     fn document(objects: Vec<(u32, Object)>) -> Document {
         let mut doc = Document::with_version("1.7");
@@ -643,6 +645,103 @@ mod tests {
         assert_eq!(
             doc.get_dictionary((1, 0)).unwrap().get_type().unwrap(),
             b"Page"
+        );
+    }
+
+    #[test]
+    fn a_duplicated_page_copies_a_short_list_of_references_and_shares_a_longer_one() {
+        // The array is one value and each reference in it is another. What the reference names is
+        // not counted and is not copied. Fifteen references make sixteen values, so the second
+        // listing gets its own array and every reference in it still names the original stream.
+        // One more reference is seventeen, so both listings keep one array. Following a reference
+        // into the stream, or treating any reference as too large to copy, shares the smaller
+        // array. Not counting a reference copies the larger one. Copying what a reference names
+        // leaves a second stream. A flat array of numbers never names the stream.
+        let references = |count: usize| Object::Array(vec![Object::Reference((3, 0)); count]);
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                    "Count" => 2,
+                }),
+            ),
+            (
+                2,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => (1, 0),
+                    "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                    "Small" => references(15),
+                    "Large" => references(16),
+                }),
+            ),
+            (
+                3,
+                Object::Stream(Stream::new(Dictionary::new(), b"q Q".to_vec())),
+            ),
+        ]);
+        repair(&mut doc).unwrap();
+        let kids = doc
+            .get_dictionary((1, 0))
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+        let first = kids[0].as_reference().unwrap();
+        let second = kids[1].as_reference().unwrap();
+        assert_eq!(first, (2, 0), "the first listing is the original page");
+        assert_ne!(second, first, "the second listing is a page of its own");
+        let entry = |page: ObjectId, key: &[u8]| {
+            doc.get_dictionary(page).unwrap().get(key).unwrap().clone()
+        };
+        let expect_references = |object: &Object, count: usize| {
+            let Object::Array(items) = object else {
+                panic!("the list is an array, got {object:?}");
+            };
+            assert_eq!(items.len(), count, "every reference in the list was kept");
+            assert!(
+                items.iter().all(|item| item == &Object::Reference((3, 0))),
+                "the list still names the original stream, got {items:?}"
+            );
+        };
+        let Object::Array(copied) = entry(second, b"Small") else {
+            panic!(
+                "an array of 15 references is copied onto the second listing, got {:?}",
+                entry(second, b"Small")
+            );
+        };
+        expect_references(&Object::Array(copied), 15);
+        let Object::Array(_) = entry(first, b"Small") else {
+            panic!(
+                "the first listing keeps its own array, got {:?}",
+                entry(first, b"Small")
+            );
+        };
+        expect_references(&entry(first, b"Small"), 15);
+        let shared = entry(first, b"Large");
+        assert_eq!(
+            shared,
+            entry(second, b"Large"),
+            "both listings name the same array of 16 references"
+        );
+        let Object::Reference(id) = shared else {
+            panic!("an array of 16 references stays a reference, got {shared:?}");
+        };
+        assert_ne!(id, (3, 0), "the shared array is not the stream");
+        expect_references(doc.get_object(id).unwrap(), 16);
+        let streams = doc
+            .objects
+            .values()
+            .filter(|object| matches!(object, Object::Stream(stream) if stream.content == b"q Q"))
+            .count();
+        assert_eq!(streams, 1, "the stream the arrays name was not copied");
+        assert!(
+            matches!(doc.get_object((3, 0)).unwrap(), Object::Stream(stream) if stream.content == b"q Q"),
+            "the original stream is unchanged"
         );
     }
 }
