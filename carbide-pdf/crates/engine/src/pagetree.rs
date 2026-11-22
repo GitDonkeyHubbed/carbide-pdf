@@ -645,4 +645,139 @@ mod tests {
             b"Page"
         );
     }
+
+    #[test]
+    fn a_duplicated_page_copies_short_empty_containers_and_shares_longer_ones() {
+        // An empty dictionary is one value, so both listings get their own. A dictionary of
+        // fifteen empty dictionaries is sixteen values and is copied too. Sixteen empty
+        // dictionaries are seventeen values, so that one stays a single object. An array of
+        // fifteen empty arrays is copied; sixteen stays one object. Treating an empty dictionary
+        // as too large shares the bare dictionary and the dictionary of fifteen. Not counting an
+        // empty dictionary copies the dictionary of sixteen. Treating an empty array as too large
+        // shares the array of fifteen. Not counting an empty array copies the array of sixteen.
+        // Lowering the copy limit to 15 shares both fifteens. Raising it to 17 copies both
+        // sixteens. A flat array of numbers never takes this path.
+        let groups = |count: usize| {
+            let mut dict = Dictionary::new();
+            for n in 0..count {
+                dict.set(format!("G{n}"), Object::Dictionary(Dictionary::new()));
+            }
+            Object::Dictionary(dict)
+        };
+        let rows = |count: usize| Object::Array(vec![Object::Array(Vec::new()); count]);
+        let mut page = dictionary! {
+            "Type" => "Page",
+            "Parent" => (1, 0),
+            "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        };
+        page.set("Bare", Object::Dictionary(Dictionary::new()));
+        page.set("Short", groups(15));
+        page.set("Wide", groups(16));
+        page.set("Row", rows(15));
+        page.set("Long", rows(16));
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                    "Count" => 2,
+                }),
+            ),
+            (2, Object::Dictionary(page)),
+        ]);
+        repair(&mut doc).unwrap();
+        let kids = doc
+            .get_dictionary((1, 0))
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+        let first = kids[0].as_reference().unwrap();
+        let second = kids[1].as_reference().unwrap();
+        assert_eq!(first, (2, 0), "the first listing is the original page");
+        assert_ne!(second, first, "the second listing is a page of its own");
+        let entry = |page_id: ObjectId, key: &[u8]| {
+            doc.get_dictionary(page_id)
+                .unwrap()
+                .get(key)
+                .unwrap()
+                .clone()
+        };
+        let empty_dict = Object::Dictionary(Dictionary::new());
+        assert_eq!(entry(first, b"Bare"), empty_dict);
+        assert_eq!(entry(second, b"Bare"), empty_dict);
+        let expect_groups = |object: &Object, count: usize| {
+            let Object::Dictionary(dict) = object else {
+                panic!("the groups stayed a dictionary, got {object:?}");
+            };
+            assert_eq!(
+                dict.len(),
+                count,
+                "the dictionary kept its empty dictionaries"
+            );
+            for (key, value) in dict.iter() {
+                let Object::Dictionary(inner) = value else {
+                    panic!(
+                        "group {} stayed a dictionary, got {value:?}",
+                        String::from_utf8_lossy(key)
+                    );
+                };
+                assert!(
+                    inner.is_empty(),
+                    "group {} stayed empty",
+                    String::from_utf8_lossy(key)
+                );
+            }
+        };
+        let expect_rows = |object: &Object, count: usize| {
+            let Object::Array(items) = object else {
+                panic!("the rows stayed an array, got {object:?}");
+            };
+            assert_eq!(items.len(), count, "the array kept its empty arrays");
+            for (n, item) in items.iter().enumerate() {
+                assert_eq!(item, &Object::Array(Vec::new()), "row {n}");
+            }
+        };
+        let short_first = entry(first, b"Short");
+        let short_second = entry(second, b"Short");
+        expect_groups(&short_first, 15);
+        expect_groups(&short_second, 15);
+        assert_eq!(
+            short_first, short_second,
+            "the second listing copied the dictionary of 15 empty dictionaries"
+        );
+        let row_first = entry(first, b"Row");
+        let row_second = entry(second, b"Row");
+        expect_rows(&row_first, 15);
+        expect_rows(&row_second, 15);
+        assert_eq!(
+            row_first, row_second,
+            "the second listing copied the array of 15 empty arrays"
+        );
+        let shared = |key: &[u8], label: &str| {
+            let value = entry(first, key);
+            assert_eq!(
+                value,
+                entry(second, key),
+                "both listings name the same {label}"
+            );
+            let Object::Reference(id) = value else {
+                panic!("the {label} stays a reference, got {value:?}");
+            };
+            id
+        };
+        expect_groups(
+            doc.get_object(shared(b"Wide", "dictionary of 16 empty dictionaries"))
+                .unwrap(),
+            16,
+        );
+        expect_rows(
+            doc.get_object(shared(b"Long", "array of 16 empty arrays"))
+                .unwrap(),
+            16,
+        );
+    }
 }
