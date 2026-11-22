@@ -598,6 +598,76 @@ mod tests {
     }
 
     #[test]
+    fn a_real_turn_is_taken_toward_zero_before_it_is_normalized() {
+        // 89.9 is just short of a quarter turn. Viewers drop the fraction toward zero, so the
+        // page stores no turn. Rounding it stores 90. A real of 90.5 is already past that turn,
+        // so the older check stays green.
+        // -89.9 is the same distance past zero on the other side. Toward zero it is no turn.
+        // Rounding it, or taking it toward negative infinity, stores 270. The positive one stays
+        // green for that change.
+        // -90.0 is a whole quarter turn written as a real, not as an integer. Viewers read 270.
+        // Keeping the real's own integer stores -90. A plain integer of -90 is left as written,
+        // so it does not take this path.
+        // 1e30 does not fit in a signed 32-bit integer. Viewers saturate and read 90. Treating a
+        // real that large as no turn stores 0. The older real is 90.5.
+        // -1e30 saturates the other way and reads as 270. The integer rule, which reads a
+        // negative past that range as no turn, stores 0. The positive real stays green.
+        let turned = |rotate: f32| {
+            Object::Dictionary(
+                dictionary! { "Type" => "Page", "Parent" => (1, 0), "Rotate" => Object::Real(rotate) },
+            )
+        };
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![(2, 0).into(), (3, 0).into(), (4, 0).into(), (5, 0).into(), (6, 0).into()],
+                    "Count" => 5,
+                }),
+            ),
+            (2, turned(89.9)),
+            (3, turned(-89.9)),
+            (4, turned(-90.0)),
+            (5, turned(1.0e30)),
+            (6, turned(-1.0e30)),
+        ]);
+        repair(&mut doc).unwrap();
+        let rotate = |id: u32| {
+            doc.get_dictionary((id, 0))
+                .unwrap()
+                .get(b"Rotate")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            rotate(2),
+            Object::Integer(0),
+            "just short of a quarter turn is no turn"
+        );
+        assert_eq!(
+            rotate(3),
+            Object::Integer(0),
+            "just short of a negative quarter turn is no turn"
+        );
+        assert_eq!(
+            rotate(4),
+            Object::Integer(270),
+            "a negative real quarter turn is the turn viewers read"
+        );
+        assert_eq!(
+            rotate(5),
+            Object::Integer(90),
+            "a real past the signed range saturates to one quarter turn"
+        );
+        assert_eq!(
+            rotate(6),
+            Object::Integer(270),
+            "a negative real past the signed range saturates to three quarter turns"
+        );
+    }
+
+    #[test]
     fn deep_trees_and_shared_branches_are_refused() {
         let mut objects = vec![];
         for n in 1..=(MAX_DEPTH as u32 + 2) {
