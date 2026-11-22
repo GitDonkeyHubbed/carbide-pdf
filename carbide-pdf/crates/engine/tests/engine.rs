@@ -5739,6 +5739,72 @@ fn how_far_down_a_form_is_first_drawn_does_not_change_the_size_found() {
 }
 
 #[test]
+fn a_form_without_resources_is_sized_for_each_set_it_is_drawn_with() {
+    // The shared form has no resources of its own. It draws /N. One form that draws it supplies
+    // an /N which paints the photo at 100 by 75 pt, and another supplies an /N which paints it at
+    // 400 by 300 pt. The photo is sized for the larger of those, about 833 pixels. Remembering
+    // the shared form by its object alone, and not by whose resources it was drawn with, keeps
+    // whichever drawing came first. Drawn small first, the photo is then sized for 100 pt, about
+    // 209 pixels. The four-times matrix is one form with its own resources, and so is each form
+    // in the chain of seven.
+    let widths = |small_first: bool| {
+        let content: &[u8] = if small_first {
+            b"/A Do /B Do"
+        } else {
+            b"/B Do /A Do"
+        };
+        let mut pdf = photo_page(content, |doc, photo| {
+            let paint = |doc: &mut Document, body: &[u8]| {
+                doc.add_object(Stream::new(
+                    dictionary! {
+                        "Type" => "XObject",
+                        "Subtype" => "Form",
+                        "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                        "Resources" => dictionary! { "XObject" => dictionary! { "Im" => photo } },
+                    },
+                    body.to_vec(),
+                ))
+            };
+            let small = paint(doc, b"q 100 0 0 75 0 0 cm /Im Do Q");
+            let large = paint(doc, b"q 400 0 0 300 0 0 cm /Im Do Q");
+            let shared = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                },
+                b"/N Do".to_vec(),
+            ));
+            let wrap = |doc: &mut Document, nested: lopdf::ObjectId| {
+                doc.add_object(Stream::new(
+                    dictionary! {
+                        "Type" => "XObject",
+                        "Subtype" => "Form",
+                        "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                        "Resources" => dictionary! {
+                            "XObject" => dictionary! { "S" => shared, "N" => nested }
+                        },
+                    },
+                    b"/S Do".to_vec(),
+                ))
+            };
+            dictionary! { "A" => wrap(doc, small), "B" => wrap(doc, large) }
+        });
+        image_widths(&pdf.reduce(&ReduceOptions::default(), None).unwrap().0)
+    };
+    let small_first = widths(true);
+    let large_first = widths(false);
+    assert_eq!(
+        small_first, large_first,
+        "whose resources came first changed the size: {small_first:?} vs {large_first:?}"
+    );
+    assert!(
+        small_first.len() == 1 && (700..1000).contains(&small_first[0]),
+        "the larger drawing should size the photo, got {small_first:?}"
+    );
+}
+
+#[test]
 fn slider_trades_size_for_quality() {
     let mut pdf = photo_pdf();
     let small = pdf
