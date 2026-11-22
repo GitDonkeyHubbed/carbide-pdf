@@ -440,6 +440,8 @@ fn plain_boxes(doc: &mut Document, id: ObjectId) -> Result<()> {
 mod tests {
     use super::*;
 
+    use lopdf::Dictionary;
+
     /// A catalog whose page tree root is `root`, holding `objects`.
     fn document(objects: Vec<(u32, Object)>) -> Document {
         let mut doc = Document::with_version("1.7");
@@ -643,6 +645,115 @@ mod tests {
         assert_eq!(
             doc.get_dictionary((1, 0)).unwrap().get_type().unwrap(),
             b"Page"
+        );
+    }
+
+    #[test]
+    fn a_duplicated_page_copies_a_short_nested_dictionary_and_shares_a_longer_one() {
+        // The outer dictionary is one value and the inner dictionary is another. Each number
+        // inside is one more. Fourteen numbers make sixteen values, so the second listing gets
+        // its own copy of both dictionaries. Fifteen numbers make seventeen, so both listings
+        // name one object. Skipping a dictionary that sits inside another copies the larger
+        // one. A copy limit of 15 shares the smaller one, and a copy limit of 17 copies the
+        // larger one.
+        let nested = |count: usize| {
+            let mut inner = Dictionary::new();
+            for n in 0..count {
+                inner.set(format!("N{n:02}"), n as i64);
+            }
+            let mut outer = Dictionary::new();
+            outer.set("Inner", inner);
+            Object::Dictionary(outer)
+        };
+        let mut page = dictionary! {
+            "Type" => "Page",
+            "Parent" => (1, 0),
+            "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        };
+        page.set("Small", nested(14));
+        page.set("Large", nested(15));
+        let mut doc = document(vec![
+            (
+                1,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![(2, 0).into(), (2, 0).into()],
+                    "Count" => 2,
+                }),
+            ),
+            (2, Object::Dictionary(page)),
+        ]);
+        repair(&mut doc).unwrap();
+        let kids = doc
+            .get_dictionary((1, 0))
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+        let first = kids[0].as_reference().unwrap();
+        let second = kids[1].as_reference().unwrap();
+        assert_eq!(first, (2, 0), "the first listing is the original page");
+        assert_ne!(second, first, "the second listing is a page of its own");
+        let entry = |page_id: ObjectId, key: &[u8]| {
+            doc.get_dictionary(page_id)
+                .unwrap()
+                .get(key)
+                .unwrap()
+                .clone()
+        };
+        let expect_nested = |object: &Object, count: usize| {
+            let Object::Dictionary(outer) = object else {
+                panic!("the nested dictionary is a dictionary, got {object:?}");
+            };
+            assert_eq!(outer.len(), 1, "the outer dictionary has one entry");
+            let inner = outer.get(b"Inner").unwrap();
+            let Object::Dictionary(inner) = inner else {
+                panic!("the inner dictionary stays inside it, got {inner:?}");
+            };
+            assert_eq!(
+                inner.len(),
+                count,
+                "every number in the inner dictionary was kept"
+            );
+            for n in 0..count {
+                assert_eq!(
+                    inner.get(format!("N{n:02}").as_bytes()).unwrap(),
+                    &Object::Integer(n as i64),
+                    "number {n}"
+                );
+            }
+        };
+        let small_first = entry(first, b"Small");
+        let small_second = entry(second, b"Small");
+        expect_nested(&small_first, 14);
+        expect_nested(&small_second, 14);
+        let shared = entry(first, b"Large");
+        assert_eq!(
+            shared,
+            entry(second, b"Large"),
+            "both listings name the same dictionary of 15 numbers"
+        );
+        let Object::Reference(id) = shared else {
+            panic!(
+                "a dictionary holding a dictionary of 15 numbers stays a reference, got {shared:?}"
+            );
+        };
+        expect_nested(doc.get_object(id).unwrap(), 15);
+        let shared_dictionaries = doc
+            .objects
+            .values()
+            .filter(|object| {
+                let Object::Dictionary(outer) = object else {
+                    return false;
+                };
+                matches!(outer.get(b"Inner"), Ok(Object::Dictionary(_)))
+            })
+            .count();
+        assert_eq!(
+            shared_dictionaries, 1,
+            "the larger nested dictionary was not copied"
         );
     }
 }
